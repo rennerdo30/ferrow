@@ -27,8 +27,11 @@ pub(super) fn directory(path: &Path, system: bool) -> io::Result<()> {
         let created = match std::fs::symlink_metadata(&current) {
             Ok(_) => false,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new().mode(0o700).create(&current)?;
-                true
+                match std::fs::DirBuilder::new().mode(0o700).create(&current) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         };
