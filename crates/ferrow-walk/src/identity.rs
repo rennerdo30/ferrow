@@ -8,6 +8,39 @@
 
 use std::path::Path;
 
+/// Inspect the reparse point itself: the name-surrogate bit also covers
+/// junctions and mount points, independently of Rust's symlink classification.
+#[cfg(windows)]
+pub fn is_name_surrogate(path: &Path) -> std::io::Result<bool> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    // SAFETY: zeroed FILE_ATTRIBUTE_TAG_INFO is a valid output buffer.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns the live handle throughout the query. The output
+    // pointer and size describe `info` exactly and it outlives the call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.ReparseTag & 0x2000_0000 != 0)
+}
+
 /// Identity of one filesystem object on one volume.
 ///
 /// `kind` separates the namespaces the platform APIs report, so ids

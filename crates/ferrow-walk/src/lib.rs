@@ -112,11 +112,82 @@ struct ExcludeSet {
     dirs: HashSet<FileId>,
     files: HashSet<FileId>,
     files_by_parent: HashMap<FileId, HashSet<FileId>>,
+    ancestors: Mutex<HashMap<FileId, bool>>,
 }
 
 impl ExcludeSet {
     fn is_empty(&self) -> bool {
         self.dirs.is_empty() && self.files.is_empty()
+    }
+
+    /// A real location is inside an excluded directory when any resolved
+    /// ancestor has that identity. Cache only complete, successful results;
+    /// never cache an IO failure as a negative match.
+    fn excluded_ancestors(&self, resolved: &Path) -> std::io::Result<bool> {
+        let mut visited = Vec::new();
+        let mut excluded = false;
+        for ancestor in resolved.ancestors() {
+            let id = file_id(ancestor)?;
+            if self.dirs.contains(&id) {
+                excluded = true;
+                break;
+            }
+            if let Some(cached) = self
+                .ancestors
+                .lock()
+                .expect("ancestor cache poisoned")
+                .get(&id)
+            {
+                excluded = *cached;
+                break;
+            }
+            visited.push(id);
+        }
+        let mut cache = self.ancestors.lock().expect("ancestor cache poisoned");
+        for id in visited {
+            cache.insert(id, excluded);
+        }
+        Ok(excluded)
+    }
+
+    /// Shared location check for roots and aliases, including aliases kept
+    /// as leaves. Canonical strings locate ancestors; only identities match.
+    fn excluded_location(
+        &self,
+        path: &Path,
+        id: Option<FileId>,
+        is_link: bool,
+    ) -> std::io::Result<bool> {
+        if self.is_empty() {
+            return Ok(false);
+        }
+        if let Some(id) = id
+            && (self.dirs.contains(&id) || self.files.contains(&id))
+        {
+            return Ok(true);
+        }
+        if self.dirs.is_empty() {
+            return Ok(false);
+        }
+        // A link's own containing location matters even if its target is
+        // outside that directory. Resolve the parent, not lexical ancestors
+        // of a spelling that could contain a `..` detour.
+        if is_link
+            && let Some(parent) = path.parent()
+            && self.excluded_ancestors(&std::fs::canonicalize(parent)?)?
+        {
+            return Ok(true);
+        }
+        if let Some(id) = id
+            && let Some(cached) = self
+                .ancestors
+                .lock()
+                .expect("ancestor cache poisoned")
+                .get(&id)
+        {
+            return Ok(*cached);
+        }
+        self.excluded_ancestors(&std::fs::canonicalize(path)?)
     }
 }
 
@@ -159,24 +230,22 @@ fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
     set
 }
 
-/// True when a scan root is an excluded object itself or lies below
-/// an excluded directory. Ancestors are resolved once per root; the
-/// count is bounded by the root's depth.
-fn root_is_excluded(abs: &Path, root_identity: Option<FileId>, excludes: &ExcludeSet) -> bool {
-    if excludes.is_empty() {
-        return false;
-    }
-    if let Some(id) = root_identity
-        && (excludes.dirs.contains(&id) || excludes.files.contains(&id))
+/// Windows junctions and other name-surrogate reparse points are aliases,
+/// even when FileType::is_symlink does not classify them as symlinks.
+fn is_link(path: &Path, md: &std::fs::Metadata) -> std::io::Result<bool> {
+    #[cfg(windows)]
     {
-        return true;
+        use std::os::windows::fs::MetadataExt;
+        if md.file_attributes() & 0x400 == 0 {
+            return Ok(false);
+        }
+        identity::is_name_surrogate(path)
     }
-    abs.ancestors()
-        .skip(1)
-        .any(|ancestor| match file_id(ancestor) {
-            Ok(id) => excludes.dirs.contains(&id),
-            Err(_) => false,
-        })
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(md.file_type().is_symlink())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -231,12 +300,27 @@ impl<'x> Walker<'x> {
             let mut name = Vec::new();
             name_to_bytes(&entry.file_name(), &mut name);
             let mut ent_flags: u16 = 0;
+            #[cfg(windows)]
+            let is_symlink = match entry.metadata() {
+                Ok(md) => match is_link(&path, &md) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        self.errors.add(format!("{}: {e}", path.display()));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    self.errors.add(format!("{}: {e}", path.display()));
+                    continue;
+                }
+            };
+            #[cfg(not(windows))]
             let is_symlink = file_type.is_symlink();
             // file_type() never follows links: a symlinked directory is
             // a leaf unless following is on, in which case fs::metadata
             // (which traverses) decides. DirEntry::metadata() does NOT
             // traverse links, so it cannot be used for this.
-            let mut is_dir = file_type.is_dir();
+            let mut is_dir = file_type.is_dir() && !is_symlink;
             if is_symlink {
                 ent_flags |= flags::SYMLINK;
                 if self.follow_symlinks {
@@ -270,6 +354,16 @@ impl<'x> Walker<'x> {
                                 continue;
                             }
                             child_identity = Some(id);
+                            if is_symlink {
+                                match self.excludes.excluded_location(&path, Some(id), true) {
+                                    Ok(true) => continue,
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        self.errors.add(format!("{}: {e}", path.display()));
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             self.errors.add(format!("{}: {e}", path.display()));
@@ -364,9 +458,6 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
             .as_ref()
             .and_then(|r| r.as_ref().ok())
             .copied();
-        if root_is_excluded(&abs, root_identity, &excludes) {
-            continue;
-        }
         let name = root_name_bytes(&abs);
         // symlink_metadata first: a root symlink is only followed when
         // the switch is on (fs::metadata would traverse it silently).
@@ -383,7 +474,21 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
             // never silent.
             errors.add(format!("{}: {e}", root.display()));
         }
-        let is_symlink = link_md.file_type().is_symlink();
+        let is_symlink = match is_link(&abs, &link_md) {
+            Ok(value) => value,
+            Err(e) => {
+                errors.add(format!("{}: {e}", root.display()));
+                continue;
+            }
+        };
+        match excludes.excluded_location(&abs, root_identity, is_symlink) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                errors.add(format!("{}: {e}", root.display()));
+                continue;
+            }
+        }
         let mut root_flags: u16 = 0;
         if is_symlink {
             root_flags |= flags::SYMLINK;

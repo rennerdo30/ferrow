@@ -124,14 +124,32 @@ to the 64-bit file index from `GetFileInformationByHandle` where
 start is reported in the scan report as `exclude not found: …` and
 otherwise ignored.
 
-When the walker is about to descend into a directory, including each
-scan root, it compares that directory's identity against the excluded
-set; a match skips the directory and everything below it. For roots,
-the ancestors' identities are also checked once (bounded by the
-root's depth), so an excluded directory cannot be re-included by
-naming it, or a directory under it, as an explicit root. File
-excludes match by identity inside the directory that contains the
-spelled-out path.
+**Exclude contract.** An exclude names a filesystem object, resolved once at
+scan start; links in the exclude path itself are resolved to their target.
+An entry is excluded when its own location, or the location it resolves to,
+lies inside an excluded directory, or is itself an excluded file. Being inside
+means the excluded directory's identity appears among the identities of the
+resolved location's ancestor chain. Excluded entries and everything below
+them are not indexed, whatever spelling, link, junction or alias reaches them,
+and whether following is on or off.
+
+One location check applies to every root and to links and name-surrogate
+reparse points (including junctions), even when they remain traversal leaves.
+It uses `std::fs::canonicalize` to locate real ancestors, then compares their
+identities, never the canonical strings. This also avoids treating a lexical
+`..` detour as an ancestor. A link's containing location is checked as well as
+its resolved target, so an alias inside an excluded directory cannot escape
+the exclusion by pointing outside. Successful ancestor results are cached by
+directory identity for the scan. Ordinary real parent-to-child directory
+edges only check the child's identity: the parent chain has already passed.
+The stored path spelling is preserved independently of these checks.
+
+File excludes match by identity inside the directory that contains the
+resolved exclude path; explicit file roots are checked directly. Identity
+lookup failures on existing paths are counted with their reason, rather than
+reported as missing excludes. Windows identity handles use Rust's
+`OpenOptions` path conversion, attribute-only access, read/write/delete sharing
+and backup semantics, and close through RAII.
 
 Consequences of identity matching, by construction:
 
@@ -148,11 +166,25 @@ Consequences of identity matching, by construction:
   hard-linked names of the same file in the same containing
   directory.
 
-Cost: one identity lookup per directory (only while excludes are
-configured or symlinks are followed; the same lookup feeds
-symlink-cycle detection), plus per-file lookups only inside a
-directory that contains a file exclude. Files in general are never
-resolved.
+Cost: one identity lookup per ordinary directory (only while excludes are
+configured or symlinks are followed; the same lookup feeds cycle detection),
+plus per-file lookups only inside a directory that contains a file exclude.
+Roots and aliases alone pay O(depth) ancestor lookups, with cached results
+making repeated targets cheap. Files in general are never resolved.
+
+### Limitations
+
+- Excludes are start-of-scan identities, not retained handles or an atomic
+  filesystem snapshot. Replacement, deletion and identity reuse during a
+  scan can change the result; M1 is a best-effort walk.
+- FAT, network and ReFS volumes with unstable, zero or non-unique identities
+  need provider validation before support can be promised; this is later scope.
+- File hard links in other containing directories stay indexed. M1 does not
+  perform global per-file identity lookups.
+- Test fixture creation failures fail tests. Platform exclusions use `cfg` or
+  real `#[ignore = "reason"]` attributes. The Unix unreadable-directory test
+  omits its permission-denial assertion when a privileged process can still
+  read mode-000 directories, and prints an explicit ignored-assertion reason.
 
 ## Alternatives considered
 
