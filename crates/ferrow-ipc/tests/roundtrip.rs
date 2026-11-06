@@ -8,6 +8,12 @@ use ferrow_ipc::protocol::{
 use ferrow_ipc::{Client, Endpoint, ErrorCode, Listener, Stream, serve_stream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn accepted_stream_can_move_to_a_worker() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Stream>();
+}
+
 fn test_endpoint(tag: &str) -> Endpoint {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     Endpoint::named(&format!(

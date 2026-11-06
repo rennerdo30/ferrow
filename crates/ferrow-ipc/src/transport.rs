@@ -309,6 +309,11 @@ mod platform {
     /// An owned pipe handle; disconnected and closed on drop.
     struct PipeHandle(HANDLE);
 
+    // SAFETY: this wrapper uniquely owns the kernel handle. Moving it transfers
+    // ownership; it is never cloned or exposed for concurrent I/O. Windows pipe
+    // handles are not thread-affine. This does not implement Sync.
+    unsafe impl Send for PipeHandle {}
+
     impl Drop for PipeHandle {
         fn drop(&mut self) {
             // FlushFileBuffers on a pipe waits until the peer has
