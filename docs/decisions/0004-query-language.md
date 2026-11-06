@@ -34,9 +34,10 @@ predicates. `path:` selects the indexed full path, joined with the native
 separator, without filesystem I/O or path canonicalization. `wholeword:`
 requires both match edges to be next to the start/end or a non-word scalar;
 letters, numbers and underscore are word characters. Regex syntax and
-matching use the permissively licensed Rust `regex` crate. Case-insensitive
-regex literals are folded with the same index function; regex syntax is
-preserved. Inline case-mode overrides are rejected to keep folding consistent.
+matching use the permissively licensed Rust `regex` crate, including its
+Unicode case-insensitive semantics and inline flags. Plain and wildcard
+terms retain the index fold; regex character classes follow the crate's
+Unicode rules, including folds whose byte length differs.
 
 Current predicates: `ext:log;txt` compares the final nonempty extension,
 excluding directories and leading-dot-only names; `parent:"/some/folder"`

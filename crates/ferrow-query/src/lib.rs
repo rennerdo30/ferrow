@@ -1,14 +1,9 @@
 //! Query parser and parallel name matcher.
 //!
-//! Grammar (M1):
-//! - terms separated by whitespace mean AND;
-//! - `!term` means NOT;
-//! - `"quoted phrase"` is one literal term (spaces included);
-//! - matching is case-insensitive by default; `case:term` (also after
-//!   `!`, e.g. `!case:Foo`) makes one term case-sensitive.
-//!
-//! Matching is a substring test on the entry name only. The parser never
-//! panics on any input.
+//! Space means AND, `|` means OR, `!` means NOT and `<...>` groups terms.
+//! Plain terms are substrings; wildcard terms match the whole name.
+//! Quotes protect literal phrases. Modifiers and filters are described in
+//! ADR 0004. Parsing and matching are bounded; errors carry byte spans.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,99 +11,13 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use ferrow_index::{Index, fold_name};
 use memchr::memmem;
+
 use rayon::prelude::*;
 
-/// One search term.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Term {
-    pub text: String,
-    pub negated: bool,
-    pub case_sensitive: bool,
-}
-
-/// A parsed query: all terms must match (AND).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Query {
-    pub terms: Vec<Term>,
-}
-
-impl Query {
-    /// Parse a query string. An empty (or whitespace-only) query has no
-    /// terms and matches every entry.
-    pub fn parse(input: &str) -> Result<Query, ParseError> {
-        let bytes = input.as_bytes();
-        let mut terms = Vec::new();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            // Skip separators (ASCII whitespace; non-ASCII bytes form terms).
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                break;
-            }
-            let term_start = i;
-            let mut negated = false;
-            let mut case_sensitive = false;
-            if bytes[i] == b'!' {
-                negated = true;
-                i += 1;
-            }
-            if input[i..].starts_with("case:") {
-                case_sensitive = true;
-                i += "case:".len();
-            }
-            let text: String;
-            if i < bytes.len() && bytes[i] == b'"' {
-                let quote_at = i;
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return Err(ParseError::UnclosedQuote { at: quote_at });
-                }
-                text = input[start..i].to_string();
-                i += 1; // closing quote
-            } else {
-                let start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                text = input[start..i].to_string();
-            }
-            if text.is_empty() {
-                return Err(ParseError::EmptyTerm { at: term_start });
-            }
-            terms.push(Term {
-                text,
-                negated,
-                case_sensitive,
-            });
-        }
-        Ok(Query { terms })
-    }
-}
-
-/// Precise parse failures. `at` is a byte offset into the input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseError {
-    UnclosedQuote { at: usize },
-    EmptyTerm { at: usize },
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::UnclosedQuote { at } => {
-                write!(f, "unclosed quote starting at position {at}")
-            }
-            ParseError::EmptyTerm { at } => write!(f, "empty search term at position {at}"),
-        }
-    }
-}
-impl std::error::Error for ParseError {}
+mod parser;
+pub use parser::{
+    DateField, Expr, Filter, MetadataFilter, ParseError, Pattern, Query, RegexPlan, Term,
+};
 
 /// Shared cancellation flag, checked per chunk while searching.
 #[derive(Debug, Clone, Default)]
@@ -500,19 +409,8 @@ mod tests {
     fn parse_grammar() {
         let q = Query::parse("report 2024").unwrap();
         assert_eq!(
-            q.terms,
-            vec![
-                Term {
-                    text: "report".into(),
-                    negated: false,
-                    case_sensitive: false
-                },
-                Term {
-                    text: "2024".into(),
-                    negated: false,
-                    case_sensitive: false
-                },
-            ]
+            q.terms.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            ["report", "2024"]
         );
         let q = Query::parse("!tmp log").unwrap();
         assert!(q.terms[0].negated && q.terms[0].text == "tmp");
