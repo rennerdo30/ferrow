@@ -75,6 +75,42 @@ fn validate_binary(path: &Path) -> io::Result<()> {
     }
 }
 
+pub fn state_directory(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::validate_path(
+            path.parent()
+                .ok_or_else(|| refused("missing state parent"))?,
+            windows::Role::Ancestor,
+        )?;
+        if !path.try_exists()? {
+            let _privilege = windows::RestorePrivilege::enable()?;
+            windows::create_directory(path, "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
+        }
+        windows::validate_path(path, windows::Role::StateDirectory)
+    }
+    #[cfg(unix)]
+    {
+        unix::directory(path, 0o700)
+    }
+}
+
+pub fn state_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows::validate_path(path, windows::Role::StateFile)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = unix::metadata(path, false)?;
+        if meta.mode() & 0o777 != 0o600 {
+            return Err(refused("service index must be root-owned 0600"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 pub(crate) mod unix {
     use super::*;
@@ -160,6 +196,8 @@ pub(crate) mod windows {
         Ancestor,
         Directory,
         Binary,
+        StateDirectory,
+        StateFile,
     }
     pub struct Descriptor(pub PSECURITY_DESCRIPTOR);
     impl Drop for Descriptor {
@@ -201,6 +239,22 @@ pub(crate) mod windows {
             {
                 return Err(refused("service path has an untrusted owner"));
             }
+            let state = matches!(role, Role::StateDirectory | Role::StateFile);
+            if matches!(role, Role::StateDirectory) {
+                let mut control = 0;
+                let mut revision = 0;
+                // SAFETY: live descriptor and initialized outputs.
+                if sid_text(owner)? != "S-1-5-18"
+                    || unsafe {
+                        GetSecurityDescriptorControl(self.0, &raw mut control, &raw mut revision)
+                    } == 0
+                    || control & SE_DACL_PROTECTED == 0
+                {
+                    return Err(refused(
+                        "state directory requires SYSTEM owner and disabled inheritance",
+                    ));
+                }
+            }
             // SAFETY: same valid descriptor and live output pointers.
             if unsafe {
                 GetSecurityDescriptorDacl(
@@ -219,9 +273,11 @@ pub(crate) mod windows {
                 Role::Ancestor => 0x000d0040,
                 Role::Directory => 0x000d0156,
                 Role::Binary => 0x000d0116,
+                Role::StateDirectory | Role::StateFile => u32::MAX,
             };
             // SAFETY: API-owned ACL is initialized and remains live for enumeration.
             let count = unsafe { (*acl).AceCount };
+            let (mut system_full, mut admin_full) = (false, false);
             for index in 0..count {
                 let mut ace = std::ptr::null_mut();
                 // SAFETY: bounded index into live ACL; API supplies the ACE pointer.
@@ -231,7 +287,7 @@ pub(crate) mod windows {
                 // SAFETY: OS-validated ACE storage; unaligned value reads avoid Rust references.
                 let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
                 if (header.AceFlags & INHERIT_ONLY_ACE as u8 != 0
-                    && !matches!(role, Role::Directory))
+                    && !matches!(role, Role::Directory | Role::StateDirectory))
                     || header.AceType == 1
                 {
                     continue;
@@ -256,11 +312,27 @@ pub(crate) mod windows {
                 };
                 // SAFETY: initialized mask/mapping, used only to expand generic rights.
                 unsafe { MapGenericMask(&raw mut mask, &mapping) };
+                if state {
+                    if trustee != "S-1-5-18" && trustee != "S-1-5-32-544" && mask != 0 {
+                        return Err(refused(
+                            "state must be accessible only to SYSTEM and Administrators",
+                        ));
+                    }
+                    system_full |=
+                        trustee == "S-1-5-18" && mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS;
+                    admin_full |=
+                        trustee == "S-1-5-32-544" && mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS;
+                }
                 if mask & forbidden != 0 && !trusted(&trustee) && trustee != "S-1-3-4" {
                     return Err(refused(
                         "non-admin can modify or replace protected service path",
                     ));
                 }
+            }
+            if state && (!system_full || !admin_full) {
+                return Err(refused(
+                    "state requires SYSTEM and Administrators full control",
+                ));
             }
             Ok(())
         }
@@ -365,9 +437,119 @@ pub(crate) mod windows {
         Ok(result)
     }
 
+    pub struct RestorePrivilege {
+        token: std::os::windows::io::OwnedHandle,
+        previous: TOKEN_PRIVILEGES,
+    }
+    impl RestorePrivilege {
+        pub fn enable() -> io::Result<Self> {
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+            let mut token = std::ptr::null_mut();
+            // SAFETY: current process pseudo-handle, owned output captured immediately.
+            if unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    &raw mut token,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: newly returned unique token handle.
+            let token = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(token) };
+            let name: Vec<u16> = "SeRestorePrivilege".encode_utf16().chain(Some(0)).collect();
+            let mut luid = windows_sys::Win32::Foundation::LUID::default();
+            // SAFETY: terminated name and live LUID output.
+            if unsafe { LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &raw mut luid) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let requested = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            // SAFETY: zero is a valid initial token-privilege output buffer.
+            let mut previous: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+            let mut bytes = 0;
+            // SAFETY: valid token, one request and exact-size previous-state buffer.
+            let ok = unsafe {
+                AdjustTokenPrivileges(
+                    token.as_raw_handle(),
+                    0,
+                    &requested,
+                    size_of::<TOKEN_PRIVILEGES>() as u32,
+                    &raw mut previous,
+                    &raw mut bytes,
+                )
+            };
+            let error = io::Error::last_os_error();
+            let result = Self { token, previous };
+            if ok == 0
+                || error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_NOT_ALL_ASSIGNED as i32)
+            {
+                return Err(refused(
+                    "administrator restore privilege required for SYSTEM-owned state",
+                ));
+            }
+            Ok(result)
+        }
+    }
+    impl Drop for RestorePrivilege {
+        fn drop(&mut self) {
+            // SAFETY: restore this token's exact prior privilege state, then release it.
+            if unsafe {
+                AdjustTokenPrivileges(
+                    self.token.as_raw_handle(),
+                    0,
+                    &self.previous,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                std::process::abort();
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn state_requires_system_owner_protected_inheritance_and_only_admin_access() {
+            Descriptor::sddl("O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+                .unwrap()
+                .validate(Role::StateDirectory)
+                .unwrap();
+            for sddl in [
+                "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+                "O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)",
+                "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)",
+                "O:SYD:P(A;;FA;;;SY)",
+            ] {
+                assert!(
+                    Descriptor::sddl(sddl)
+                        .unwrap()
+                        .validate(Role::StateDirectory)
+                        .is_err(),
+                    "{sddl}"
+                );
+            }
+            assert!(
+                Descriptor::sddl("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;AU)")
+                    .unwrap()
+                    .validate(Role::StateFile)
+                    .is_err()
+            );
+        }
 
         #[test]
         fn ancestor_create_only_is_safe_but_replacement_and_control_are_not() {

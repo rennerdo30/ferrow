@@ -52,9 +52,9 @@ pub fn install() -> Result<String, String> {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     let exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
-    let index = crate::default_service_index_path();
+    let index = crate::default_service_index_path().map_err(|e| admin_hint("install", &e))?;
     if let Some(parent) = index.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| admin_hint("install", &e))?;
+        crate::protection::state_directory(parent).map_err(|e| admin_hint("install", &e))?;
     }
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -154,7 +154,13 @@ fn root_hint(action: &str, e: &std::io::Error) -> String {
 pub fn install() -> Result<String, String> {
     let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     std::fs::write(UNIT_PATH, systemd_unit()).map_err(|e| root_hint("install", &e))?;
-    std::fs::create_dir_all("/var/lib/ferrow").map_err(|e| root_hint("install", &e))?;
+    crate::protection::state_directory(
+        crate::default_service_index_path()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .unwrap(),
+    )
+    .map_err(|e| root_hint("install", &e))?;
     run_cmd("systemctl", &["daemon-reload"])?;
     run_cmd("systemctl", &["enable", SERVICE_NAME])?;
     Ok(format!(
@@ -179,7 +185,7 @@ pub fn uninstall() -> Result<String, String> {
 #[cfg(target_os = "macos")]
 fn launchd_plist() -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCHD_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--service-endpoint</string>\n\t\t<string>--index</string>\n\t\t<string>/var/lib/ferrow/index.bin</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>WorkingDirectory</key>\n\t<string>/var/lib/ferrow</string>\n\t<key>StandardOutPath</key>\n\t<string>/var/log/ferrowd.log</string>\n\t<key>StandardErrorPath</key>\n\t<string>/var/log/ferrowd.log</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCHD_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--service-endpoint</string>\n\t\t<string>--index</string>\n\t\t<string>/private/var/lib/ferrow/index.bin</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>WorkingDirectory</key>\n\t<string>/private/var/lib/ferrow</string>\n\t<key>StandardOutPath</key>\n\t<string>/var/log/ferrowd.log</string>\n\t<key>StandardErrorPath</key>\n\t<string>/var/log/ferrowd.log</string>\n</dict>\n</plist>\n",
         "/usr/local/libexec/ferrow/ferrowd"
     )
 }
@@ -194,7 +200,13 @@ pub fn install() -> Result<String, String> {
     let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     let path = plist_path();
     std::fs::write(&path, launchd_plist()).map_err(|e| root_hint("install", &e))?;
-    std::fs::create_dir_all("/var/lib/ferrow").map_err(|e| root_hint("install", &e))?;
+    crate::protection::state_directory(
+        crate::default_service_index_path()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .unwrap(),
+    )
+    .map_err(|e| root_hint("install", &e))?;
     Ok(format!(
         "launchd daemon {LAUNCHD_LABEL} installed ({path}). Load it with: sudo launchctl bootstrap system {path}\n\
          Grant ferrowd Full Disk Access in System Settings > Privacy & Security, or home directories stay unindexed."

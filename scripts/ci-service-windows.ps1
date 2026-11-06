@@ -39,6 +39,7 @@ function Cleanup-Service {
 
 if ($CleanupOnly) { Cleanup-Service; exit 0 }
 $expectedFailure = $false
+$ordinaryUser = $null
 try {
     $tree = Join-Path $env:RUNNER_TEMP 'svc-tree'
     New-Item -ItemType Directory -Force $tree | Out-Null
@@ -59,6 +60,22 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if (-not $ready) { throw 'service did not become ready' }
+    $stateAcl = Get-Acl 'C:\ProgramData\Ferrow'
+    if ($stateAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-18' -or -not $stateAcl.AreAccessRulesProtected) { throw 'state owner/inheritance is not protected' }
+    $ordinaryUser = 'ferrow-ci-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $password = ConvertTo-SecureString ([Guid]::NewGuid().ToString('N') + '!aA1') -AsPlainText -Force
+    $account = New-LocalUser -Name $ordinaryUser -Password $password
+    Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $account
+    $credential = [Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$ordinaryUser", $password)
+    $probe = Join-Path $PSScriptRoot 'ci-ordinary-user.ps1'
+    $ordinaryLog = Join-Path $env:RUNNER_TEMP 'ferrow-ordinary-user.log'
+    $ordinaryError = Join-Path $env:RUNNER_TEMP 'ferrow-ordinary-user.err'
+    $ordinary = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -Credential $credential -WindowStyle Hidden -PassThru -RedirectStandardOutput $ordinaryLog -RedirectStandardError $ordinaryError -ArgumentList @('-NoProfile', '-NonInteractive', '-File', "`"$probe`"", '-Cli', "`"$bin\ferrow.exe`"")
+    Write-Host "Started ordinary-user probe PID $($ordinary.Id)"
+    try {
+        if (-not $ordinary.WaitForExit(15000)) { $ordinary.Kill($true); $ordinary.WaitForExit(); throw 'ordinary-user probe timed out' }
+        if ($ordinary.ExitCode -ne 0) { throw "ordinary-user ACL/refusal probe failed: $(Get-Content $ordinaryError -Raw)" }
+    } finally { $ordinary.Dispose() }
     $hits = Invoke-Bounded (Join-Path $bin 'ferrow.exe') @('search', 'ci-needle')
     if ($hits -notmatch 'ci-needle.txt') { throw "service missed query: $hits" }
     $cpu1 = $process.TotalProcessorTime.TotalSeconds
@@ -69,4 +86,6 @@ try {
 } catch {
     if (-not $expectedFailure) { throw }
     Write-Host 'Observed injected failure; finally must still remove the service.'
-} finally { Cleanup-Service }
+} finally {
+    try { Cleanup-Service } finally { if ($ordinaryUser) { Remove-LocalUser -Name $ordinaryUser } }
+}

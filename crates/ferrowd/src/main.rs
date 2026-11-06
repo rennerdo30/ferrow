@@ -77,7 +77,7 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
 
     #[cfg(windows)]
     if run_as_service {
-        let config = service_config(endpoint, index_path, roots, excludes, follow_symlinks);
+        let config = service_config(endpoint, index_path, roots, excludes, follow_symlinks)?;
         return service_windows::run(config).map_err(|e| e.to_string());
     }
     #[cfg(not(windows))]
@@ -85,6 +85,9 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
         return Err("--run-as-service is only supported on Windows".into());
     }
 
+    if endpoint == Endpoint::default_service() && index_path.is_none() {
+        index_path = Some(ferrowd::default_service_index_path().map_err(|e| e.to_string())?);
+    }
     let config = DaemonConfig {
         endpoint,
         index_path,
@@ -92,7 +95,7 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
         excludes,
         follow_symlinks,
     };
-    let store = SnapshotStore::new(initial_snapshot(&config));
+    let store = SnapshotStore::new(initial_snapshot(&config).map_err(|e| e.to_string())?);
     eprintln!("ferrowd: {}", store.get().report);
     serve(&config, store, Shutdown::new()).map_err(|e| e.to_string())
 }
@@ -104,14 +107,17 @@ fn service_config(
     roots: Vec<PathBuf>,
     excludes: Vec<PathBuf>,
     follow_symlinks: bool,
-) -> DaemonConfig {
-    DaemonConfig {
-        index_path: Some(index_path.unwrap_or_else(ferrowd::default_service_index_path)),
+) -> Result<DaemonConfig, String> {
+    Ok(DaemonConfig {
+        index_path: Some(match index_path {
+            Some(path) => path,
+            None => ferrowd::default_service_index_path().map_err(|e| e.to_string())?,
+        }),
         endpoint,
         roots,
         excludes,
         follow_symlinks,
-    }
+    })
 }
 
 fn main() -> ExitCode {

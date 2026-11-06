@@ -22,6 +22,9 @@ mkdir -p "$tree"
 echo x > "$tree/ci-needle.txt"
 timeout 25s sudo "$bin/ferrow" service install
 timeout 10s sudo "$bin/ferrow" index "$tree" --out /var/lib/ferrow/index.bin
+test "$(stat -c '%u:%a' /var/lib/ferrow)" = '0:700'
+test "$(sudo stat -c '%u:%a' /var/lib/ferrow/index.bin)" = '0:600'
+if cat /var/lib/ferrow/index.bin >/dev/null 2>&1; then echo 'ordinary user read privileged state' >&2; exit 1; fi
 timeout 25s sudo systemctl start ferrowd.service
 service_pid=$(systemctl show ferrowd.service -p MainPID --value)
 test "$service_pid" -gt 0

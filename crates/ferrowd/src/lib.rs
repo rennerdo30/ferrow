@@ -119,29 +119,52 @@ pub struct DaemonConfig {
 /// service (enforced by the directory ACL / mode at install
 /// time; the file itself is written 0600 on Unix by
 /// `Index::save`'s exclusive temp creation? see `ferrow-index`).
-pub fn default_service_index_path() -> PathBuf {
-    if cfg!(windows) {
-        let base = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        base.join("ferrow").join("index.bin")
-    } else {
-        PathBuf::from("/var/lib/ferrow/index.bin")
+pub fn default_service_index_path() -> std::io::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        Ok(
+            protection::windows::known_folder(
+                &windows_sys::Win32::UI::Shell::FOLDERID_ProgramData,
+            )?
+            .join("Ferrow/index.bin"),
+        )
     }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(PathBuf::from("/private/var/lib/ferrow/index.bin"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Ok(PathBuf::from("/var/lib/ferrow/index.bin"))
+    }
+}
+
+fn prepare_state(config: &DaemonConfig) -> std::io::Result<()> {
+    if config.endpoint == Endpoint::default_service() {
+        let expected = default_service_index_path()?;
+        if config.index_path.as_ref() != Some(&expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "system service requires its fixed protected index path",
+            ));
+        }
+        protection::state_directory(expected.parent().unwrap())?;
+        if expected.try_exists()? {
+            protection::state_file(&expected)?;
+        }
+    }
+    Ok(())
 }
 
 /// Initial snapshot for a config: a saved index file wins, then
 /// a walk of the configured roots (saved back to `index_path`
 /// when set), else an empty index.
-pub fn initial_snapshot(config: &DaemonConfig) -> Snapshot {
+pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
+    prepare_state(config)?;
     if let Some(path) = &config.index_path
         && path.exists()
     {
-        match Snapshot::from_file(path) {
-            Ok(snapshot) => return snapshot,
-            Err(e) => eprintln!("ferrowd: loading {}: {e}; starting empty", path.display()),
-        }
+        return Snapshot::from_file(path);
     }
     if !config.roots.is_empty() {
         let options = WalkOptions {
@@ -157,13 +180,12 @@ pub fn initial_snapshot(config: &DaemonConfig) -> Snapshot {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(e) = snapshot.index.save(path) {
-                eprintln!("ferrowd: saving {}: {e}", path.display());
-            }
+            snapshot.index.save(path).map_err(std::io::Error::other)?;
+            prepare_state(config)?;
         }
-        return snapshot;
+        return Ok(snapshot);
     }
-    Snapshot::empty()
+    Ok(Snapshot::empty())
 }
 
 /// Page budgets for streamed `Results` (well under the frame cap).
@@ -333,6 +355,7 @@ pub fn serve(
     store: SnapshotStore,
     shutdown: Shutdown,
 ) -> std::io::Result<()> {
+    prepare_state(config)?;
     let listener = Arc::new(Listener::bind(&config.endpoint)?);
     shutdown.register(&listener)?;
     let owner = CallerIdentity::current()?;

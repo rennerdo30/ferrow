@@ -62,7 +62,8 @@ fn run_service() -> Result<(), windows_service::Error> {
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
     )?;
-    let store = SnapshotStore::new(initial_snapshot(&config));
+    let store =
+        SnapshotStore::new(initial_snapshot(&config).map_err(windows_service::Error::Winapi)?);
     let result = serve(&config, store, shutdown);
     set_state(ServiceState::Stopped, ServiceControlAccept::empty())?;
     result.map_err(|e| {

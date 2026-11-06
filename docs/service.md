@@ -71,9 +71,13 @@ terminal / with sudo, as it tells you.
   folders (including most of each home directory) stay
   unindexed. Remove with `sudo ferrow service uninstall`.
 
-The system service reads its index from
-`%ProgramData%\ferrow\index.bin` (Windows) or
-`/var/lib/ferrow/index.bin` (Unix). Build one with
+The system service validates its state before every load and save:
+`%ProgramData%\Ferrow\index.bin` (Windows) or
+`/var/lib/ferrow/index.bin` (Unix; macOS uses its real `/private/var` ancestor).
+The Windows directory is SYSTEM-owned with inheritance disabled and only
+SYSTEM/Administrators full control; reparse points and hostile existing state
+are refused. New index files inherit only those protected grants. Unix state
+is root-owned 0700 and the index is root-owned 0600. Build an index with
 `ferrow index <roots> --out <that path>` from an elevated shell,
 or pass roots in the service command line. Keep that directory
 service-only: the index lists every file name on the machine.

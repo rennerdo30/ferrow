@@ -539,7 +539,9 @@ fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
                 excludes: args.excludes,
                 follow_symlinks: args.follow_symlinks,
             };
-            let store = ferrowd::SnapshotStore::new(ferrowd::initial_snapshot(&config));
+            let store = ferrowd::SnapshotStore::new(
+                ferrowd::initial_snapshot(&config).map_err(|e| e.to_string())?,
+            );
             eprintln!("ferrowd: {}", store.get().report);
             ferrowd::serve(&config, store, ferrowd::Shutdown::new()).map_err(|e| e.to_string())
         }
