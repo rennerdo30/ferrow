@@ -150,6 +150,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrow-ipc"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "ferrow-query"
 version = "0.0.0"
 dependencies = [
