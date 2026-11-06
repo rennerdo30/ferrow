@@ -350,34 +350,84 @@ fn service_client() -> Discovery {
     }
 }
 
-/// Write result paths in the selected output mode. Shared by the
-/// service and in-process search paths so both are byte-identical.
-fn emit_paths<W: Write>(
-    out: &mut W,
+/// The formatter retains only the largest escaped path, in every mode.
+struct PathOutput<'a, W: Write> {
+    out: &'a mut W,
+    json: bool,
+    null: bool,
+    first: bool,
+    escaped: String,
+}
+
+impl<'a, W: Write> PathOutput<'a, W> {
+    fn new(out: &'a mut W, json: bool, null: bool) -> Result<Self, String> {
+        if json {
+            out.write_all(b"[").map_err(|e| e.to_string())?;
+        }
+        Ok(Self {
+            out,
+            json,
+            null,
+            first: true,
+            escaped: String::new(),
+        })
+    }
+    fn path(&mut self, path: &[u8]) -> Result<(), String> {
+        if self.json {
+            self.escaped.clear();
+            if !self.first {
+                self.escaped.push(',');
+            }
+            self.escaped.push('"');
+            json_escape(&String::from_utf8_lossy(path), &mut self.escaped);
+            self.escaped.push('"');
+            self.out
+                .write_all(self.escaped.as_bytes())
+                .map_err(|e| e.to_string())?;
+        } else {
+            self.out.write_all(path).map_err(|e| e.to_string())?;
+            self.out
+                .write_all(if self.null { &[0] } else { b"\n" })
+                .map_err(|e| e.to_string())?;
+        }
+        self.first = false;
+        Ok(())
+    }
+    fn finish(self) -> Result<(), String> {
+        if self.json {
+            self.out.write_all(b"]\n").map_err(|e| e.to_string())?;
+        }
+        self.out.flush().map_err(|e| e.to_string())
+    }
+}
+
+fn emit_paths(
+    out: &mut impl Write,
     paths: &[Vec<u8>],
     json: bool,
     null: bool,
 ) -> Result<(), String> {
-    if json {
-        let mut text = String::from("[");
-        for (i, path) in paths.iter().enumerate() {
-            if i > 0 {
-                text.push(',');
-            }
-            text.push('"');
-            json_escape(&String::from_utf8_lossy(path), &mut text);
-            text.push('"');
-        }
-        text.push_str("]\n");
-        out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-    } else {
-        let sep: &[u8] = if null { &[0] } else { b"\n" };
-        for path in paths {
-            out.write_all(path).map_err(|e| e.to_string())?;
-            out.write_all(sep).map_err(|e| e.to_string())?;
-        }
+    let mut output = PathOutput::new(out, json, null)?;
+    for path in paths {
+        output.path(path)?;
     }
-    out.flush().map_err(|e| e.to_string())
+    output.finish()
+}
+
+fn emit_hits<W: Write>(
+    out: &mut W,
+    index: &Index,
+    hits: impl IntoIterator<Item = u32>,
+    json: bool,
+    null: bool,
+) -> Result<(), String> {
+    let mut output = PathOutput::new(out, json, null)?;
+    let mut buf = Vec::new();
+    for id in hits {
+        index.path_bytes(id, &mut buf);
+        output.path(&buf)?;
+    }
+    output.finish()
 }
 
 fn cmd_search(args: Args) -> Result<(), String> {
@@ -460,13 +510,7 @@ fn cmd_search(args: Args) -> Result<(), String> {
         return Err("search cancelled".to_string());
     }
 
-    let mut paths: Vec<Vec<u8>> = Vec::with_capacity(result.hits.len());
-    let mut buf: Vec<u8> = Vec::new();
-    for &id in &result.hits {
-        index.path_bytes(id, &mut buf);
-        paths.push(buf.clone());
-    }
-    emit_paths(&mut out, &paths, args.json, args.null)
+    emit_hits(&mut out, &index, result.hits, args.json, args.null)
 }
 
 fn cmd_stats(args: Args) -> Result<(), String> {
@@ -673,5 +717,43 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Writer(Rc<RefCell<Vec<u8>>>);
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn fallback_writes_before_requesting_the_next_path() {
+        let builder = ferrow_index::IndexBuilder::new();
+        let root = builder.add_root(b"root", ferrow_index::flags::DIR);
+        let first = builder.add(root, b"first", 0);
+        let second = builder.add(root, b"second", 0);
+        let index = builder.freeze();
+        for (json, null) in [(false, false), (false, true), (true, false)] {
+            let bytes = Rc::new(RefCell::new(Vec::new()));
+            let observed = bytes.clone();
+            let hits = std::iter::once(first).chain(std::iter::once_with(|| {
+                assert!(
+                    observed.borrow().len() > usize::from(json),
+                    "first path was buffered"
+                );
+                second
+            }));
+            emit_hits(&mut Writer(bytes), &index, hits, json, null).unwrap();
+        }
     }
 }
