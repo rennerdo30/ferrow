@@ -637,25 +637,14 @@ mod tests {
         assert!(report.summary().contains("parallel read_dir"));
     }
 
-    fn make_symlink_dir(original: &Path, link: &Path) -> bool {
+    fn make_symlink_dir(original: &Path, link: &Path) {
         #[cfg(windows)]
         let result = std::os::windows::fs::symlink_dir(original, link);
         #[cfg(unix)]
         let result = std::os::unix::fs::symlink(original, link);
-        match result {
-            Ok(()) => true,
-            Err(e) => {
-                // Windows without Developer Mode refuses symlink
-                // creation. That capability is present on GitHub CI, so
-                // a refusal there is a real failure, never a silent
-                // pass; locally the test reports the skip and returns.
-                if std::env::var_os("CI").is_some() {
-                    panic!("symlink creation refused on CI: {e}");
-                }
-                eprintln!("SKIP: symlink creation refused ({e}); test not run");
-                false
-            }
-        }
+        // Fixture refusals fail locally and on CI. A real unsupported
+        // platform must use cfg or an explicit ignored test instead.
+        result.expect("symlink fixture creation refused");
     }
 
     #[test]
@@ -663,9 +652,7 @@ mod tests {
         let root = TestDir::new("links-root");
         let target = TestDir::new("links-target");
         target.file("target-leaf.txt");
-        if !make_symlink_dir(&target.0, &root.0.join("link")) {
-            return;
-        }
+        make_symlink_dir(&target.0, &root.0.join("link"));
         let (idx, report) = scan(&WalkOptions {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
@@ -694,9 +681,7 @@ mod tests {
         let target = TestDir::new("root-link-target");
         target.file("private-leaf.txt");
         let link = parent.0.join("root-link");
-        if !make_symlink_dir(&target.0, &link) {
-            return;
-        }
+        make_symlink_dir(&target.0, &link);
         let (idx, _) = scan(&WalkOptions {
             roots: vec![link.clone()],
             follow_symlinks: false,
@@ -726,9 +711,7 @@ mod tests {
         let root = TestDir::new("cycle");
         root.file("f.txt");
         root.file("a/g.txt");
-        if !make_symlink_dir(&root.0, &root.0.join("a").join("loop")) {
-            return;
-        }
+        make_symlink_dir(&root.0, &root.0.join("a").join("loop"));
         let (idx, report) = scan(&WalkOptions {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
@@ -1040,7 +1023,9 @@ mod tests {
     #[test]
     fn unreadable_directory_is_counted_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
-        // Root (as in some CI containers) ignores permission bits; skip then.
+        // Privileged processes (e.g. root in CI containers) can ignore mode
+        // bits. In that case only the permission-denial assertions below
+        // are omitted, with a visible reason under --nocapture (ADR 0001).
         let dir = TestDir::new("unreadable");
         dir.file("open.txt");
         dir.file("locked/secret.txt");
@@ -1056,6 +1041,10 @@ mod tests {
         if !can_read {
             assert!(report.errors >= 1, "expected a counted error");
             assert!(!by_name(&idx).contains_key("secret.txt"));
+        } else {
+            eprintln!(
+                "IGNORED permission-denial assertions: process can read mode-000 directory (privileged execution or filesystem ignores mode bits)"
+            );
         }
     }
 }
