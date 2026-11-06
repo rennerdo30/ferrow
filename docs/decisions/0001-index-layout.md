@@ -148,7 +148,21 @@ The stored path spelling is preserved independently of these checks.
 File excludes match by identity inside the directory that contains the
 resolved exclude path; explicit file roots are checked directly. Identity
 lookup failures on existing paths are counted with their reason, rather than
-reported as missing excludes. Windows identity handles use Rust's
+reported as missing excludes.
+
+**Excludes fail closed** (N5; owner decision, 2026-11-06). While excludes
+are configured, every candidate — root, ordinary directory, link or alias
+whether followed or kept as a leaf, and file in a directory holding a file
+exclude — goes through the one location/exclude decision. If an identity
+or location lookup needed for that decision fails, exclusion cannot be
+determined: the candidate is **not indexed** (nor descended), and the
+failure is counted once in the scan report. A counted error never admits
+an entry whose exclusion status is unknown. Scans with **no excludes**
+keep a separate, weaker policy: identity lookups then only feed
+symlink-cycle detection, so a lookup failure is counted and the entry is
+kept (as a leaf when following), because there is nothing to exclude.
+
+Windows identity handles use Rust's
 `OpenOptions` path conversion, attribute-only access, read/write/delete sharing
 and backup semantics, and close through RAII.
 
