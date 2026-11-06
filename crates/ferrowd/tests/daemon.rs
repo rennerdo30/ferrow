@@ -83,6 +83,19 @@ fn daemon_answers_and_snapshot_swap_is_visible() {
     assert_eq!(hits.len(), 1);
     assert!(String::from_utf8_lossy(&hits[0]).ends_with("alpha-report.txt"));
     let (entries, mode, _) = client.status().unwrap();
+    let (rows, columns) = client
+        .query_rows("alpha", 10, ferrow_ipc::Sort::Modified, true)
+        .unwrap();
+    assert_eq!(columns, ferrow_index::ColumnSet::DEFAULT.bits());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].size, Some(1));
+    assert!(rows[0].modified.is_some());
+    assert_eq!(rows[0].created, None);
+    assert!(
+        client
+            .query_rows("alpha", 10, ferrow_ipc::Sort::Created, false)
+            .is_err()
+    );
     assert_eq!(entries, entries_before);
     assert_eq!(mode, "walk");
 
@@ -99,6 +112,58 @@ fn daemon_answers_and_snapshot_swap_is_visible() {
         "shutdown left a detached connection alive"
     );
     drop(client);
+}
+
+#[test]
+fn metadata_sort_keeps_values_aligned_across_pages() {
+    let b = ferrow_index::IndexBuilder::with_columns(ferrow_index::ColumnSet::DEFAULT);
+    for i in 0..700 {
+        b.add_with_metadata(
+            ferrow_index::ROOT_PARENT,
+            format!("file-{i:04}").as_bytes(),
+            0,
+            ferrow_index::EntryMetadata {
+                size: Some(i),
+                modified: Some(i as i64),
+                ..Default::default()
+            },
+        );
+    }
+    let store = SnapshotStore::new(Snapshot {
+        index: std::sync::Arc::new(b.freeze()),
+        mode: "fixture".into(),
+        report: String::new(),
+    });
+    let responses = ferrowd::handle(
+        &store,
+        ferrow_ipc::Request::Query {
+            text: "file".into(),
+            limit: 700,
+            sort: ferrow_ipc::Sort::Modified,
+            flags: 3,
+        },
+    );
+    assert!(responses.len() > 1);
+    let mut expected = 699;
+    for (i, response) in responses.iter().enumerate() {
+        let ferrow_ipc::Response::Rows {
+            rows,
+            columns,
+            more,
+        } = response
+        else {
+            panic!("{response:?}")
+        };
+        assert_eq!(*columns, 3);
+        assert_eq!(*more, i + 1 < responses.len());
+        for row in rows {
+            assert_eq!(row.size, Some(expected));
+            assert_eq!(row.modified, Some(expected as i64));
+            assert_eq!(row.path, format!("file-{expected:04}").as_bytes());
+            expected = expected.saturating_sub(1);
+        }
+    }
+    assert_eq!(expected, 0);
 }
 
 #[test]
@@ -179,6 +244,7 @@ fn controlled_shutdown_saves_the_latest_replaced_snapshot() {
     let server = std::thread::spawn(move || serve(&config, server_store, stop));
     drop(connect(&endpoint));
     store.rescan(&WalkOptions {
+        columns: Default::default(),
         roots: vec![dir.0.clone()],
         ..Default::default()
     });

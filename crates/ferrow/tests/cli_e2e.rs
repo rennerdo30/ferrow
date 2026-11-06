@@ -46,6 +46,62 @@ fn ferrow(args: &[&str]) -> Output {
         .expect("run ferrow")
 }
 
+#[test]
+fn configurable_columns_sorting_json_and_missing_sort() {
+    let tree = TestTree::new();
+    let b = ferrow_index::IndexBuilder::with_columns(ferrow_index::ColumnSet::DEFAULT);
+    for (name, size, modified) in [(b"a".as_slice(), 3, 10), (b"b", 1, 30), (b"c", 2, 20)] {
+        b.add_with_metadata(
+            ferrow_index::ROOT_PARENT,
+            name,
+            0,
+            ferrow_index::EntryMetadata {
+                size: Some(size),
+                modified: Some(modified),
+                ..Default::default()
+            },
+        );
+    }
+    b.freeze().save(&tree.index).unwrap();
+    let path = tree.index.to_str().unwrap();
+    let out = ferrow(&[
+        "search",
+        "",
+        "--index",
+        path,
+        "--sort",
+        "modified",
+        "--desc",
+        "--columns",
+        "path,size,modified",
+    ]);
+    assert_eq!(stdout(&out), "b\t1\t30\nc\t2\t20\na\t3\t10\n");
+    let out = ferrow(&["search", "", "--index", path, "--sort", "size", "--json"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(rows[0]["path"], "b");
+    assert_eq!(rows[0]["size"], 1);
+    assert_eq!(rows[0]["modified"], 30);
+    assert!(rows[0]["created"].is_null());
+    let absent = ferrow(&["search", "", "--index", path, "--sort", "created"]);
+    assert!(!absent.status.success());
+    assert!(String::from_utf8_lossy(&absent.stderr).contains("rebuild"));
+    let out = ferrow(&[
+        "index",
+        tree.root.to_str().unwrap(),
+        "--out",
+        path,
+        "--index-columns",
+        "none",
+    ]);
+    stdout(&out);
+    assert_eq!(
+        ferrow_index::Index::load(&tree.index)
+            .unwrap()
+            .columns_present(),
+        ferrow_index::ColumnSet::NONE
+    );
+}
+
 fn stdout(out: &Output) -> String {
     assert!(
         out.status.success(),
@@ -168,7 +224,16 @@ fn json_and_nul_escape_tricky_names_exactly() {
         index.to_str().unwrap(),
         "--json",
     ]);
-    let parsed: Vec<String> = serde_json::from_str(&stdout(&out)).expect("valid JSON array");
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&stdout(&out)).expect("valid JSON array");
+    let parsed: Vec<String> = rows
+        .iter()
+        .map(|row| row["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        rows.iter()
+            .all(|row| row["size"] == 1 && row["modified"].is_i64() && row["created"].is_null())
+    );
     let mut expected: Vec<String> = names
         .iter()
         .map(|n| root.join(n).to_string_lossy().into_owned())
@@ -227,7 +292,11 @@ fn index_then_search_all_modes() {
     // JSON output, parsed with a real JSON parser.
     let out = ferrow(&["search", "budget", "--index", index, "--json"]);
     let text = stdout(&out);
-    let parsed: Vec<String> = serde_json::from_str(&text).expect("valid JSON array");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&text).expect("valid JSON array");
+    let parsed: Vec<String> = rows
+        .iter()
+        .map(|row| row["path"].as_str().unwrap().to_owned())
+        .collect();
     assert_eq!(
         parsed,
         vec![tree.root.join("Budget.xlsx").to_string_lossy().into_owned()]

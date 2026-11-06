@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrow_index::osname::name_to_bytes;
-use ferrow_index::{Index, IndexBuilder, flags};
+use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, timestamp_ticks};
 
 mod identity;
 
@@ -23,6 +23,8 @@ use identity::{FileId, file_id};
 /// What to scan.
 #[derive(Debug, Clone, Default)]
 pub struct WalkOptions {
+    /// Optional metadata arrays; defaults to size and modified time.
+    pub columns: ColumnSet,
     /// Roots to include. Each becomes one root entry in the index.
     pub roots: Vec<PathBuf>,
     /// Paths to exclude (files or whole subtrees), matched by
@@ -103,6 +105,53 @@ fn is_hidden(name: &[u8], entry: &std::fs::DirEntry) -> bool {
     {
         let _ = entry;
         name.first() == Some(&b'.') && name.len() > 1
+    }
+}
+
+fn from_std_metadata(md: &std::fs::Metadata, set: ColumnSet) -> EntryMetadata {
+    let mut result = EntryMetadata::default();
+    if set.contains(ColumnSet::SIZE) {
+        result.size = Some(md.len());
+    }
+    if set.contains(ColumnSet::MODIFIED) {
+        result.modified = md.modified().ok().and_then(timestamp_ticks);
+    }
+    if set.contains(ColumnSet::CREATED) {
+        result.created = md.created().ok().and_then(timestamp_ticks);
+    }
+    if set.contains(ColumnSet::ACCESSED) {
+        result.accessed = md.accessed().ok().and_then(timestamp_ticks);
+    }
+    if set.contains(ColumnSet::ATTRIBUTES) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            result.attributes = Some(md.file_attributes());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            result.attributes = Some(md.mode());
+        }
+    }
+    result
+}
+
+fn collect_metadata(
+    set: ColumnSet,
+    read: impl FnOnce() -> std::io::Result<std::fs::Metadata>,
+    path: &Path,
+    errors: &Errors,
+) -> EntryMetadata {
+    if set == ColumnSet::NONE {
+        return EntryMetadata::default();
+    }
+    match read() {
+        Ok(md) => from_std_metadata(&md, set),
+        Err(error) => {
+            errors.add(format!("metadata {}: {error}", path.display()));
+            EntryMetadata::default()
+        }
     }
 }
 
@@ -280,6 +329,7 @@ fn is_link(path: &Path, md: &std::fs::Metadata) -> std::io::Result<bool> {
 
 #[derive(Clone, Copy)]
 struct Walker<'a> {
+    columns: ColumnSet,
     builder: &'a IndexBuilder,
     excludes: &'a ExcludeSet,
     follow_symlinks: bool,
@@ -443,7 +493,10 @@ impl<'x> Walker<'x> {
             if skip {
                 continue;
             }
-            let id = self.builder.add(dir_id, &name, ent_flags);
+            let metadata = collect_metadata(self.columns, || entry.metadata(), &path, self.errors);
+            let id = self
+                .builder
+                .add_with_metadata(dir_id, &name, ent_flags, metadata);
             if is_dir {
                 let mut child_ancestors = ancestors.clone();
                 if self.follow_symlinks {
@@ -491,7 +544,7 @@ fn root_name_bytes(path: &Path) -> Vec<u8> {
 /// Scan all roots and freeze the index.
 pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     let started = Instant::now();
-    let builder = IndexBuilder::new();
+    let builder = IndexBuilder::with_columns(options.columns);
     let errors = Errors::new();
     let excludes = match resolve_excludes(&options.excludes, &errors) {
         Ok(set) => set,
@@ -513,6 +566,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         }
     };
     let walker = Walker {
+        columns: options.columns,
         builder: &builder,
         excludes: &excludes,
         follow_symlinks: options.follow_symlinks,
@@ -600,7 +654,8 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         if is_dir {
             root_flags |= flags::DIR;
         }
-        let id = builder.add_root(&name, root_flags);
+        let metadata = from_std_metadata(&link_md, options.columns);
+        let id = builder.add_with_metadata(ferrow_index::ROOT_PARENT, &name, root_flags, metadata);
         if is_dir {
             root_dirs.push((abs, id, root_identity));
         }
@@ -641,6 +696,65 @@ mod tests {
     use super::*;
     use ferrow_index::ROOT_PARENT;
     use std::collections::HashMap;
+
+    #[test]
+    fn metadata_disabled_never_requests_a_record_and_errors_stay_unknown() {
+        let errors = Errors::new();
+        let metadata = collect_metadata(
+            ColumnSet::NONE,
+            || panic!("disabled metadata requested"),
+            Path::new("unused"),
+            &errors,
+        );
+        assert_eq!(metadata, EntryMetadata::default());
+        let metadata = collect_metadata(
+            ColumnSet::ALL,
+            || Err(std::io::Error::other("mock unavailable")),
+            Path::new("mock"),
+            &errors,
+        );
+        assert_eq!(metadata, EntryMetadata::default());
+        assert_eq!(errors.count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn enabled_columns_match_filesystem_metadata() {
+        let tree = TestDir::new("metadata");
+        let path = tree.0.join("metadata.txt");
+        std::fs::write(&path, b"metadata bytes").unwrap();
+        let expected =
+            from_std_metadata(&std::fs::symlink_metadata(&path).unwrap(), ColumnSet::ALL);
+        for columns in [ColumnSet::NONE, ColumnSet::DEFAULT, ColumnSet::ALL] {
+            let (index, report) = scan(&WalkOptions {
+                roots: vec![path.clone()],
+                columns,
+                ..WalkOptions::default()
+            });
+            assert_eq!(report.errors, 0);
+            assert_eq!(index.columns_present(), columns);
+            let metadata = index.metadata(0);
+            if columns == ColumnSet::NONE {
+                assert_eq!(metadata, EntryMetadata::default());
+                assert_eq!(index.metadata_heap_bytes(), 0);
+            } else {
+                assert_eq!(metadata.size, Some(14));
+                assert_eq!(metadata.modified, expected.modified);
+            }
+            if columns == ColumnSet::ALL {
+                assert_eq!(metadata, expected);
+            }
+        }
+        let (index, report) = scan(&WalkOptions {
+            roots: vec![tree.0.clone()],
+            ..WalkOptions::default()
+        });
+        assert_eq!(report.errors, 0);
+        let id = (0..index.len() as u32)
+            .find(|&id| index.name(id) == b"metadata.txt")
+            .unwrap();
+        assert_eq!(index.metadata(id).size, Some(14));
+        assert_eq!(index.metadata(id).modified, expected.modified);
+    }
 
     struct TestDir(PathBuf);
 
@@ -729,6 +843,7 @@ mod tests {
         target.file("target-leaf.txt");
         make_symlink_dir(&target.0, &root.0.join("link"));
         let (idx, report) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
@@ -740,6 +855,7 @@ mod tests {
         );
         // And with following off, the target children stay out.
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![root.0.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
@@ -758,6 +874,7 @@ mod tests {
         let link = parent.0.join("root-link");
         make_symlink_dir(&target.0, &link);
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![link.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
@@ -771,6 +888,7 @@ mod tests {
         assert_ne!(idx.flags(0) & flags::SYMLINK, 0);
         // With following on, the same root is descended.
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![link],
             follow_symlinks: true,
             excludes: Vec::new(),
@@ -788,6 +906,7 @@ mod tests {
         root.file("a/g.txt");
         make_symlink_dir(&root.0, &root.0.join("a").join("loop"));
         let (idx, report) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
@@ -802,6 +921,7 @@ mod tests {
         let dir = TestDir::new("excluded-root");
         dir.file("private.txt");
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
@@ -818,6 +938,7 @@ mod tests {
         let dir = TestDir::new("excluded-ancestor");
         dir.file("sub/private.txt");
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![dir.0.join("sub")],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
@@ -837,6 +958,7 @@ mod tests {
         dir.file("keep.txt");
         // Same directory, different case spelling.
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("KEEPDIR")],
             follow_symlinks: false,
@@ -855,6 +977,7 @@ mod tests {
         dir.file("keep.txt");
         dir.file("skip/gone.txt");
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("skip")],
             follow_symlinks: false,
@@ -875,6 +998,7 @@ mod tests {
         // Both spelling directions name the same directory.
         for (root, exclude) in [(verbatim.clone(), dir.0.clone()), (dir.0.clone(), verbatim)] {
             let (idx, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![root],
                 excludes: vec![exclude],
                 follow_symlinks: false,
@@ -914,6 +1038,7 @@ mod tests {
             );
             for (scan_root, exclude) in [(root.clone(), alt.clone()), (alt, root)] {
                 let (idx, report) = scan(&WalkOptions {
+                    columns: Default::default(),
                     roots: vec![scan_root],
                     excludes: vec![exclude],
                     follow_symlinks: false,
@@ -932,6 +1057,7 @@ mod tests {
         let dir = TestDir::new("missing-exclude");
         dir.file("keep.txt");
         let (idx, report) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("no-such-exclude")],
             follow_symlinks: false,
@@ -953,6 +1079,7 @@ mod tests {
         dir.file("keep.txt");
         dir.file("secret.txt");
         let (idx, _) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("secret.txt")],
             follow_symlinks: false,
@@ -1031,6 +1158,7 @@ mod tests {
         let fx = n5_fixture("dir");
         for follow in [false, true] {
             let (idx, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![fx.root.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
@@ -1053,6 +1181,7 @@ mod tests {
         let fx = n5_fixture("alias");
         for follow in [false, true] {
             let (idx, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![fx.aliases.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
@@ -1080,6 +1209,7 @@ mod tests {
         make_symlink_file(&file, &exclude);
         for follow in [false, true] {
             let (idx, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![root_dir.0.clone()],
                 excludes: vec![exclude.clone()],
                 follow_symlinks: follow,
@@ -1103,6 +1233,7 @@ mod tests {
         for root in [fx.root.clone(), fx.aliases.clone()] {
             for follow in [false, true] {
                 let (idx, report) = scan(&WalkOptions {
+                    columns: Default::default(),
                     roots: vec![root.clone()],
                     excludes: vec![fx.exclude.clone()],
                     follow_symlinks: follow,
@@ -1143,6 +1274,7 @@ mod tests {
                 // only the root itself is indexed.
                 set_refusal(false);
                 let (idx, report) = scan(&WalkOptions {
+                    columns: Default::default(),
                     roots: vec![root.clone()],
                     excludes: excludes.clone(),
                     follow_symlinks: follow,
@@ -1155,6 +1287,7 @@ mod tests {
                 set_refusal(true);
                 for scan_root in [root.clone(), private.clone()] {
                     let (idx, report) = scan(&WalkOptions {
+                        columns: Default::default(),
                         roots: vec![scan_root.clone()],
                         excludes: excludes.clone(),
                         follow_symlinks: follow,
@@ -1218,6 +1351,7 @@ mod tests {
             );
             set_refusal(false);
             let (idx, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![root.clone()],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
@@ -1226,6 +1360,7 @@ mod tests {
             assert_eq!(idx.len(), 1, "follow={follow}: control");
             set_refusal(true);
             let (idx, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![root],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
@@ -1262,6 +1397,7 @@ mod tests {
         // real target path; both must keep the target out.
         for exclude in [link, target.0.clone()] {
             let (idx, _) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![root.0.clone()],
                 excludes: vec![exclude],
                 follow_symlinks: true,

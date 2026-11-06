@@ -142,6 +142,7 @@ fn excludes_support_long_paths_that_std_can_scan() {
         for exclude in [&root, &verbatim] {
             for follow in [false, true] {
                 let (index, report) = scan(&WalkOptions {
+                    columns: Default::default(),
                     roots: vec![scan_root.clone()],
                     excludes: vec![exclude.clone()],
                     follow_symlinks: follow,
@@ -160,6 +161,7 @@ fn excludes_support_long_paths_that_std_can_scan() {
     f.link(&verbatim, &verbatim.join("loop"));
     for (scan_root, expected) in [(&scan_root, 4), (&root, 3), (&verbatim, 3)] {
         let (index, report) = scan(&WalkOptions {
+            columns: Default::default(),
             roots: vec![scan_root.clone()],
             excludes: vec![],
             follow_symlinks: true,
@@ -204,6 +206,7 @@ fn explicitly_excluded_directory_symlink_is_absent_with_following_off() {
     for exclude in spellings {
         for follow in [false, true] {
             let (index, report) = scan(&WalkOptions {
+                columns: Default::default(),
                 roots: vec![root.clone()],
                 excludes: vec![exclude.clone()],
                 follow_symlinks: follow,
@@ -307,6 +310,7 @@ fn file_alias_checks_resolved_parent_even_after_hardlink_root() {
     // File hard links have no unique containing directory. Admitting a root
     // hard link outside private must not cache its parent as the alias's.
     let (index, report) = scan(&WalkOptions {
+        columns: Default::default(),
         roots: vec![keep.clone(), alias],
         excludes: vec![private],
         follow_symlinks: false,

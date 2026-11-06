@@ -192,6 +192,7 @@ fn cancellation_after_first_chunk_bounds_admitted_work() {
                     hook_token.cancel();
                 }
             })),
+            ..SearchOptions::default()
         },
     );
     assert!(got.cancelled, "cancellation was not reported");
