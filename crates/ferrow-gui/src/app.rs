@@ -571,7 +571,14 @@ impl FerrowApp {
 
         if let Some((err, _)) = &self.query_error {
             let err = err.clone();
-            return self.placeholder(ui, outer, "Check the search text", Some(&err));
+            // The position is shown by the underline in the search box, so
+            // drop the technical "at bytes …" suffix.
+            let friendly = err.split(" at bytes").next().unwrap_or(&err).to_owned();
+            let mut friendly = friendly;
+            if let Some(first) = friendly.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            return self.placeholder(ui, outer, "Check the search text", Some(&friendly));
         }
         let Some(hits) = self.hits.clone() else {
             return;
@@ -1042,6 +1049,7 @@ impl FerrowApp {
         let painter = ui.painter();
         let font = FontId::proportional(12.0);
         let left = match (&self.state, &self.index) {
+            (State::Ready, Some(_)) if self.query_error.is_some() => String::new(),
             (State::Ready, Some(index)) => {
                 let rows = self.row_count();
                 let results = if self.query.trim().is_empty() {
