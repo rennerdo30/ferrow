@@ -207,8 +207,18 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     // Roots are added sequentially (cheap), their subtrees in parallel.
     let mut root_dirs: Vec<(PathBuf, u32)> = Vec::new();
     for root in &options.roots {
-        let name = root_name_bytes(root);
-        let (name_bytes, is_dir) = match std::fs::metadata(root) {
+        // Roots are made absolute before scanning (without resolving
+        // symlinks) so stored paths never depend on the working
+        // directory of a later search.
+        let abs = match std::path::absolute(root) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.add(format!("{}: {e}", root.display()));
+                continue;
+            }
+        };
+        let name = root_name_bytes(&abs);
+        let (name_bytes, is_dir) = match std::fs::metadata(&abs) {
             Ok(md) => (name, md.is_dir()),
             Err(e) => {
                 errors.add(format!("{}: {e}", root.display()));
@@ -218,7 +228,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         let root_flags = if is_dir { flags::DIR } else { 0 };
         let id = builder.add_root(&name_bytes, root_flags);
         if is_dir {
-            root_dirs.push((root.clone(), id));
+            root_dirs.push((abs, id));
         }
     }
 
@@ -342,6 +352,48 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert_eq!(report.errors, 1);
         assert_eq!(report.error_samples.len(), 1);
+    }
+
+    #[test]
+    fn relative_roots_produce_absolute_paths() {
+        static NEXT: AtomicUsize = AtomicUsize::new(500);
+        let rel = PathBuf::from(format!(
+            "ferrow-rel-root-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert!(rel.is_relative());
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(rel.join("file.txt"), b"x").unwrap();
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![rel.clone()],
+            ..WalkOptions::default()
+        });
+        let expected_root = std::path::absolute(&rel).unwrap();
+        let _ = std::fs::remove_dir_all(&rel);
+        assert_eq!(report.errors, 0, "{:?}", report.error_samples);
+        assert!(
+            idx.path(0).is_absolute(),
+            "persisted relative path {:?}",
+            idx.path(0)
+        );
+        assert_eq!(idx.path(0), expected_root);
+        assert_eq!(idx.path(1), expected_root.join("file.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_root_keeps_its_separator() {
+        assert_eq!(root_name_bytes(Path::new("E:\\")), b"E:\\");
+        assert_eq!(root_name_bytes(Path::new("E:\\foo\\")), b"E:\\foo");
+        assert_eq!(root_name_bytes(Path::new("E:/foo/")), b"E:/foo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_filesystem_root_keeps_its_separator() {
+        assert_eq!(root_name_bytes(Path::new("/")), b"/");
+        assert_eq!(root_name_bytes(Path::new("/tmp/foo/")), b"/tmp/foo");
     }
 
     #[cfg(windows)]
