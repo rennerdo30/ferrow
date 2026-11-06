@@ -74,12 +74,35 @@ cargo run --release -- search "case:Report" --json
 cargo run --release -- stats
 ```
 
-Query syntax: space means AND, `!term` means NOT, `"quoted phrase"` is
-literal, and `case:term` is case-sensitive. Useful flags: `--out <file>`
+Useful flags: `--out <file>`
 and `--index <file>` choose the index location, `--exclude <path>` skips
 a subtree while indexing, and `--count` / `--null` change the search
 output for scripts. Live updates, the daemon and the GUI come in later
 milestones — see [`docs/SPEC.md`](docs/SPEC.md).
+
+## Search syntax
+
+Plain terms match name substrings, ignoring case. Space means AND, `|` means
+OR, `!` means NOT, and `<...>` groups terms (NOT, AND, then OR precedence).
+Quotes protect literal phrases and punctuation.
+
+Wildcard terms match the **whole name**: `*.log` ends in `.log`, `report*`
+starts with `report`, and `?` consumes one Unicode scalar. `*` also matches
+an empty run. Quote the complete query for your shell:
+
+```sh
+ferrow search '*.log'
+ferrow search '<report*|draft> !tmp'
+ferrow search 'path:docs report ext:txt;md'
+```
+
+Stack `case:`, `path:`, `wholeword:`, `file:`, `folder:` and `regex:` on a
+term; for example `case:file:Report*`. Quote regex operators inside the query,
+such as `regex:"report|draft"`. `ext:txt;md` filters extensions,
+`parent:"/folder"` selects direct children by indexed path, and `depth:2`
+counts parent edges from an indexed root (depth zero). Paths use the native
+separator. Size, date and attribute filters are reserved for Part 2.
+See [ADR 0004](docs/decisions/0004-query-language.md) for details and bounds.
 
 ## Background service (milestone 2, in progress)
 

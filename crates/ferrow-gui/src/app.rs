@@ -67,7 +67,7 @@ pub struct FerrowApp {
     hits: Option<Hits>,
     complete: bool,
     search_time: Duration,
-    query_error: Option<String>,
+    query_error: Option<(String, std::ops::Range<usize>)>,
     /// Top visible row, fractional for smooth scrolling.
     scroll: f64,
     selected: Option<usize>,
@@ -202,10 +202,11 @@ impl FerrowApp {
                 Event::QueryError {
                     generation,
                     message,
+                    span,
                 } => {
                     if generation >= self.shown_generation {
                         self.shown_generation = generation;
-                        self.query_error = Some(message);
+                        self.query_error = Some((message, span));
                     }
                 }
             }
@@ -405,9 +406,10 @@ impl FerrowApp {
         );
 
         let clear_w = if self.query.is_empty() { 0.0 } else { 32.0 };
+        let help_w = 30.0;
         let text_rect = Rect::from_min_max(
             pos2(rect.left() + 40.0, rect.top()),
-            pos2(rect.right() - 12.0 - clear_w, rect.bottom()),
+            pos2(rect.right() - 12.0 - clear_w - help_w, rect.bottom()),
         );
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -436,7 +438,76 @@ impl FerrowApp {
             .text_color(p.text)
             .desired_width(text_rect.width())
             .align(Align2::LEFT_CENTER);
-        let response = child.add(edit);
+        let output = edit.show(&mut child);
+        let response = output.response.clone();
+        // Red wavy underline under the part of the query that does not parse.
+        if let Some((_, span)) = &self.query_error
+            && span.start < self.query.len()
+        {
+            let to_char = |b: usize| self.query[..b.min(self.query.len())].chars().count();
+            let a = output
+                .galley
+                .pos_from_cursor(egui::text::CCursor::new(to_char(span.start)));
+            let b = output
+                .galley
+                .pos_from_cursor(egui::text::CCursor::new(to_char(
+                    span.end.max(span.start + 1),
+                )));
+            let x0 = output.galley_pos.x + a.min.x;
+            let x1 = (output.galley_pos.x + b.min.x).max(x0 + 6.0);
+            let y = output.galley_pos.y + a.max.y + 1.0;
+            let red = Color32::from_rgb(0xE8, 0x5A, 0x4F);
+            let mut pts = Vec::new();
+            let mut x = x0;
+            let mut up = true;
+            while x <= x1 {
+                pts.push(pos2(x, if up { y } else { y + 2.0 }));
+                x += 2.0;
+                up = !up;
+            }
+            ui.painter().add(Shape::line(pts, Stroke::new(1.0, red)));
+        }
+        // Syntax help.
+        let hc = pos2(
+            rect.right() - 12.0 - clear_w - help_w / 2.0,
+            rect.center().y,
+        );
+        let hr = Rect::from_center_size(hc, vec2(26.0, 26.0));
+        let help = ui.interact(hr, egui::Id::unique("syntax-help"), Sense::click());
+        if help.hovered() {
+            ui.painter()
+                .rect_filled(hr, CornerRadius::same(4), p.row_hover);
+        }
+        ui.painter().text(
+            hc,
+            Align2::CENTER_CENTER,
+            "?",
+            FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into())),
+            p.text_secondary,
+        );
+        let help = help.on_hover_text("Search syntax");
+        egui::Popup::menu(&help).show(|ui| {
+            ui.set_min_width(460.0);
+            ui.label(
+                egui::RichText::new("Search syntax")
+                    .font(FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into()))),
+            );
+            ui.add_space(6.0);
+            egui::Grid::new("syntax-grid")
+                .num_columns(2)
+                .spacing(vec2(16.0, 6.0))
+                .show(ui, |ui| {
+                    for (example, meaning) in SYNTAX_HELP {
+                        ui.label(
+                            egui::RichText::new(*example)
+                                .monospace()
+                                .color(p.accent_text),
+                        );
+                        ui.label(egui::RichText::new(*meaning).color(p.text_secondary));
+                        ui.end_row();
+                    }
+                });
+        });
         if self.focus_search {
             response.request_focus();
             self.focus_search = false;
@@ -498,7 +569,7 @@ impl FerrowApp {
             return;
         };
 
-        if let Some(err) = &self.query_error {
+        if let Some((err, _)) = &self.query_error {
             let err = err.clone();
             return self.placeholder(ui, outer, "Check the search text", Some(&err));
         }
@@ -652,7 +723,7 @@ impl FerrowApp {
         let hover_pos = ui
             .input(|i| i.pointer.hover_pos())
             .filter(|p| list.contains(*p) && p.x < track.left());
-        let terms = highlight_terms(&self.query);
+        let parsed = ferrow_query::Query::parse(&self.query).ok();
         let name_font = FontId::proportional(14.0);
         let sub_font = FontId::proportional(13.0);
         let mut clicked_row = None;
@@ -695,7 +766,17 @@ impl FerrowApp {
                 pos2(col_name + 28.0, rect.top()),
                 pos2(col_path - 8.0, rect.bottom()),
             );
-            let mut job = highlighted(&name, &terms, name_font.clone(), p.text, p.accent_text);
+            // Highlight with the engine's own match ranges, so wildcards,
+            // phrases and `case:` highlight exactly what matched. Ranges are
+            // byte offsets into the raw name, so only use them when the name
+            // is shown unchanged (valid UTF-8).
+            let ranges = match (&parsed, &name) {
+                (Some(q), std::borrow::Cow::Borrowed(_)) => {
+                    ferrow_query::highlight_ranges(q, index.name(id))
+                }
+                _ => Vec::new(),
+            };
+            let mut job = highlighted(&name, &ranges, name_font.clone(), p.text, p.accent_text);
             job.wrap.max_width = name_clip.width();
             job.wrap.overflow_character = Some('…');
             job.wrap.break_anywhere = true;
@@ -1200,45 +1281,18 @@ fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> b
     ui.add_enabled(enabled, button).clicked()
 }
 
-/// Lower-cased, non-negated search words, for match highlighting.
-fn highlight_terms(query: &str) -> Vec<String> {
-    let Ok(q) = ferrow_query::Query::parse(query) else {
-        return Vec::new();
-    };
-    q.terms
-        .into_iter()
-        .filter(|t| !t.negated && !t.text.is_empty())
-        .map(|t| {
-            if t.case_sensitive {
-                t.text
-            } else {
-                t.text.to_lowercase()
-            }
-        })
-        .collect()
-}
-
-/// Lay out `name` with every occurrence of the search words highlighted.
+/// Lay out `name` with the given byte ranges highlighted.
 fn highlighted(
     name: &str,
-    terms: &[String],
+    ranges: &[std::ops::Range<usize>],
     font: FontId,
     color: Color32,
     highlight: Color32,
 ) -> LayoutJob {
-    let lower = name.to_lowercase();
-    // Byte ranges to mark; lower-casing can change byte lengths, so only
-    // highlight when the lengths agree (always true for ASCII).
     let mut marks = vec![false; name.len()];
-    if lower.len() == name.len() {
-        for term in terms {
-            let mut from = 0;
-            while let Some(pos) = lower[from..].find(term.as_str()) {
-                let s = from + pos;
-                marks[s..s + term.len()].iter_mut().for_each(|m| *m = true);
-                from = s + term.len().max(1);
-            }
-        }
+    for r in ranges {
+        let (s, e) = (r.start.min(name.len()), r.end.min(name.len()));
+        marks[s..e].iter_mut().for_each(|m| *m = true);
     }
     let mut job = LayoutJob::default();
     let mut start = 0;
@@ -1255,6 +1309,28 @@ fn highlighted(
     job.wrap.max_rows = 1;
     job
 }
+
+/// Rows of the search syntax help: (example, meaning).
+const SYNTAX_HELP: &[(&str, &str)] = &[
+    ("report 2024", "Both words (AND)"),
+    ("jpg | png", "Either word (OR)"),
+    ("!tmp", "Without this word (NOT)"),
+    ("<a | b> c", "Group terms"),
+    ("\"two words\"", "Exact phrase"),
+    (
+        "*.log",
+        "Wildcards match the whole name: * any run, ? one character",
+    ),
+    ("report*2024*", "Starts with report, contains 2024"),
+    ("ext:log;txt", "File extensions"),
+    ("path:docs", "Match the full path, not just the name"),
+    ("file:  folder:", "Only files, or only folders"),
+    ("case:Readme", "Case-sensitive"),
+    ("wholeword:log", "Whole words only"),
+    ("regex:^\\d+\\.txt$", "Regular expression"),
+    ("parent:C:\\logs", "Direct children of a folder"),
+    ("depth:2", "Folder depth"),
+];
 
 fn type_label(name: &str, is_dir: bool) -> String {
     if is_dir {
@@ -1387,7 +1463,7 @@ mod tests {
     fn highlight_marks_case_insensitive_matches() {
         let job = highlighted(
             "ReadMe.md",
-            &["readme".into()],
+            std::slice::from_ref(&(0..6)),
             FontId::proportional(14.0),
             Color32::WHITE,
             Color32::RED,
@@ -1404,7 +1480,7 @@ mod tests {
     fn highlight_handles_non_ascii() {
         let job = highlighted(
             "Ärger.txt",
-            &["ä".into()],
+            std::slice::from_ref(&(0..2)),
             FontId::proportional(14.0),
             Color32::WHITE,
             Color32::RED,

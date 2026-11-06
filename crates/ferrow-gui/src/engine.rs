@@ -64,7 +64,12 @@ pub enum Event {
         elapsed: Duration,
     },
     /// The query text does not parse.
-    QueryError { generation: u64, message: String },
+    QueryError {
+        generation: u64,
+        message: String,
+        /// Byte range of the problem in the query text.
+        span: std::ops::Range<usize>,
+    },
 }
 
 enum Command {
@@ -294,6 +299,7 @@ impl<W: Fn()> Worker<W> {
                 self.send(Event::QueryError {
                     generation,
                     message: e.to_string(),
+                    span: e.span(),
                 });
                 return;
             }
