@@ -348,12 +348,13 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
     // every chain must reach a root within n steps. O(n * depth) worst
     // case is too slow for big files, so walk with a visiting mark.
     let mut state = vec![0u8; n]; // 0 = unseen, 1 = on current walk, 2 = done
+    let mut walk: Vec<usize> = Vec::new(); // reused: no per-entry allocation
     for start in 0..n {
         if state[start] != 0 {
             continue;
         }
         let mut cur = start;
-        let mut walk = Vec::new();
+        walk.clear();
         loop {
             if state[cur] == 1 {
                 return Err(LoadError::Corrupt("parent cycle"));
@@ -368,7 +369,7 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
             walk.push(cur);
             cur = parent[cur] as usize;
         }
-        for id in walk {
+        for &id in &walk {
             state[id] = 2;
         }
     }
