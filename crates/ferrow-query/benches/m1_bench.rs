@@ -169,7 +169,7 @@ fn full_count(bencher: divan::Bencher, text: &str) {
 
 fn main() {
     println!(
-        "FERROW-ACTIVE query=arena-count-window crc=crc32fast derived=per-name freeze=per-name"
+        "FERROW-ACTIVE query=arena-count-window crc=crc32fast derived=per-name freeze=worker-scratch"
     );
     measures();
     divan::main();

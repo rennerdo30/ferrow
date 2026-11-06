@@ -57,6 +57,24 @@ fn saved_bytes(entries: usize) -> Vec<u8> {
 
 #[test]
 fn load_allocation_count_is_independent_of_entry_count() {
+    let mut freeze_counts = Vec::new();
+    for entries in [100, 1000] {
+        let builder = IndexBuilder::new();
+        let root = builder.add_root(b"root", flags::DIR);
+        for _ in 1..entries {
+            builder.add(root, b"file", 0);
+        }
+        ALLOCS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::Relaxed);
+        let index = builder.freeze();
+        COUNTING.store(false, Ordering::Relaxed);
+        freeze_counts.push(ALLOCS.load(Ordering::Relaxed));
+        assert_eq!(index.len(), entries);
+    }
+    assert!(
+        freeze_counts[1] <= freeze_counts[0] + 32 && freeze_counts[1] < 96,
+        "freeze must reuse worker scratch, allocations: {freeze_counts:?}"
+    );
     let mut counts = Vec::new();
     for entries in [100usize, 1000] {
         let data = saved_bytes(entries);
