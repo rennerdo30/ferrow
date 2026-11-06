@@ -444,7 +444,14 @@ fn wholeword_retries_overlapping_candidates_and_highlights_them() {
     }
     for text in ["a|b", "regex:a|regex:b", "wholeword:a"] {
         let query = Query::parse(text).unwrap();
-        let ranges = ferrow_query::highlight_ranges(&query, "a b ".repeat(600).as_bytes());
+        // Stay inside macOS's 1023-byte target bound while exceeding the
+        // shared 256-range budget, including the combined two-term case.
+        let name = if text.contains('|') {
+            "a b ".repeat(200)
+        } else {
+            "a ".repeat(300)
+        };
+        let ranges = ferrow_query::highlight_ranges(&query, name.as_bytes());
         assert_eq!(ranges.len(), 256, "{text}");
     }
 }
