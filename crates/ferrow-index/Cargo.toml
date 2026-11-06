@@ -10,4 +10,5 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+casefold = "0.1.0"
 rayon = "1"

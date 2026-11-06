@@ -416,6 +416,17 @@ mod tests {
     }
 
     #[test]
+    fn default_case_matching_unifies_final_sigma() {
+        let b = IndexBuilder::new();
+        b.add_root("ς".as_bytes(), 0);
+        let idx = b.freeze();
+        let r = search(&idx, &Query::parse("Σ").unwrap(), &SearchOptions::default());
+        assert_eq!(r.hits.len(), 1);
+        let r = search(&idx, &Query::parse("σ").unwrap(), &SearchOptions::default());
+        assert_eq!(r.hits.len(), 1);
+    }
+
+    #[test]
     fn cancelled_search_reports_it() {
         let idx = sample();
         let opts = SearchOptions {

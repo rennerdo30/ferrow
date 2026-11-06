@@ -36,14 +36,18 @@ are not valid UTF-8.
 
 **Case folding is length-preserving.** The folded arena shares offsets and
 lengths with the original arena, which halves the lookup work in the
-matcher. `fold_name` folds ASCII directly; for valid UTF-8 it also folds
-each `char` whose lowercase is a single `char` of the same byte length
-(covers Latin, Greek, Cyrillic pairs like `Ä`/`ä`). Characters whose
-lowercase expands (e.g. `İ` → `i̇`, final sigma handled as `σ`) do not
-fold. The query side folds with the same function, so matches are
-consistent; only exotic casing pairs are missed. This is the one
-deliberate trade-off recorded here; revisiting it means a second
-offset/length column pair (+6 bytes/entry).
+matcher. `fold_name` applies Unicode simple case folding
+(`CaseFolding.txt`, status C and S, via the MIT-licensed `casefold`
+crate) and keeps every mapping whose UTF-8 byte length is unchanged.
+That covers the full same-length equivalence classes: Latin, Greek and
+Cyrillic pairs like `Ä`/`ä`, the sigma forms `Σ`/`σ`/`ς` (all fold to
+`σ`), the micro sign `µ` → `μ`, and Cherokee, whose fold target is the
+uppercase letter. Two groups do **not** fold in M1 and are a known
+limitation for a later milestone: simple folds that change the byte
+length (e.g. Kelvin sign U+212A → `k`, long s `ſ` → `s`) and all full
+(multi-character) folds (e.g. `ß` → `ss`, `İ` → `i̇`). The query side
+folds with the same function, so matches are consistent. Lifting the
+limitation means a second offset/length column pair (+6 bytes/entry).
 
 **Sort order** is by folded name bytes, then raw name bytes, then id —
 deterministic on every platform and independent of locale.
@@ -69,11 +73,19 @@ One file, little-endian, no per-entry allocation on load:
 | `arena`, `folded_arena` | bytes | |
 | `sorted` | `u32` × n | |
 
-Loading reads the file in one sequential read, then validates magic,
-version, total length, checksum, every parent/name/sort id, and the
-absence of parent cycles. Any problem is a typed error, never a panic
-(`ferrow-index/src/persist.rs`). Saving writes a temp file and renames it,
-so a crash never leaves a half-written index at the target path.
+Loading first reads and validates the bounded header (magic, version,
+counts), checks the exact expected total length against the file size
+(with a 16 GiB ceiling), and only then reads the payload in one
+sequential read. Trailing bytes are rejected; they are not covered by
+trusting the checksum alone. After the checksum, every parent/name/sort
+id is range-checked, parent cycles are rejected, and the derived data
+(the sort permutation and the folded arena) is validated as described
+below. Any problem is a typed error, never a panic
+(`ferrow-index/src/persist.rs`). Saving creates a unique temp file
+beside the destination with exclusive creation (mode 0600 on Unix),
+writes and syncs it, then renames it over the destination, so a crash
+or a concurrent save never leaves a half-written index at the target
+path and no unrelated sibling file is touched.
 
 CRC-32 is a hand-written, table-driven implementation: it is short, has
 no dependency, and easily outruns the disk on load. If load ever becomes

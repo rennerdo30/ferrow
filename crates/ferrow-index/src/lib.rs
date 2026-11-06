@@ -34,27 +34,30 @@ pub const ROOT_PARENT: u32 = u32::MAX;
 
 /// Case-fold a name for case-insensitive search.
 ///
-/// The fold preserves the UTF-8 byte length so the folded arena can share
-/// offsets with the original arena: ASCII bytes fold directly, and for
-/// valid UTF-8 input each `char` whose lowercase form is a single `char`
-/// with the same byte length folds in place (this covers Latin, Greek and
-/// Cyrillic pairs such as `Ä`/`ä`). Characters whose lowercase expands
-/// (such as `İ`) are left unchanged. Invalid UTF-8 (raw Unix bytes, WTF-8)
-/// gets ASCII-only folding. The query side folds with this same function,
-/// so matching stays consistent.
+/// The fold is Unicode simple case folding (`CaseFolding.txt`, status C
+/// and S, via the `casefold` crate), restricted to mappings that keep
+/// the UTF-8 byte length so the folded arena can share offsets with the
+/// original arena. That covers the full same-length equivalence classes,
+/// including `Σ`/`σ`/`ς`, the micro sign `µ`/`μ`, and Cherokee, where
+/// the fold target is the uppercase letter. Mappings that would change
+/// the byte length (for example `K` U+212A → `k`, `ſ` → `s`) and all
+/// full (multi-char) folds such as `ß` → `ss` are a known M1 limitation
+/// documented in ADR 0001; those characters are left unchanged. Invalid
+/// UTF-8 (raw Unix bytes, WTF-8) gets ASCII-only folding. The query side
+/// folds with this same function, so matching stays consistent.
 pub fn fold_name(name: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(name.len());
     if let Ok(s) = std::str::from_utf8(name) {
         let mut buf = [0u8; 4];
         for ch in s.chars() {
-            let mut lower = ch.to_lowercase();
-            let first = lower.next().unwrap_or(ch);
-            if lower.next().is_none() && first.len_utf8() == ch.len_utf8() {
-                out.extend_from_slice(first.encode_utf8(&mut buf).as_bytes());
+            let folded = casefold::simple_fold_char(ch);
+            let use_char = if folded.len_utf8() == ch.len_utf8() {
+                folded
             } else {
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-            }
+                ch
+            };
+            out.extend_from_slice(use_char.encode_utf8(&mut buf).as_bytes());
         }
     } else {
         out.extend(name.iter().map(u8::to_ascii_lowercase));
@@ -455,6 +458,59 @@ mod tests {
                 .windows(2)
                 .all(|w| { idx.folded_name(w[0]) <= idx.folded_name(w[1]) })
         );
+    }
+
+    /// Independent oracle: expected folds written out by hand from
+    /// Unicode CaseFolding.txt (status C and S), restricted to mappings
+    /// that keep the UTF-8 byte length. This test deliberately does not
+    /// derive its expectations from `fold_name` itself.
+    #[test]
+    fn fold_matches_unicode_simple_case_folding_same_length() {
+        let cases: &[(char, char)] = &[
+            ('A', 'a'),
+            ('Ä', 'ä'),
+            ('Σ', 'σ'), // GREEK CAPITAL SIGMA
+            ('ς', 'σ'), // GREEK SMALL FINAL SIGMA folds to sigma
+            ('σ', 'σ'),
+            ('µ', 'μ'), // MICRO SIGN folds to GREEK SMALL MU
+            ('Μ', 'μ'),
+            ('\u{0345}', 'ι'), // COMBINING GREEK YPOGEGRAMMENI -> iota
+            ('Ж', 'ж'),
+            ('ǅ', 'ǆ'), // titlecase digraph -> lowercase digraph
+            ('ꭰ', 'Ꭰ'), // CHEROKEE SMALL LETTER A -> CHEROKEE LETTER A
+            ('Ꭰ', 'Ꭰ'),
+            ('ᾈ', 'ᾀ'), // GREEK CAPITAL ... YPOGEGRAMMENI
+            ('ß', 'ß'), // sharp s: simple fold is itself (ss is full folding)
+            ('İ', 'İ'), // no simple fold; length-changing full fold is out of scope
+        ];
+        let mut out = Vec::new();
+        for &(input, expected) in cases {
+            assert_eq!(
+                input.len_utf8(),
+                expected.len_utf8(),
+                "oracle pair U+{:04X} -> U+{:04X} must be same-length",
+                input as u32,
+                expected as u32
+            );
+            fold_name(input.to_string().as_bytes(), &mut out);
+            assert_eq!(
+                String::from_utf8(out.clone()).unwrap(),
+                expected.to_string(),
+                "fold of U+{:04X}",
+                input as u32
+            );
+        }
+        // Length-changing simple folds stay unfolded in M1 (documented
+        // limitation): KELVIN SIGN -> k and LONG S -> s would shrink.
+        for input in ['\u{212A}', 'ſ'] {
+            fold_name(input.to_string().as_bytes(), &mut out);
+            assert_eq!(
+                String::from_utf8(out.clone()).unwrap(),
+                input.to_string(),
+                "length-changing fold of U+{:04X} must be left alone",
+                input as u32
+            );
+        }
     }
 
     #[test]
