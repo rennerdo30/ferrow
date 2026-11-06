@@ -1,115 +1,23 @@
 //! Query parser and parallel name matcher.
 //!
-//! Grammar (M1):
-//! - terms separated by whitespace mean AND;
-//! - `!term` means NOT;
-//! - `"quoted phrase"` is one literal term (spaces included);
-//! - matching is case-insensitive by default; `case:term` (also after
-//!   `!`, e.g. `!case:Foo`) makes one term case-sensitive.
-//!
-//! Matching is a substring test on the entry name only. The parser never
-//! panics on any input.
+//! Space means AND, `|` means OR, `!` means NOT and `<...>` groups terms.
+//! Plain terms are substrings; wildcard terms match the whole name.
+//! Quotes protect literal phrases. Modifiers and filters are described in
+//! ADR 0004. Parsing and matching are bounded; errors carry byte spans.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use ferrow_index::Index;
 pub use ferrow_index::SortKey;
-use ferrow_index::{Index, fold_name};
-use memchr::memmem;
+
 use rayon::prelude::*;
 
-/// One search term.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Term {
-    pub text: String,
-    pub negated: bool,
-    pub case_sensitive: bool,
-}
-
-/// A parsed query: all terms must match (AND).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Query {
-    pub terms: Vec<Term>,
-}
-
-impl Query {
-    /// Parse a query string. An empty (or whitespace-only) query has no
-    /// terms and matches every entry.
-    pub fn parse(input: &str) -> Result<Query, ParseError> {
-        let bytes = input.as_bytes();
-        let mut terms = Vec::new();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            // Skip separators (ASCII whitespace; non-ASCII bytes form terms).
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                break;
-            }
-            let term_start = i;
-            let mut negated = false;
-            let mut case_sensitive = false;
-            if bytes[i] == b'!' {
-                negated = true;
-                i += 1;
-            }
-            if input[i..].starts_with("case:") {
-                case_sensitive = true;
-                i += "case:".len();
-            }
-            let text: String;
-            if i < bytes.len() && bytes[i] == b'"' {
-                let quote_at = i;
-                i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return Err(ParseError::UnclosedQuote { at: quote_at });
-                }
-                text = input[start..i].to_string();
-                i += 1; // closing quote
-            } else {
-                let start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                text = input[start..i].to_string();
-            }
-            if text.is_empty() {
-                return Err(ParseError::EmptyTerm { at: term_start });
-            }
-            terms.push(Term {
-                text,
-                negated,
-                case_sensitive,
-            });
-        }
-        Ok(Query { terms })
-    }
-}
-
-/// Precise parse failures. `at` is a byte offset into the input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseError {
-    UnclosedQuote { at: usize },
-    EmptyTerm { at: usize },
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::UnclosedQuote { at } => {
-                write!(f, "unclosed quote starting at position {at}")
-            }
-            ParseError::EmptyTerm { at } => write!(f, "empty search term at position {at}"),
-        }
-    }
-}
-impl std::error::Error for ParseError {}
+mod parser;
+pub use parser::{
+    DateField, Expr, Filter, MetadataFilter, ParseError, Pattern, Query, RegexPlan, Term,
+};
 
 /// Shared cancellation flag, checked per chunk while searching.
 #[derive(Debug, Clone, Default)]
@@ -222,46 +130,11 @@ impl QueryTimings {
     }
 }
 
-struct Matcher {
-    finders: Vec<(memmem::Finder<'static>, bool, bool)>, // finder, negated, case_sensitive
-}
-
-impl Matcher {
-    fn new(query: &Query) -> Matcher {
-        let finders = query
-            .terms
-            .iter()
-            .map(|t| {
-                let needle: Vec<u8> = if t.case_sensitive {
-                    t.text.as_bytes().to_vec()
-                } else {
-                    let mut folded = Vec::new();
-                    fold_name(t.text.as_bytes(), &mut folded);
-                    folded
-                };
-                (
-                    memmem::Finder::new(&needle).into_owned(),
-                    t.negated,
-                    t.case_sensitive,
-                )
-            })
-            .collect();
-        Matcher { finders }
-    }
-
-    fn matches(&self, index: &Index, id: u32) -> bool {
-        self.finders
-            .iter()
-            .all(|(finder, negated, case_sensitive)| {
-                let haystack = if *case_sensitive {
-                    index.name(id)
-                } else {
-                    index.folded_name(id)
-                };
-                finder.find(haystack).is_some() != *negated
-            })
-    }
-}
+mod matcher;
+#[cfg(feature = "test-hooks")]
+pub use matcher::take_compact_plan_for_test;
+use matcher::{EntryMatcher, Matcher, Scratch};
+pub use matcher::{MAX_REGEX_INPUT_UNITS, highlight_ranges};
 
 /// Entries admitted per worker chunk; cancellation also runs inside it.
 const BLOCK_SIZE: usize = 4_096;
@@ -297,10 +170,27 @@ fn search_impl<const TIMED: bool>(
     options: &SearchOptions,
 ) -> (SearchResult, QueryTimings) {
     let started = TIMED.then(std::time::Instant::now);
-    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
+    let (result, mut timings) = match &matcher {
+        Matcher::Plain(m) => search_prepared::<TIMED, _>(index, m, options, started),
+        Matcher::General(m) => search_prepared::<TIMED, _>(index, m, options, started),
+    };
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
+    }
+    (result, timings)
+}
+
+fn search_prepared<const TIMED: bool, M: EntryMatcher>(
+    index: &Index,
+    matcher: &M,
+    options: &SearchOptions,
+    started: Option<std::time::Instant>,
+) -> (SearchResult, QueryTimings) {
+    let mut timings = QueryTimings::default();
     let sorted = if options.sort == SortKey::Name {
-        index.sorted()
+        matcher.candidates(index)
     } else if let Some(order) = index.metadata_order(options.sort, options.descending) {
         order
     } else {
@@ -345,6 +235,7 @@ fn search_impl<const TIMED: bool>(
     }
     let scan_started = TIMED.then(std::time::Instant::now);
     (0..width).into_par_iter().for_each(|_| {
+        let mut scratch = Scratch::default();
         loop {
             let chunk = {
                 let mut state = ordered.lock().expect("query progress poisoned");
@@ -380,11 +271,14 @@ fn search_impl<const TIMED: bool>(
                     } else {
                         position
                     }];
-                    if matcher.matches(index, id)
+                    if matcher.matches(index, id, &mut scratch, &options.cancel)
                         && options.limit.is_none_or(|limit| found.len() < limit)
                     {
                         found.push(id);
                     }
+                }
+                if M::CANCELLABLE_TERM && options.cancel.is_cancelled() {
+                    break;
                 }
                 examined += end - offset;
             }
@@ -441,7 +335,6 @@ fn search_impl<const TIMED: bool>(
         cancelled: options.cancel.is_cancelled(),
         visited,
     };
-    drop(matcher);
     if let Some(t) = started {
         timings.total = t.elapsed();
     }
@@ -468,8 +361,25 @@ fn count_impl<const TIMED: bool>(
     cancel: &CancelToken,
 ) -> ((usize, bool), QueryTimings) {
     let started = TIMED.then(std::time::Instant::now);
-    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
+    let (result, mut timings) = match &matcher {
+        Matcher::Plain(m) => count_prepared::<TIMED, _>(index, m, cancel, started),
+        Matcher::General(m) => count_prepared::<TIMED, _>(index, m, cancel, started),
+    };
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
+    }
+    (result, timings)
+}
+
+fn count_prepared<const TIMED: bool, M: EntryMatcher>(
+    index: &Index,
+    matcher: &M,
+    cancel: &CancelToken,
+    started: Option<std::time::Instant>,
+) -> ((usize, bool), QueryTimings) {
+    let mut timings = QueryTimings::default();
     if let Some(t) = started {
         timings.prepare = t.elapsed();
     }
@@ -477,6 +387,7 @@ fn count_impl<const TIMED: bool>(
     let total = (0..index.len().div_ceil(BLOCK_SIZE))
         .into_par_iter()
         .map(|chunk| {
+            let mut scratch = Scratch::default();
             let start = chunk * BLOCK_SIZE;
             let end = (start + BLOCK_SIZE).min(index.len());
             let mut total = 0;
@@ -485,7 +396,7 @@ fn count_impl<const TIMED: bool>(
                     break;
                 }
                 total += (start..(start + CANCEL_INTERVAL).min(end))
-                    .filter(|&id| matcher.matches(index, id as u32))
+                    .filter(|&id| matcher.matches(index, id as u32, &mut scratch, cancel))
                     .count();
             }
             total
@@ -495,7 +406,6 @@ fn count_impl<const TIMED: bool>(
         timings.scan = t.elapsed();
     }
     let result = (total, cancel.is_cancelled());
-    drop(matcher);
     if let Some(t) = started {
         timings.total = t.elapsed();
     }
@@ -530,19 +440,8 @@ mod tests {
     fn parse_grammar() {
         let q = Query::parse("report 2024").unwrap();
         assert_eq!(
-            q.terms,
-            vec![
-                Term {
-                    text: "report".into(),
-                    negated: false,
-                    case_sensitive: false
-                },
-                Term {
-                    text: "2024".into(),
-                    negated: false,
-                    case_sensitive: false
-                },
-            ]
+            q.terms.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(),
+            ["report", "2024"]
         );
         let q = Query::parse("!tmp log").unwrap();
         assert!(q.terms[0].negated && q.terms[0].text == "tmp");

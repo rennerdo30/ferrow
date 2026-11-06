@@ -55,17 +55,17 @@ emit() {
     echo
     echo "| Query | First page (limit 100) | Full count | Hits |"
     echo "|---|---|---|---|"
-    sed -n 's/^FERROW-QUERY query="\(.*\)" first_page_ms=\([^ ]*\) page_hits=[^ ]* full_count_ms=\([^ ]*\) total_hits=\([^ ]*\).*/| `\1` | \2 ms | \3 ms | \4 |/p' "$out_file"
+    sed 's/|/\\|/g' "$out_file" | sed -n 's/^FERROW-QUERY query="\(.*\)" first_page_ms=\([^ ]*\) page_hits=[^ ]* full_count_ms=\([^ ]*\) total_hits=\([^ ]*\).*/| `\1` | \2 ms | \3 ms | \4 |/p'
     echo
     echo "Additive query spans from the median-total sample (milliseconds):"
     echo
     echo '| Query | Operation | Total | Prepare | Scan | Collect | Unattributed |'
     echo '|---|---|---|---|---|---|---|'
-    sed -n 's/^FERROW-QUERY-PARTS query="\(.*\)" operation=\([^ ]*\) total_ms=\([^ ]*\) prepare_ms=\([^ ]*\) scan_ms=\([^ ]*\) collect_ms=\([^ ]*\) unattributed_ms=\([^ ]*\).*/| `\1` | \2 | \3 | \4 | \5 | \6 | \7 |/p' "$out_file"
+    sed 's/|/\\|/g' "$out_file" | sed -n 's/^FERROW-QUERY-PARTS query="\(.*\)" operation=\([^ ]*\) total_ms=\([^ ]*\) prepare_ms=\([^ ]*\) scan_ms=\([^ ]*\) collect_ms=\([^ ]*\) unattributed_ms=\([^ ]*\).*/| `\1` | \2 | \3 | \4 | \5 | \6 | \7 |/p'
     echo
     echo '| Service IPC query | First page (limit 100) | Full count | Hits |'
     echo '|---|---|---|---|'
-    sed -n 's/^FERROW-SERVICE query="\(.*\)" first_page_ms=\([^ ]*\) page_hits=[^ ]* full_count_ms=\([^ ]*\) total_hits=\([^ ]*\).*/| `\1` | \2 ms | \3 ms | \4 |/p' "$out_file"
+    sed 's/|/\\|/g' "$out_file" | sed -n 's/^FERROW-SERVICE query="\(.*\)" first_page_ms=\([^ ]*\) page_hits=[^ ]* full_count_ms=\([^ ]*\) total_hits=\([^ ]*\).*/| `\1` | \2 ms | \3 ms | \4 |/p'
     echo
     echo "<details><summary>divan output</summary>"
     echo
