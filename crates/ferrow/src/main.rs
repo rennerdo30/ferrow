@@ -347,6 +347,18 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
     }
 }
 
+fn main() -> ExitCode {
+    // args_os: paths may be non-Unicode; std::env::args() would panic.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match run(argv) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,17 +428,5 @@ mod tests {
             Some(abs(&["Local", "ferrow"]))
         );
         assert!(default_index_path().is_none_or(|p| p.is_absolute()));
-    }
-}
-
-fn main() -> ExitCode {
-    // args_os: paths may be non-Unicode; std::env::args() would panic.
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    match run(argv) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            ExitCode::FAILURE
-        }
     }
 }
