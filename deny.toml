@@ -1,0 +1,18 @@
+# cargo-deny configuration. Ferrow ships only permissively licensed
+# dependencies; CI enforces this list (docs/SPEC.md section 7).
+# For "A OR B" expressions one allowed side is enough (e.g. MIT covers
+# "Unlicense OR MIT"). "(MIT OR Apache-2.0) AND Unicode-3.0" needs the
+# Unicode entry below.
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]

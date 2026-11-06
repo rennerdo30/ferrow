@@ -22,9 +22,37 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+  deny:
+    name: cargo-deny (licenses)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check licenses
+  bench:
+    name: bench (5M fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Informational until the owner confirms the SPEC section 3 targets.
+    continue-on-error: true
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show active-toolchain
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Run the 5M-entry benchmark
+        run: cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee bench-output.txt
+      - name: Write the job summary table
+        if: always()
+        run: ./scripts/bench-summary.sh bench-output.txt
