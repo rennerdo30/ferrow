@@ -14,6 +14,10 @@ use ferrow_index::{Index, flags};
 
 use crate::engine::{Engine, Event, Hits, home_dir};
 use crate::logo::TitleLogo;
+use crate::settings::Settings;
+
+#[path = "settings_page.rs"]
+mod settings_page;
 use crate::platform;
 use crate::theme::{self, Palette};
 
@@ -21,7 +25,9 @@ const ROW_HEIGHT: f32 = 32.0;
 const HEADER_HEIGHT: f32 = 32.0;
 const SCROLLBAR_WIDTH: f32 = 12.0;
 /// Title row height; matches the Windows 11 tall title bar.
-const TITLE_HEIGHT: f32 = 48.0;
+const TITLE_HEIGHT: f32 = 40.0;
+/// Settings (gear) button in the title row.
+const GEAR_WIDTH: f32 = 40.0;
 /// Room for the system minimise / maximise / close buttons.
 /// Width of one caption button (Windows 11 metrics).
 const CAPTION_BUTTON_WIDTH: f32 = 46.0;
@@ -34,6 +40,19 @@ enum State {
     Scanning(String),
     Failed(String),
     Ready,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Results,
+    Settings,
+}
+
+/// Which folder list a folder dialog adds to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickTarget {
+    Root,
+    Exclude,
 }
 
 pub struct FerrowApp {
@@ -61,12 +80,20 @@ pub struct FerrowApp {
     accent: Option<[u8; 3]>,
     focus_search: bool,
     title_logo: TitleLogo,
+    page: Page,
+    settings: Settings,
+    folder_pick: Option<(PickTarget, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
+    /// Set while a rebuild runs; search keeps using the old index.
+    scan_status: Option<String>,
+    settings_error: Option<String>,
 }
 
 impl FerrowApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Result<FerrowApp, String> {
         let ctx = cc.egui_ctx.clone();
         theme::install_fonts(&ctx)?;
+        let settings = Settings::load();
+        settings_page::apply_theme_choice(&ctx, settings.theme);
         let dark = ctx.theme() == egui::Theme::Dark;
         let accent = platform::accent_color();
         let palette = Palette::new(dark, accent);
@@ -99,6 +126,11 @@ impl FerrowApp {
             accent,
             focus_search: true,
             title_logo: TitleLogo::new(),
+            page: Page::Results,
+            settings,
+            folder_pick: None,
+            scan_status: None,
+            settings_error: None,
         })
     }
 
@@ -111,14 +143,28 @@ impl FerrowApp {
                     source,
                 } => {
                     self.index = Some(index);
+                    self.scan_status = None;
                     self.load_time = elapsed;
                     self.index_source = source;
                     self.state = State::Ready;
                     self.sent_query = None; // re-run the current query
                 }
                 Event::NoIndex { path } => self.state = State::NoIndex { path },
-                Event::Failed(msg) => self.state = State::Failed(msg),
-                Event::Scanning(msg) => self.state = State::Scanning(msg),
+                Event::Failed(msg) => {
+                    self.scan_status = None;
+                    if self.index.is_some() {
+                        // Keep searching the current index; report the error.
+                        self.settings_error = Some(msg);
+                    } else {
+                        self.state = State::Failed(msg);
+                    }
+                }
+                Event::Scanning(msg) => {
+                    if self.index.is_none() {
+                        self.state = State::Scanning(msg.clone());
+                    }
+                    self.scan_status = Some(msg);
+                }
                 Event::Results {
                     generation,
                     hits,
@@ -738,7 +784,7 @@ impl FerrowApp {
         if resp.on_hover_cursor(CursorIcon::Default).clicked()
             && let Some(home) = home
         {
-            self.engine.scan(home);
+            self.index_home(home);
         }
         painter.text(
             c + vec2(0.0, 64.0),
@@ -747,6 +793,37 @@ impl FerrowApp {
             FontId::proportional(12.0),
             p.text_tertiary,
         );
+    }
+
+    /// Settings button (gear) in the title row.
+    fn gear_button(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let p = self.palette;
+        let resp = ui.interact(rect, egui::Id::unique("gear"), Sense::click());
+        let on = self.page == Page::Settings;
+        let inner = rect.shrink2(vec2(4.0, 6.0));
+        if resp.hovered() || on {
+            ui.painter().rect_filled(
+                inner,
+                CornerRadius::same(4),
+                if on { p.row_selected } else { p.row_hover },
+            );
+        }
+        let c = rect.center();
+        if theme::has_icon_font(ui.ctx()) {
+            ui.painter().text(
+                c,
+                Align2::CENTER_CENTER,
+                "\u{E713}",
+                FontId::new(14.0, FontFamily::Name(theme::ICONS.into())),
+                p.text,
+            );
+        } else {
+            ui.painter().circle_stroke(c, 5.0, Stroke::new(1.5, p.text));
+        }
+        if resp.on_hover_text("Settings").clicked() {
+            self.page = if on { Page::Results } else { Page::Settings };
+            self.focus_search = on;
+        }
     }
 
     /// Minimise, maximise/restore and close, drawn like Windows 11 with
@@ -889,6 +966,12 @@ impl eframe::App for FerrowApp {
         self.drain_events();
 
         // Every keystroke starts a new (cancelling) search on the worker.
+        if self.page == Page::Settings
+            && self.sent_query.is_some()
+            && self.sent_query.as_deref() != Some(self.query.as_str())
+        {
+            self.page = Page::Results;
+        }
         if matches!(self.state, State::Ready)
             && self.sent_query.as_deref() != Some(self.query.as_str())
         {
@@ -910,8 +993,8 @@ impl eframe::App for FerrowApp {
         let search_rect = if platform::CUSTOM_TITLE_ROW {
             let painter = ui.painter();
             let mid = full.top() + title_h / 2.0;
-            if let Some(tex) = self.title_logo.texture(&ctx, 18.0) {
-                let r = Rect::from_center_size(pos2(full.left() + 22.0, mid), vec2(18.0, 18.0));
+            if let Some(tex) = self.title_logo.texture(&ctx, 24.0) {
+                let r = Rect::from_center_size(pos2(full.left() + 24.0, mid), vec2(24.0, 24.0));
                 painter.image(
                     tex.id(),
                     r,
@@ -920,18 +1003,23 @@ impl eframe::App for FerrowApp {
                 );
             }
             painter.text(
-                pos2(full.left() + 40.0, mid),
+                pos2(full.left() + 44.0, mid),
                 Align2::LEFT_CENTER,
                 "Ferrow",
-                FontId::proportional(12.0),
+                FontId::proportional(13.0),
                 p.text_secondary,
             );
             let left = full.left() + 110.0;
-            let right = full.right() - CAPTION_BUTTONS_WIDTH;
+            let right = full.right() - CAPTION_BUTTONS_WIDTH - GEAR_WIDTH - 8.0;
             let width = (right - left).clamp(120.0, 640.0);
             let x = (full.center().x - width / 2.0).max(left).min(right - width);
-            let r = Rect::from_min_size(pos2(x, mid - 16.0), vec2(width, 32.0));
+            let r = Rect::from_min_size(pos2(x, mid - 15.0), vec2(width, 30.0));
             let buttons_left = full.right() - CAPTION_BUTTONS_WIDTH;
+            let gear = Rect::from_min_max(
+                pos2(buttons_left - GEAR_WIDTH, full.top()),
+                pos2(buttons_left, full.top() + title_h),
+            );
+            self.gear_button(ui, gear);
             let max_button = (
                 buttons_left + CAPTION_BUTTON_WIDTH,
                 buttons_left + 2.0 * CAPTION_BUTTON_WIDTH,
@@ -940,7 +1028,7 @@ impl eframe::App for FerrowApp {
             crate::frame::set_caption(&crate::frame::Caption {
                 height: title_h * ppp,
                 control: (r.left() * ppp, r.right() * ppp),
-                buttons_left: buttons_left * ppp,
+                buttons_left: gear.left() * ppp,
                 max_button: (max_button.0 * ppp, max_button.1 * ppp),
             });
             let _ = max_button;
@@ -965,18 +1053,27 @@ impl eframe::App for FerrowApp {
             pos2(full.left() + 8.0, top),
             pos2(full.right() - 8.0, full.bottom() - 2.0),
         );
-        let list_h = (content.height() - STATUS_HEIGHT).max(0.0);
-        let visible_rows = ((list_h - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(1.0) as usize;
-        self.handle_keys(&ctx, visible_rows);
-        let list_rect = Rect::from_min_size(content.min, vec2(content.width(), list_h));
-        let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
-        self.results(&mut list_ui);
-        let status_rect = Rect::from_min_max(
-            pos2(content.left() + 6.0, list_rect.bottom()),
-            pos2(content.right() - 6.0, content.bottom()),
-        );
-        let mut status_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_rect));
-        self.status_bar(&mut status_ui);
+        if self.page == Page::Settings {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.page = Page::Results;
+                self.focus_search = true;
+            }
+            let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
+            self.settings_page(&mut page_ui);
+        } else {
+            let list_h = (content.height() - STATUS_HEIGHT).max(0.0);
+            let visible_rows = ((list_h - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(1.0) as usize;
+            self.handle_keys(&ctx, visible_rows);
+            let list_rect = Rect::from_min_size(content.min, vec2(content.width(), list_h));
+            let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
+            self.results(&mut list_ui);
+            let status_rect = Rect::from_min_max(
+                pos2(content.left() + 6.0, list_rect.bottom()),
+                pos2(content.right() - 6.0, content.bottom()),
+            );
+            let mut status_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_rect));
+            self.status_bar(&mut status_ui);
+        }
 
         // Forward egui copy commands (Ctrl+C in the search box) to the
         // system clipboard.

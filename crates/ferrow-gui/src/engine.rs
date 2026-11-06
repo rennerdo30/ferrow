@@ -73,8 +73,14 @@ enum Command {
         text: String,
         cancel: Arc<AtomicBool>,
     },
-    Scan {
-        root: PathBuf,
+    Scan(ferrow_walk::WalkOptions),
+    /// Pass an event from a background thread to the UI (with a wake).
+    Forward(Event),
+    /// A background scan finished; swap in its index.
+    ScanDone {
+        index: Box<Index>,
+        elapsed: Duration,
+        source: String,
     },
 }
 
@@ -94,7 +100,14 @@ impl Engine {
         let (event_tx, events) = mpsc::channel();
         std::thread::Builder::new()
             .name("ferrow-engine".into())
-            .spawn(move || Worker::new(event_tx, wake).run(command_rx))
+            .spawn({
+                let commands = commands.clone();
+                move || {
+                    Worker::new(event_tx, wake)
+                        .with_commands(commands)
+                        .run(command_rx)
+                }
+            })
             .expect("spawn engine thread");
         Engine {
             commands,
@@ -121,8 +134,10 @@ impl Engine {
         self.generation
     }
 
-    pub fn scan(&mut self, root: PathBuf) {
-        let _ = self.commands.send(Command::Scan { root });
+    /// Rebuild the index in the background. Search keeps working on the
+    /// current index until the new one is ready.
+    pub fn scan(&mut self, options: ferrow_walk::WalkOptions) {
+        let _ = self.commands.send(Command::Scan(options));
     }
 
     pub fn poll(&self) -> Option<Event> {
@@ -134,6 +149,8 @@ struct Worker<W: Fn()> {
     events: Sender<Event>,
     wake: W,
     index: Option<Arc<Index>>,
+    /// Lets scan threads hand their result back to this worker.
+    commands: Option<Sender<Command>>,
 }
 
 impl<W: Fn()> Worker<W> {
@@ -142,7 +159,13 @@ impl<W: Fn()> Worker<W> {
             events,
             wake,
             index: None,
+            commands: None,
         }
+    }
+
+    fn with_commands(mut self, commands: Sender<Command>) -> Self {
+        self.commands = Some(commands);
+        self
     }
 
     fn send(&self, event: Event) {
@@ -156,11 +179,13 @@ impl<W: Fn()> Worker<W> {
             // Only the newest search matters; skip superseded ones.
             while let Ok(next) = commands.try_recv() {
                 match next {
-                    Command::Scan { .. } => {
+                    Command::Search { .. } if matches!(command, Command::Search { .. }) => {
+                        command = next;
+                    }
+                    _ => {
                         self.handle(command);
                         command = next;
                     }
-                    Command::Search { .. } => command = next,
                 }
             }
             self.handle(command);
@@ -174,7 +199,13 @@ impl<W: Fn()> Worker<W> {
                 text,
                 cancel,
             } => self.search(generation, &text, cancel),
-            Command::Scan { root } => self.scan(root),
+            Command::Scan(options) => self.scan(options),
+            Command::ScanDone {
+                index,
+                elapsed,
+                source,
+            } => self.set_index(*index, elapsed, source),
+            Command::Forward(event) => self.send(event),
         }
     }
 
@@ -207,27 +238,47 @@ impl<W: Fn()> Worker<W> {
         });
     }
 
-    fn scan(&mut self, root: PathBuf) {
-        self.send(Event::Scanning(format!("Indexing {}…", root.display())));
-        let options = ferrow_walk::WalkOptions {
-            roots: vec![root.clone()],
-            ..Default::default()
-        };
-        let started = Instant::now();
-        let (index, report) = ferrow_walk::scan(&options);
-        if let Some(fatal) = report.fatal_error {
-            self.send(Event::Failed(fatal));
+    fn scan(&mut self, options: ferrow_walk::WalkOptions) {
+        let source = options
+            .roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.send(Event::Scanning(format!("Indexing {source}…")));
+        let Some(commands) = self.commands.clone() else {
             return;
+        };
+        // The walk runs on its own thread, so searches keep being answered
+        // from the current index while it runs (never freeze).
+        let spawned = std::thread::Builder::new()
+            .name("ferrow-scan".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let (index, report) = ferrow_walk::scan(&options);
+                if let Some(fatal) = report.fatal_error {
+                    let _ = commands.send(Command::Forward(Event::Failed(fatal)));
+                    return;
+                }
+                if let Some(path) = default_index_path() {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if let Err(e) = index.save(&path) {
+                        let _ = commands.send(Command::Forward(Event::Failed(format!(
+                            "Indexed, but saving failed: {e}"
+                        ))));
+                    }
+                }
+                let _ = commands.send(Command::ScanDone {
+                    index: Box::new(index),
+                    elapsed: started.elapsed(),
+                    source,
+                });
+            });
+        if let Err(e) = spawned {
+            self.send(Event::Failed(format!("Could not start indexing: {e}")));
         }
-        if let Some(path) = default_index_path() {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = index.save(&path) {
-                self.send(Event::Failed(format!("Indexed, but saving failed: {e}")));
-            }
-        }
-        self.set_index(index, started.elapsed(), root.display().to_string());
     }
 
     fn search(&self, generation: u64, text: &str, cancel: Arc<AtomicBool>) {

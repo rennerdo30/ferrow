@@ -13,6 +13,7 @@ mod engine;
 mod frame;
 mod logo;
 mod platform;
+mod settings;
 mod theme;
 
 use eframe::egui;
