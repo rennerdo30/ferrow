@@ -104,3 +104,8 @@ one 250 ms deadline; a clean index waits indefinitely for an event. Controlled
 shutdown saves the latest snapshot and reports persistence failures. Unix
 foreground hosts handle SIGTERM/SIGINT cooperatively; SCM STOP/SHUTDOWN uses
 the same final-save path. A failed load or state-policy check refuses startup.
+
+The host admits at most 32 connections, with one in-flight operation each.
+Handshake and frame I/O have absolute five-second deadlines. Shutdown cancels
+and joins owned workers. A reply is capped at 10,000 paths and 4 MiB of encoded
+path data; exceeding either returns `TooLarge` with a request to use `--limit`.

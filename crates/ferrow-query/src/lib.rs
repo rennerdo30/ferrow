@@ -117,6 +117,11 @@ pub struct CancelToken {
 }
 
 impl CancelToken {
+    /// Share an existing cancellation owner, for event-driven hosts.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+
     pub fn new() -> CancelToken {
         CancelToken::default()
     }

@@ -17,6 +17,10 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }

@@ -92,9 +92,43 @@ fn daemon_answers_and_snapshot_swap_is_visible() {
     store.rescan(&options);
     assert_eq!(client.count("report").unwrap(), 3);
 
-    drop(client);
     shutdown.request(&endpoint);
     server.join().unwrap().unwrap();
+    assert!(
+        client.status().is_err(),
+        "shutdown left a detached connection alive"
+    );
+    drop(client);
+}
+
+#[test]
+fn unlimited_service_queries_have_an_explicit_overall_result_budget() {
+    let builder = ferrow_index::IndexBuilder::new();
+    let root = builder.add_root(b"root", ferrow_index::flags::DIR);
+    for _ in 0..10_001 {
+        builder.add(root, b"hit", 0);
+    }
+    let store = SnapshotStore::new(Snapshot {
+        index: std::sync::Arc::new(builder.freeze()),
+        mode: "fixture".into(),
+        report: "fixture".into(),
+    });
+    let request = |limit| ferrow_ipc::Request::Query {
+        text: "hit".into(),
+        limit,
+        sort: ferrow_ipc::protocol::Sort::Name,
+        flags: 0,
+    };
+    assert!(matches!(
+        &ferrowd::handle(&store, request(0))[..],
+        [ferrow_ipc::Response::Error {
+            code: ferrow_ipc::ErrorCode::TooLarge,
+            ..
+        }]
+    ));
+    assert!(
+        matches!(&ferrowd::handle(&store, request(1))[..], [ferrow_ipc::Response::Results { paths, more: false }] if paths.len() == 1)
+    );
 }
 
 #[test]

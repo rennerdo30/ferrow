@@ -518,7 +518,7 @@ mod platform {
     // AU data/attribute/synchronization rights exclude FILE_CREATE_PIPE_INSTANCE.
     // Owner rights allow an unprivileged dev listener to create successors.
     const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;AU)";
-    const PIPE_INSTANCES: u32 = 33; // 32 connected streams plus one pending instance
+    const PIPE_INSTANCES: u32 = 34; // 32 admitted, one being refused, one pending
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()

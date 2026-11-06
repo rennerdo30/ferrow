@@ -21,6 +21,7 @@ use ferrow_ipc::{
 use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
+mod admission;
 pub mod install;
 pub mod persistence;
 pub mod protection;
@@ -200,6 +201,7 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
 }
 
 /// Page budgets for streamed `Results` (well under the frame cap).
+const MAX_QUERY_RESULTS: usize = 10_000;
 const PAGE_MAX_PATHS: usize = 512;
 const PAGE_MAX_BYTES: usize = 256 * 1024;
 
@@ -212,6 +214,10 @@ fn bad_request(msg: String) -> Response {
 
 /// Answer one request from the current snapshot.
 pub fn handle(store: &SnapshotStore, request: Request) -> Vec<Response> {
+    handle_cancel(store, request, CancelToken::new())
+}
+
+fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -> Vec<Response> {
     let snapshot = store.get();
     match request {
         Request::Query { text, limit, .. } => {
@@ -220,12 +226,12 @@ pub fn handle(store: &SnapshotStore, request: Request) -> Vec<Response> {
                 Err(e) => return vec![bad_request(e.to_string())],
             };
             let options = SearchOptions {
-                limit: if limit == 0 {
-                    None
+                limit: Some(if limit == 0 {
+                    MAX_QUERY_RESULTS + 1
                 } else {
-                    Some(limit as usize)
-                },
-                cancel: CancelToken::new(),
+                    (limit as usize).min(MAX_QUERY_RESULTS + 1)
+                }),
+                cancel,
                 ..SearchOptions::default()
             };
             let result = ferrow_query::search(&snapshot.index, &query, &options);
@@ -235,12 +241,28 @@ pub fn handle(store: &SnapshotStore, request: Request) -> Vec<Response> {
                     msg: "query cancelled".into(),
                 }];
             }
+            if result.hits.len() > MAX_QUERY_RESULTS {
+                return vec![Response::Error {
+                    code: ErrorCode::TooLarge,
+                    msg: "service result budget exceeded; use --limit".into(),
+                }];
+            }
+            let mut total_bytes = 0usize;
             let mut pages: Vec<Response> = Vec::new();
             let mut page: Vec<Vec<u8>> = Vec::new();
             let mut page_bytes = 0usize;
             let mut buf: Vec<u8> = Vec::new();
             for &id in &result.hits {
                 snapshot.index.path_bytes(id, &mut buf);
+                total_bytes = total_bytes.saturating_add(buf.len() + 4);
+                if total_bytes > ferrow_ipc::MAX_FRAME_BYTES
+                    || buf.len() > ferrow_ipc::protocol::MAX_PATH_BYTES
+                {
+                    return vec![Response::Error {
+                        code: ErrorCode::TooLarge,
+                        msg: "service path byte budget exceeded; use --limit".into(),
+                    }];
+                }
                 if !page.is_empty()
                     && (page.len() >= PAGE_MAX_PATHS || page_bytes + buf.len() > PAGE_MAX_BYTES)
                 {
@@ -264,7 +286,7 @@ pub fn handle(store: &SnapshotStore, request: Request) -> Vec<Response> {
                 Ok(q) => q,
                 Err(e) => return vec![bad_request(e.to_string())],
             };
-            let (n, cancelled) = ferrow_query::count(&snapshot.index, &query, &CancelToken::new());
+            let (n, cancelled) = ferrow_query::count(&snapshot.index, &query, &cancel);
             if cancelled {
                 return vec![Response::Error {
                     code: ErrorCode::Cancelled,
@@ -295,6 +317,17 @@ pub fn handle_authorized(
     owner: &CallerIdentity,
     system: bool,
 ) -> Vec<Response> {
+    handle_authorized_cancel(store, request, caller, owner, system, CancelToken::new())
+}
+
+fn handle_authorized_cancel(
+    store: &SnapshotStore,
+    request: Request,
+    caller: &CallerIdentity,
+    owner: &CallerIdentity,
+    system: bool,
+    cancel: CancelToken,
+) -> Vec<Response> {
     let allowed = if system {
         caller.is_system_administrator()
     } else {
@@ -313,7 +346,7 @@ pub fn handle_authorized(
         return vec![Response::Error { code: ErrorCode::Unauthorized,
             msg: "per-user visibility not yet available; system access requires SYSTEM/Administrators or root; development access requires its owner".into() }];
     }
-    handle(store, request)
+    handle_cancel(store, request, cancel)
 }
 
 /// Cooperative shutdown with persistent listener cancellation. Registration
@@ -373,27 +406,68 @@ pub fn serve(
     let system = config.endpoint == Endpoint::default_service();
     let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
     eprintln!("ferrowd: listening on {}", config.endpoint);
+    let budget = admission::Admission::new(32);
+    let mut workers: Vec<(ferrow_ipc::Stream, std::thread::JoinHandle<()>)> =
+        Vec::with_capacity(32);
     let result = (|| {
         while !shutdown.is_requested() {
-            let (stream, _caller) = match listener.accept() {
+            let (stream, _) = match listener.accept() {
                 Ok(pair) => pair,
                 Err(_) if shutdown.is_requested() => break,
                 Err(e) => return Err(e),
             };
             if shutdown.is_requested() {
-                drop(stream);
                 break;
             }
+            for index in (0..workers.len()).rev() {
+                if workers[index].1.is_finished() {
+                    let _ = workers.swap_remove(index).1.join();
+                }
+            }
+            if workers.len() >= 32 {
+                drop(stream);
+                continue;
+            }
+            let Some(permit) = budget.acquire() else {
+                drop(stream);
+                continue;
+            };
+            let control = stream.try_clone()?;
             let store = store.clone();
             let owner = owner.clone();
-            std::thread::spawn(move || {
-                let _ = serve_cancellable(stream, move |context, request| {
-                    handle_authorized(&store, request, &context.caller, &owner, system)
-                });
-            });
+            let stopping = shutdown.clone();
+            let thread = std::thread::Builder::new()
+                .name("ipc-connection".into())
+                .spawn(move || {
+                    let _permit = permit;
+                    let result = serve_cancellable(stream, move |context, request| {
+                        handle_authorized_cancel(
+                            &store,
+                            request,
+                            &context.caller,
+                            &owner,
+                            system,
+                            CancelToken::from_flag(context.cancellation_flag()),
+                        )
+                    });
+                    if let Err(error) = result
+                        && !stopping.is_requested()
+                    {
+                        eprintln!("ferrowd: connection closed: {error}");
+                    }
+                })?;
+            workers.push((control, thread));
         }
         Ok(())
     })();
+    for (control, _) in &workers {
+        let _ = control.shutdown();
+    }
+    for (_, thread) in workers {
+        thread
+            .join()
+            .map_err(|_| std::io::Error::other("connection worker panicked"))?;
+    }
     if let Some(worker) = persistence {
         worker.finish()?;
     }
