@@ -78,9 +78,14 @@ counts), checks the exact expected total length against the file size
 (with a 16 GiB ceiling), and only then reads the payload in one
 sequential read. Trailing bytes are rejected; they are not covered by
 trusting the checksum alone. After the checksum, every parent/name/sort
-id is range-checked, parent cycles are rejected, and the derived data
-(the sort permutation and the folded arena) is validated as described
-below. Any problem is a typed error, never a panic
+id is range-checked and parent cycles are rejected. The derived data
+is **validated, not rebuilt**: the sort column must be a permutation
+(no duplicate ids) in exact sort order, and every folded name must
+equal `fold_name` of the raw name. Validation was chosen over
+rebuilding on load because it is O(n) plus one pass over the arena,
+while rebuilding would pay a full parallel sort on every cold start,
+against the load-time target. A crafted file with a valid checksum
+but inconsistent derived data is rejected as corrupt. Any problem is a typed error, never a panic
 (`ferrow-index/src/persist.rs`). Saving creates a unique temp file
 beside the destination with exclusive creation (mode 0600 on Unix),
 writes and syncs it, then renames it over the destination, so a crash

@@ -24,7 +24,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::Path;
 
-use crate::{Index, OwnedColumns, ROOT_PARENT};
+use crate::{Index, OwnedColumns, ROOT_PARENT, fold_name};
 
 pub const MAGIC: [u8; 8] = *b"FERROWID";
 pub const VERSION: u32 = 1;
@@ -373,6 +373,43 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
         }
     }
 
+    // Validate the derived data instead of trusting it (ADR 0001:
+    // validation chosen over rebuild — uniqueness/order checks are O(n)
+    // and the folded check is one pass over the arena with a single
+    // reused buffer, while rebuilding would pay a full parallel sort).
+    fn name_at<'a>(arena: &'a [u8], name_off: &[u32], name_len: &[u16], i: usize) -> &'a [u8] {
+        let off = name_off[i] as usize;
+        &arena[off..off + name_len[i] as usize]
+    }
+    let mut folded_buf: Vec<u8> = Vec::new();
+    for i in 0..n {
+        fold_name(name_at(&arena, &name_off, &name_len, i), &mut folded_buf);
+        if folded_buf != name_at(&folded_arena, &name_off, &name_len, i) {
+            return Err(LoadError::Corrupt("folded arena inconsistent with names"));
+        }
+    }
+    let mut seen = vec![false; n];
+    for &id in &sorted {
+        if seen[id as usize] {
+            return Err(LoadError::Corrupt("duplicate id in sort order"));
+        }
+        seen[id as usize] = true;
+    }
+    let key_cmp = |a: u32, b: u32| {
+        name_at(&folded_arena, &name_off, &name_len, a as usize)
+            .cmp(name_at(&folded_arena, &name_off, &name_len, b as usize))
+            .then_with(|| {
+                name_at(&arena, &name_off, &name_len, a as usize)
+                    .cmp(name_at(&arena, &name_off, &name_len, b as usize))
+            })
+            .then_with(|| a.cmp(&b))
+    };
+    for w in sorted.windows(2) {
+        if key_cmp(w[0], w[1]) != std::cmp::Ordering::Less {
+            return Err(LoadError::Corrupt("sort order is not sorted"));
+        }
+    }
+
     Ok(Index::from_columns(OwnedColumns {
         parent,
         name_off,
@@ -480,6 +517,66 @@ mod tests {
         let result = load_from(&mut reader, bytes.len() as u64 + 4096);
         assert!(matches!(result, Err(LoadError::Corrupt(_))), "{result:?}");
         assert_eq!(reader.read, HEADER_LEN, "payload was read before rejection");
+    }
+
+    fn three_entry_bytes() -> Vec<u8> {
+        let dir = test_dir("three");
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        b.add(root, b"apple", 0);
+        b.add(root, b"zebra", 0);
+        b.freeze().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+
+    fn fix_checksum(bytes: &mut [u8]) {
+        let sum = crc32(&bytes[HEADER_LEN..]);
+        bytes[20..24].copy_from_slice(&sum.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_duplicate_sort_ids_with_valid_checksum() {
+        let mut bytes = three_entry_bytes();
+        let at = bytes.len() - 12;
+        for off in [at, at + 4, at + 8] {
+            bytes[off..off + 4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        fix_checksum(&mut bytes);
+        assert!(
+            matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
+            "duplicate sort ids must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_unsorted_permutation_with_valid_checksum() {
+        let mut bytes = three_entry_bytes();
+        let at = bytes.len() - 12;
+        // Valid permutation, wrong order (zebra, root, apple).
+        for (i, id) in [2u32, 0, 1].iter().enumerate() {
+            bytes[at + i * 4..at + i * 4 + 4].copy_from_slice(&id.to_le_bytes());
+        }
+        fix_checksum(&mut bytes);
+        assert!(
+            matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
+            "unsorted permutation must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_inconsistent_folded_arena_with_valid_checksum() {
+        let mut bytes = three_entry_bytes();
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let folded_at = HEADER_LEN + 3 * 12 + arena_len;
+        bytes[folded_at..folded_at + arena_len].fill(b'x');
+        fix_checksum(&mut bytes);
+        assert!(
+            matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
+            "inconsistent folded arena must be rejected"
+        );
     }
 
     #[test]
