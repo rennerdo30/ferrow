@@ -21,7 +21,7 @@
 //! and checksum, validates every offset, and never panics on bad input.
 
 use std::fmt;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -338,12 +338,22 @@ fn load_from<R: std::io::Read>(
     let t = Instant::now();
     data.try_reserve_exact(total - data.len())
         .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
-    data.resize(total, 0);
     timings.buffer += t.elapsed();
     let t = Instant::now();
-    reader
-        .read_exact(&mut data[head_len..])
+    // Let Read manage initialized spare capacity: File can fill it directly
+    // without first zeroing the entire payload. Take retains the validated
+    // header's hard byte bound, including for a source that grows mid-read.
+    let remaining = total - head_len;
+    let read = reader
+        .take(remaining as u64)
+        .read_to_end(&mut data)
         .map_err(LoadError::Io)?;
+    if read != remaining {
+        return Err(LoadError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "index payload truncated",
+        )));
+    }
     timings.read += t.elapsed();
     let index = from_bytes_inner(&data, &mut timings)?;
     let t = Instant::now();
