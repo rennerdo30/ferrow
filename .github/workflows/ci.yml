@@ -140,7 +140,7 @@ jobs:
       - name: Prepare the identical selective retry driver for both arms
         run: |
           cat > crates/ferrow-query/examples/latency_probe.rs <<'RUST'
-          //! Selective paired CI latency retry. Built against each arm's libraries.
+          //! One warmed sample per process, orchestrated in interleaved order by CI.
           use ferrow_index::Index;
           use ferrow_ipc::{Client, Endpoint};
           use ferrow_query::{CancelToken, Query, SearchOptions, count, search};
@@ -155,20 +155,35 @@ jobs:
               }
           }
           
+          fn digest(paths: &[Vec<u8>]) -> u64 {
+              let mut digest = 0xcbf29ce484222325u64;
+              for path in paths {
+                  for byte in (path.len() as u64).to_le_bytes().iter().chain(path) {
+                      digest = (digest ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+                  }
+              }
+              digest
+          }
+          
           fn main() -> Result<(), Box<dyn std::error::Error>> {
               let args: Vec<_> = std::env::args().skip(1).collect();
               if args.len() != 5 {
                   return Err("expected binary, index, kind, query, operation".into());
               }
               let path = std::path::Path::new(&args[1]);
-              let mut samples = Vec::new();
-              let mut hits = 0;
-              if args[2] == "load" {
-                  for _ in 0..3 {
-                      let (index, timing) = Index::load_with_timings(path)?;
-                      hits = index.len();
-                      samples.push(timing.total);
-                  }
+              eprintln!(
+                  "FERROW-PROBE-ACTIVE pid={} timeout_s=120",
+                  std::process::id()
+              );
+              let (elapsed, hits, fingerprint, heap, entries) = if args[2] == "load" {
+                  let (index, timings) = Index::load_with_timings(path)?;
+                  (
+                      timings.total,
+                      index.len(),
+                      0,
+                      index.heap_bytes(),
+                      index.len(),
+                  )
               } else {
                   let index = Index::load(path)?;
                   let query = Query::parse(&args[3])?;
@@ -180,28 +195,42 @@ jobs:
                       limit: Some(100),
                       ..SearchOptions::default()
                   };
-                  match args[2].as_str() {
+                  // Per-process warm-up also validates the expected content.
+                  let expected = search(&index, &query, &options);
+                  let expected_paths: Vec<_> = expected
+                      .hits
+                      .iter()
+                      .map(|&id| {
+                          let mut bytes = Vec::new();
+                          index.path_bytes(id, &mut bytes);
+                          bytes
+                      })
+                      .collect();
+                  let (total, cancelled) = count(&index, &query, &CancelToken::new());
+                  if cancelled || expected.cancelled {
+                      return Err("cancelled warm-up".into());
+                  }
+                  let (elapsed, hits, fingerprint) = match args[2].as_str() {
                       "in-process" => {
-                          for _ in 0..5 {
-                              let started = Instant::now();
-                              hits = if page {
-                                  let result = search(&index, &query, &options);
-                                  if result.cancelled {
-                                      return Err("cancelled page".into());
-                                  }
-                                  result.hits.len()
-                              } else {
-                                  let (n, cancelled) = count(&index, &query, &CancelToken::new());
-                                  if cancelled {
-                                      return Err("cancelled count".into());
-                                  }
-                                  n
-                              };
-                              samples.push(started.elapsed());
+                          let started = Instant::now();
+                          if page {
+                              let result = search(&index, &query, &options);
+                              let elapsed = started.elapsed();
+                              if result.cancelled || result.hits != expected.hits {
+                                  return Err("page content mismatch".into());
+                              }
+                              (elapsed, result.hits.len(), digest(&expected_paths))
+                          } else {
+                              let (n, cancelled) = count(&index, &query, &CancelToken::new());
+                              let elapsed = started.elapsed();
+                              if cancelled || n != total {
+                                  return Err("count mismatch".into());
+                              }
+                              (elapsed, n, n as u64)
                           }
                       }
                       "IPC" => {
-                          let name = format!("ferrow-retry-{}", std::process::id());
+                          let name = format!("ferrow-probe-{}", std::process::id());
                           let endpoint = Endpoint::named(&name);
                           let mut service = Service(
                               Command::new(&args[0])
@@ -212,13 +241,16 @@ jobs:
                                   .stderr(Stdio::inherit())
                                   .spawn()?,
                           );
-                          eprintln!("FERROW-RETRY-ACTIVE pid={} timeout_s=120", service.0.id());
+                          eprintln!(
+                              "FERROW-PROBE-SERVICE pid={} startup_timeout_s=30",
+                              service.0.id()
+                          );
                           let startup = Instant::now();
                           let mut client = loop {
                               if startup.elapsed() > Duration::from_secs(30)
                                   || service.0.try_wait()?.is_some()
                               {
-                                  return Err("retry service startup failed".into());
+                                  return Err("probe service startup failed".into());
                               }
                               if let Ok(mut client) = Client::connect(&endpoint)
                                   && let Ok((n, _, _)) = client.status()
@@ -230,43 +262,37 @@ jobs:
                               }
                               std::thread::sleep(Duration::from_millis(10));
                           };
-                          let expected = search(&index, &query, &options);
-                          let expected_paths: Vec<_> = expected
-                              .hits
-                              .iter()
-                              .map(|&id| {
-                                  let mut bytes = Vec::new();
-                                  index.path_bytes(id, &mut bytes);
-                                  bytes
-                              })
-                              .collect();
-                          let (total, _) = count(&index, &query, &CancelToken::new());
-                          for _ in 0..5 {
-                              let started = Instant::now();
-                              if page {
-                                  let paths = client.query(&args[3], 100)?;
-                                  samples.push(started.elapsed());
-                                  if paths != expected_paths {
-                                      return Err("retry content/order mismatch".into());
-                                  }
-                                  hits = paths.len();
-                              } else {
-                                  let n = client.count(&args[3])?;
-                                  samples.push(started.elapsed());
-                                  if n != total as u64 {
-                                      return Err("retry count mismatch".into());
-                                  }
-                                  hits = n as usize;
+                          if page {
+                              if client.query(&args[3], 100)? != expected_paths {
+                                  return Err("IPC warm-up content mismatch".into());
                               }
+                              let started = Instant::now();
+                              let paths = client.query(&args[3], 100)?;
+                              let elapsed = started.elapsed();
+                              if paths != expected_paths {
+                                  return Err("IPC content mismatch".into());
+                              }
+                              (elapsed, paths.len(), digest(&paths))
+                          } else {
+                              if client.count(&args[3])? != total as u64 {
+                                  return Err("IPC warm-up count mismatch".into());
+                              }
+                              let started = Instant::now();
+                              let n = client.count(&args[3])?;
+                              let elapsed = started.elapsed();
+                              if n != total as u64 {
+                                  return Err("IPC count mismatch".into());
+                              }
+                              (elapsed, n as usize, n)
                           }
                       }
-                      _ => return Err("unknown retry kind".into()),
-                  }
-              }
-              samples.sort_unstable();
+                      _ => return Err("unknown probe kind".into()),
+                  };
+                  (elapsed, hits, fingerprint, index.heap_bytes(), index.len())
+              };
               println!(
-                  "FERROW-RETRY value_ms={:.6} hits={hits}",
-                  samples[samples.len() / 2].as_secs_f64() * 1000.0
+                  "FERROW-RETRY value_ms={:.9} hits={hits} digest={fingerprint} heap_bytes={heap} entries={entries}",
+                  elapsed.as_secs_f64() * 1000.0
               );
               Ok(())
           }
@@ -297,37 +323,35 @@ jobs:
         run: |
           cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
           timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin"
-      - name: Measure main in-process
+      - name: Smoke interleaved collection on the shared 16-entry fixture
         if: github.event_name == 'pull_request'
-        working-directory: .bench-base
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
-          FERROW_MEASURES_ONLY: "1"
-          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-base.bin
         run: |
-          git rev-parse HEAD
-          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee "$GITHUB_WORKSPACE/base-output.txt"
-      - name: Measure head in-process
+          echo '## 16-entry chain smoke (latency outcomes informational)' >> "$GITHUB_STEP_SUMMARY"
+          result=0
+          timeout -k 5s 300s python3 scripts/bench-gate.py base-smoke.txt head-smoke.txt --measure --entries 16 \
+            --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
+            --head-probe "$PWD/target/release/examples/latency_probe" \
+            --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
+            --head-binary "$PWD/target/release/ferrow" \
+            --base-index "$RUNNER_TEMP/ferrow-small.bin" --head-index "$RUNNER_TEMP/ferrow-small.bin" || result=$?
+          # Smoke validates producers/content/completeness, not tiny-fixture latency.
+          test "$result" -le 1
+      - name: Prepare one shared fixture (profiling only, not paired evidence)
         env:
           FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
           FERROW_MEASURES_ONLY: "1"
         run: |
           git rev-parse HEAD
-          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee bench-output.txt
-      - name: Measure main service through the same IPC harness and fixture
-        if: github.event_name == 'pull_request'
-        run: timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a base-output.txt
-      - name: Measure head service IPC
-        run: timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a bench-output.txt
-      - name: Write additive head summary
+          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee fixture-output.txt
+      - name: Write fixture profiling summary (separate from paired samples)
         if: always()
-        run: ./scripts/bench-summary.sh bench-output.txt
+        run: ./scripts/bench-summary.sh fixture-output.txt
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
         run: |
-          python3 scripts/bench-gate.py base-output.txt bench-output.txt \
+          python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure \
             --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
             --head-probe "$PWD/target/release/examples/latency_probe" \
             --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
             --head-binary "$PWD/target/release/ferrow" \
-            --base-index "$RUNNER_TEMP/ferrow-base.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin"
+            --base-index "$RUNNER_TEMP/ferrow-bench.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin"

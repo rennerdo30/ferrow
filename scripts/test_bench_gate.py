@@ -87,10 +87,11 @@ class GateTests(unittest.TestCase):
         calls = []
         def measure(*args):
             calls.append(args)
-            return (1 if args[0] == "base" else 1.05), 2
+            return (1 if args[0] == "base" else 1.05), 2, 42, 800, 16
         rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
         self.assertFalse(any(row[-1] for row in rows))
-        self.assertEqual(calls, [(arm, "IPC", "report 2024", "first_page_ms") for arm in ("base", "head")])
+        self.assertEqual([call[0] for call in calls], ["base", "head", "base", "head", "head", "base", "base", "head", "head", "base", "base", "head"])
+        self.assertTrue(all(call[1:] == ("IPC", "report 2024", "first_page_ms") for call in calls))
         calls.clear()
         self.head[0]["heap_bytes"] = 1000
         self.assertTrue(any(row[-1] for row in gate.retry_failures(self.rows(), self.base, self.head, measure)))
@@ -99,19 +100,62 @@ class GateTests(unittest.TestCase):
     def test_retry_repeat_breach_fails_and_bad_evidence_refuses(self):
         self.head[0]["load_ms_median"] = 200
         rows = gate.retry_failures(self.rows(), self.base, self.head,
-                                   lambda arm, *_: (100 if arm == "base" else 111, 16))
+                                   lambda arm, *_: (100 if arm == "base" else 111, 16, 0, 800, 16))
         self.assertTrue(any(row[-1] for row in rows))
         for bad in ((float("nan"), 16), (100, 17), (-1, 16)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: bad)
+                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: (*bad, 0, 800, 16))
 
     def test_retry_pass_does_not_run_producers(self):
         def unexpected(*_):
             self.fail("passing metrics must not be remeasured")
         self.assertEqual(gate.retry_failures(self.rows(), self.base, self.head, unexpected), self.rows())
 
+    def test_interleaved_samples_exclude_warmups_and_take_medians(self):
+        calls, trace = [], []
+        values = {"base": iter([999, 1, 50, 2, 100, 3]), "head": iter([999, 2, 60, 3, 90, 4])}
+        def measure(arm, *_):
+            calls.append(arm)
+            return next(values[arm]), 2, 42, 800, 16
+        result = gate.interleaved(measure, "IPC", "a", "first_page_ms", trace=trace)
+        self.assertEqual(calls, ["base", "head", "base", "head", "head", "base", "base", "head", "head", "base", "base", "head"])
+        self.assertEqual((result["base"][0], result["head"][0]), (3, 4))
+        self.assertIn("warm A warm B A B B A A B B A A B", trace[0])
+
+    def test_every_interleaved_sample_must_keep_counts_and_content(self):
+        for slot in (1, 2, 4):
+            calls = 0
+            def measure(*_):
+                nonlocal calls
+                calls += 1
+                sample = [1, 2, 42, 800, 16]
+                if calls == 3:
+                    sample[slot] += 1
+                return tuple(sample)
+            with self.subTest(slot=slot), self.assertRaises(ValueError):
+                gate.interleaved(measure, "IPC", "a", "first_page_ms")
+            self.assertEqual(calls, 3)
+
+    def test_initial_interleaved_measurement_produces_all_26_metrics(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = SimpleNamespace(base=Path(folder)/"base.txt", head=Path(folder)/"head.txt",
+                                   base_index=Path(folder)/"fixture", head_index=Path(folder)/"fixture", entries=16)
+            calls, trace = [], []
+            def measure(arm, kind, query, operation):
+                calls.append((arm, kind, query, operation))
+                return 1, 16 if kind == "load" else 2, 42, 800, 16
+            gate.measure_pair(args, measure, trace)
+            rows = gate.compare(gate.parse(args.base.read_text(encoding="utf-8")), gate.parse(args.head.read_text(encoding="utf-8")), 16)
+            self.assertEqual(len(rows), 26)
+            self.assertFalse(any(row[-1] for row in rows))
+            self.assertEqual(len(trace), 25)
+            self.assertEqual(len(calls), 8 + 24*12)
+            args.head_index = Path(folder)/"different-fixture"
+            with self.assertRaises(ValueError):
+                gate.measure_pair(args, measure, trace)
+
     def test_retry_producer_failure_and_timeout_are_not_retry_passes(self):
-        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"))
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
         for error in (subprocess.CalledProcessError(42, "probe"), subprocess.TimeoutExpired("probe", 120)):
             with self.subTest(error=error), patch.object(gate.subprocess, "run", side_effect=error) as run:
                 with self.assertRaises(subprocess.SubprocessError):
@@ -121,8 +165,8 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(run.call_args.kwargs["timeout"], 120)
 
     def test_retry_receipt_must_be_complete_finite_and_unique(self):
-        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"))
-        receipt = "FERROW-RETRY value_ms=1 hits=2\n"
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
+        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
         for stdout in ("", receipt*2, receipt.replace("value_ms=1", "value_ms=NaN"), "FERROW-RETRY value_ms=1\n"):
             with self.subTest(stdout=stdout), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
                 with self.assertRaises((ValueError, KeyError)):
