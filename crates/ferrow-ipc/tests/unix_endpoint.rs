@@ -2,6 +2,25 @@
 use ferrow_ipc::{Endpoint, Listener};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
+#[test]
+fn client_refuses_writable_directory_before_sending_hello() {
+    let (dir, ep) = fixture("client-auth");
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("ipc.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let error = match ferrow_ipc::Client::connect(&ep) {
+        Err(error) => error,
+        Ok(_) => panic!("connected through an untrusted directory"),
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(listener);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn fixture(tag: &str) -> (std::path::PathBuf, Endpoint) {
     let dir = std::env::temp_dir()
         .canonicalize()
