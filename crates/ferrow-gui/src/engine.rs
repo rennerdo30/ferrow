@@ -281,6 +281,10 @@ impl<W: Fn()> Worker<W> {
         }
     }
 
+    #[allow(
+        clippy::needless_update,
+        reason = "SearchOptions gains fields under ferrow-query's test-hooks feature"
+    )]
     fn search(&self, generation: u64, text: &str, cancel: Arc<AtomicBool>) {
         let Some(index) = &self.index else { return };
         let started = Instant::now();
@@ -312,6 +316,8 @@ impl<W: Fn()> Worker<W> {
             &SearchOptions {
                 limit: Some(FIRST_PAGE),
                 cancel: token.clone(),
+                // Other fields exist with the workspace's test-hooks feature.
+                ..Default::default()
             },
         );
         if first.cancelled {
@@ -333,6 +339,7 @@ impl<W: Fn()> Worker<W> {
             &SearchOptions {
                 limit: None,
                 cancel: token,
+                ..Default::default()
             },
         );
         if full.cancelled {
