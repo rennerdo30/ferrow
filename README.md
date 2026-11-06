@@ -18,7 +18,7 @@
 
 Ferrow keeps an index of every file and folder on your drives in memory and answers each keystroke in milliseconds, even with millions of entries. It follows the file system's own change feeds, so results stay current without rescanning, and it uses no CPU while you are not searching.
 
-> **Status: early design.** Nothing is usable yet. The draft specification is in [`docs/SPEC.md`](docs/SPEC.md); feedback is welcome in the issues.
+> **Status: milestone 1.** The index core, parallel walk backend, query engine and CLI work (see "Try it" below); live updates and the GUI are next. The draft specification is in [`docs/SPEC.md`](docs/SPEC.md); feedback is welcome in the issues.
 
 ## Why
 
@@ -56,6 +56,30 @@ These are drafts in [`docs/SPEC.md`](docs/SPEC.md) and will be enforced in CI on
 | Cold start with a saved index | ≤ 300 ms |
 | File change visible in results | ≤ 1 s |
 | Idle CPU | 0 % |
+
+## Try it
+
+Milestone 1 is a working core: scan a tree into an index, then search it.
+
+```sh
+# Build an index of one or more roots (saved to the platform data dir)
+cargo run --release -- index ~/Documents /data
+
+# Search it (case-insensitive substring match on file names)
+cargo run --release -- search "report 2024"
+cargo run --release -- search "!tmp log" --limit 20
+cargo run --release -- search "case:Report" --json
+
+# Index statistics (entries, bytes per entry, load time)
+cargo run --release -- stats
+```
+
+Query syntax: space means AND, `!term` means NOT, `"quoted phrase"` is
+literal, and `case:term` is case-sensitive. Useful flags: `--out <file>`
+and `--index <file>` choose the index location, `--exclude <path>` skips
+a subtree while indexing, and `--count` / `--null` change the search
+output for scripts. Live updates, the daemon and the GUI come in later
+milestones — see [`docs/SPEC.md`](docs/SPEC.md).
 
 ## Building
 
