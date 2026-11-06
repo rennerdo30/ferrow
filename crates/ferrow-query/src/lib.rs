@@ -144,18 +144,21 @@ pub struct SearchOptions {
     pub limit: Option<usize>,
     /// Cancellation flag shared with the caller.
     pub cancel: CancelToken,
-    /// Diagnostic/test hook invoked after each visited block with the
-    /// block index, before the next block starts. `None` in normal use.
+    /// Test hook invoked after each visited block with the block
+    /// index, before the next block starts. Only present with the
+    /// non-default `test-hooks` feature, so normal builds neither
+    /// expose it nor pay for its dispatch.
+    #[cfg(feature = "test-hooks")]
     pub on_block: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 }
 
 impl fmt::Debug for SearchOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SearchOptions")
-            .field("limit", &self.limit)
-            .field("cancel", &self.cancel)
-            .field("on_block", &self.on_block.is_some())
-            .finish()
+        let mut s = f.debug_struct("SearchOptions");
+        s.field("limit", &self.limit).field("cancel", &self.cancel);
+        #[cfg(feature = "test-hooks")]
+        s.field("on_block", &self.on_block.is_some());
+        s.finish()
     }
 }
 
@@ -212,15 +215,27 @@ impl Matcher {
 }
 
 /// Entries examined per parallel block; cancellation and the
-/// `on_block` hook act at this granularity.
+/// `test-hooks` hook act at this granularity.
+const BLOCK_SIZE: usize = 65_536;
+
+/// Block size, exposed only to the test-hooks build so integration
+/// tests can assert exact per-block behaviour.
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
-pub const BLOCK: usize = 65_536;
+pub const BLOCK: usize = BLOCK_SIZE;
 
 /// Run a search over the whole index, in name-sort order, in parallel.
 ///
 /// With a `limit`, the sorted order is walked in blocks (each block is
 /// matched in parallel) and the search stops as soon as enough hits are
 /// found, so a first-page query never scans the whole index.
+#[cfg_attr(
+    not(feature = "test-hooks"),
+    allow(
+        clippy::unused_enumerate_index,
+        reason = "index feeds the test-hooks hook"
+    )
+)]
 pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchResult {
     let matcher = Matcher::new(query);
     let sorted = index.sorted();
@@ -233,7 +248,7 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
             visited,
         };
     }
-    for (block_index, block) in sorted.chunks(BLOCK).enumerate() {
+    for (_block_index, block) in sorted.chunks(BLOCK_SIZE).enumerate() {
         if options.cancel.is_cancelled() {
             return SearchResult {
                 hits,
@@ -248,8 +263,9 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
             .collect();
         visited += block.len();
         hits.append(&mut found);
+        #[cfg(feature = "test-hooks")]
         if let Some(hook) = &options.on_block {
-            hook(block_index);
+            hook(_block_index);
         }
         if let Some(limit) = options.limit
             && hits.len() >= limit
@@ -272,7 +288,7 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
 pub fn count(index: &Index, query: &Query, cancel: &CancelToken) -> (usize, bool) {
     let matcher = Matcher::new(query);
     let mut total = 0usize;
-    for block in index.sorted().chunks(BLOCK) {
+    for block in index.sorted().chunks(BLOCK_SIZE) {
         if cancel.is_cancelled() {
             return (total, true);
         }
@@ -457,9 +473,8 @@ mod tests {
     fn cancelled_search_reports_it() {
         let idx = sample();
         let opts = SearchOptions {
-            limit: None,
             cancel: CancelToken::cancelled(),
-            on_block: None,
+            ..SearchOptions::default()
         };
         let r = search(&idx, &Query::parse("report").unwrap(), &opts);
         assert!(r.cancelled);

@@ -9,6 +9,11 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+# Deterministic cancellation hook for tests only; never enabled by
+# normal consumers (see SearchOptions::on_block).
+test-hooks = []
+
 [dependencies]
 ferrow-index = { path = "../ferrow-index" }
 memchr = "2"
@@ -17,6 +22,7 @@ rayon = "1"
 [dev-dependencies]
 divan = "0.1.21"
 ferrow-fixture = { path = "../ferrow-fixture" }
+ferrow-query = { path = ".", features = ["test-hooks"] }
 
 [[bench]]
 name = "m1_bench"

@@ -156,6 +156,7 @@ dependencies = [
  "divan",
  "ferrow-fixture",
  "ferrow-index",
+ "ferrow-query",
  "memchr",
  "rayon",
 ]

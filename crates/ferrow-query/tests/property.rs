@@ -162,15 +162,11 @@ fn cancellation_stops_and_is_reported() {
     let index = generate(100_000, 11);
     let query = Query::parse("a").unwrap();
     // Pre-cancelled: nothing is scanned.
-    let got = search(
-        &index,
-        &query,
-        &SearchOptions {
-            limit: None,
-            cancel: CancelToken::cancelled(),
-            on_block: None,
-        },
-    );
+    let opts = SearchOptions {
+        cancel: CancelToken::cancelled(),
+        ..SearchOptions::default()
+    };
+    let got = search(&index, &query, &opts);
     assert!(got.cancelled);
     assert!(got.hits.is_empty());
     assert_eq!(got.visited, 0);
