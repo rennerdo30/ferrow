@@ -90,7 +90,7 @@ fn every_message_round_trips() {
         round_trip(
             13,
             Message::Response(Response::Rows {
-                sort_pending: false,
+                sort_pending: mask & 1 != 0,
                 rows: vec![ferrow_ipc::FileRow {
                     path: vec![b'a', 0xff],
                     size: (mask & 1 != 0).then_some(u64::MAX),

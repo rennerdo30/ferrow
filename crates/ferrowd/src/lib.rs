@@ -240,6 +240,11 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 return vec![bad_request("unsupported query flags".into())];
             }
             let metadata = flags & ferrow_ipc::protocol::QUERY_METADATA != 0;
+            if sort != ferrow_ipc::Sort::Name && !metadata {
+                return vec![bad_request(
+                    "non-name sorts require metadata rows with readiness status".into(),
+                )];
+            }
             let query = match Query::parse(&text) {
                 Ok(q) => q,
                 Err(e) => return vec![bad_request(e.to_string())],

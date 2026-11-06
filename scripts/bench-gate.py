@@ -7,12 +7,11 @@ from pathlib import Path
 import shlex
 import sys
 import subprocess
+import statistics
 
 QUERIES = {"a", "re", "report 2024", "!tmp log", "zzzz-no-hit-zzzz", "文書"}
 # load + memory, then first page and full count per query, in-process and IPC.
 EXPECTED_METRICS = 2 + 2 * 2 * len(QUERIES)
-# New sorts have no comparable main arm yet. Require all observations, while
-# preserving the complete strict paired inventory above (and other extensions).
 EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES)
 EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
 
@@ -128,7 +127,7 @@ def metadata_observations(text, head, expected_entries=5_000_000):
     cold = scalars["cold_default_heap_bytes"]
     if not scalars["core_heap_bytes"] <= cold <= scalars["default_heap_bytes"]:
         raise ValueError("invalid cold metadata heap")
-    cached = (6 if expected_entries <= 2**24 else 8)*expected_entries
+    cached = (6 if expected_entries <= 2**23 else 8 if expected_entries <= 2**31 else 10)*expected_entries
     if scalars["lazy_saved_bytes"] != cached or scalars["default_heap_bytes"]-cold != cached:
         raise ValueError("inconsistent lazy-cache saving")
     if total > 66 or extra > 16.5:
@@ -151,14 +150,46 @@ def metadata_observations(text, head, expected_entries=5_000_000):
     report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
     report += "".join(f"| {name} | {value:.6f} |\n" for name, value in rows)
     report += f"\nDeferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
+    report += f"\nCore/default load: {scalars['core_load_ms_median']:.6f}/{scalars['load_ms_median']:.6f} ms; limit core + 15%. Cold/warm default heap: {scalars['cold_default_heap_bytes']/expected_entries:.6f}/{total:.6f} B/entry; limit 66 B/entry with both sorts ready.\n"
     report += f"\nSame-tree scan, none/default columns: {scan['none_ms_median']:.6f}/{scan['default_ms_median']:.6f} ms (five alternating samples per arm, 2101 entries).\n"
     return rows, report
 
 
-def retry_failures(rows, base, head, measure):
+
+def interleaved(measure, kind, query, operation, expected=None, trace=None):
+    """Warm both arms, then take 3 load or 5 query samples in ABBA order."""
+    samples = {"base": [], "head": []}
+    signatures, order = {}, []
+    trace_index = len(trace) if trace is not None else None
+    if trace is not None:
+        trace.append("")
+    count = 3 if kind == "load" else 5
+    for warmup, arms in [(True, ("base", "head"))] + [
+            (False, ("base", "head") if i % 2 == 0 else ("head", "base")) for i in range(count)]:
+        for arm in arms:
+            order.append(("warm " if warmup else "") + ("A" if arm == "base" else "B"))
+            if trace is not None:
+                trace[trace_index] = f"| {kind} {query!r} {operation} | {' '.join(order)} |"
+            sample = measure(arm, kind, query, operation)
+            value, hits, digest, heap, entries = sample
+            number(value)
+            if expected is not None and hits != expected:
+                raise ValueError(f"remeasure changed hits: {arm} {kind} {query!r}")
+            signature = hits, digest, entries
+            if signatures and signature != next(iter(signatures.values())):
+                raise ValueError("paired sample content/count/fixture mismatch")
+            signatures[arm] = signature
+            if samples[arm] and heap != samples[arm][0][3]:
+                raise ValueError("heap changed within one arm")
+            if not warmup:
+                samples[arm].append(sample)
+    return {arm: (statistics.median(s[0] for s in values), *values[0][1:]) for arm, values in samples.items()}
+
+
+def retry_failures(rows, base, head, measure, trace=None):
     """Validate first, then retry each failing latency exactly once per arm.
 
-    The callback runs a bounded producer and returns (median_ms, hit_count).
+    The callback runs one bounded producer sample; both arms are interleaved.
     Memory regressions cannot be recovered by remeasurement.
     """
     if any(bad and name == "bytes/entry" for name, _, _, _, bad in rows):
@@ -175,13 +206,8 @@ def retry_failures(rows, base, head, measure):
             result.append(row)
             continue
         kind, query, operation, expected = descriptors[name]
-        samples = []
-        for arm in ("base", "head"):
-            value, hits = measure(arm, kind, query, operation)
-            samples.append(number(value))
-            if number(hits) != expected:
-                raise ValueError(f"retry changed hits: {arm} {name}")
-        b, h = samples
+        samples = interleaved(measure, kind, query, operation, expected, trace)
+        b, h = (samples[arm][0] for arm in ("base", "head"))
         limit = b + max(b * 0.10, 0.1)
         result.append((name, b, h, limit, h > limit))
     return result
@@ -190,12 +216,52 @@ def retry_failures(rows, base, head, measure):
 def probe(args, arm, kind, query, operation):
     command = [str(getattr(args, arm + "_probe")), str(getattr(args, arm + "_binary")),
                str(getattr(args, arm + "_index")), kind, query, operation]
-    run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True)
+    try:
+        run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True)
+    except subprocess.CalledProcessError as error:
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise
+    if getattr(run, "stderr", ""):
+        print(run.stderr, file=sys.stderr, end="")
     records = [line for line in run.stdout.splitlines() if line.startswith("FERROW-RETRY ")]
     if len(records) != 1:
         raise ValueError("retry producer must emit exactly one receipt")
     fields = dict(word.split("=", 1) for word in records[0].split()[1:])
-    return number(fields["value_ms"]), number(fields["hits"])
+    integers = tuple(int(fields[key]) for key in ("hits", "digest", "heap_bytes", "entries"))
+    if any(v < 0 for v in integers) or integers[-1] != args.entries or integers[-2] <= 0:
+        raise ValueError("invalid probe count, heap or fixture")
+    return number(fields["value_ms"]), *integers
+
+
+def measure_pair(args, measure, trace):
+    if args.base_index.resolve() != args.head_index.resolve():
+        raise ValueError("interleaved arms require the same fixture file")
+    output = {"base": [], "head": []}
+    load = interleaved(measure, "load", "", "load", args.entries, trace)
+    for arm, (elapsed, _, _, heap, entries) in load.items():
+        output[arm].append(f"FERROW-MEASURE entries={entries} seed=2026 heap_bytes={heap} bytes_per_entry={heap/entries:.9f} load_ms_median={elapsed:.9f}")
+    for kind, prefix in (("in-process", "FERROW-QUERY"), ("IPC", "FERROW-SERVICE")):
+        for query in sorted(QUERIES):
+            page = interleaved(measure, kind, query, "first_page_ms", trace=trace)
+            full = interleaved(measure, kind, query, "full_count_ms", trace=trace)
+            for arm in output:
+                if page[arm][1] != min(100, full[arm][1]):
+                    raise ValueError("page/count evidence disagrees")
+                output[arm].append(f'{prefix} query="{query}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]}')
+    for arm, lines in output.items():
+        getattr(args, arm).write_text("\n".join(lines)+"\n", encoding="utf-8")
+
+
+def sample_order(trace):
+    return ("\n### Sample order (A = base, B = head; warm samples excluded)\n\n| Metric | Producer order |\n|---|---|\n" + "\n".join(trace) + "\n") if trace else ""
+
+
+def publish(report):
+    print(report)
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a", encoding="utf-8") as out:
+            out.write(report)
 
 
 def main():
@@ -205,36 +271,45 @@ def main():
     parser.add_argument("head", type=Path)
     parser.add_argument("--entries", type=int, default=5_000_000)
     parser.add_argument("--require-metadata", action="store_true")
+    parser.add_argument("--head-observations", type=Path)
+    parser.add_argument("--measure", action="store_true", help="collect initial interleaved medians before comparison")
     for arm in ("base", "head"):
         for field in ("probe", "binary", "index"):
             parser.add_argument(f"--{arm}-{field}", type=Path)
     args = parser.parse_args()
+    trace = []
+    report = ""
     try:
+        retry_paths = [getattr(args, arm + "_" + field) for arm in ("base", "head") for field in ("probe", "binary", "index")]
+        if (any(retry_paths) or args.measure) and not all(retry_paths):
+            raise ValueError("all paired producer paths are required")
+        if args.measure:
+            trace.append("| Initial phase | Warm both arms, then interleave samples |")
+            measure_pair(args, lambda *metric: probe(args, *metric), trace)
+        if args.head_observations:
+            args.head.write_text(args.head.read_text(encoding="utf-8")+"\n"+args.head_observations.read_text(encoding="utf-8"),encoding="utf-8")
         rows = compare(parse(args.base.read_text(encoding="utf-8")),
                        parse(args.head.read_text(encoding="utf-8")), args.entries)
         report = render(rows)
         if args.require_metadata:
-            _, metadata_report = metadata_observations(args.head.read_text(encoding="utf-8"),
-                                                       parse(args.head.read_text(encoding="utf-8")), args.entries)
-            report += metadata_report
-        retry_paths = [getattr(args, arm + "_" + field) for arm in ("base", "head")
-                       for field in ("probe", "binary", "index")]
+            _, metadata_report=metadata_observations(args.head.read_text(encoding="utf-8"),parse(args.head.read_text(encoding="utf-8")),args.entries)
+            report+=metadata_report
         if any(retry_paths):
             if not all(retry_paths):
                 raise ValueError("all paired retry paths are required")
+            if any(row[-1] for row in rows):
+                trace.append("| Single retry phase | Only failing latency metrics |")
             retried = retry_failures(rows, parse(args.base.read_text(encoding="utf-8")),
                                      parse(args.head.read_text(encoding="utf-8")),
-                                     lambda *metric: probe(args, *metric))
+                                     lambda *metric: probe(args, *metric), trace)
             if any(row[-1] for row in rows) and not any(row[-1] and row[0] == "bytes/entry" for row in rows):
                 report += "\n### One paired latency remeasurement (final decision)\n\n" + render(retried)
             rows = retried
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"benchmark gate refused incomplete evidence: {error}", file=sys.stderr)
+        publish(report + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))
         return 2
-    print(report)
-    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(path, "a", encoding="utf-8") as out:
-            out.write(report)
+    publish(report + sample_order(trace))
     return int(any(row[-1] for row in rows))
 
 

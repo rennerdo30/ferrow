@@ -122,28 +122,48 @@ impl SortTicket {
 struct PackedIds {
     bytes: Vec<u8>,
     width: usize,
+    known: usize,
 }
 impl PackedIds {
     fn width(n: usize) -> usize {
-        if n <= 1 << 24 { 3 } else { 4 }
-    }
-    fn from_ids(ids: &[u32]) -> Self {
-        let width = Self::width(ids.len());
-        let mut bytes = Vec::with_capacity(ids.len() * width);
-        for id in ids {
-            bytes.extend_from_slice(&id.to_le_bytes()[..width]);
+        if n <= 1 << 23 {
+            3
+        } else if n <= 1 << 31 {
+            4
+        } else {
+            5
         }
-        Self { bytes, width }
+    }
+    fn from_ids(ids: &[u32], known: usize, boundary: impl Fn(usize) -> bool) -> Self {
+        let width = Self::width(ids.len());
+        let flag = 1u64 << (width * 8 - 1);
+        let mut bytes = Vec::with_capacity(ids.len() * width);
+        for (i, &id) in ids.iter().enumerate() {
+            let code = u64::from(id) | if boundary(i) { flag } else { 0 };
+            bytes.extend_from_slice(&code.to_le_bytes()[..width]);
+        }
+        Self {
+            bytes,
+            width,
+            known,
+        }
     }
     fn len(&self) -> usize {
         self.bytes.len() / self.width
     }
+    fn group_start(&self, i: usize) -> bool {
+        self.bytes[(i + 1) * self.width - 1] & 128 != 0
+    }
     fn get(&self, i: usize) -> u32 {
-        let mut bytes = [0; 4];
-        bytes[..self.width].copy_from_slice(&self.bytes[i * self.width..(i + 1) * self.width]);
-        u32::from_le_bytes(bytes)
+        let bytes = &self.bytes[i * self.width..(i + 1) * self.width];
+        match self.width {
+            3 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2] & 127, 0]),
+            4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3] & 127]),
+            _ => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        }
     }
 }
+
 trait Value: Copy + Default + Ord + Send + Sync + 'static {
     const WIDTH: usize;
     const RAW: usize;
@@ -299,7 +319,10 @@ impl<T: Value> Column<T> {
                         // Stable input name order preserves ties. This dedicated
                         // thread never occupies or waits for the query Rayon pool.
                         ids.sort_by(|&a, &b| column.cmp(a, b));
-                        let _ = column.order.set(PackedIds::from_ids(&ids));
+                        let known = ids.partition_point(|&id| column.get(id).is_some());
+                        let _ = column.order.set(PackedIds::from_ids(&ids, known, |i| {
+                            i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal
+                        }));
                     }));
                     column.signal.finish(if result.is_ok() { 2 } else { 3 });
                 });
@@ -514,16 +537,13 @@ impl MetadataColumns {
             SortKey::Accessed => self.accessed.as_ref().and_then(|c| c.order.get()),
             _ => None,
         }?;
-        let mut result = MetadataOrder {
+        let result = MetadataOrder {
             columns: self,
             ids,
             key,
             descending,
-            known: ids.len(),
+            known: ids.known,
         };
-        if descending {
-            result.known = result.bound(0, ids.len(), |id| self.value(key, id).is_some());
-        }
         Some(result)
     }
     pub(crate) fn heap_bytes(&self) -> usize {
@@ -634,19 +654,26 @@ impl MetadataOrder<'_> {
             } else {
                 if group_pos == group_end {
                     let mirrored = self.known - 1 - virtual_pos;
-                    let value = self.columns.value(self.key, self.ids.get(mirrored));
-                    let equal = |i| self.columns.value(self.key, self.ids.get(i)) == value;
-                    let start = if mirrored > 0 && equal(mirrored - 1) {
-                        self.bound(0, mirrored, |id| self.columns.value(self.key, id) < value)
-                    } else {
+                    // The spare high bit marks value-group starts. Singleton
+                    // and two-row groups need no random metadata reads.
+                    let start = if self.ids.group_start(mirrored) {
                         mirrored
+                    } else if mirrored > 0 && self.ids.group_start(mirrored - 1) {
+                        mirrored - 1
+                    } else {
+                        let value = self.columns.value(self.key, self.ids.get(mirrored));
+                        self.bound(0, mirrored, |id| self.columns.value(self.key, id) < value)
                     };
-                    group_end = if mirrored + 1 < self.known && equal(mirrored + 1) {
+                    group_end = if mirrored + 1 == self.known || self.ids.group_start(mirrored + 1)
+                    {
+                        mirrored + 1
+                    } else if mirrored + 2 == self.known || self.ids.group_start(mirrored + 2) {
+                        mirrored + 2
+                    } else {
+                        let value = self.columns.value(self.key, self.ids.get(mirrored));
                         self.bound(mirrored + 1, self.known, |id| {
                             self.columns.value(self.key, id) <= value
                         })
-                    } else {
-                        mirrored + 1
                     };
                     group_pos = start + virtual_pos - (self.known - group_end);
                 }
@@ -714,17 +741,20 @@ mod tests {
             };
             assert_eq!(overflow.unwrap_or_else(|| i64::unpack(packed)), expected);
         }
-        assert_eq!(PackedIds::width(1 << 24), 3);
-        assert_eq!(PackedIds::width((1 << 24) + 1), 4);
+        assert_eq!(PackedIds::width(1 << 23), 3);
+        assert_eq!(PackedIds::width((1 << 23) + 1), 4);
         let ids = PackedIds {
             bytes: vec![255, 255, 255, 0, 0, 0],
             width: 3,
+            known: 0,
         };
-        assert_eq!(ids.get(0), 0xffffff);
+        assert_eq!(ids.get(0), 0x7fffff);
+        assert!(ids.group_start(0));
         assert_eq!(ids.get(1), 0);
         let ids = PackedIds {
-            bytes: u32::MAX.to_le_bytes().to_vec(),
-            width: 4,
+            bytes: vec![255, 255, 255, 255, 128],
+            width: 5,
+            known: 0,
         };
         assert_eq!(ids.get(0), u32::MAX);
     }

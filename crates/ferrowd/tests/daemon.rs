@@ -145,6 +145,22 @@ fn metadata_sort_keeps_values_aligned_across_pages() {
         report: String::new(),
     });
     let snapshot = store.get();
+    let refused = ferrowd::handle(
+        &store,
+        ferrow_ipc::Request::Query {
+            text: "file".into(),
+            limit: 1,
+            sort: ferrow_ipc::Sort::Modified,
+            flags: 1,
+        },
+    );
+    assert!(matches!(
+        &refused[..],
+        [ferrow_ipc::Response::Error {
+            code: ferrow_ipc::ErrorCode::BadRequest,
+            ..
+        }]
+    ));
     snapshot.index.request_sort(ferrow_index::SortKey::Modified);
     assert_eq!(
         snapshot

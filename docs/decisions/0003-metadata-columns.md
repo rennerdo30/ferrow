@@ -44,7 +44,7 @@ value groups in reverse while retaining ascending names within a group; unknown
 values remain last. Group boundaries are found without linear scans of a large
 equal group. Query cancellation and bounded first-page admission remain intact.
 
-Cached ids use 24 bits through 2^24 entries and 32 bits above that range. At 5M:
+Cached ids use 24 bits through 2^23 entries, 32 bits through 2^31 entries, and 40 bits above that range. The spare high bit marks value-group starts. At 5M:
 
 | Column | Values + validity | One ready order | Total bytes/entry |
 |---|---:|---:|---:|
@@ -54,7 +54,7 @@ Cached ids use 24 bits through 2^24 entries and 32 bits above that range. At 5M:
 | Defaults, both orders ready | 9.25 | 6 | 15.25 |
 
 Add 12 bytes per overflow and small fixed objects/capacity tails. Before either
-sort is requested, defaults cost 9.25 bytes/entry. Above 2^24 entries, each
+sort is requested, defaults cost 9.25 bytes/entry. Above 2^23 entries, each
 prepared order adds one further byte/entry. Background scratch and old snapshots
 are reported separately from retained current-snapshot heap.
 
