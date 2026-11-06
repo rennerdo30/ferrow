@@ -1,0 +1,31 @@
+[Unit]
+Description=Ferrow file-name index service
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart="/usr/local/libexec/ferrow/ferrowd" --service-endpoint --index /var/lib/ferrow/index.bin
+Restart=on-failure
+RestartSec=2s
+# Only the capabilities the indexer needs: read every directory
+# (live backends in later milestones use CAP_SYS_ADMIN).
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+RuntimeDirectory=ferrow
+StateDirectory=ferrow
+StateDirectoryMode=0700
+# Hardening. ProtectHome stays off: indexing home directories is
+# the point. Writes are confined to the state directory.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ferrow
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

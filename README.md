@@ -81,6 +81,22 @@ a subtree while indexing, and `--count` / `--null` change the search
 output for scripts. Live updates, the daemon and the GUI come in later
 milestones — see [`docs/SPEC.md`](docs/SPEC.md).
 
+## Background service (milestone 2, in progress)
+
+`ferrowd` can hold the index as a system service and answer
+searches over a local, access-controlled pipe/socket; the CLI
+uses it automatically when reachable and falls back to the saved
+index otherwise. For development, no install or privileges:
+
+```sh
+cargo run --release -- service run ~/Documents
+cargo run --release -- status   # which mode is active, and why
+```
+
+System install (`ferrow service install`, admin/root once),
+per-platform details and the current privacy limits are in
+[`docs/service.md`](docs/service.md).
+
 ## Building
 
 ```sh

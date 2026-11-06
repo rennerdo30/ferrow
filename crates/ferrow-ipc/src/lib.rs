@@ -16,6 +16,8 @@
 mod dispatch;
 pub mod protocol;
 pub mod transport;
+#[cfg(any(unix, test))]
+pub mod unix_acl;
 pub use dispatch::{RequestContext, serve_cancellable};
 
 use std::io::{Read, Write};
@@ -183,9 +185,31 @@ where
 pub struct Client<S> {
     stream: S,
     next_id: u32,
+    deadline_limit: Option<Instant>,
 }
 
 impl Client<Stream> {
+    pub fn connect_deadline(
+        endpoint: &Endpoint,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Client<Stream>> {
+        Client::new_limited(
+            Stream::connect_deadline(endpoint, deadline)?,
+            Some(deadline),
+        )
+    }
+
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) -> std::io::Result<()> {
+        self.deadline_limit = Some(deadline);
+        self.stream.set_deadline(deadline)
+    }
+
+    /// End an explicit overall budget (for example service discovery). Normal
+    /// requests then receive fresh per-operation deadlines.
+    pub fn clear_deadline(&mut self) {
+        self.deadline_limit = None;
+    }
+
     /// Connect to a service endpoint and perform the handshake.
     pub fn connect(endpoint: &Endpoint) -> std::io::Result<Client<Stream>> {
         Client::new(Stream::connect(endpoint)?)
@@ -196,8 +220,13 @@ impl<S: DeadlineIo> Client<S> {
     /// Wrap a connected stream and perform the `Hello` handshake.
     /// A server `Error{VersionMismatch}` surfaces as `InvalidData`
     /// carrying the server's message.
-    pub fn new(mut stream: S) -> std::io::Result<Client<S>> {
-        operation(&mut stream)?;
+    pub fn new(stream: S) -> std::io::Result<Client<S>> {
+        Self::new_limited(stream, None)
+    }
+
+    fn new_limited(mut stream: S, deadline_limit: Option<Instant>) -> std::io::Result<Client<S>> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        stream.set_deadline(deadline_limit.map_or(deadline, |limit| limit.min(deadline)))?;
         write_message(
             &mut stream,
             0,
@@ -209,7 +238,11 @@ impl<S: DeadlineIo> Client<S> {
             Some(Envelope {
                 message: Message::Response(Response::HelloOk { version }),
                 ..
-            }) if version == PROTOCOL_VERSION => Ok(Client { stream, next_id: 1 }),
+            }) if version == PROTOCOL_VERSION => Ok(Client {
+                stream,
+                next_id: 1,
+                deadline_limit,
+            }),
             Some(Envelope {
                 message: Message::Response(Response::Error { code, msg }),
                 ..
@@ -222,7 +255,7 @@ impl<S: DeadlineIo> Client<S> {
     }
 
     fn send(&mut self, request: Request) -> std::io::Result<u32> {
-        operation(&mut self.stream)?;
+        self.begin_operation()?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         write_message(&mut self.stream, id, &Message::Request(request))?;
@@ -230,7 +263,7 @@ impl<S: DeadlineIo> Client<S> {
     }
 
     fn expect(&mut self, id: u32) -> std::io::Result<Response> {
-        operation(&mut self.stream)?;
+        self.begin_operation()?;
         match read_message(&mut self.stream)? {
             Some(envelope) if envelope.id == id => match envelope.message {
                 Message::Response(response) => Ok(response),
@@ -253,6 +286,14 @@ impl<S: DeadlineIo> Client<S> {
             }
             other => Ok(other),
         }
+    }
+
+    fn begin_operation(&mut self) -> std::io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.stream.set_deadline(
+            self.deadline_limit
+                .map_or(deadline, |limit| limit.min(deadline)),
+        )
     }
 
     /// Run a query, collecting every `Results` page. `limit = 0`

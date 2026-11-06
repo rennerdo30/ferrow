@@ -28,6 +28,7 @@ pub(super) fn client_directory(socket: &Path, expected: u32) -> io::Result<()> {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&current)?;
         let meta = dir.metadata()?;
+        crate::unix_acl::validate(&dir, current != path)?;
         if current == path {
             super::server_policy::directory(expected, meta.uid(), meta.mode(), meta.is_dir())?;
         } else {
@@ -76,6 +77,11 @@ pub(super) fn directory(path: &Path, system: bool) -> io::Result<()> {
         {
             return Err(refused("untrusted endpoint directory or ancestor"));
         }
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&current)?;
+        crate::unix_acl::validate(&dir, current != path)?;
         if current == path {
             if meta.uid() != uid {
                 return Err(refused("endpoint directory has another owner"));
@@ -108,6 +114,7 @@ pub(super) fn lease(path: &Path) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path.with_extension("lock"))?;
     let meta = lock.metadata()?;
+    crate::unix_acl::validate(&lock, false)?;
     // SAFETY: credential getter has no preconditions.
     if !meta.is_file()
         || meta.uid() != unsafe { libc::geteuid() }

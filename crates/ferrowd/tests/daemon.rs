@@ -1,0 +1,198 @@
+//! Daemon tests over a per-test unprivileged endpoint: query,
+//! count, status, snapshot swap visibility, clean shutdown.
+
+use ferrow_ipc::{Client, Endpoint};
+use ferrow_walk::WalkOptions;
+use ferrowd::{DaemonConfig, Shutdown, Snapshot, SnapshotStore, serve};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(tag: &str) -> TestDir {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ferrowd-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        TestDir(dir)
+    }
+    fn file(&self, rel: &str) {
+        let path = self.0.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn connect(endpoint: &Endpoint) -> Client<ferrow_ipc::Stream> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match Client::connect(endpoint) {
+            Ok(client) => return client,
+            Err(e) => {
+                assert!(std::time::Instant::now() < deadline, "connect: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[test]
+fn daemon_answers_and_snapshot_swap_is_visible() {
+    let dir = TestDir::new("serve");
+    dir.file("alpha-report.txt");
+    dir.file("sub/beta-report.txt");
+    let options = WalkOptions {
+        roots: vec![dir.0.clone()],
+        ..WalkOptions::default()
+    };
+    let (snapshot, _) = Snapshot::from_scan(&options);
+    let entries_before = snapshot.index.len() as u64;
+    let store = SnapshotStore::new(snapshot);
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let endpoint = Endpoint::named(&format!(
+        "ferrowd-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let config = DaemonConfig {
+        endpoint: endpoint.clone(),
+        index_path: None,
+        roots: vec![],
+        excludes: vec![],
+        follow_symlinks: false,
+    };
+    let shutdown = Shutdown::new();
+    let server_store = store.clone();
+    let server_shutdown = shutdown.clone();
+    let server = std::thread::spawn(move || serve(&config, server_store, server_shutdown));
+
+    let mut client = connect(&endpoint);
+    assert_eq!(client.count("report").unwrap(), 2);
+    let hits = client.query("alpha", 0).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(String::from_utf8_lossy(&hits[0]).ends_with("alpha-report.txt"));
+    let (entries, mode, _) = client.status().unwrap();
+    assert_eq!(entries, entries_before);
+    assert_eq!(mode, "walk");
+
+    // Swap in a fresh snapshot: new queries see the new file,
+    // without reconnecting.
+    dir.file("gamma-report.txt");
+    store.rescan(&options);
+    assert_eq!(client.count("report").unwrap(), 3);
+
+    shutdown.request(&endpoint);
+    server.join().unwrap().unwrap();
+    assert!(
+        client.status().is_err(),
+        "shutdown left a detached connection alive"
+    );
+    drop(client);
+}
+
+#[test]
+fn unlimited_service_queries_have_an_explicit_overall_result_budget() {
+    let builder = ferrow_index::IndexBuilder::new();
+    let root = builder.add_root(b"root", ferrow_index::flags::DIR);
+    for _ in 0..10_001 {
+        builder.add(root, b"hit", 0);
+    }
+    let store = SnapshotStore::new(Snapshot {
+        index: std::sync::Arc::new(builder.freeze()),
+        mode: "fixture".into(),
+        report: "fixture".into(),
+    });
+    let request = |limit| ferrow_ipc::Request::Query {
+        text: "hit".into(),
+        limit,
+        sort: ferrow_ipc::protocol::Sort::Name,
+        flags: 0,
+    };
+    assert!(matches!(
+        &ferrowd::handle(&store, request(0))[..],
+        [ferrow_ipc::Response::Error {
+            code: ferrow_ipc::ErrorCode::TooLarge,
+            ..
+        }]
+    ));
+    assert!(
+        matches!(&ferrowd::handle(&store, request(1))[..], [ferrow_ipc::Response::Results { paths, more: false }] if paths.len() == 1)
+    );
+}
+
+#[test]
+fn unknown_callers_cannot_read_any_snapshot_data() {
+    let store = SnapshotStore::new(Snapshot::empty());
+    let owner = ferrow_ipc::CallerIdentity::current().unwrap();
+    let unknown = ferrow_ipc::CallerIdentity::default();
+    for system in [false, true] {
+        for request in [
+            ferrow_ipc::Request::Status,
+            ferrow_ipc::Request::Count { text: "".into() },
+            ferrow_ipc::Request::Query {
+                text: "".into(),
+                limit: 0,
+                sort: ferrow_ipc::protocol::Sort::Name,
+                flags: 0,
+            },
+        ] {
+            let response = ferrowd::handle_authorized(&store, request, &unknown, &owner, system);
+            assert!(matches!(
+                &response[..],
+                [ferrow_ipc::Response::Error {
+                    code: ferrow_ipc::ErrorCode::Unauthorized,
+                    ..
+                }]
+            ));
+        }
+    }
+}
+
+#[test]
+fn controlled_shutdown_saves_the_latest_replaced_snapshot() {
+    let dir = TestDir::new("persist");
+    dir.file("new-after-start.txt");
+    let store = SnapshotStore::new(Snapshot::empty());
+    let endpoint = Endpoint::named(&format!("fr-persist-{}", std::process::id()));
+    let path = dir.0.join("saved.bin");
+    let config = DaemonConfig {
+        endpoint: endpoint.clone(),
+        index_path: Some(path.clone()),
+        roots: vec![],
+        excludes: vec![],
+        follow_symlinks: false,
+    };
+    let shutdown = Shutdown::new();
+    let stop = shutdown.clone();
+    let server_store = store.clone();
+    let server = std::thread::spawn(move || serve(&config, server_store, stop));
+    drop(connect(&endpoint));
+    store.rescan(&WalkOptions {
+        roots: vec![dir.0.clone()],
+        ..Default::default()
+    });
+    shutdown.request(&endpoint);
+    server.join().unwrap().unwrap();
+    let saved = Snapshot::from_file(&path).unwrap();
+    let response = ferrowd::handle(
+        &SnapshotStore::new(saved),
+        ferrow_ipc::Request::Count {
+            text: "new-after-start".into(),
+        },
+    );
+    assert!(matches!(
+        &response[..],
+        [ferrow_ipc::Response::Count { n: 1 }]
+    ));
+}

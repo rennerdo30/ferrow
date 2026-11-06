@@ -82,6 +82,7 @@ pub enum ErrorCode {
     Internal = 3,
     Cancelled = 4,
     TooLarge = 5,
+    Unauthorized = 6,
 }
 
 /// A server response. `Results` is streamed in pages: every page but
@@ -358,6 +359,7 @@ fn error_code(v: u16) -> Result<ErrorCode, ProtocolError> {
         3 => ErrorCode::Internal,
         4 => ErrorCode::Cancelled,
         5 => ErrorCode::TooLarge,
+        6 => ErrorCode::Unauthorized,
         _ => return Err(ProtocolError::InvalidValue("error code")),
     })
 }

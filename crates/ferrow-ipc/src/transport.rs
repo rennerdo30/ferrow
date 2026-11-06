@@ -6,8 +6,8 @@
 //!   connect/read/write — and `PIPE_REJECT_REMOTE_CLIENTS`, so
 //!   only local callers can connect at all.
 //! - Linux: a Unix domain socket at `/run/ferrow/ferrowd.sock`;
-//!   macOS: `/var/run/ferrow/ferrowd.sock`. The socket file is
-//!   mode 0666 so every local user may connect; *what a caller
+//!   macOS: `/private/var/run/ferrow/ferrowd.sock`. System sockets are
+//!   mode 0666; development sockets have a uid-owned 0700 parent. What a caller
 //!   may see* is enforced per request from the OS identity
 //!   (M2c), never from anything the client claims.
 //!
@@ -46,7 +46,7 @@ pub struct Endpoint {
 impl Endpoint {
     /// The system service endpoint: `\\.\pipe\ferrowd` on Windows,
     /// `/run/ferrow/ferrowd.sock` on Linux,
-    /// `/var/run/ferrow/ferrowd.sock` on macOS.
+    /// `/private/var/run/ferrow/ferrowd.sock` on macOS.
     pub fn default_service() -> Endpoint {
         #[cfg(windows)]
         {
@@ -89,7 +89,7 @@ impl Endpoint {
     }
 
     /// An endpoint from a short name: `\\.\pipe\<name>` on
-    /// Windows, `<temp dir>/<name>.sock` on Unix. Tests use a
+    /// Windows, `<canonical /tmp>/ferrow-<uid>/<name>.sock` on Unix. Tests use a
     /// unique name per test so nothing privileged is touched.
     pub fn named(name: &str) -> Endpoint {
         #[cfg(windows)]
@@ -229,9 +229,15 @@ mod platform {
                     revents: 0,
                 },
             ];
-            // SAFETY: two valid descriptors and a live two-element pollfd array.
-            if unsafe { libc::poll(waits.as_mut_ptr(), 2, -1) } < 0 {
-                return Err(std::io::Error::last_os_error());
+            loop {
+                // SAFETY: two valid descriptors and a live two-element pollfd array.
+                if unsafe { libc::poll(waits.as_mut_ptr(), 2, -1) } >= 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
             if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(std::io::Error::new(
@@ -343,23 +349,31 @@ mod platform {
         deadline: std::time::Instant,
     ) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
-        let timeout = super::remaining(deadline)?
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
-        let mut wait = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        // SAFETY: one live socket descriptor and one initialized pollfd.
-        match unsafe { libc::poll(&raw mut wait, 1, timeout) } {
-            -1 => Err(std::io::Error::last_os_error()),
-            0 => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "IPC deadline expired",
-            )),
-            _ => Ok(()),
+        loop {
+            let timeout = super::remaining(deadline)?
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut wait = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            // SAFETY: one live socket descriptor and one initialized pollfd.
+            return match unsafe { libc::poll(&raw mut wait, 1, timeout) } {
+                -1 => {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    Err(error)
+                }
+                0 => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IPC deadline expired",
+                )),
+                _ => Ok(()),
+            };
         }
     }
 
@@ -463,7 +477,7 @@ mod platform {
     // AU data/attribute/synchronization rights exclude FILE_CREATE_PIPE_INSTANCE.
     // Owner rights allow an unprivileged dev listener to create successors.
     const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;AU)";
-    const PIPE_INSTANCES: u32 = 33; // 32 connected streams plus one pending instance
+    const PIPE_INSTANCES: u32 = 34; // 32 admitted, one being refused, one pending
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -1234,6 +1248,13 @@ impl Stream {
     ) -> std::io::Result<Stream> {
         remaining(deadline)?;
         Ok(Stream(platform::Stream::connect(endpoint, deadline)?))
+    }
+
+    pub fn connect_deadline(
+        endpoint: &Endpoint,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Stream> {
+        Self::connect_with_deadline(endpoint, deadline)
     }
 
     /// Absolute budget shared by every read/write until explicitly renewed.
