@@ -10,7 +10,7 @@ use eframe::egui::{
 
 use super::{FerrowApp, Page, PickTarget};
 use crate::platform;
-use crate::settings::ThemeChoice;
+use crate::settings::{SourceKind, ThemeChoice};
 use crate::theme;
 
 const CARD_GAP: f32 = 4.0;
@@ -21,6 +21,7 @@ impl FerrowApp {
     pub(super) fn settings_page(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
         self.poll_folder_pick();
+        self.poll_drives();
         let outer = ui.max_rect();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -64,15 +65,115 @@ impl FerrowApp {
         section_title(ui, &p, "Index");
 
         let mut changed = false;
-        // Indexed folders.
         card(ui, &p, |ui| {
             row_header(
                 ui,
                 &p,
-                "Indexed folders",
-                "Ferrow finds files and folders inside these locations.",
+                "Locations",
+                "Drives, folders, network drives and network folders that Ferrow searches.",
             );
-            changed |= self.folder_list(ui, PickTarget::Root);
+            changed |= self.location_list(ui);
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let picking = self.folder_pick.is_some();
+                if ui
+                    .add_enabled(!picking, std_button(&p, "Add folder…", 140.0))
+                    .clicked()
+                {
+                    self.pick_folder(ui.ctx(), PickTarget::Root);
+                }
+                if cfg!(windows) {
+                    let resp = ui.add(std_button(&p, "Add drive ▾", 130.0));
+                    if resp.clicked() && self.drives.is_none() {
+                        self.load_drives(ui.ctx());
+                    }
+                    let mut added = None;
+                    egui::Popup::menu(&resp).show(|ui| {
+                        ui.set_min_width(300.0);
+                        match &self.drives {
+                            None => {
+                                ui.label(
+                                    RichText::new("Looking for drives…").color(p.text_secondary),
+                                );
+                            }
+                            Some(drives) if drives.is_empty() => {
+                                ui.label(RichText::new("No drives found").color(p.text_secondary));
+                            }
+                            Some(drives) => {
+                                for d in drives {
+                                    let listed =
+                                        self.settings.sources.iter().any(|s| s.path == d.root);
+                                    let mut text =
+                                        format!("{}   {}", d.root.display(), d.kind_label);
+                                    if !d.detail.is_empty() {
+                                        text.push_str(&format!("  ·  {}", d.detail));
+                                    }
+                                    let b = egui::Button::new(text).min_size(vec2(290.0, 30.0));
+                                    if ui.add_enabled(!listed, b).clicked() {
+                                        added = Some(d.root.clone());
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    if let Some(root) = added {
+                        changed |= self.settings.add_source(root);
+                        self.drives = None; // refresh next time
+                    }
+                }
+                if ui
+                    .add(std_button(&p, "Add network location…", 190.0))
+                    .clicked()
+                {
+                    self.network_input = Some(String::new());
+                }
+            });
+            if let Some(text) = &mut self.network_input {
+                ui.add_space(8.0);
+                let mut add = false;
+                let mut cancel = false;
+                ui.horizontal(|ui| {
+                    let hint = if cfg!(windows) {
+                        r"\\server\share\folder"
+                    } else {
+                        "/mnt/share"
+                    };
+                    let edit = egui::TextEdit::singleline(text)
+                        .hint_text(hint)
+                        .desired_width(360.0)
+                        .margin(vec2(8.0, 6.0));
+                    let r = ui.add(edit);
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        add = true;
+                    }
+                    if ui
+                        .add(accent_button(&p, "Add", 70.0, !text.trim().is_empty()))
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    if ui.add(std_button(&p, "Cancel", 80.0)).clicked() {
+                        cancel = true;
+                    }
+                });
+                if add && !text.trim().is_empty() {
+                    let path = PathBuf::from(text.trim());
+                    changed |= self.settings.add_source(path);
+                    cancel = true;
+                }
+                if cancel {
+                    self.network_input = None;
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Network locations are read with your account. They don't update live; \
+                     rebuild them, or set an automatic rebuild below.",
+                )
+                .size(12.0)
+                .color(p.text_tertiary),
+            );
         });
         ui.add_space(CARD_GAP);
         card(ui, &p, |ui| {
@@ -82,7 +183,15 @@ impl FerrowApp {
                 "Excluded folders",
                 "Left out of the index, including everything inside them.",
             );
-            changed |= self.folder_list(ui, PickTarget::Exclude);
+            changed |= self.exclude_list(ui);
+            ui.add_space(6.0);
+            let picking = self.folder_pick.is_some();
+            if ui
+                .add_enabled(!picking, std_button(&p, "Add excluded folder…", 190.0))
+                .clicked()
+            {
+                self.pick_folder(ui.ctx(), PickTarget::Exclude);
+            }
         });
         ui.add_space(CARD_GAP);
         card(ui, &p, |ui| {
@@ -103,6 +212,34 @@ impl FerrowApp {
         ui.add_space(CARD_GAP);
         card(ui, &p, |ui| {
             ui.horizontal(|ui| {
+                row_text(
+                    ui,
+                    &p,
+                    "Rebuild automatically",
+                    "Off by default, so Ferrow does no work while idle.",
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let current = self.settings.auto_rebuild;
+                    egui::ComboBox::from_id_salt("auto-rebuild")
+                        .selected_text(current.label())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for choice in crate::settings::AutoRebuild::ALL {
+                                if ui
+                                    .selectable_label(current == choice, choice.label())
+                                    .clicked()
+                                {
+                                    self.settings.auto_rebuild = choice;
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+            });
+        });
+        ui.add_space(CARD_GAP);
+        card(ui, &p, |ui| {
+            ui.horizontal(|ui| {
                 let detail = match (&self.scan_status, &self.index) {
                     (Some(s), _) => s.clone(),
                     (None, Some(index)) => format!(
@@ -114,23 +251,52 @@ impl FerrowApp {
                 };
                 row_text(ui, &p, "Rebuild index", &detail);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let can = !self.settings.roots.is_empty() && self.scan_status.is_none();
-                    let button = egui::Button::new(RichText::new("Rebuild now").color(if can {
-                        Color32::WHITE
-                    } else {
-                        p.text_tertiary
-                    }))
-                    .fill(if can { p.accent } else { p.control })
-                    .min_size(vec2(120.0, 32.0));
-                    let resp = ui.add_enabled(can, button);
-                    if self.settings.roots.is_empty() {
-                        resp.on_disabled_hover_text("Add a folder to index first.");
+                    let can = self.settings.has_locations() && self.scan_status.is_none();
+                    let resp = ui.add_enabled(can, accent_button(&p, "Rebuild now", 120.0, can));
+                    if !self.settings.has_locations() {
+                        resp.on_disabled_hover_text("Add a location to index first.");
                     } else if resp.clicked() {
                         self.rebuild_index();
                     }
                 });
             });
         });
+
+        if cfg!(windows) {
+            ui.add_space(SECTION_GAP);
+            section_title(ui, &p, "Windows");
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    row_text(
+                        ui,
+                        &p,
+                        "Index all internal drives",
+                        "Every fixed drive, including drives you add later. Removable and network drives are not included.",
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if toggle(ui, &p, &mut self.settings.windows.all_fixed_drives).changed() {
+                            changed = true;
+                        }
+                    });
+                });
+            });
+            ui.add_space(CARD_GAP);
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    row_text(
+                        ui,
+                        &p,
+                        "Fast NTFS index and live updates",
+                        "Reads the NTFS file table and change journal through the background service. Coming in a later version.",
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut off = false;
+                        ui.add_enabled_ui(false, |ui| toggle(ui, &p, &mut off));
+                    });
+                });
+            });
+        }
+
         if changed {
             self.save_settings();
         }
@@ -140,82 +306,86 @@ impl FerrowApp {
         }
     }
 
-    /// Rows for one folder list, with remove buttons and an add button.
+    /// Rows of index locations with their kind and a remove button.
     /// Returns true when the list changed.
-    fn folder_list(&mut self, ui: &mut egui::Ui, target: PickTarget) -> bool {
+    fn location_list(&mut self, ui: &mut egui::Ui) -> bool {
         let p = self.palette;
-        let mut remove = None;
-        let list = match target {
-            PickTarget::Root => &self.settings.roots,
-            PickTarget::Exclude => &self.settings.excludes,
-        };
         ui.add_space(8.0);
-        for (i, folder) in list.iter().enumerate() {
-            let (rect, _) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::hover());
-            let hovered = ui.rect_contains_pointer(rect);
-            if hovered {
-                ui.painter()
-                    .rect_filled(rect, CornerRadius::same(4), p.row_hover);
-            }
-            super::icon_folder(ui.painter(), rect.left_center() + vec2(14.0, 0.0), &p);
-            let text_rect = egui::Rect::from_min_max(
-                rect.left_top() + vec2(32.0, 0.0),
-                rect.right_bottom() - vec2(90.0, 0.0),
-            );
-            let galley = super::ellipsized(
+        let mut remove = None;
+        for (i, source) in self.settings.sources.iter().enumerate() {
+            let rect = list_row(
                 ui,
-                folder.display().to_string(),
-                FontId::proportional(14.0),
-                p.text,
-                text_rect.width(),
+                &p,
+                source.kind,
+                &source.path.display().to_string(),
+                source.kind.label(),
             );
-            ui.painter().galley(
-                egui::pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0),
-                galley,
-                p.text,
-            );
-            let btn = egui::Rect::from_min_size(
-                egui::pos2(rect.right() - 84.0, rect.center().y - 14.0),
-                vec2(80.0, 28.0),
-            );
-            let resp = ui.put(
-                btn,
-                egui::Button::new("Remove")
-                    .fill(p.control)
-                    .stroke(Stroke::new(1.0, p.control_stroke))
-                    .min_size(btn.size()),
-            );
-            if resp.clicked() {
+            if remove_button(ui, &p, rect).clicked() {
                 remove = Some(i);
             }
         }
-        if list.is_empty() {
-            ui.label(RichText::new("None").color(p.text_tertiary));
+        if cfg!(windows) && self.settings.windows.all_fixed_drives {
+            list_row(
+                ui,
+                &p,
+                SourceKind::Drive,
+                "All internal drives",
+                "From the Windows option below",
+            );
         }
-        ui.add_space(6.0);
-        let picking = self.folder_pick.is_some();
-        let add = ui.add_enabled(
-            !picking,
-            egui::Button::new(match target {
-                PickTarget::Root => "Add folder…",
-                PickTarget::Exclude => "Add excluded folder…",
-            })
-            .fill(p.control)
-            .stroke(Stroke::new(1.0, p.control_stroke))
-            .min_size(vec2(160.0, 32.0)),
-        );
-        if add.clicked() {
-            self.pick_folder(ui.ctx(), target);
+        if !self.settings.has_locations() {
+            ui.label(RichText::new("No locations yet.").color(p.text_tertiary));
         }
         if let Some(i) = remove {
-            match target {
-                PickTarget::Root => self.settings.roots.remove(i),
-                PickTarget::Exclude => self.settings.excludes.remove(i),
-            };
+            self.settings.sources.remove(i);
             return true;
         }
         false
+    }
+
+    fn exclude_list(&mut self, ui: &mut egui::Ui) -> bool {
+        let p = self.palette;
+        ui.add_space(8.0);
+        let mut remove = None;
+        for (i, path) in self.settings.excludes.iter().enumerate() {
+            let rect = list_row(ui, &p, SourceKind::Folder, &path.display().to_string(), "");
+            if remove_button(ui, &p, rect).clicked() {
+                remove = Some(i);
+            }
+        }
+        if self.settings.excludes.is_empty() {
+            ui.label(RichText::new("None").color(p.text_tertiary));
+        }
+        if let Some(i) = remove {
+            self.settings.excludes.remove(i);
+            return true;
+        }
+        false
+    }
+
+    fn load_drives(&mut self, ctx: &egui::Context) {
+        // Drive queries can stall on a sleeping or disconnected drive, so
+        // they run on their own thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ferrow-drives".into())
+            .spawn(move || {
+                let _ = tx.send(platform::list_drives());
+                wake.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.drives_rx = Some(rx);
+        }
+    }
+
+    fn poll_drives(&mut self) {
+        if let Some(rx) = &self.drives_rx
+            && let Ok(list) = rx.try_recv()
+        {
+            self.drives = Some(list);
+            self.drives_rx = None;
+        }
     }
 
     fn appearance_section(&mut self, ui: &mut egui::Ui) {
@@ -330,12 +500,17 @@ impl FerrowApp {
         let Ok(result) = rx.try_recv() else { return };
         self.folder_pick = None;
         if let Some(folder) = result {
-            let list = match target {
-                PickTarget::Root => &mut self.settings.roots,
-                PickTarget::Exclude => &mut self.settings.excludes,
+            let added = match target {
+                PickTarget::Root => self.settings.add_source(folder),
+                PickTarget::Exclude => {
+                    let new = !self.settings.excludes.contains(&folder);
+                    if new {
+                        self.settings.excludes.push(folder);
+                    }
+                    new
+                }
             };
-            if !list.contains(&folder) {
-                list.push(folder);
+            if added {
                 self.save_settings();
             }
         }
@@ -350,19 +525,29 @@ impl FerrowApp {
     }
 
     pub(super) fn rebuild_index(&mut self) {
-        if self.settings.roots.is_empty() {
+        let fixed = if self.settings.windows.all_fixed_drives {
+            platform::fixed_drive_roots()
+        } else {
+            Vec::new()
+        };
+        let roots = self.settings.scan_roots(&fixed);
+        if roots.is_empty() {
             return;
         }
         self.engine.scan(ferrow_walk::WalkOptions {
-            roots: self.settings.roots.clone(),
+            roots,
             excludes: self.settings.excludes.clone(),
             follow_symlinks: self.settings.follow_symlinks,
         });
+        self.settings.last_rebuild = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        self.save_settings();
     }
 
     pub(super) fn index_home(&mut self, home: PathBuf) {
-        if !self.settings.roots.contains(&home) {
-            self.settings.roots.push(home);
+        if self.settings.add_source(home) {
             self.save_settings();
         }
         self.rebuild_index();
@@ -460,4 +645,94 @@ fn toggle(ui: &mut egui::Ui, p: &theme::Palette, on: &mut bool) -> egui::Respons
         painter.circle_filled(rect.left_center() + vec2(10.0, 0.0), 5.0, p.text_secondary);
     }
     resp
+}
+
+fn std_button(p: &theme::Palette, text: &str, width: f32) -> egui::Button<'static> {
+    egui::Button::new(text.to_owned())
+        .fill(p.control)
+        .stroke(Stroke::new(1.0, p.control_stroke))
+        .min_size(vec2(width, 32.0))
+}
+
+fn accent_button(
+    p: &theme::Palette,
+    text: &str,
+    width: f32,
+    enabled: bool,
+) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_owned()).color(if enabled {
+        Color32::WHITE
+    } else {
+        p.text_tertiary
+    }))
+    .fill(if enabled { p.accent } else { p.control })
+    .min_size(vec2(width, 32.0))
+}
+
+/// One list row with a kind icon, the main text and a secondary label.
+/// Returns the row rect (the remove button goes on its right).
+fn list_row(
+    ui: &mut egui::Ui,
+    p: &theme::Palette,
+    kind: SourceKind,
+    text: &str,
+    detail: &str,
+) -> egui::Rect {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+    if ui.rect_contains_pointer(rect) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), p.row_hover);
+    }
+    let icon_c = rect.left_center() + vec2(14.0, 0.0);
+    let glyph = match kind {
+        SourceKind::Drive => Some("\u{EDA2}"),
+        SourceKind::NetworkDrive => Some("\u{E8CE}"),
+        SourceKind::NetworkFolder => Some("\u{E774}"),
+        SourceKind::Folder => None,
+    };
+    match glyph {
+        Some(g) if theme::has_icon_font(ui.ctx()) => {
+            ui.painter().text(
+                icon_c,
+                egui::Align2::CENTER_CENTER,
+                g,
+                FontId::new(16.0, FontFamily::Name(theme::ICONS.into())),
+                p.text_secondary,
+            );
+        }
+        _ => super::icon_folder(ui.painter(), icon_c, p),
+    }
+    let text_left = rect.left() + 34.0;
+    let text_right = rect.right() - 100.0;
+    let detail_w = if detail.is_empty() { 0.0 } else { 120.0 };
+    let main = super::ellipsized(
+        ui,
+        text.to_owned(),
+        FontId::proportional(14.0),
+        p.text,
+        text_right - text_left - detail_w,
+    );
+    ui.painter().galley(
+        egui::pos2(text_left, rect.center().y - main.size().y / 2.0),
+        main,
+        p.text,
+    );
+    if !detail.is_empty() {
+        ui.painter().text(
+            egui::pos2(text_right - 8.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            detail,
+            FontId::proportional(12.0),
+            p.text_tertiary,
+        );
+    }
+    rect
+}
+
+fn remove_button(ui: &mut egui::Ui, p: &theme::Palette, row: egui::Rect) -> egui::Response {
+    let btn = egui::Rect::from_min_size(
+        egui::pos2(row.right() - 88.0, row.center().y - 15.0),
+        vec2(84.0, 30.0),
+    );
+    ui.put(btn, std_button(p, "Remove", 84.0))
 }

@@ -88,6 +88,13 @@ pub struct FerrowApp {
     /// Set while a rebuild runs; search keeps using the old index.
     scan_status: Option<String>,
     settings_error: Option<String>,
+    /// Drives for the "Add drive" menu, loaded off the UI thread.
+    drives: Option<Vec<platform::DriveInfo>>,
+    drives_rx: Option<std::sync::mpsc::Receiver<Vec<platform::DriveInfo>>>,
+    /// Text of the "Add network location" field while it is open.
+    network_input: Option<String>,
+    /// The on-start automatic rebuild already ran in this session.
+    auto_started: bool,
 }
 
 impl FerrowApp {
@@ -134,6 +141,10 @@ impl FerrowApp {
             folder_pick: None,
             scan_status: None,
             settings_error: None,
+            drives: None,
+            drives_rx: None,
+            network_input: None,
+            auto_started: false,
         })
     }
 
@@ -196,6 +207,42 @@ impl FerrowApp {
                         self.shown_generation = generation;
                         self.query_error = Some(message);
                     }
+                }
+            }
+        }
+    }
+
+    /// Automatic rebuilds, when the user turned them on. A due rebuild is
+    /// scheduled with one delayed repaint, never with a polling timer.
+    fn auto_rebuild(&mut self, ctx: &egui::Context) {
+        use crate::settings::AutoRebuild;
+        if !matches!(self.state, State::Ready | State::NoIndex { .. })
+            || self.scan_status.is_some()
+            || !self.settings.has_locations()
+        {
+            return;
+        }
+        match self.settings.auto_rebuild {
+            AutoRebuild::Never => {}
+            AutoRebuild::OnStart => {
+                if !self.auto_started {
+                    self.auto_started = true;
+                    self.rebuild_index();
+                }
+            }
+            every => {
+                let Some(interval) = every.interval_secs() else {
+                    return;
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let due = self.settings.last_rebuild.map_or(now, |t| t + interval);
+                if now >= due {
+                    self.rebuild_index();
+                } else {
+                    ctx.request_repaint_after(Duration::from_secs(due - now));
                 }
             }
         }
@@ -970,6 +1017,7 @@ impl eframe::App for FerrowApp {
         let ctx = ui.ctx().clone();
         self.sync_theme(&ctx, frame);
         self.drain_events();
+        self.auto_rebuild(&ctx);
 
         // Every keystroke starts a new (cancelling) search on the worker.
         if self.page == Page::Settings

@@ -1,7 +1,7 @@
 //! OS integration: opening files, revealing them in the file manager,
 //! the clipboard, the system accent colour and the window backdrop.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Open a file or folder with its default application.
@@ -100,6 +100,68 @@ pub fn is_remote_session() -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+/// A drive or volume the user can add as an index location.
+#[derive(Clone, Debug)]
+pub struct DriveInfo {
+    /// Root path, e.g. `C:\`.
+    pub root: PathBuf,
+    /// "Local disk", "Removable", "Network", "CD/DVD", …
+    pub kind_label: &'static str,
+    /// Volume label, or for a network drive the share it maps to.
+    pub detail: String,
+}
+
+/// List drives. Volume labels are read only for fixed drives, because
+/// querying a disconnected network or empty optical drive can stall;
+/// call this off the UI thread anyway.
+pub fn list_drives() -> Vec<DriveInfo> {
+    #[cfg(windows)]
+    return win::list_drives();
+    #[cfg(not(windows))]
+    return Vec::new();
+}
+
+/// Roots of the fixed (internal) drives, from drive types only (no
+/// volume queries, so this does not stall on network drives).
+pub fn fixed_drive_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    return win::fixed_drive_roots();
+    #[cfg(not(windows))]
+    return Vec::new();
+}
+
+/// Classify a location for display: drive root, network share, or folder.
+pub fn classify_location(path: &Path) -> crate::settings::SourceKind {
+    use crate::settings::SourceKind;
+    let s = path.as_os_str().to_string_lossy();
+    if cfg!(windows) {
+        let s = s.replace('/', "\\");
+        if s.starts_with("\\\\") && !s.starts_with("\\\\?\\") && !s.starts_with("\\\\.\\") {
+            return SourceKind::NetworkFolder;
+        }
+        let bytes = s.as_bytes();
+        let is_root = bytes.len() <= 3
+            && bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':';
+        #[cfg(windows)]
+        let remote = bytes.len() >= 2 && bytes[1] == b':' && win::is_remote_drive(bytes[0]);
+        #[cfg(not(windows))]
+        let remote = false;
+        return match (is_root, remote) {
+            (true, true) => SourceKind::NetworkDrive,
+            (true, false) => SourceKind::Drive,
+            (false, true) => SourceKind::NetworkFolder,
+            (false, false) => SourceKind::Folder,
+        };
+    }
+    if path == Path::new("/") {
+        SourceKind::Drive
+    } else {
+        SourceKind::Folder
     }
 }
 
@@ -271,6 +333,105 @@ mod win {
             GlobalUnlock(handle);
             Some(text)
         }
+    }
+
+    fn drive_root(letter: u8) -> Vec<u16> {
+        [letter as u16, b':' as u16, b'\\' as u16, 0].to_vec()
+    }
+
+    pub fn is_remote_drive(letter: u8) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+        use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+        let root = drive_root(letter.to_ascii_uppercase());
+        // SAFETY: root is a NUL-terminated UTF-16 string.
+        unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+    }
+
+    pub fn fixed_drive_roots() -> Vec<std::path::PathBuf> {
+        use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+        use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+        // SAFETY: no preconditions.
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u8)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| b'A' + i)
+            .filter(|&l| {
+                let root = drive_root(l);
+                // SAFETY: root is a NUL-terminated UTF-16 string.
+                unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED }
+            })
+            .map(|l| std::path::PathBuf::from(format!("{}:\\", l as char)))
+            .collect()
+    }
+
+    pub fn list_drives() -> Vec<super::DriveInfo> {
+        use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+        };
+        use windows_sys::Win32::System::WindowsProgramming::{
+            DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+        };
+        // SAFETY: no preconditions.
+        let mask = unsafe { GetLogicalDrives() };
+        let mut out = Vec::new();
+        for i in 0..26u8 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let letter = b'A' + i;
+            let root = drive_root(letter);
+            // SAFETY: root is a NUL-terminated UTF-16 string.
+            let ty = unsafe { GetDriveTypeW(root.as_ptr()) };
+            let kind_label = match ty {
+                DRIVE_FIXED => "Local disk",
+                DRIVE_REMOVABLE => "Removable drive",
+                DRIVE_REMOTE => "Network drive",
+                DRIVE_CDROM => "CD/DVD drive",
+                DRIVE_RAMDISK => "RAM disk",
+                _ => continue,
+            };
+            let mut detail = String::new();
+            if ty == DRIVE_FIXED {
+                let mut name = [0u16; 261];
+                // SAFETY: root is NUL-terminated; the name buffer and its
+                // length match; the other out-parameters are optional.
+                let ok = unsafe {
+                    GetVolumeInformationW(
+                        root.as_ptr(),
+                        name.as_mut_ptr(),
+                        name.len() as u32,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if ok != 0 {
+                    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                    detail = String::from_utf16_lossy(&name[..end]);
+                }
+            } else if ty == DRIVE_REMOTE {
+                let local = [letter as u16, b':' as u16, 0];
+                let mut remote = [0u16; 1024];
+                let mut len = remote.len() as u32;
+                // SAFETY: local is NUL-terminated; remote and len describe
+                // a writable buffer of that many UTF-16 units.
+                let status =
+                    unsafe { WNetGetConnectionW(local.as_ptr(), remote.as_mut_ptr(), &mut len) };
+                if status == 0 {
+                    let end = remote.iter().position(|&c| c == 0).unwrap_or(remote.len());
+                    detail = String::from_utf16_lossy(&remote[..end]);
+                }
+            }
+            out.push(super::DriveInfo {
+                root: std::path::PathBuf::from(format!("{}:\\", letter as char)),
+                kind_label,
+                detail,
+            });
+        }
+        out
     }
 
     pub fn accent_color() -> Option<[u8; 3]> {
