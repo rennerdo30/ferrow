@@ -102,8 +102,17 @@ struct Walker<'a> {
 }
 
 impl<'x> Walker<'x> {
-    fn scan_dir<'scope>(self, scope: &rayon::Scope<'scope>, dir: PathBuf, dir_id: u32)
-    where
+    /// `ancestors` holds the canonical paths of the directory chain
+    /// from the root down to and including `dir`. It is only populated
+    /// when following symlinks, where it bounds cycles: a directory
+    /// whose canonical path is already an ancestor is not descended.
+    fn scan_dir<'scope>(
+        self,
+        scope: &rayon::Scope<'scope>,
+        dir: PathBuf,
+        dir_id: u32,
+        ancestors: Vec<PathBuf>,
+    ) where
         'x: 'scope,
     {
         let read = match std::fs::read_dir(&dir) {
@@ -136,12 +145,20 @@ impl<'x> Walker<'x> {
             name_to_bytes(&entry.file_name(), &mut name);
             let mut ent_flags: u16 = 0;
             let is_symlink = file_type.is_symlink();
+            // file_type() never follows links: a symlinked directory is
+            // a leaf unless following is on, in which case fs::metadata
+            // (which traverses) decides. DirEntry::metadata() does NOT
+            // traverse links, so it cannot be used for this.
             let mut is_dir = file_type.is_dir();
             if is_symlink {
                 ent_flags |= flags::SYMLINK;
                 if self.follow_symlinks {
-                    // metadata() follows the link; a broken link stays a leaf.
-                    is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+                    match std::fs::metadata(&path) {
+                        Ok(md) => is_dir = md.is_dir(),
+                        Err(e) => {
+                            self.errors.add(format!("{}: {e}", path.display()));
+                        }
+                    }
                 }
             }
             if is_dir {
@@ -152,7 +169,26 @@ impl<'x> Walker<'x> {
             }
             let id = self.builder.add(dir_id, &name, ent_flags);
             if is_dir {
-                scope.spawn(move |s| self.scan_dir(s, path, id));
+                let mut child_ancestors = ancestors.clone();
+                if self.follow_symlinks {
+                    match std::fs::canonicalize(&path) {
+                        Ok(canonical) => {
+                            if ancestors.contains(&canonical) {
+                                self.errors.add(format!(
+                                    "{}: symlink cycle (already an ancestor)",
+                                    path.display()
+                                ));
+                                continue;
+                            }
+                            child_ancestors.push(canonical);
+                        }
+                        Err(e) => {
+                            self.errors.add(format!("{}: {e}", path.display()));
+                            continue;
+                        }
+                    }
+                }
+                scope.spawn(move |s| self.scan_dir(s, path, id, child_ancestors));
             }
         }
     }
@@ -218,15 +254,38 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
             }
         };
         let name = root_name_bytes(&abs);
-        let (name_bytes, is_dir) = match std::fs::metadata(&abs) {
-            Ok(md) => (name, md.is_dir()),
+        // symlink_metadata first: a root symlink is only followed when
+        // the switch is on (fs::metadata would traverse it silently).
+        let link_md = match std::fs::symlink_metadata(&abs) {
+            Ok(md) => md,
             Err(e) => {
                 errors.add(format!("{}: {e}", root.display()));
                 continue;
             }
         };
-        let root_flags = if is_dir { flags::DIR } else { 0 };
-        let id = builder.add_root(&name_bytes, root_flags);
+        let is_symlink = link_md.file_type().is_symlink();
+        let mut root_flags: u16 = 0;
+        if is_symlink {
+            root_flags |= flags::SYMLINK;
+        }
+        let is_dir = if is_symlink && !options.follow_symlinks {
+            false
+        } else if is_symlink {
+            match std::fs::metadata(&abs) {
+                Ok(md) => md.is_dir(),
+                Err(e) => {
+                    // Broken link: counted, kept as a leaf entry.
+                    errors.add(format!("{}: {e}", root.display()));
+                    false
+                }
+            }
+        } else {
+            link_md.is_dir()
+        };
+        if is_dir {
+            root_flags |= flags::DIR;
+        }
+        let id = builder.add_root(&name, root_flags);
         if is_dir {
             root_dirs.push((abs, id));
         }
@@ -234,7 +293,18 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
 
     rayon::scope(|scope| {
         for (dir, id) in root_dirs {
-            scope.spawn(move |s| walker.scan_dir(s, dir, id));
+            let ancestors = if walker.follow_symlinks {
+                match std::fs::canonicalize(&dir) {
+                    Ok(canonical) => vec![canonical],
+                    Err(e) => {
+                        walker.errors.add(format!("{}: {e}", dir.display()));
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            scope.spawn(move |s| walker.scan_dir(s, dir, id, ancestors));
         }
     });
 
@@ -325,6 +395,103 @@ mod tests {
         let rebuilt = idx.path(names["c.md"]);
         assert_eq!(rebuilt, dir.0.join("sub").join("deep").join("c.md"));
         assert!(report.summary().contains("parallel read_dir"));
+    }
+
+    fn make_symlink_dir(original: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_dir(original, link);
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(original, link);
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                // Windows without Developer Mode refuses symlink
+                // creation; skip loudly instead of faking a pass.
+                eprintln!("SKIP: symlink creation refused ({e}); test not run");
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn follow_symlinks_includes_target_children() {
+        let root = TestDir::new("links-root");
+        let target = TestDir::new("links-target");
+        target.file("target-leaf.txt");
+        if !make_symlink_dir(&target.0, &root.0.join("link")) {
+            return;
+        }
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![root.0.clone()],
+            follow_symlinks: true,
+            excludes: Vec::new(),
+        });
+        assert_eq!(report.errors, 0, "{:?}", report.error_samples);
+        assert!(
+            (0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
+            "follow=true omitted target children"
+        );
+        // And with following off, the target children stay out.
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![root.0.clone()],
+            follow_symlinks: false,
+            excludes: Vec::new(),
+        });
+        assert!(
+            !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
+            "follow=false descended through a symlink"
+        );
+    }
+
+    #[test]
+    fn symlink_root_is_not_followed_when_disabled() {
+        let parent = TestDir::new("root-link-parent");
+        let target = TestDir::new("root-link-target");
+        target.file("private-leaf.txt");
+        let link = parent.0.join("root-link");
+        if !make_symlink_dir(&target.0, &link) {
+            return;
+        }
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![link.clone()],
+            follow_symlinks: false,
+            excludes: Vec::new(),
+        });
+        assert!(
+            !(0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
+            "follow=false descended through root symlink"
+        );
+        // The root entry itself exists and is marked as a symlink.
+        assert_eq!(idx.len(), 1);
+        assert_ne!(idx.flags(0) & flags::SYMLINK, 0);
+        // With following on, the same root is descended.
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![link],
+            follow_symlinks: true,
+            excludes: Vec::new(),
+        });
+        assert!(
+            (0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
+            "follow=true did not descend through root symlink"
+        );
+    }
+
+    #[test]
+    fn symlink_cycle_is_bounded() {
+        let root = TestDir::new("cycle");
+        root.file("f.txt");
+        root.file("a/g.txt");
+        if !make_symlink_dir(&root.0, &root.0.join("a").join("loop")) {
+            return;
+        }
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![root.0.clone()],
+            follow_symlinks: true,
+            excludes: Vec::new(),
+        });
+        // root, f.txt, a, g.txt, loop — the loop is a leaf, never descended.
+        assert_eq!(idx.len(), 5, "cycle was not bounded");
+        assert!(report.errors >= 1, "cycle must be counted: {report:?}");
     }
 
     #[test]
