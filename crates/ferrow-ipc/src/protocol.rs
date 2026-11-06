@@ -19,7 +19,9 @@
 use std::io::{Read, Write};
 
 /// The only protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
+pub const QUERY_DESCENDING: u32 = 1;
+pub const QUERY_METADATA: u32 = 2;
 /// Hard cap on one frame's payload. Results are paged to fit.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// Hard cap on a length-prefixed text field (query, mode, message).
@@ -39,6 +41,7 @@ const KIND_RESULTS: u8 = 102;
 const KIND_COUNT_RESULT: u8 = 103;
 const KIND_STATUS_RESULT: u8 = 104;
 const KIND_ERROR: u8 = 105;
+const KIND_ROWS: u8 = 106;
 
 /// Result sort order. Only name order exists in protocol version 1;
 /// the field is on the wire so later versions can add orders
@@ -48,6 +51,30 @@ pub enum Sort {
     /// Index name order (folded name, then raw name, then id).
     #[default]
     Name,
+    Size,
+    Modified,
+    Created,
+    Accessed,
+}
+
+/// Result values use signed Unix-epoch 100 ns ticks; absent values stay unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileRow {
+    pub path: Vec<u8>,
+    pub size: Option<u64>,
+    pub modified: Option<i64>,
+    pub created: Option<i64>,
+    pub accessed: Option<i64>,
+    pub attributes: Option<u32>,
+}
+impl FileRow {
+    fn presence(&self) -> u8 {
+        u8::from(self.size.is_some())
+            | (u8::from(self.modified.is_some()) << 1)
+            | (u8::from(self.created.is_some()) << 2)
+            | (u8::from(self.accessed.is_some()) << 3)
+            | (u8::from(self.attributes.is_some()) << 4)
+    }
 }
 
 /// A client request.
@@ -94,6 +121,12 @@ pub enum Response {
     },
     Results {
         paths: Vec<Vec<u8>>,
+        more: bool,
+    },
+    Rows {
+        rows: Vec<FileRow>,
+        columns: u32,
+        sort_pending: bool,
         more: bool,
     },
     Count {
@@ -217,6 +250,10 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             w.u32(*limit);
             w.u8(match sort {
                 Sort::Name => 0,
+                Sort::Size => 1,
+                Sort::Modified => 2,
+                Sort::Created => 3,
+                Sort::Accessed => 4,
             });
             w.u32(*flags);
             KIND_QUERY
@@ -259,6 +296,49 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
         Message::Response(Response::Count { n }) => {
             w.u64(*n);
             KIND_COUNT_RESULT
+        }
+        Message::Response(Response::Rows {
+            rows,
+            columns,
+            sort_pending,
+            more,
+        }) => {
+            if *columns & !31 != 0 {
+                return Err(ProtocolError::InvalidValue("columns"));
+            }
+            if rows.len() > MAX_PATHS_PER_PAGE {
+                return Err(ProtocolError::TooLarge);
+            }
+            rows.iter().try_fold(16usize, |size, row| {
+                if row.path.len() > MAX_PATH_BYTES || size + row.path.len() + 41 > MAX_FRAME_BYTES {
+                    return Err(ProtocolError::TooLarge);
+                }
+                if u32::from(row.presence()) & !columns != 0 {
+                    return Err(ProtocolError::InvalidValue("row columns"));
+                }
+                Ok(size + row.path.len() + 41)
+            })?;
+            w.u8(u8::from(*more));
+            w.u32(*columns);
+            w.u8(u8::from(*sort_pending));
+            w.u32(rows.len() as u32);
+            for row in rows {
+                w.bytes(&row.path)?;
+                w.u8(row.presence());
+                if let Some(v) = row.size {
+                    w.u64(v);
+                }
+                for v in [row.modified, row.created, row.accessed]
+                    .into_iter()
+                    .flatten()
+                {
+                    w.u64(v as u64);
+                }
+                if let Some(v) = row.attributes {
+                    w.u32(v);
+                }
+            }
+            KIND_ROWS
         }
         Message::Response(Response::Status {
             entries,
@@ -388,6 +468,10 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             let limit = r.u32()?;
             let sort = match r.u8()? {
                 0 => Sort::Name,
+                1 => Sort::Size,
+                2 => Sort::Modified,
+                3 => Sort::Created,
+                4 => Sort::Accessed,
                 _ => return Err(ProtocolError::InvalidValue("sort")),
             };
             let flags = r.u32()?;
@@ -421,6 +505,68 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             Message::Response(Response::Results { paths, more })
         }
         KIND_COUNT_RESULT => Message::Response(Response::Count { n: r.u64()? }),
+        KIND_ROWS => {
+            let more = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProtocolError::InvalidValue("more flag")),
+            };
+            let columns = r.u32()?;
+            if columns & !31 != 0 {
+                return Err(ProtocolError::InvalidValue("columns"));
+            }
+            let sort_pending = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProtocolError::InvalidValue("sort pending flag")),
+            };
+            let n = r.u32()? as usize;
+            if n > MAX_PATHS_PER_PAGE {
+                return Err(ProtocolError::TooLarge);
+            }
+            if n > (r.bytes.len() - r.pos) / 5 {
+                return Err(ProtocolError::Truncated);
+            }
+            let mut rows = Vec::with_capacity(n);
+            for _ in 0..n {
+                let path = r.len_prefixed(MAX_PATH_BYTES)?.to_vec();
+                let mask = r.u8()?;
+                if u32::from(mask) & !columns != 0 {
+                    return Err(ProtocolError::InvalidValue("row columns"));
+                }
+                let size = if mask & 1 != 0 { Some(r.u64()?) } else { None };
+                let modified = if mask & 2 != 0 {
+                    Some(r.u64()? as i64)
+                } else {
+                    None
+                };
+                let created = if mask & 4 != 0 {
+                    Some(r.u64()? as i64)
+                } else {
+                    None
+                };
+                let accessed = if mask & 8 != 0 {
+                    Some(r.u64()? as i64)
+                } else {
+                    None
+                };
+                let attributes = if mask & 16 != 0 { Some(r.u32()?) } else { None };
+                rows.push(FileRow {
+                    path,
+                    size,
+                    modified,
+                    created,
+                    accessed,
+                    attributes,
+                });
+            }
+            Message::Response(Response::Rows {
+                rows,
+                columns,
+                sort_pending,
+                more,
+            })
+        }
         KIND_STATUS_RESULT => {
             let entries = r.u64()?;
             let mode = r.str()?;

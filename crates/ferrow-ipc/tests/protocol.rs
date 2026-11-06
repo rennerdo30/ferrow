@@ -69,6 +69,41 @@ fn round_trip(id: u32, message: Message) {
 
 #[test]
 fn every_message_round_trips() {
+    for sort in [
+        Sort::Name,
+        Sort::Size,
+        Sort::Modified,
+        Sort::Created,
+        Sort::Accessed,
+    ] {
+        round_trip(
+            12,
+            Message::Request(Request::Query {
+                text: "metadata".into(),
+                limit: 10,
+                sort,
+                flags: 3,
+            }),
+        );
+    }
+    for mask in 0..32u8 {
+        round_trip(
+            13,
+            Message::Response(Response::Rows {
+                sort_pending: mask & 1 != 0,
+                rows: vec![ferrow_ipc::FileRow {
+                    path: vec![b'a', 0xff],
+                    size: (mask & 1 != 0).then_some(u64::MAX),
+                    modified: (mask & 2 != 0).then_some(i64::MIN),
+                    created: (mask & 4 != 0).then_some(i64::MAX),
+                    accessed: (mask & 8 != 0).then_some(-1),
+                    attributes: (mask & 16 != 0).then_some(u32::MAX),
+                }],
+                columns: u32::from(mask),
+                more: false,
+            }),
+        );
+    }
     round_trip(
         0,
         Message::Request(Request::Hello {
@@ -126,6 +161,50 @@ fn every_message_round_trips() {
 }
 
 #[test]
+fn metadata_rows_refuse_invalid_masks_versions_and_truncation() {
+    let frame = encode_frame(
+        7,
+        &Message::Response(Response::Rows {
+            sort_pending: false,
+            rows: vec![ferrow_ipc::FileRow {
+                path: b"x".to_vec(),
+                size: Some(3),
+                ..Default::default()
+            }],
+            columns: 3,
+            more: false,
+        }),
+    )
+    .unwrap();
+    for len in 0..frame.len() - 4 {
+        assert!(decode_payload(&frame[4..4 + len]).is_err());
+    }
+    for (offset, value) in [(4, 1), (11, 128), (15, 128), (25, 128)] {
+        let mut invalid = frame.clone();
+        invalid[offset] = value;
+        assert!(
+            decode_payload(&invalid[4..]).is_err(),
+            "accepted offset {offset}"
+        );
+    }
+    assert!(
+        encode_frame(
+            0,
+            &Message::Response(Response::Rows {
+                sort_pending: false,
+                rows: vec![ferrow_ipc::FileRow {
+                    size: Some(1),
+                    ..Default::default()
+                }],
+                columns: 0,
+                more: false
+            })
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn frame_limits_are_enforced_on_encode() {
     let big_text = "x".repeat(MAX_TEXT_BYTES + 1);
     assert_eq!(
@@ -173,15 +252,15 @@ fn over_limit_length_prefix_is_rejected_before_allocating() {
 fn malformed_payloads_are_typed_errors() {
     assert_eq!(decode_payload(&[]), Err(ProtocolError::Truncated));
     assert_eq!(
-        decode_payload(&[1, 99, 0, 0, 0, 0]),
+        decode_payload(&[PROTOCOL_VERSION as u8, 99, 0, 0, 0, 0]),
         Err(ProtocolError::UnknownKind(99))
     );
     // Query with a huge text length.
-    let mut payload = vec![1, 2, 0, 0, 0, 0];
+    let mut payload = vec![PROTOCOL_VERSION as u8, 2, 0, 0, 0, 0];
     payload.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(decode_payload(&payload), Err(ProtocolError::TooLarge));
     // Query with invalid UTF-8 text.
-    let mut payload = vec![1, 2, 0, 0, 0, 0];
+    let mut payload = vec![PROTOCOL_VERSION as u8, 2, 0, 0, 0, 0];
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.push(0xff);
     payload.extend_from_slice(&[0; 9]);

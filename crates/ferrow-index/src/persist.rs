@@ -5,10 +5,12 @@
 //! | Field | Type | Notes |
 //! |---|---|---|
 //! | magic | `[u8; 8]` | `FERROWID` |
-//! | version | `u32` | currently 1 |
+//! | version | `u32` | writes 3; reads core v1 and v3 |
 //! | entry_count | `u32` | |
 //! | arena_len | `u32` | both arenas have this length |
 //! | checksum | `u32` | CRC-32 (IEEE) over everything after this field |
+//! | columns | `u32` | v3 presence mask |
+//! | metadata_len | `u32` | v3 exact packed metadata length |
 //! | parent | `u32` × n | |
 //! | name_off | `u32` × n | |
 //! | name_len | `u16` × n | |
@@ -27,16 +29,21 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::{Index, OwnedColumns, ROOT_PARENT, fold_name};
+use crate::metadata::MetadataColumns;
+use crate::{ColumnSet, Index, OwnedColumns, ROOT_PARENT, fold_name};
 
 pub const MAGIC: [u8; 8] = *b"FERROWID";
-pub const VERSION: u32 = 1;
-const HEADER_LEN: usize = 8 + 4 + 4 + 4 + 4;
+pub const VERSION: u32 = 3;
+const HEADER_LEN: usize = 32;
+const CHECKSUM_START: usize = 24;
 /// Sane ceiling for one index file (16 GiB). A header claiming more is
 /// rejected before any payload is read or allocated.
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 struct Header {
+    header_len: usize,
+    metadata_len: u32,
+    columns: ColumnSet,
     entry_count: u32,
     arena_len: u32,
     checksum: u32,
@@ -44,33 +51,57 @@ struct Header {
 
 /// Exact total file length for the given counts, in `u64` so the math is
 /// overflow-free on 32-bit targets too.
-fn expected_len(entry_count: u32, arena_len: u32) -> u64 {
-    HEADER_LEN as u64 + entry_count as u64 * 16 + arena_len as u64 * 2
+fn expected_len(n: u32, arena: u32, metadata: u32, header: usize) -> u64 {
+    header as u64 + n as u64 * 16 + arena as u64 * 2 + metadata as u64
 }
 
 fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
-    if data.len() < HEADER_LEN {
-        // Too short for a header: bad magic if the prefix disagrees, else truncated.
-        if data.len() >= MAGIC.len() && data[..MAGIC.len()] != MAGIC {
-            return Err(LoadError::WrongMagic);
-        }
+    if data.len() < 8 {
         return Err(LoadError::Truncated);
     }
     if data[..8] != MAGIC {
         return Err(LoadError::WrongMagic);
     }
-    let u32at =
-        |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
-    let version = u32at(8);
-    if version != VERSION {
+    if data.len() < 12 {
+        return Err(LoadError::Truncated);
+    }
+    let at = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().expect("bounded header"));
+    let version = at(8);
+    if version != 1 && version != VERSION {
         return Err(LoadError::UnsupportedVersion(version));
     }
-    let header = Header {
-        entry_count: u32at(12),
-        arena_len: u32at(16),
-        checksum: u32at(20),
+    let header_len = if version == 1 { 24 } else { HEADER_LEN };
+    if data.len() < header_len {
+        return Err(LoadError::Truncated);
+    }
+    let columns = if version == 1 {
+        ColumnSet::NONE
+    } else {
+        ColumnSet::from_bits(at(24)).ok_or(LoadError::Corrupt("unknown metadata columns"))?
     };
-    if expected_len(header.entry_count, header.arena_len) > MAX_INDEX_BYTES {
+    let metadata_len = if version == 1 { 0 } else { at(28) };
+    let header = Header {
+        header_len,
+        metadata_len,
+        columns,
+        entry_count: at(12),
+        arena_len: at(16),
+        checksum: at(20),
+    };
+    let n = header.entry_count as u64;
+    let count = columns.bits().count_ones() as u64;
+    let minimum =
+        count * (n * 4 + n.div_ceil(8) + 4) + u64::from(columns.contains(ColumnSet::SIZE)) * n;
+    if (metadata_len as u64) < minimum || metadata_len as u64 > minimum + count * n * 12 {
+        return Err(LoadError::Corrupt("invalid metadata payload length"));
+    }
+    if expected_len(
+        header.entry_count,
+        header.arena_len,
+        metadata_len,
+        header_len,
+    ) > MAX_INDEX_BYTES
+    {
         return Err(LoadError::Corrupt("index size exceeds limit"));
     }
     Ok(header)
@@ -110,7 +141,7 @@ impl fmt::Display for LoadError {
             LoadError::UnsupportedVersion(v) => {
                 write!(
                     f,
-                    "unsupported index version {v} (this build reads {VERSION})"
+                    "unsupported index version {v} (this build reads 1 and {VERSION}); rebuild the index"
                 )
             }
             LoadError::Truncated => write!(f, "index file is truncated"),
@@ -133,7 +164,11 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
     let n32 = u32::try_from(n).map_err(|_| SaveError::TooLarge("entry count"))?;
     let arena32 = u32::try_from(c.arena.len()).map_err(|_| SaveError::TooLarge("name arena"))?;
 
-    let payload_len = n * (4 + 4 + 2 + 2 + 4) + c.arena.len() * 2;
+    let metadata_len = u32::try_from(index.metadata.serialized_len())
+        .map_err(|_| SaveError::TooLarge("metadata columns"))?;
+    let payload_len = usize::try_from(expected_len(n32, arena32, metadata_len, HEADER_LEN))
+        .map_err(|_| SaveError::TooLarge("metadata columns"))?
+        - HEADER_LEN;
     let mut buf = Vec::with_capacity(HEADER_LEN + payload_len);
     buf.extend_from_slice(&MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -141,6 +176,8 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
     buf.extend_from_slice(&arena32.to_le_bytes());
     let checksum_at = buf.len();
     buf.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    buf.extend_from_slice(&index.columns_present().bits().to_le_bytes());
+    buf.extend_from_slice(&metadata_len.to_le_bytes());
 
     for v in c.parent {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -160,7 +197,8 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    let sum = crc32(&buf[HEADER_LEN..]);
+    index.metadata.write(&mut buf);
+    let sum = crc32(&buf[CHECKSUM_START..]);
     buf[checksum_at..checksum_at + 4].copy_from_slice(&sum.to_le_bytes());
 
     write_atomically(path, &buf).map_err(SaveError::Io)
@@ -327,7 +365,12 @@ fn load_from<R: std::io::Read>(
     reader.read_exact(&mut data).map_err(LoadError::Io)?;
     timings.read += t.elapsed();
     let header = parse_header(&data)?;
-    let expected = expected_len(header.entry_count, header.arena_len);
+    let expected = expected_len(
+        header.entry_count,
+        header.arena_len,
+        header.metadata_len,
+        header.header_len,
+    );
     if file_len < expected {
         return Err(LoadError::Truncated);
     }
@@ -362,7 +405,12 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     let header = parse_header(data)?;
     let n = header.entry_count as usize;
     let arena_len = header.arena_len as usize;
-    let expected = expected_len(header.entry_count, header.arena_len);
+    let expected = expected_len(
+        header.entry_count,
+        header.arena_len,
+        header.metadata_len,
+        header.header_len,
+    );
     if (data.len() as u64) < expected {
         return Err(LoadError::Truncated);
     }
@@ -370,14 +418,14 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
     let t = Instant::now();
-    let sum_ok = crc32(&data[HEADER_LEN..]) == header.checksum;
+    let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
     timings.checksum += t.elapsed();
     if !sum_ok {
         return Err(LoadError::ChecksumMismatch);
     }
 
     let t = Instant::now();
-    let mut at = HEADER_LEN;
+    let mut at = header.header_len;
     let parent = read_u32s(data, &mut at, n)?;
     let name_off = read_u32s(data, &mut at, n)?;
     let name_len = read_u16s(data, &mut at, n)?;
@@ -385,6 +433,10 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     let arena = take(data, &mut at, arena_len)?.to_vec();
     let folded_arena = take(data, &mut at, arena_len)?.to_vec();
     let sorted = read_u32s(data, &mut at, n)?;
+    let metadata = MetadataColumns::read(data, &mut at, n, header.columns)?;
+    if at != data.len() {
+        return Err(LoadError::Corrupt("unexpected metadata bytes"));
+    }
     timings.decode += t.elapsed();
     let structure_started = Instant::now();
 
@@ -532,7 +584,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     timings.derived += derived_started.elapsed();
     timings.derived_sort = timings.derived - timings.derived_fold;
 
-    Ok(Index::from_columns(OwnedColumns {
+    let mut index = Index::from_columns(OwnedColumns {
         parent,
         name_off,
         name_len,
@@ -540,7 +592,9 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         arena,
         folded_arena,
         sorted,
-    }))
+    });
+    index.metadata = metadata;
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -655,7 +709,7 @@ mod tests {
     }
 
     fn fix_checksum(bytes: &mut [u8]) {
-        let sum = crc32(&bytes[HEADER_LEN..]);
+        let sum = crc32(&bytes[CHECKSUM_START..]);
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
     }
 
@@ -711,7 +765,7 @@ mod tests {
         let a = 255u32;
         let mut b = Vec::new();
         b.extend_from_slice(b"FERROWID");
-        for v in [1, n, a, 0] {
+        for v in [VERSION, n, a, 0, 0, 0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         for _ in 0..n {
@@ -789,7 +843,7 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
         // Point entry 1's parent at itself (parent column starts at HEADER_LEN).
         bytes[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&1u32.to_le_bytes());
-        let sum = crc32(&bytes[HEADER_LEN..]);
+        let sum = crc32(&bytes[CHECKSUM_START..]);
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
         assert!(matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))));
     }

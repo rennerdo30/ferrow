@@ -7,13 +7,19 @@
 //! rebuilt from the parent chain on demand. See
 //! `docs/decisions/0001-index-layout.md`.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
+mod metadata;
 pub mod osname;
 pub mod persist;
+use metadata::MetadataColumns;
+pub use metadata::{
+    ColumnSet, EntryMetadata, MetadataOrder, SortKey, SortStatus, SortTicket, metadata_timestamp,
+    timestamp_ticks,
+};
 
 pub use persist::{LoadError, LoadTimings, SaveError};
 
@@ -73,16 +79,63 @@ pub fn fold_name(name: &[u8], out: &mut Vec<u8>) {
 /// Immutable, query-ready index. Share it as `Arc<Index>`.
 #[derive(Debug)]
 pub struct Index {
+    metadata: MetadataColumns,
     parent: Vec<u32>,
     name_off: Vec<u32>,
     name_len: Vec<u16>,
     flags: Vec<u16>,
     arena: Vec<u8>,
     folded_arena: Vec<u8>,
-    sorted: Vec<u32>,
+    sorted: Arc<Vec<u32>>,
 }
 
 impl Index {
+    pub fn columns_present(&self) -> ColumnSet {
+        self.metadata.present()
+    }
+    pub fn metadata(&self, id: u32) -> EntryMetadata {
+        self.metadata.get(id)
+    }
+    /// Ready metadata order; `None` means the column was not indexed.
+    pub fn metadata_order(&self, key: SortKey, descending: bool) -> Option<MetadataOrder<'_>> {
+        self.metadata.order(key, descending)
+    }
+    /// Start preparation once, without waiting, allocating by entry count, or
+    /// borrowing the query pool. Pending searches can keep using name order.
+    pub fn request_sort(&self, key: SortKey) -> SortStatus {
+        self.metadata.request(key, self.sorted.clone(), None)
+    }
+    /// Share preparation until every requesting token is cancelled. An
+    /// uncancelled request continues warming the cache after search returns.
+    /// Explicit `request_sort` calls keep it alive until ready or retirement.
+    pub fn request_sort_cancellable(
+        &self,
+        key: SortKey,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> SortStatus {
+        self.metadata
+            .request(key, self.sorted.clone(), Some(cancel))
+    }
+    #[cfg(feature = "test-hooks")]
+    pub fn request_sort_with_hook(
+        &self,
+        key: SortKey,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> SortStatus {
+        self.metadata
+            .request_with_hook(key, self.sorted.clone(), hook)
+    }
+    pub fn sort_ticket(&self, key: SortKey) -> Option<SortTicket> {
+        self.metadata.ticket(key)
+    }
+    #[cfg(feature = "bench-internals")]
+    pub fn sort_value_for_benchmark(&self, key: SortKey, id: u32) -> Option<i128> {
+        self.metadata.value(key, id)
+    }
+    pub fn metadata_heap_bytes(&self) -> usize {
+        self.metadata.heap_bytes()
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.parent.len()
@@ -163,6 +216,9 @@ impl Index {
             + self.arena.capacity()
             + self.folded_arena.capacity()
             + self.sorted.capacity() * 4
+            + self.metadata.heap_bytes()
+            + std::mem::size_of::<Vec<u32>>()
+            + 2 * std::mem::size_of::<usize>()
     }
 
     /// Save to the versioned binary format. See [`persist`].
@@ -197,13 +253,14 @@ impl Index {
 
     pub(crate) fn from_columns(c: OwnedColumns) -> Index {
         Index {
+            metadata: MetadataColumns::default(),
             parent: c.parent,
             name_off: c.name_off,
             name_len: c.name_len,
             flags: c.flags,
             arena: c.arena,
             folded_arena: c.folded_arena,
-            sorted: c.sorted,
+            sorted: Arc::new(c.sorted),
         }
     }
 }
@@ -229,6 +286,7 @@ pub(crate) struct OwnedColumns {
 }
 
 struct RawEntry {
+    metadata: EntryMetadata,
     id: u32,
     parent: u32,
     name: Vec<u8>,
@@ -237,11 +295,20 @@ struct RawEntry {
 
 const SHARDS: usize = 16;
 
+/// Freeze costs; metadata collection and sort are disjoint parts of total.
+#[derive(Debug, Clone, Copy)]
+pub struct FreezeTimings {
+    pub total: std::time::Duration,
+    pub metadata_collect: std::time::Duration,
+    pub metadata_sort: std::time::Duration,
+}
+
 /// Thread-safe builder. Entries may be added from many threads in any
 /// order; sharding keeps lock contention low. Ids are handed out densely,
 /// so parent ids returned by [`IndexBuilder::add`] stay valid after
 /// [`IndexBuilder::freeze`].
 pub struct IndexBuilder {
+    columns: ColumnSet,
     shards: Vec<Mutex<Vec<RawEntry>>>,
     next_id: AtomicU32,
     next_shard: AtomicUsize,
@@ -255,7 +322,12 @@ impl Default for IndexBuilder {
 
 impl IndexBuilder {
     pub fn new() -> IndexBuilder {
+        Self::with_columns(ColumnSet::NONE)
+    }
+
+    pub fn with_columns(columns: ColumnSet) -> IndexBuilder {
         IndexBuilder {
+            columns,
             shards: (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect(),
             next_id: AtomicU32::new(0),
             next_shard: AtomicUsize::new(0),
@@ -272,6 +344,16 @@ impl IndexBuilder {
     /// Names longer than `u16::MAX` bytes are truncated to fit the column
     /// (real file systems cap components far below that).
     pub fn add(&self, parent: u32, name: &[u8], flags: u16) -> u32 {
+        self.add_with_metadata(parent, name, flags, EntryMetadata::default())
+    }
+
+    pub fn add_with_metadata(
+        &self,
+        parent: u32,
+        name: &[u8],
+        flags: u16,
+        metadata: EntryMetadata,
+    ) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let shard = self.next_shard.fetch_add(1, Ordering::Relaxed) % SHARDS;
         let mut flags = flags;
@@ -279,6 +361,7 @@ impl IndexBuilder {
             flags |= flags::NAME_NOT_UTF8;
         }
         let entry = RawEntry {
+            metadata,
             id,
             parent,
             name: name.to_vec(),
@@ -304,6 +387,11 @@ impl IndexBuilder {
     /// Freeze into an immutable [`Index`]: builds the arenas (folding in
     /// parallel) and the name-sort permutation (parallel sort).
     pub fn freeze(self) -> Index {
+        self.freeze_with_timings().0
+    }
+
+    pub fn freeze_with_timings(self) -> (Index, FreezeTimings) {
+        let started = std::time::Instant::now();
         let n = self.len();
         let mut raw: Vec<RawEntry> = Vec::with_capacity(n);
         for shard in self.shards {
@@ -331,6 +419,9 @@ impl IndexBuilder {
         }
 
         // Release builder entries before folding/sorting the frozen columns.
+        let t = std::time::Instant::now();
+        let metadata = MetadataColumns::build(&raw, self.columns);
+        let metadata_collect = t.elapsed();
         drop(raw);
         // Allocate the final arena once and split it only at entry boundaries.
         // Each worker reuses scratch; no per-name Vec or slice table survives.
@@ -378,15 +469,25 @@ impl IndexBuilder {
                 .then_with(|| a.cmp(&b))
         });
 
-        Index {
+        let metadata_sort = std::time::Duration::ZERO;
+        let index = Index {
+            metadata,
             parent,
             name_off,
             name_len,
             flags: ent_flags,
             arena,
             folded_arena,
-            sorted,
-        }
+            sorted: Arc::new(sorted),
+        };
+        (
+            index,
+            FreezeTimings {
+                total: started.elapsed(),
+                metadata_collect,
+                metadata_sort,
+            },
+        )
     }
 }
 
@@ -550,7 +651,7 @@ mod tests {
         idx.flags.reserve(47);
         idx.arena.reserve(53);
         idx.folded_arena.reserve(59);
-        idx.sorted.reserve(61);
+        Arc::get_mut(&mut idx.sorted).unwrap().reserve(61);
         assert!(idx.parent.capacity() > idx.parent.len());
         assert!(idx.name_off.capacity() > idx.name_off.len());
         assert!(idx.name_len.capacity() > idx.name_len.len());
@@ -567,7 +668,9 @@ mod tests {
             + idx.flags.capacity() * 2
             + idx.arena.capacity()
             + idx.folded_arena.capacity()
-            + idx.sorted.capacity() * 4;
+            + idx.sorted.capacity() * 4
+            + std::mem::size_of::<Vec<u32>>()
+            + 2 * std::mem::size_of::<usize>();
         assert_eq!(idx.heap_bytes(), expected);
         assert_eq!(idx.arena.len(), idx.folded_arena.len());
         let live_floor = idx.len() * (4 + 4 + 2 + 2 + 4) + idx.arena.len() * 2;

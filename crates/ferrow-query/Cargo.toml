@@ -22,6 +22,7 @@ regex = "1.13.1"
 regex-syntax = "0.8.11"
 
 [dev-dependencies]
+ferrow-index = { path = "../ferrow-index", features = ["test-hooks", "bench-internals"] }
 divan = "0.1.21"
 ferrow-fixture = { path = "../ferrow-fixture" }
 ferrow-ipc = { path = "../ferrow-ipc" }

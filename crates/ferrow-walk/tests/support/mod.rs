@@ -91,6 +91,7 @@ impl Drop for Fixture {
 
 pub fn run(root: &Path, excludes: Vec<PathBuf>, follow: bool) -> ferrow_index::Index {
     let (index, report) = ferrow_walk::scan(&ferrow_walk::WalkOptions {
+        columns: Default::default(),
         roots: vec![root.to_path_buf()],
         excludes,
         follow_symlinks: follow,
