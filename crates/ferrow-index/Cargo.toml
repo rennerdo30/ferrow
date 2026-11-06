@@ -1,0 +1,13 @@
+[package]
+name = "ferrow-index"
+description = "Compact columnar in-memory file-name index for Ferrow."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+rayon = "1"

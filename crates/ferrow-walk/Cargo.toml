@@ -1,0 +1,14 @@
+[package]
+name = "ferrow-walk"
+description = "Portable parallel directory-walk backend for Ferrow."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ferrow-index = { path = "../ferrow-index" }
+rayon = "1"

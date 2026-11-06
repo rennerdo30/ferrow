@@ -1,0 +1,18 @@
+[package]
+name = "ferrow-query"
+description = "Query parser and parallel matcher for Ferrow."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ferrow-index = { path = "../ferrow-index" }
+memchr = "2"
+rayon = "1"
+
+[dev-dependencies]
+ferrow-fixture = { path = "../ferrow-fixture" }
