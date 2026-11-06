@@ -56,7 +56,10 @@ deterministic on every platform and independent of locale.
 ids), so many threads can add entries in any order and parent ids stay
 valid after `freeze()`. Freeze merges the shards, builds both arenas
 (folding in parallel), and computes the sort order with a parallel sort.
-After freeze the index is immutable and shared as `Arc<Index>`.
+Freeze drops the merged builder entries before folding/sorting. The final
+folded arena is allocated once, partitioned at entry boundaries, and filled
+with reusable worker scratch rather than per-name allocations or a per-name
+slice table. After freeze the index is immutable and shared as `Arc<Index>`.
 
 ### File format (version 1)
 

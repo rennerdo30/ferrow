@@ -21,15 +21,23 @@ fn median(mut samples: Vec<Duration>) -> f64 {
 }
 
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("service benchmark: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    assert_eq!(args.len(), 2, "usage: service_bench <ferrow> <index>");
-    let index = Index::load(std::path::Path::new(&args[1])).expect("load reference fixture");
+    if args.len() != 2 {
+        return Err("usage: service_bench <ferrow> <index>".into());
+    }
+    let index = Index::load(std::path::Path::new(&args[1]))?;
     let name = format!(
         "ferrow-bench-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos()
     );
     let endpoint = Endpoint::named(&name);
@@ -41,26 +49,25 @@ fn main() {
             .env("FERROW_ENDPOINT_NAME", &name)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start service run"),
+            .spawn()?,
     );
     eprintln!(
         "FERROW-SERVICE-ACTIVE pid={} mode=unprivileged-run startup_timeout_s=30",
         service.0.id()
     );
     let mut client = loop {
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "service startup timed out"
-        );
-        assert!(
-            service.0.try_wait().unwrap().is_none(),
-            "service exited during startup"
-        );
+        if started.elapsed() >= Duration::from_secs(30) {
+            return Err("service startup timed out".into());
+        }
+        if service.0.try_wait()?.is_some() {
+            return Err("service exited during startup".into());
+        }
         if let Ok(mut client) = Client::connect(&endpoint)
             && let Ok((entries, _, _)) = client.status()
         {
-            assert_eq!(entries, index.len() as u64);
+            if entries != index.len() as u64 {
+                return Err("service loaded wrong fixture".into());
+            }
             break client;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -78,7 +85,7 @@ fn main() {
         "zzzz-no-hit-zzzz",
         "文書",
     ] {
-        let query = Query::parse(text).unwrap();
+        let query = Query::parse(text)?;
         let expected = search(
             &index,
             &query,
@@ -97,18 +104,24 @@ fn main() {
             })
             .collect();
         let (total, cancelled) = count(&index, &query, &CancelToken::new());
-        assert!(!cancelled);
+        if cancelled {
+            return Err("reference count cancelled".into());
+        }
         let mut page = Vec::new();
         let mut full = Vec::new();
         for _ in 0..5 {
             let t = Instant::now();
-            let paths = client.query(text, 100).expect("IPC first page");
+            let paths = client.query(text, 100)?;
             page.push(t.elapsed());
-            assert_eq!(paths, expected_paths, "IPC order/content for {text:?}");
+            if paths != expected_paths {
+                return Err(format!("IPC order/content for {text:?}").into());
+            }
             let t = Instant::now();
-            let got = client.count(text).expect("IPC count");
+            let got = client.count(text)?;
             full.push(t.elapsed());
-            assert_eq!(got, total as u64, "IPC count for {text:?}");
+            if got != total as u64 {
+                return Err(format!("IPC count for {text:?}").into());
+            }
         }
         println!(
             "FERROW-SERVICE query={text:?} first_page_ms={:.6} page_hits={} full_count_ms={:.6} total_hits={total}",
@@ -120,4 +133,5 @@ fn main() {
     drop(client);
     // Every normal IPC operation has its existing five-second deadline.
     // The CI step also imposes an overall harness timeout.
+    Ok(())
 }
