@@ -515,11 +515,28 @@ mod tests {
 
     #[test]
     fn heap_bytes_counts_all_columns() {
-        let idx = small_index();
+        let mut idx = small_index();
+        // Reserve extra capacity in every column and both arenas so
+        // capacity and len differ everywhere: a heap_bytes() that used
+        // len() instead of capacity() (or dropped a column) cannot
+        // accidentally produce the same total.
+        idx.parent.reserve(37);
+        idx.name_off.reserve(41);
+        idx.name_len.reserve(43);
+        idx.flags.reserve(47);
+        idx.arena.reserve(53);
+        idx.folded_arena.reserve(59);
+        idx.sorted.reserve(61);
+        assert!(idx.parent.capacity() > idx.parent.len());
+        assert!(idx.name_off.capacity() > idx.name_off.len());
+        assert!(idx.name_len.capacity() > idx.name_len.len());
+        assert!(idx.flags.capacity() > idx.flags.len());
+        assert!(idx.arena.capacity() > idx.arena.len());
+        assert!(idx.folded_arena.capacity() > idx.folded_arena.len());
+        assert!(idx.sorted.capacity() > idx.sorted.len());
         // Exact per-column capacity accounting: 4+4+2+2 bytes of fixed
         // columns plus 4 bytes of sort order per entry, plus both
-        // arenas. Dropping a column (or using len instead of capacity)
-        // breaks this assertion.
+        // arenas.
         let expected = idx.parent.capacity() * 4
             + idx.name_off.capacity() * 4
             + idx.name_len.capacity() * 2
@@ -528,12 +545,8 @@ mod tests {
             + idx.folded_arena.capacity()
             + idx.sorted.capacity() * 4;
         assert_eq!(idx.heap_bytes(), expected);
-        // Every column contributes, and capacities cover the live data.
-        assert!(idx.parent.capacity() >= idx.len());
-        assert!(idx.sorted.capacity() >= idx.len());
-        assert!(idx.arena.capacity() >= idx.arena.len());
         assert_eq!(idx.arena.len(), idx.folded_arena.len());
         let live_floor = idx.len() * (4 + 4 + 2 + 2 + 4) + idx.arena.len() * 2;
-        assert!(idx.heap_bytes() >= live_floor);
+        assert!(idx.heap_bytes() > live_floor);
     }
 }
