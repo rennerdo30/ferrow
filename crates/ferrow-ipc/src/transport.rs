@@ -221,9 +221,15 @@ mod platform {
                     revents: 0,
                 },
             ];
-            // SAFETY: two valid descriptors and a live two-element pollfd array.
-            if unsafe { libc::poll(waits.as_mut_ptr(), 2, -1) } < 0 {
-                return Err(std::io::Error::last_os_error());
+            loop {
+                // SAFETY: two valid descriptors and a live two-element pollfd array.
+                if unsafe { libc::poll(waits.as_mut_ptr(), 2, -1) } >= 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
             if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(std::io::Error::new(
@@ -384,23 +390,31 @@ mod platform {
         deadline: std::time::Instant,
     ) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
-        let timeout = super::remaining(deadline)?
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
-        let mut wait = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        // SAFETY: one live socket descriptor and one initialized pollfd.
-        match unsafe { libc::poll(&raw mut wait, 1, timeout) } {
-            -1 => Err(std::io::Error::last_os_error()),
-            0 => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "IPC deadline expired",
-            )),
-            _ => Ok(()),
+        loop {
+            let timeout = super::remaining(deadline)?
+                .as_millis()
+                .saturating_add(1)
+                .min(i32::MAX as u128) as i32;
+            let mut wait = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            // SAFETY: one live socket descriptor and one initialized pollfd.
+            return match unsafe { libc::poll(&raw mut wait, 1, timeout) } {
+                -1 => {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    Err(error)
+                }
+                0 => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "IPC deadline expired",
+                )),
+                _ => Ok(()),
+            };
         }
     }
 
