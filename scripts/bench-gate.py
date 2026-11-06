@@ -8,6 +8,8 @@ import shlex
 import sys
 
 QUERIES = {"a", "re", "report 2024", "!tmp log", "zzzz-no-hit-zzzz", "文書"}
+# load + memory, then first page and full count per query, in-process and IPC.
+EXPECTED_METRICS = 2 + 2 * 2 * len(QUERIES)
 
 
 def number(value):
@@ -40,8 +42,12 @@ def parse(text):
             raise ValueError(f"missing measurement: {key}")
     if measures["entries"] <= 0 or measures["heap_bytes"] <= 0:
         raise ValueError("empty fixture")
-    if set(queries) != QUERIES or (service and set(service) != QUERIES):
-        raise ValueError("missing or unexpected query set")
+    if set(queries) != QUERIES:
+        raise ValueError("missing or unexpected in-process query set")
+    # Every arm must carry the full IPC set: an absent service arm is
+    # missing evidence, never a reason to compare fewer metrics.
+    if set(service) != QUERIES:
+        raise ValueError("missing or unexpected service (IPC) query set")
     return measures, queries, service
 
 
@@ -52,8 +58,6 @@ def compare(base, head, expected_entries=5_000_000):
         raise ValueError("wrong fixture size")
     if bm["seed"] != 2026 or hm["seed"] != 2026:
         raise ValueError("wrong fixture seed")
-    if bool(bs) != bool(hs):
-        raise ValueError("service arm missing")
     metrics = [("load total (ms)", bm["load_ms_median"], hm["load_ms_median"], True),
                ("bytes/entry", bm["heap_bytes"] / expected_entries,
                 hm["heap_bytes"] / expected_entries, False)]
@@ -64,6 +68,8 @@ def compare(base, head, expected_entries=5_000_000):
                     raise ValueError(f"changed {key}: {label} {query!r}")
             for key in ("first_page_ms", "full_count_ms"):
                 metrics.append((f"{label} {query!r} {key}", before[query][key], after[query][key], True))
+    if len(metrics) != EXPECTED_METRICS:
+        raise ValueError(f"expected {EXPECTED_METRICS} metrics, got {len(metrics)}")
     # 0.1 ms absolute tolerance dominates the relative allowance below 1 ms.
     # Memory has no timing tolerance. Strictly greater fails; the boundary passes.
     return [(name, b, h, b + max(b * 0.10, 0.1 if timed else 0),

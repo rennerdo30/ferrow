@@ -16,8 +16,13 @@ def fixture():
     lines = ["FERROW-MEASURE entries=16 seed=2026 heap_bytes=800 bytes_per_entry=50",
              "FERROW-MEASURE load_ms_median=100"]
     for query in sorted(gate.QUERIES):
-        lines.append(f'FERROW-QUERY query="{query}" first_page_ms=0.2 page_hits=2 full_count_ms=10 total_hits=2')
+        for prefix in ("FERROW-QUERY", "FERROW-SERVICE"):
+            lines.append(f'{prefix} query="{query}" first_page_ms=0.2 page_hits=2 full_count_ms=10 total_hits=2')
     return "\n".join(lines)
+
+
+def without_service(text):
+    return "\n".join(line for line in text.splitlines() if not line.startswith("FERROW-SERVICE"))
 
 
 class GateTests(unittest.TestCase):
@@ -70,15 +75,33 @@ class GateTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises((ValueError, KeyError)):
                 gate.parse(text)
 
-    def test_service_uses_the_same_gate_and_is_required_in_both_arms(self):
-        service_text = fixture() + "\n" + "\n".join(line.replace("FERROW-QUERY", "FERROW-SERVICE")
-                                                       for line in fixture().splitlines() if line.startswith("FERROW-QUERY"))
-        base = gate.parse(service_text)
-        head = copy.deepcopy(base)
-        head[2]["a"]["full_count_ms"] = 12
-        self.assertTrue(any(row[-1] for row in gate.compare(base, head, 16)))
+    def test_service_uses_the_same_gate(self):
+        self.head[2]["a"]["full_count_ms"] = 12
+        self.assertTrue(any(row[-1] for row in self.rows()))
+        self.assertEqual(len(self.rows()), gate.EXPECTED_METRICS)
+
+    def test_service_set_is_required_in_every_arm(self):
+        # Missing in one arm, in both arms, or only partly present: refused.
         with self.assertRaises(ValueError):
-            gate.compare(self.base, head, 16)
+            gate.parse(without_service(fixture()))
+        partial = fixture().replace('FERROW-SERVICE query="a"', 'IGNORE query="a"')
+        with self.assertRaises(ValueError):
+            gate.parse(partial)
+
+    def test_cli_refuses_when_both_service_arms_are_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
+            base.write_text(without_service(fixture()), encoding="utf-8")
+            head.write_text(without_service(fixture()), encoding="utf-8")
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name("bench-gate.py")),
+                                     str(base), str(head), "--entries", "16"], capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_compare_refuses_an_incomplete_metric_inventory(self):
+        del self.head[2]["a"]
+        del self.base[2]["a"]
+        with self.assertRaises(ValueError):
+            self.rows()
 
     def test_cli_exit_codes_and_summary_on_trivial_inputs(self):
         with tempfile.TemporaryDirectory() as folder:
