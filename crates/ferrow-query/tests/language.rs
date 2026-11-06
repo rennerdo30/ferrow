@@ -344,6 +344,46 @@ fn raw_names_scalar_questions_and_prefix_pruning_are_sound() {
     );
 }
 
+#[test]
+fn wildcard_and_path_cancellation_preserve_the_completed_prefix() {
+    use ferrow_query::CancelToken;
+    let index = ferrow_fixture::generate(100_000, 2026);
+    for text in ["*.log", "path:*"] {
+        let query = Query::parse(text).unwrap();
+        let token = CancelToken::new();
+        let hook = token.clone();
+        let result = search(
+            &index,
+            &query,
+            &SearchOptions {
+                cancel: token,
+                on_block: Some(std::sync::Arc::new(move |block| {
+                    if block == 0 {
+                        hook.cancel();
+                    }
+                })),
+                ..SearchOptions::default()
+            },
+        );
+        assert!(result.cancelled);
+        assert!(result.visited <= ferrow_query::BLOCK * rayon::current_num_threads());
+        let expected = oracle(&index, &query);
+        assert_eq!(result.hits, expected[..result.hits.len()], "{text}");
+        let cancelled = CancelToken::cancelled();
+        let result = search(
+            &index,
+            &query,
+            &SearchOptions {
+                cancel: cancelled.clone(),
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(result.visited, 0);
+        assert!(result.hits.is_empty() && result.cancelled);
+        assert_eq!(ferrow_query::count(&index, &query, &cancelled), (0, true));
+    }
+}
+
 fn names(index: &Index, text: &str) -> Vec<String> {
     search(
         index,

@@ -53,7 +53,7 @@ impl Prepared {
             },
         }
     }
-    fn text_match(&self, hay: &[u8]) -> bool {
+    fn text_match(&self, hay: &[u8], cancel: &CancelToken) -> bool {
         match &self.term.pattern {
             Pattern::Literal => self
                 .finder
@@ -80,7 +80,7 @@ impl Prepared {
                     };
                     at += found + piece.needle().len();
                 }
-                !self.needle.contains(&b'?') || glob(&self.needle, hay)
+                !self.needle.contains(&b'?') || glob(&self.needle, hay, cancel)
             }
             Pattern::Regex(r) => {
                 self.finder.find(hay).is_some()
@@ -372,7 +372,7 @@ impl Matcher {
                 } else {
                     index.folded_name(id)
                 };
-                p.text_match(hay)
+                p.text_match(hay, cancel)
             }
         }
     }
@@ -388,9 +388,14 @@ fn width(bytes: &[u8]) -> Option<usize> {
     };
     std::str::from_utf8(bytes.get(..n)?).ok().map(|_| n)
 }
-fn glob(pattern: &[u8], hay: &[u8]) -> bool {
+fn glob(pattern: &[u8], hay: &[u8], cancel: &CancelToken) -> bool {
     let (mut p, mut h, mut star) = (0, 0, None);
+    let mut steps = 0usize;
     while h < hay.len() {
+        if steps.is_multiple_of(256) && cancel.is_cancelled() {
+            return false;
+        }
+        steps += 1;
         if pattern.get(p) == Some(&b'*') {
             star = Some((p + 1, h));
             p += 1;
@@ -454,7 +459,7 @@ pub fn highlight_ranges(query: &Query, name: &[u8]) -> Vec<Range<usize>> {
                 } else {
                     &folded
                 };
-                if !p.text_match(hay) {
+                if !p.text_match(hay, &CancelToken::new()) {
                     return;
                 }
                 match &term.pattern {
@@ -522,6 +527,10 @@ mod tests {
         assert!(
             scratch.chain.is_empty(),
             "cancellation must stop parent traversal"
+        );
+        assert!(
+            !glob(b"*?a", b"aaaa", &CancelToken::cancelled()),
+            "scalar wildcard retry must observe cancellation"
         );
     }
 }

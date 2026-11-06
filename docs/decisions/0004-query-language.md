@@ -83,6 +83,8 @@ appears first in the input. Rebuild paths only for surviving candidates,
 with per-worker reused path, folded path and ancestor buffers; no index or
 SearchOptions changes. Check cancellation while traversing parent chains.
 Keep existing ordered first-page admission and cancellation contracts.
+Scalar wildcard retry checks cancellation every 256 steps, so an adversarial
+pattern can be interrupted inside a single long name.
 An anchored wildcard's required name prefix also narrows the existing sorted
 name order by two binary searches. AND may use any required prefix; OR only
 uses a shared required prefix, and NOT never narrows. Non-ASCII sensitive
