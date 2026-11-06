@@ -106,13 +106,47 @@ bump.
 
 ### Exclude matching (`ferrow-walk`)
 
-Excludes are compared against absolute paths component by component: a
-path is excluded when it equals an excluded path or lies under one.
-The check applies to scan roots exactly as to children, so an excluded
-directory cannot be re-included by naming it (or a directory under it)
-as an explicit root. On **Windows the comparison is case-insensitive**
-(components are case-folded with the same `fold_name` used for search),
-matching the platform's usual path semantics; on Unix it is byte-exact.
+Excludes are matched by **filesystem identity**, never by path
+spelling. (String comparison failed twice in review: verbatim `\\?\`
+prefixes and WTF-8 components with non-ASCII case differences both
+named the same directory under a different string.) At scan start
+every exclude path that exists is resolved to its identity — Unix
+`(st_dev, st_ino)`, Windows volume serial number plus the 128-bit
+file id from `GetFileInformationByHandleEx(FileIdInfo)` (falling back
+to the 64-bit file index from `GetFileInformationByHandle` where
+128-bit ids are unsupported). A path that does not exist at scan
+start is reported in the scan report as `exclude not found: …` and
+otherwise ignored.
+
+When the walker is about to descend into a directory, including each
+scan root, it compares that directory's identity against the excluded
+set; a match skips the directory and everything below it. For roots,
+the ancestors' identities are also checked once (bounded by the
+root's depth), so an excluded directory cannot be re-included by
+naming it, or a directory under it, as an explicit root. File
+excludes match by identity inside the directory that contains the
+spelled-out path.
+
+Consequences of identity matching, by construction:
+
+- Any spelling the filesystem resolves to the same object — normal
+  vs verbatim, differently cased components, 8.3 names — excludes it.
+  Case sensitivity is whatever the filesystem itself applies, so
+  per-directory case-sensitive Windows directories are honoured
+  exactly instead of approximated by folding.
+- Symlinks and junctions resolve to their target's identity: reaching
+  an excluded directory through an alias excludes it, and excluding
+  an alias excludes its target.
+- Directory hard links do not exist on the supported platforms; file
+  hard links share one identity, so a file exclude also covers other
+  hard-linked names of the same file in the same containing
+  directory.
+
+Cost: one identity lookup per directory (only while excludes are
+configured or symlinks are followed; the same lookup feeds
+symlink-cycle detection), plus per-file lookups only inside a
+directory that contains a file exclude. Files in general are never
+resolved.
 
 ## Alternatives considered
 

@@ -4,6 +4,7 @@
 //! feeds a [`ferrow_index::IndexBuilder`]. Permission and IO errors are
 //! counted and sampled into the report, never fatal.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,12 +13,18 @@ use std::time::{Duration, Instant};
 use ferrow_index::osname::name_to_bytes;
 use ferrow_index::{Index, IndexBuilder, flags};
 
+mod identity;
+
+use identity::{FileId, file_id};
+
 /// What to scan.
 #[derive(Debug, Clone, Default)]
 pub struct WalkOptions {
     /// Roots to include. Each becomes one root entry in the index.
     pub roots: Vec<PathBuf>,
-    /// Paths to exclude (files or whole subtrees), compared as absolute paths.
+    /// Paths to exclude (files or whole subtrees), matched by
+    /// filesystem identity, so any spelling or alias of the same
+    /// object excludes it.
     pub excludes: Vec<PathBuf>,
     /// Descend into symlinked directories. Off by default.
     pub follow_symlinks: bool,
@@ -92,57 +99,109 @@ fn is_hidden(name: &[u8], entry: &std::fs::DirEntry) -> bool {
     }
 }
 
-/// Normalised comparison key for exclude matching: the lossless bytes
-/// of each path component. On Windows components are case-folded, so
-/// excludes compare case-insensitively (documented in ADR 0001); on
-/// Unix they compare exactly.
-fn path_key(path: &Path) -> Vec<Vec<u8>> {
-    path.components()
-        .map(|component| {
-            let mut bytes = Vec::new();
-            name_to_bytes(component.as_os_str(), &mut bytes);
-            #[cfg(windows)]
-            {
-                let mut folded = Vec::new();
-                ferrow_index::fold_name(&bytes, &mut folded);
-                folded
-            }
-            #[cfg(not(windows))]
-            {
-                bytes
-            }
-        })
-        .collect()
+/// Excluded objects resolved to filesystem identities at scan start.
+///
+/// Directory excludes match by identity wherever the walk reaches
+/// them — any spelling (normal, verbatim, differently cased) or
+/// alias (symlink, junction) of the same directory is skipped with
+/// everything below it. File excludes match by identity inside the
+/// directory that contains the spelled-out path, so identity lookups
+/// stay at one per directory (plus files in such a directory).
+#[derive(Default)]
+struct ExcludeSet {
+    dirs: HashSet<FileId>,
+    files: HashSet<FileId>,
+    files_by_parent: HashMap<FileId, HashSet<FileId>>,
 }
 
-/// True when `key` equals an excluded path or lies under one
-/// (component-wise prefix), so an excluded ancestor cannot be
-/// bypassed by naming a deeper root explicitly.
-fn key_is_excluded(key: &[Vec<u8>], excludes: &[Vec<Vec<u8>>]) -> bool {
-    excludes
-        .iter()
-        .any(|excluded| key.len() >= excluded.len() && key[..excluded.len()] == excluded[..])
+impl ExcludeSet {
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty() && self.files.is_empty()
+    }
+}
+
+/// Resolve every exclude path that exists to its identity. A path
+/// that does not exist at scan start is reported as
+/// `exclude not found: …` and otherwise ignored.
+fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
+    let mut set = ExcludeSet::default();
+    for path in paths {
+        let id = match file_id(path) {
+            Ok(id) => id,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                errors.add(format!("exclude not found: {}", path.display()));
+                continue;
+            }
+            Err(e) => {
+                errors.add(format!("exclude {}: {e}", path.display()));
+                continue;
+            }
+        };
+        match std::fs::metadata(path) {
+            Ok(md) if md.is_dir() => {
+                set.dirs.insert(id);
+            }
+            Ok(_) => {
+                set.files.insert(id);
+                let parent = match path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                    _ => PathBuf::from("."),
+                };
+                if let Ok(parent_id) = file_id(&parent) {
+                    set.files_by_parent.entry(parent_id).or_default().insert(id);
+                }
+            }
+            Err(e) => {
+                errors.add(format!("exclude {}: {e}", path.display()));
+            }
+        }
+    }
+    set
+}
+
+/// True when a scan root is an excluded object itself or lies below
+/// an excluded directory. Ancestors are resolved once per root; the
+/// count is bounded by the root's depth.
+fn root_is_excluded(abs: &Path, root_identity: Option<FileId>, excludes: &ExcludeSet) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    if let Some(id) = root_identity
+        && (excludes.dirs.contains(&id) || excludes.files.contains(&id))
+    {
+        return true;
+    }
+    abs.ancestors()
+        .skip(1)
+        .any(|ancestor| match file_id(ancestor) {
+            Ok(id) => excludes.dirs.contains(&id),
+            Err(_) => false,
+        })
 }
 
 #[derive(Clone, Copy)]
 struct Walker<'a> {
     builder: &'a IndexBuilder,
-    excludes: &'a [Vec<Vec<u8>>],
+    excludes: &'a ExcludeSet,
     follow_symlinks: bool,
     errors: &'a Errors,
 }
 
 impl<'x> Walker<'x> {
-    /// `ancestors` holds the canonical paths of the directory chain
-    /// from the root down to and including `dir`. It is only populated
-    /// when following symlinks, where it bounds cycles: a directory
-    /// whose canonical path is already an ancestor is not descended.
+    /// `ancestors` holds the filesystem identities of the directory
+    /// chain from the root down to and including `dir`. It is only
+    /// populated when following symlinks, where it bounds cycles: a
+    /// directory whose identity is already an ancestor is not
+    /// descended. `dir_identity` is `dir`'s own identity when it was
+    /// resolved (for exclude matching or following), reused here for
+    /// contained file excludes so no second lookup happens.
     fn scan_dir<'scope>(
         self,
         scope: &rayon::Scope<'scope>,
         dir: PathBuf,
         dir_id: u32,
-        ancestors: Vec<PathBuf>,
+        ancestors: Vec<FileId>,
+        dir_identity: Option<FileId>,
     ) where
         'x: 'scope,
     {
@@ -162,9 +221,6 @@ impl<'x> Walker<'x> {
                 }
             };
             let path = entry.path();
-            if self.is_excluded(&path) {
-                continue;
-            }
             let file_type = match entry.file_type() {
                 Ok(t) => t,
                 Err(e) => {
@@ -198,39 +254,57 @@ impl<'x> Walker<'x> {
             if is_hidden(&name, &entry) {
                 ent_flags |= flags::HIDDEN;
             }
+            // Exclude matching by filesystem identity. Directories
+            // are resolved once, before descending: the same lookup
+            // serves the exclude check, symlink-cycle detection and
+            // contained file excludes in the child. Files are only
+            // resolved when their containing directory holds a file
+            // exclude.
+            let need_identity = self.follow_symlinks || !self.excludes.is_empty();
+            let mut child_identity: Option<FileId> = None;
+            if is_dir {
+                if need_identity {
+                    match file_id(&path) {
+                        Ok(id) => {
+                            if self.excludes.dirs.contains(&id) {
+                                continue;
+                            }
+                            child_identity = Some(id);
+                        }
+                        Err(e) => {
+                            self.errors.add(format!("{}: {e}", path.display()));
+                        }
+                    }
+                }
+            } else if let Some(parent_id) = dir_identity
+                && let Some(files) = self.excludes.files_by_parent.get(&parent_id)
+                && let Ok(id) = file_id(&path)
+                && files.contains(&id)
+            {
+                continue;
+            }
             let id = self.builder.add(dir_id, &name, ent_flags);
             if is_dir {
                 let mut child_ancestors = ancestors.clone();
                 if self.follow_symlinks {
-                    match std::fs::canonicalize(&path) {
-                        Ok(canonical) => {
-                            if ancestors.contains(&canonical) {
+                    match child_identity {
+                        Some(identity) => {
+                            if ancestors.contains(&identity) {
                                 self.errors.add(format!(
                                     "{}: symlink cycle (already an ancestor)",
                                     path.display()
                                 ));
                                 continue;
                             }
-                            child_ancestors.push(canonical);
+                            child_ancestors.push(identity);
                         }
-                        Err(e) => {
-                            self.errors.add(format!("{}: {e}", path.display()));
-                            continue;
-                        }
+                        // Identity error already counted above; the
+                        // entry stays a leaf.
+                        None => continue,
                     }
                 }
-                scope.spawn(move |s| self.scan_dir(s, path, id, child_ancestors));
+                scope.spawn(move |s| self.scan_dir(s, path, id, child_ancestors, child_identity));
             }
-        }
-    }
-
-    fn is_excluded(&self, path: &Path) -> bool {
-        if self.excludes.is_empty() {
-            return false;
-        }
-        match std::path::absolute(path) {
-            Ok(abs) => key_is_excluded(&path_key(&abs), self.excludes),
-            Err(_) => false,
         }
     }
 }
@@ -259,12 +333,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     let started = Instant::now();
     let builder = IndexBuilder::new();
     let errors = Errors::new();
-    let excludes: Vec<Vec<Vec<u8>>> = options
-        .excludes
-        .iter()
-        .filter_map(|p| std::path::absolute(p).ok())
-        .map(|p| path_key(&p))
-        .collect();
+    let excludes = resolve_excludes(&options.excludes, &errors);
     let walker = Walker {
         builder: &builder,
         excludes: &excludes,
@@ -273,7 +342,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     };
 
     // Roots are added sequentially (cheap), their subtrees in parallel.
-    let mut root_dirs: Vec<(PathBuf, u32)> = Vec::new();
+    let mut root_dirs: Vec<(PathBuf, u32, Option<FileId>)> = Vec::new();
     for root in &options.roots {
         // Roots are made absolute before scanning (without resolving
         // symlinks) so stored paths never depend on the working
@@ -286,8 +355,16 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
             }
         };
         // Excludes apply to roots too, including excluded ancestors:
-        // naming a directory explicitly never re-includes it.
-        if key_is_excluded(&path_key(&abs), &excludes) {
+        // naming a directory explicitly never re-includes it. The
+        // root identity (resolved when excludes or following need it)
+        // is reused for the subtree walk and cycle detection.
+        let need_identity = options.follow_symlinks || !excludes.is_empty();
+        let identity_result = need_identity.then(|| file_id(&abs));
+        let root_identity = identity_result
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .copied();
+        if root_is_excluded(&abs, root_identity, &excludes) {
             continue;
         }
         let name = root_name_bytes(&abs);
@@ -300,6 +377,12 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
                 continue;
             }
         };
+        if let Some(Err(e)) = &identity_result {
+            // The root exists but its identity could not be resolved;
+            // excludes and cycle detection cannot see it. Counted,
+            // never silent.
+            errors.add(format!("{}: {e}", root.display()));
+        }
         let is_symlink = link_md.file_type().is_symlink();
         let mut root_flags: u16 = 0;
         if is_symlink {
@@ -324,24 +407,23 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         }
         let id = builder.add_root(&name, root_flags);
         if is_dir {
-            root_dirs.push((abs, id));
+            root_dirs.push((abs, id, root_identity));
         }
     }
 
     rayon::scope(|scope| {
-        for (dir, id) in root_dirs {
+        for (dir, id, identity) in root_dirs {
             let ancestors = if walker.follow_symlinks {
-                match std::fs::canonicalize(&dir) {
-                    Ok(canonical) => vec![canonical],
-                    Err(e) => {
-                        walker.errors.add(format!("{}: {e}", dir.display()));
-                        continue;
-                    }
+                match identity {
+                    Some(identity) => vec![identity],
+                    // Identity error already counted; cannot bound
+                    // cycles below this root, so do not descend.
+                    None => continue,
                 }
             } else {
                 Vec::new()
             };
-            scope.spawn(move |s| walker.scan_dir(s, dir, id, ancestors));
+            scope.spawn(move |s| walker.scan_dir(s, dir, id, ancestors, identity));
         }
     });
 
@@ -602,6 +684,125 @@ mod tests {
         assert!(names.contains_key("keep.txt"));
         assert!(!names.contains_key("gone.txt"));
         assert!(!names.contains_key("skip"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn excludes_match_verbatim_and_normal_windows_paths() {
+        let dir = TestDir::new("verbatim-excluded");
+        dir.file("private.txt");
+        let verbatim = std::fs::canonicalize(&dir.0).unwrap();
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+        // Both spelling directions name the same directory.
+        for (root, exclude) in [(verbatim.clone(), dir.0.clone()), (dir.0.clone(), verbatim)] {
+            let (idx, report) = scan(&WalkOptions {
+                roots: vec![root],
+                excludes: vec![exclude],
+                follow_symlinks: false,
+            });
+            assert!(
+                idx.is_empty(),
+                "excluded root exposed {} entries: {report:?}",
+                idx.len()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn excludes_fold_unicode_even_in_wtf8_components() {
+        use std::os::windows::ffi::OsStringExt;
+        let parent = TestDir::new("wtf8-excluded");
+        // Ü (U+00DC) with a lone surrogate, vs ü (U+00FC) likewise.
+        // Both creation spellings, both root/exclude directions.
+        for (i, (real, alternate)) in [
+            ([0x00dcu16, 0xd800], [0x00fcu16, 0xd800]),
+            ([0x00fcu16, 0xd800], [0x00dcu16, 0xd800]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let case = parent.0.join(format!("case{i}"));
+            let root = case.join(std::ffi::OsString::from_wide(real));
+            let alt = case.join(std::ffi::OsString::from_wide(alternate));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("private.txt"), b"x").unwrap();
+            // Precondition: the filesystem resolves both spellings to
+            // the same directory. Without it this test proves nothing.
+            assert!(
+                alt.join("private.txt").exists(),
+                "precondition: OS resolves both spellings"
+            );
+            for (scan_root, exclude) in [(root.clone(), alt.clone()), (alt, root)] {
+                let (idx, report) = scan(&WalkOptions {
+                    roots: vec![scan_root],
+                    excludes: vec![exclude],
+                    follow_symlinks: false,
+                });
+                assert!(
+                    idx.is_empty(),
+                    "excluded root exposed {} entries: {report:?}",
+                    idx.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_exclude_is_reported_and_ignored() {
+        let dir = TestDir::new("missing-exclude");
+        dir.file("keep.txt");
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![dir.0.clone()],
+            excludes: vec![dir.0.join("no-such-exclude")],
+            follow_symlinks: false,
+        });
+        assert!(by_name(&idx).contains_key("keep.txt"));
+        assert!(
+            report
+                .error_samples
+                .iter()
+                .any(|s| s.contains("exclude not found:")),
+            "missing exclude not reported: {report:?}"
+        );
+    }
+
+    #[test]
+    fn excludes_single_file() {
+        let dir = TestDir::new("exclude-file");
+        dir.file("keep.txt");
+        dir.file("secret.txt");
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![dir.0.clone()],
+            excludes: vec![dir.0.join("secret.txt")],
+            follow_symlinks: false,
+        });
+        let names = by_name(&idx);
+        assert!(names.contains_key("keep.txt"));
+        assert!(!names.contains_key("secret.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclude_via_symlinked_alias_applies_when_following() {
+        let root = TestDir::new("alias-root");
+        let target = TestDir::new("alias-target");
+        target.file("target-leaf.txt");
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(&target.0, &link).unwrap();
+        // The exclude may be spelled through the alias or through the
+        // real target path; both must keep the target out.
+        for exclude in [link, target.0.clone()] {
+            let (idx, _) = scan(&WalkOptions {
+                roots: vec![root.0.clone()],
+                excludes: vec![exclude],
+                follow_symlinks: true,
+            });
+            assert!(
+                !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
+                "excluded symlinked target was indexed"
+            );
+        }
     }
 
     #[test]

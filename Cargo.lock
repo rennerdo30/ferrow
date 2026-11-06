@@ -167,6 +167,7 @@ version = "0.0.0"
 dependencies = [
  "ferrow-index",
  "rayon",
+ "windows-sys",
 ]
 
 [[package]]
