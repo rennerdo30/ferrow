@@ -194,6 +194,36 @@ fn index_path(flag: &Option<PathBuf>) -> Result<PathBuf, String> {
     }
 }
 
+/// Create `dir` and any missing parents. On Unix, directories created
+/// by this call get mode 0700 (existing directories keep their mode),
+/// so the per-user app data directory is private from the start.
+fn create_private_dir_all(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // Collect the missing chain, deepest first.
+        let mut missing: Vec<PathBuf> = Vec::new();
+        let mut current = Some(dir.to_path_buf());
+        while let Some(path) = current {
+            if path.exists() {
+                break;
+            }
+            current = path.parent().map(|p| p.to_path_buf());
+            missing.push(path);
+        }
+        for path in missing.iter().rev() {
+            std::fs::DirBuilder::new().mode(0o700).create(path)?;
+            // DirBuilder mode is still masked by umask; pin it exactly.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 fn cmd_index(args: Args) -> Result<(), String> {
     if args.positional.is_empty() {
         return Err("index needs at least one root path".to_string());
@@ -215,8 +245,14 @@ fn cmd_index(args: Args) -> Result<(), String> {
     if let Some(parent) = out.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        // The default app data directory is created privately (0700 on
+        // Unix); an explicit --out parent keeps default permissions.
+        let created = if args.out.is_none() {
+            create_private_dir_all(parent)
+        } else {
+            std::fs::create_dir_all(parent)
+        };
+        created.map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
     index.save(&out).map_err(|e| e.to_string())?;
     println!("saved {} entries to {}", index.len(), out.display());
@@ -428,5 +464,25 @@ mod tests {
             Some(abs(&["Local", "ferrow"]))
         );
         assert!(default_index_path().is_none_or(|p| p.is_absolute()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_data_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("ferrow-private-dir-{}", std::process::id()));
+        let dir = base.join("ferrow");
+        let _ = std::fs::remove_dir_all(&base);
+        create_private_dir_all(&dir).unwrap();
+        for path in [&base, &dir] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} mode was {mode:o}", path.display());
+        }
+        // Existing directories keep their mode.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir_all(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
