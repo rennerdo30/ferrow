@@ -1,0 +1,149 @@
+//! In-process client/server round trips over a per-test
+//! unprivileged pipe or socket, plus version-mismatch handling
+//! and OS caller identity.
+
+use ferrow_ipc::protocol::{
+    Message, PROTOCOL_VERSION, Request, Response, read_message, write_message,
+};
+use ferrow_ipc::{Client, Endpoint, ErrorCode, Listener, Stream, serve_stream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn test_endpoint(tag: &str) -> Endpoint {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    Endpoint::named(&format!(
+        "ferrow-ipc-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn handler(request: Request) -> Vec<Response> {
+    match request {
+        Request::Query { text, .. } => vec![
+            Response::Results {
+                paths: vec![format!("/hits/{text}/a.txt").into_bytes()],
+                more: true,
+            },
+            Response::Results {
+                paths: vec![format!("/hits/{text}/b.txt").into_bytes()],
+                more: false,
+            },
+        ],
+        Request::Count { text } => vec![Response::Count {
+            n: text.len() as u64,
+        }],
+        Request::Status => vec![Response::Status {
+            entries: 42,
+            mode: "test".into(),
+            report: "test backend".into(),
+        }],
+        Request::Cancel { .. } => vec![Response::Count { n: 0 }],
+        Request::Hello { .. } => vec![],
+    }
+}
+
+#[test]
+fn client_server_round_trip_and_caller_identity() {
+    let endpoint = test_endpoint("rt");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, caller) = listener.accept().unwrap();
+        // Same process on the other end: the OS must say so where
+        // it reports a pid (Windows, Linux).
+        if cfg!(any(windows, target_os = "linux")) {
+            assert_eq!(
+                caller.pid,
+                Some(std::process::id()),
+                "caller identity: {caller:?}"
+            );
+        }
+        if cfg!(windows) {
+            let sid = caller.user_sid.as_deref().unwrap_or_default();
+            assert!(sid.starts_with("S-1-"), "token user SID: {caller:?}");
+        }
+        if cfg!(unix) {
+            assert!(caller.uid.is_some(), "caller identity: {caller:?}");
+        }
+        serve_stream(stream, handler).unwrap();
+    });
+
+    let mut client = loop {
+        match Client::connect(&endpoint) {
+            Ok(client) => break client,
+            // The pipe instance/socket may not exist yet on a
+            // cold start; the accept thread creates it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("connect: {e}"),
+        }
+    };
+    let hits = client.query("report", 0).unwrap();
+    assert_eq!(
+        hits,
+        vec![
+            b"/hits/report/a.txt".to_vec(),
+            b"/hits/report/b.txt".to_vec()
+        ],
+        "both Results pages, in order"
+    );
+    assert_eq!(client.count("abcd").unwrap(), 4);
+    assert_eq!(
+        client.status().unwrap(),
+        (42, "test".to_string(), "test backend".to_string())
+    );
+    drop(client);
+    server.join().unwrap();
+}
+
+#[test]
+fn version_mismatch_gets_a_typed_error() {
+    let endpoint = test_endpoint("ver");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        // Handshake must refuse the bogus version.
+        assert!(serve_stream(stream, handler).is_err());
+    });
+
+    let mut stream = loop {
+        match Stream::connect(&endpoint) {
+            Ok(s) => break s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("connect: {e}"),
+        }
+    };
+    write_message(
+        &mut stream,
+        0,
+        &Message::Request(Request::Hello {
+            version: PROTOCOL_VERSION + 100,
+        }),
+    )
+    .unwrap();
+    let reply = read_message(&mut stream).unwrap().expect("a refusal reply");
+    match reply.message {
+        Message::Response(Response::Error { code, msg }) => {
+            assert_eq!(code, ErrorCode::VersionMismatch);
+            assert!(msg.contains("not supported"), "{msg}");
+        }
+        other => panic!("expected VersionMismatch error, got {other:?}"),
+    }
+    drop(stream);
+    server.join().unwrap();
+}
+
+#[test]
+fn default_and_user_endpoints_are_named_as_documented() {
+    let service = Endpoint::default_service().display();
+    if cfg!(windows) {
+        assert_eq!(service, r"\\.\pipe\ferrowd");
+    } else if cfg!(target_os = "linux") {
+        assert_eq!(service, "/run/ferrow/ferrowd.sock");
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(service, "/var/run/ferrow/ferrowd.sock");
+    }
+    assert!(Endpoint::user_service().display().contains("ferrowd-user-"));
+}

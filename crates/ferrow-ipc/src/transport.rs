@@ -1,0 +1,711 @@
+//! Platform transports and OS-derived caller identity (M2a).
+//!
+//! - Windows: a named pipe (`\\.\pipe\ferrowd` for the service)
+//!   created with an explicit security descriptor — LocalSystem
+//!   and administrators full control, authenticated users
+//!   connect/read/write — and `PIPE_REJECT_REMOTE_CLIENTS`, so
+//!   only local callers can connect at all.
+//! - Linux: a Unix domain socket at `/run/ferrow/ferrowd.sock`;
+//!   macOS: `/var/run/ferrow/ferrowd.sock`. The socket file is
+//!   mode 0666 so every local user may connect; *what a caller
+//!   may see* is enforced per request from the OS identity
+//!   (M2c), never from anything the client claims.
+//!
+//! Caller identity comes only from the OS: Windows
+//! `GetNamedPipeClientProcessId` plus the client token's user SID,
+//! Linux `SO_PEERCRED`, macOS `getpeereid`.
+
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::path::PathBuf;
+
+/// Where a service listens and clients connect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    #[cfg(windows)]
+    pipe_name: String,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+impl Endpoint {
+    /// The system service endpoint: `\\.\pipe\ferrowd` on Windows,
+    /// `/run/ferrow/ferrowd.sock` on Linux,
+    /// `/var/run/ferrow/ferrowd.sock` on macOS.
+    pub fn default_service() -> Endpoint {
+        #[cfg(windows)]
+        {
+            Endpoint {
+                pipe_name: r"\\.\pipe\ferrowd".to_owned(),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Endpoint {
+                path: PathBuf::from("/run/ferrow/ferrowd.sock"),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Endpoint {
+                path: PathBuf::from("/var/run/ferrow/ferrowd.sock"),
+            }
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        {
+            Endpoint {
+                path: PathBuf::from("/tmp/ferrowd.sock"),
+            }
+        }
+    }
+
+    /// A per-user endpoint for unprivileged development runs
+    /// (`ferrow service run`): pipe `ferrowd-user-<name>` on
+    /// Windows, a socket of that name in the temp dir on Unix.
+    pub fn user_service() -> Endpoint {
+        let user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "user".to_owned())
+            .replace(
+                |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "_",
+            );
+        Endpoint::named(&format!("ferrowd-user-{user}"))
+    }
+
+    /// An endpoint from a short name: `\\.\pipe\<name>` on
+    /// Windows, `<temp dir>/<name>.sock` on Unix. Tests use a
+    /// unique name per test so nothing privileged is touched.
+    pub fn named(name: &str) -> Endpoint {
+        #[cfg(windows)]
+        {
+            let pipe_name = if name.starts_with(r"\\") {
+                name.to_owned()
+            } else {
+                format!(r"\\.\pipe\{name}")
+            };
+            Endpoint { pipe_name }
+        }
+        #[cfg(unix)]
+        {
+            Endpoint {
+                path: std::env::temp_dir().join(format!("{name}.sock")),
+            }
+        }
+    }
+
+    /// An endpoint at an explicit Unix socket path.
+    #[cfg(unix)]
+    pub fn from_path(path: PathBuf) -> Endpoint {
+        Endpoint { path }
+    }
+
+    /// Human-readable endpoint for logs and status output.
+    pub fn display(&self) -> String {
+        #[cfg(windows)]
+        {
+            self.pipe_name.clone()
+        }
+        #[cfg(unix)]
+        {
+            self.path.display().to_string()
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display())
+    }
+}
+
+/// Who is on the other end, as reported by the OS. Fields a
+/// platform cannot provide stay `None`; `pid` is present on
+/// Windows and Linux, `uid`/`gid` on Unix, `user_sid` (the token
+/// user, e.g. `S-1-5-21-…`) on Windows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallerIdentity {
+    pub pid: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub user_sid: Option<String>,
+}
+
+#[cfg(unix)]
+mod platform {
+    use super::{CallerIdentity, Endpoint};
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    pub struct Listener {
+        inner: UnixListener,
+        path: std::path::PathBuf,
+    }
+
+    pub struct Stream {
+        inner: UnixStream,
+        caller: Option<CallerIdentity>,
+    }
+
+    impl Listener {
+        pub fn bind(endpoint: &Endpoint) -> std::io::Result<Listener> {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = endpoint.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // The endpoint is owned by this service instance: a
+            // leftover socket file from a previous run is removed.
+            match std::fs::remove_file(&endpoint.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let inner = UnixListener::bind(&endpoint.path)?;
+            std::fs::set_permissions(&endpoint.path, std::fs::Permissions::from_mode(0o666))?;
+            Ok(Listener {
+                inner,
+                path: endpoint.path.clone(),
+            })
+        }
+
+        pub fn accept(&self) -> std::io::Result<(Stream, CallerIdentity)> {
+            let (inner, _) = self.inner.accept()?;
+            let caller = peer_identity(&inner)?;
+            Ok((
+                Stream {
+                    inner,
+                    caller: Some(caller.clone()),
+                },
+                caller,
+            ))
+        }
+    }
+
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl Stream {
+        pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
+            Ok(Stream {
+                inner: UnixStream::connect(&endpoint.path)?,
+                caller: None,
+            })
+        }
+
+        pub fn caller(&self) -> Option<&CallerIdentity> {
+            self.caller.as_ref()
+        }
+
+        pub fn shutdown(&self) -> std::io::Result<()> {
+            self.inner.shutdown(std::net::Shutdown::Both)
+        }
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peer_identity(stream: &UnixStream) -> std::io::Result<CallerIdentity> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: zeroed ucred is a valid getsockopt output buffer;
+        // the fd is the live socket owned by `stream`.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: buffer pointer and length describe `cred`
+        // exactly and it outlives the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(CallerIdentity {
+            pid: u32::try_from(cred.pid).ok(),
+            uid: Some(cred.uid),
+            gid: Some(cred.gid),
+            user_sid: None,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn peer_identity(stream: &UnixStream) -> std::io::Result<CallerIdentity> {
+        use std::os::unix::io::AsRawFd;
+        let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
+        // SAFETY: output pointers point at live uid/gid values;
+        // the fd is the live socket owned by `stream`.
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(CallerIdentity {
+            pid: None,
+            uid: Some(uid),
+            gid: Some(gid),
+            user_sid: None,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn peer_identity(_stream: &UnixStream) -> std::io::Result<CallerIdentity> {
+        Ok(CallerIdentity::default())
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::{CallerIdentity, Endpoint};
+    use std::io::{Read, Write};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+    };
+
+    /// SDDL_REVISION_1.
+    const SDDL_REVISION_1: u32 = 1;
+    /// Service pipe DACL: LocalSystem (SY) and built-in
+    /// administrators (BA) full control; authenticated users (AU)
+    /// generic read/write (connect). Nobody else gets access.
+    const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn last_error() -> std::io::Error {
+        std::io::Error::last_os_error()
+    }
+
+    /// An owned pipe handle; disconnected and closed on drop.
+    struct PipeHandle(HANDLE);
+
+    impl Drop for PipeHandle {
+        fn drop(&mut self) {
+            // FlushFileBuffers on a pipe waits until the peer has
+            // read everything written, so a final reply (for
+            // example a handshake refusal) is not discarded by
+            // the disconnect below. It fails harmlessly when the
+            // peer is already gone.
+            // SAFETY: the handle is owned here and closed once.
+            unsafe {
+                FlushFileBuffers(self.0);
+                DisconnectNamedPipe(self.0);
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Build SECURITY_ATTRIBUTES from the SDDL above. The returned
+    /// descriptor must be freed with LocalFree after the pipe
+    /// instance is created (the kernel copies it at creation).
+    fn security_attributes() -> std::io::Result<(SECURITY_ATTRIBUTES, *mut core::ffi::c_void)> {
+        let sddl = wide(PIPE_SDDL);
+        let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `sddl` is a NUL-terminated wide string that
+        // outlives the call; `sd` is a live output pointer.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        Ok((
+            SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            },
+            sd,
+        ))
+    }
+
+    /// Best-effort user SID string from the client process token.
+    /// The pid stays authoritative when this fails (for example
+    /// for a protected process).
+    fn token_user_sid(pid: u32) -> Option<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::{TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: returns a handle we own and close, or null.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return None;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `process` is live; `token` is a live output.
+        let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) };
+        // SAFETY: `process` is owned here and closed once.
+        unsafe { CloseHandle(process) };
+        if ok == 0 || token.is_null() {
+            return None;
+        }
+        let sid = token_user(token).and_then(|buf| {
+            let _ = &buf;
+            // SAFETY: `buf` holds a valid TOKEN_USER for `token`
+            // and outlives the parse below.
+            let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+            let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+            // SAFETY: the SID pointer comes from the token buffer;
+            // `text` is a live output freed with LocalFree.
+            let ok = unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut text) };
+            if ok == 0 || text.is_null() {
+                return None;
+            }
+            // SAFETY: `text` is a NUL-terminated wide string
+            // owned by us until LocalFree below.
+            let mut len = 0;
+            while unsafe { *text.add(len) } != 0 {
+                len += 1;
+            }
+            // SAFETY: the slice covers exactly the string above.
+            let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+            // SAFETY: frees the string allocated by the convert call.
+            unsafe { LocalFree(text.cast()) };
+            Some(out)
+        });
+        // SAFETY: `token` is owned here and closed once.
+        unsafe { CloseHandle(token) };
+        sid
+    }
+
+    fn token_user(token: HANDLE) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenUser};
+        let mut len = 0u32;
+        // SAFETY: sizing call; a null buffer with length 0 is the
+        // documented way to learn the required buffer size.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut len) };
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: buffer pointer and length describe `buf`
+        // exactly and it outlives the call.
+        let ok = unsafe {
+            GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &raw mut len)
+        };
+        if ok == 0 { None } else { Some(buf) }
+    }
+
+    fn client_identity(handle: HANDLE) -> std::io::Result<CallerIdentity> {
+        let mut pid = 0u32;
+        // SAFETY: `handle` is a connected server pipe; `pid` is a
+        // live output.
+        let ok = unsafe { GetNamedPipeClientProcessId(handle, &raw mut pid) };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        Ok(CallerIdentity {
+            pid: Some(pid),
+            uid: None,
+            gid: None,
+            user_sid: token_user_sid(pid),
+        })
+    }
+
+    pub struct Listener {
+        name: Vec<u16>,
+    }
+
+    pub struct Stream {
+        handle: Option<PipeHandle>,
+        caller: Option<CallerIdentity>,
+    }
+
+    impl Listener {
+        pub fn bind(endpoint: &Endpoint) -> std::io::Result<Listener> {
+            Ok(Listener {
+                name: wide(&endpoint.pipe_name),
+            })
+        }
+
+        pub fn accept(&self) -> std::io::Result<(Stream, CallerIdentity)> {
+            let (mut attrs, sd) = security_attributes()?;
+            // SAFETY: name and attributes outlive the call; the
+            // returned handle is owned by PipeHandle on success.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    self.name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    super::MAX_PIPE_BUFFER as u32,
+                    super::MAX_PIPE_BUFFER as u32,
+                    0,
+                    &raw mut attrs,
+                )
+            };
+            // SAFETY: frees the descriptor allocated above; the
+            // kernel copied it during pipe creation.
+            unsafe { LocalFree(sd) };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(last_error());
+            }
+            // SAFETY: `handle` is a live server pipe instance.
+            let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            if ok == 0
+                && std::io::Error::last_os_error().raw_os_error()
+                    != Some(ERROR_PIPE_CONNECTED as i32)
+            {
+                // SAFETY: owned, unconnected, closed once here.
+                unsafe { CloseHandle(handle) };
+                return Err(last_error());
+            }
+            let owned = PipeHandle(handle);
+            let caller = client_identity(handle)?;
+            Ok((
+                Stream {
+                    handle: Some(owned),
+                    caller: Some(caller.clone()),
+                },
+                caller,
+            ))
+        }
+    }
+
+    impl Stream {
+        pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
+            let name = wide(&endpoint.pipe_name);
+            for _attempt in 0..50 {
+                // SAFETY: name outlives the call; the returned
+                // handle is owned by PipeHandle on success.
+                let handle = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if handle != INVALID_HANDLE_VALUE {
+                    return Ok(Stream {
+                        handle: Some(PipeHandle(handle)),
+                        caller: None,
+                    });
+                }
+                let err = last_error();
+                if err.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+                    return Err(err);
+                }
+                // SAFETY: name outlives the bounded wait.
+                unsafe { WaitNamedPipeW(name.as_ptr(), 2_000) };
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "named pipe stays busy",
+            ))
+        }
+
+        pub fn caller(&self) -> Option<&CallerIdentity> {
+            self.caller.as_ref()
+        }
+
+        pub fn shutdown(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.handle
+                .as_ref()
+                .map(|h| h.0)
+                .unwrap_or(std::ptr::null_mut())
+        }
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut read = 0u32;
+            // SAFETY: buffer pointer/length describe `buf`; the
+            // handle is live and owned by this stream.
+            let ok = unsafe {
+                ReadFile(
+                    self.raw(),
+                    buf.as_mut_ptr().cast(),
+                    u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    &raw mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = last_error();
+                if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    return Ok(0);
+                }
+                return Err(err);
+            }
+            Ok(read as usize)
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut written = 0u32;
+            // SAFETY: buffer pointer/length describe `buf`; the
+            // handle is live and owned by this stream.
+            let ok = unsafe {
+                WriteFile(
+                    self.raw(),
+                    buf.as_ptr().cast(),
+                    u32::try_from(buf.len()).unwrap_or(u32::MAX),
+                    &raw mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(last_error());
+            }
+            Ok(written as usize)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            // Nothing is buffered on our side; WriteFile hands the
+            // bytes to the pipe directly. (FlushFileBuffers on a
+            // pipe would block until the peer reads, which a
+            // streaming writer must not require.)
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod platform {
+    use super::{CallerIdentity, Endpoint};
+    use std::io::{Read, Write};
+
+    fn unsupported() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no IPC transport on this platform",
+        )
+    }
+
+    pub struct Listener;
+    pub struct Stream;
+
+    impl Listener {
+        pub fn bind(_endpoint: &Endpoint) -> std::io::Result<Listener> {
+            Err(unsupported())
+        }
+        pub fn accept(&self) -> std::io::Result<(Stream, CallerIdentity)> {
+            Err(unsupported())
+        }
+    }
+
+    impl Stream {
+        pub fn connect(_endpoint: &Endpoint) -> std::io::Result<Stream> {
+            Err(unsupported())
+        }
+        pub fn caller(&self) -> Option<&CallerIdentity> {
+            None
+        }
+        pub fn shutdown(&self) -> std::io::Result<()> {
+            Err(unsupported())
+        }
+    }
+
+    impl Read for Stream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(unsupported())
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(unsupported())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(unsupported())
+        }
+    }
+}
+
+/// Pipe buffer size hint (one max frame) for the Windows server.
+#[cfg(windows)]
+const MAX_PIPE_BUFFER: usize = crate::protocol::MAX_FRAME_BYTES;
+
+/// A bound server endpoint. Blocking; run the accept loop on its
+/// own thread, one thread per accepted connection.
+pub struct Listener(platform::Listener);
+
+/// One connected stream (either side).
+pub struct Stream(platform::Stream);
+
+impl Listener {
+    pub fn bind(endpoint: &Endpoint) -> std::io::Result<Listener> {
+        Ok(Listener(platform::Listener::bind(endpoint)?))
+    }
+
+    /// Accept one connection, with the caller's OS identity.
+    pub fn accept(&self) -> std::io::Result<(Stream, CallerIdentity)> {
+        let (stream, caller) = self.0.accept()?;
+        Ok((Stream(stream), caller))
+    }
+}
+
+impl Stream {
+    pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
+        Ok(Stream(platform::Stream::connect(endpoint)?))
+    }
+
+    /// The caller's OS identity, on the accepted (server) side.
+    pub fn caller(&self) -> Option<&CallerIdentity> {
+        self.0.caller()
+    }
+
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        self.0.shutdown()
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
