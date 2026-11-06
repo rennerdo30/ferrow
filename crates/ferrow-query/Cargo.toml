@@ -15,4 +15,9 @@ memchr = "2"
 rayon = "1"
 
 [dev-dependencies]
+divan = "0.1.21"
 ferrow-fixture = { path = "../ferrow-fixture" }
+
+[[bench]]
+name = "m1_bench"
+harness = false
