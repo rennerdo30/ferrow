@@ -2,7 +2,10 @@
 //!
 //! Scans directory trees with `std::fs::read_dir` on the rayon pool and
 //! feeds a [`ferrow_index::IndexBuilder`]. Permission and IO errors are
-//! counted and sampled into the report, never fatal.
+//! counted and sampled into the report, never fatal — with one
+//! exception: an existing exclude that cannot be fully resolved aborts
+//! the scan before any root is walked (fail closed, N6), reported in
+//! [`ScanReport::fatal_error`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,6 +42,10 @@ pub struct ScanReport {
     pub errors: usize,
     /// Up to 10 sampled error descriptions.
     pub error_samples: Vec<String>,
+    /// Set when the scan aborted before walking any root because an
+    /// existing exclude could not be fully resolved. The index is
+    /// empty and must not be persisted as a scan result.
+    pub fatal_error: Option<String>,
     pub elapsed: Duration,
 }
 
@@ -201,7 +208,13 @@ impl ExcludeSet {
 /// Resolve every exclude path that exists to its identity. A path
 /// that does not exist at scan start is reported as
 /// `exclude not found: …` and otherwise ignored.
-fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
+///
+/// Fail closed (N6): any other failure to fully resolve an existing
+/// exclude — its metadata, identity, canonical location, or (for a
+/// file exclude) its parent identity — is an `Err` naming the exclude.
+/// The caller must not scan with a partial set: a dropped or
+/// parentless exclude would silently admit excluded entries.
+fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> Result<ExcludeSet, String> {
     let mut set = ExcludeSet::default();
     for path in paths {
         // Establish existence independently of identity opening: a provider
@@ -212,17 +225,11 @@ fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
                 errors.add(format!("exclude not found: {}", path.display()));
                 continue;
             }
-            Err(e) => {
-                errors.add(format!("exclude {}: {e}", path.display()));
-                continue;
-            }
+            Err(e) => return Err(format!("exclude {}: {e}", path.display())),
         };
         let id = match file_id(path) {
             Ok(id) => id,
-            Err(e) => {
-                errors.add(format!("exclude identity {}: {e}", path.display()));
-                continue;
-            }
+            Err(e) => return Err(format!("exclude identity {}: {e}", path.display())),
         };
         if md.is_dir() {
             set.dirs.insert(id);
@@ -230,10 +237,7 @@ fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
             set.files.insert(id);
             let resolved = match std::fs::canonicalize(path) {
                 Ok(resolved) => resolved,
-                Err(e) => {
-                    errors.add(format!("exclude location {}: {e}", path.display()));
-                    continue;
-                }
+                Err(e) => return Err(format!("exclude location {}: {e}", path.display())),
             };
             let parent = match resolved.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -243,11 +247,17 @@ fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
                 Ok(parent_id) => {
                     set.files_by_parent.entry(parent_id).or_default().insert(id);
                 }
-                Err(e) => errors.add(format!("exclude parent identity {}: {e}", parent.display())),
+                Err(e) => {
+                    return Err(format!(
+                        "exclude parent identity {} (parent {}): {e}",
+                        path.display(),
+                        parent.display()
+                    ));
+                }
             }
         }
     }
-    set
+    Ok(set)
 }
 
 /// Windows junctions and other name-surrogate reparse points are aliases,
@@ -483,7 +493,25 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     let started = Instant::now();
     let builder = IndexBuilder::new();
     let errors = Errors::new();
-    let excludes = resolve_excludes(&options.excludes, &errors);
+    let excludes = match resolve_excludes(&options.excludes, &errors) {
+        Ok(set) => set,
+        Err(fatal) => {
+            // Fail closed (N6): an existing exclude could not be fully
+            // resolved, so no entry's exclusion status is known. Index
+            // nothing; do not walk any root.
+            errors.add(fatal.clone());
+            let report = ScanReport {
+                mode: "parallel read_dir".to_string(),
+                threads: rayon::current_num_threads(),
+                entries: 0,
+                errors: errors.count.load(Ordering::Relaxed),
+                error_samples: errors.samples.into_inner().expect("error samples poisoned"),
+                fatal_error: Some(fatal),
+                elapsed: started.elapsed(),
+            };
+            return (builder.freeze(), report);
+        }
+    };
     let walker = Walker {
         builder: &builder,
         excludes: &excludes,
@@ -602,6 +630,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         entries,
         errors: errors.count.load(Ordering::Relaxed),
         error_samples: errors.samples.into_inner().expect("error samples poisoned"),
+        fatal_error: None,
         elapsed: started.elapsed(),
     };
     (index, report)
@@ -908,6 +937,7 @@ mod tests {
             follow_symlinks: false,
         });
         assert!(by_name(&idx).contains_key("keep.txt"));
+        assert_eq!(report.fatal_error, None, "missing exclude must not abort");
         assert!(
             report
                 .error_samples
@@ -1080,6 +1110,143 @@ mod tests {
                 assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
                 assert_eq!(idx.len(), 1, "follow={follow}");
             }
+        }
+    }
+
+    /// N6: the exclude itself is a `deny-identity` alias of
+    /// `root/private`, so existence metadata succeeds but resolving
+    /// the exclude's identity is refused. An existing exclude that
+    /// cannot be fully resolved aborts the scan: nothing is indexed,
+    /// alone or together with another valid exclude, with following
+    /// off or on, for the containing root and the excluded root.
+    #[test]
+    fn unresolvable_directory_exclude_aborts_scan() {
+        let _refusal = IdentityRefusal::new(false);
+        let base = TestDir::new("n6-exclude-identity");
+        let root = base.0.join("root");
+        let private = root.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("secret.txt"), b"x").unwrap();
+        let exclude = base.0.join(identity::TEST_REFUSED_NAME);
+        make_symlink_dir(&private, &exclude);
+        let unrelated = base.0.join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let set_refusal = |on: bool| identity::TEST_IDENTITY_REFUSAL.store(on, Ordering::Relaxed);
+        for extra in [false, true] {
+            for follow in [false, true] {
+                let excludes = if extra {
+                    vec![exclude.clone(), unrelated.clone()]
+                } else {
+                    vec![exclude.clone()]
+                };
+                // Control: without refusal the exclude resolves and
+                // only the root itself is indexed.
+                set_refusal(false);
+                let (idx, report) = scan(&WalkOptions {
+                    roots: vec![root.clone()],
+                    excludes: excludes.clone(),
+                    follow_symlinks: follow,
+                });
+                assert_eq!(
+                    report.errors, 0,
+                    "extra={extra}, follow={follow}: {report:?}"
+                );
+                assert_eq!(idx.len(), 1, "extra={extra}, follow={follow}");
+                set_refusal(true);
+                for scan_root in [root.clone(), private.clone()] {
+                    let (idx, report) = scan(&WalkOptions {
+                        roots: vec![scan_root.clone()],
+                        excludes: excludes.clone(),
+                        follow_symlinks: follow,
+                    });
+                    assert_eq!(
+                        report.errors, 1,
+                        "extra={extra}, follow={follow}, root={scan_root:?}: {report:?}"
+                    );
+                    assert!(
+                        report.error_samples[0].starts_with("exclude identity ")
+                            && report.error_samples[0].contains(&exclude.display().to_string()),
+                        "extra={extra}, follow={follow}: {report:?}"
+                    );
+                    assert!(
+                        idx.is_empty(),
+                        "extra={extra}, follow={follow}, root={scan_root:?}: \
+                         unresolvable exclude admitted {} entries",
+                        idx.len()
+                    );
+                    assert_eq!(
+                        report.fatal_error.as_deref(),
+                        Some(report.error_samples[0].as_str()),
+                        "extra={extra}, follow={follow}: abort must be fatal"
+                    );
+                    assert_eq!(report.entries, 0);
+                }
+            }
+        }
+    }
+
+    /// N6: a file exclude inside a `deny-identity` directory resolves
+    /// to its file identity, but the identity of its canonical parent
+    /// is refused. Losing the parent scope must abort the scan, not
+    /// silently disable matching for the same directory reached
+    /// through another spelling or alias.
+    #[test]
+    fn unresolvable_file_exclude_parent_identity_aborts_scan() {
+        let _refusal = IdentityRefusal::new(false);
+        let base = TestDir::new("n6-exclude-parent");
+        let private = base.0.join(identity::TEST_REFUSED_NAME);
+        std::fs::create_dir(&private).unwrap();
+        let secret = private.join("secret.txt");
+        std::fs::write(&secret, b"x").unwrap();
+        let alias = base.0.join("scan-alias");
+        make_symlink_dir(&private, &alias);
+        let set_refusal = |on: bool| identity::TEST_IDENTITY_REFUSAL.store(on, Ordering::Relaxed);
+        for follow in [false, true] {
+            #[cfg(windows)]
+            let root = if follow {
+                alias.clone()
+            } else {
+                base.0.join("DENY-IDENTITY")
+            };
+            #[cfg(unix)]
+            let root = alias.clone();
+            #[cfg(windows)]
+            assert_eq!(
+                std::fs::canonicalize(&root).unwrap(),
+                std::fs::canonicalize(&private).unwrap(),
+                "precondition: root spelling resolves to the same directory"
+            );
+            set_refusal(false);
+            let (idx, report) = scan(&WalkOptions {
+                roots: vec![root.clone()],
+                excludes: vec![secret.clone()],
+                follow_symlinks: follow,
+            });
+            assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
+            assert_eq!(idx.len(), 1, "follow={follow}: control");
+            set_refusal(true);
+            let (idx, report) = scan(&WalkOptions {
+                roots: vec![root],
+                excludes: vec![secret.clone()],
+                follow_symlinks: follow,
+            });
+            assert_eq!(report.errors, 1, "follow={follow}: {report:?}");
+            assert!(
+                report.error_samples[0].starts_with("exclude parent identity ")
+                    && report.error_samples[0].contains(&secret.display().to_string()),
+                "follow={follow}: {report:?}"
+            );
+            assert!(
+                idx.is_empty(),
+                "follow={follow}: file exclude lost its parent scope, {} entries",
+                idx.len()
+            );
+            assert_eq!(
+                report.fatal_error.as_deref(),
+                Some(report.error_samples[0].as_str()),
+                "follow={follow}: abort must be fatal"
+            );
+            assert_eq!(report.entries, 0);
         }
     }
 
