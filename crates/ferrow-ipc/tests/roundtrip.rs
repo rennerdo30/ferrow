@@ -14,6 +14,30 @@ fn accepted_stream_can_move_to_a_worker() {
     assert_send::<Stream>();
 }
 
+#[test]
+fn healthy_session_survives_idle_then_active() {
+    for cancellable in [false, true] {
+        let endpoint = test_endpoint("idle");
+        let listener = Listener::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            if cancellable {
+                ferrow_ipc::serve_cancellable(stream, |_, request| handler(request))
+            } else {
+                serve_stream(stream, handler)
+            }
+        });
+        let mut client = Client::connect(&endpoint).unwrap();
+        assert_eq!(client.count("before").unwrap(), 6);
+        std::thread::sleep(std::time::Duration::from_millis(5150));
+        let result = client.count("after");
+        drop(client);
+        let served = server.join().unwrap();
+        assert_eq!(result.unwrap(), 5, "idle session lost its next operation");
+        served.unwrap();
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn bind_reserves_pipe_name_until_listener_drop() {

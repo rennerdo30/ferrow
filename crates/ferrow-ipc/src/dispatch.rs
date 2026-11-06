@@ -37,8 +37,8 @@ fn reply(writer: &Mutex<Stream>, id: u32, responses: Vec<Response>) -> io::Resul
     let mut writer = writer
         .lock()
         .map_err(|_| io::Error::other("writer poisoned"))?;
-    writer.set_deadline(Instant::now() + Duration::from_secs(5))?;
     for response in responses {
+        writer.set_deadline(Instant::now() + Duration::from_secs(5))?;
         write_message(&mut *writer, id, &Message::Response(response))?;
     }
     Ok(())
@@ -61,8 +61,7 @@ where
     let mut active: Option<Work> = None;
     let result = (|| {
         loop {
-            stream.set_deadline(Instant::now() + Duration::from_secs(5))?;
-            let Some(envelope) = crate::server_read(&mut stream)? else {
+            let Some(envelope) = crate::server_read_frame(&mut stream, true)? else {
                 return Ok(());
             };
             let Message::Request(request) = envelope.message else {
