@@ -11,8 +11,8 @@
 //! panics on any input.
 
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use ferrow_index::{Index, fold_name};
 use memchr::memmem;
@@ -142,6 +142,28 @@ impl CancelToken {
     }
 }
 
+/// Cancellation owner for an interactive query stream. Starting the next
+/// query cancels the previous token without waiting for its workers.
+#[derive(Default)]
+pub struct QuerySession {
+    active: Mutex<Option<CancelToken>>,
+}
+
+impl QuerySession {
+    pub fn start(&self) -> CancelToken {
+        let token = CancelToken::new();
+        if let Some(previous) = self
+            .active
+            .lock()
+            .expect("query session poisoned")
+            .replace(token.clone())
+        {
+            previous.cancel();
+        }
+        token
+    }
+}
+
 /// Search options.
 #[derive(Clone, Default)]
 pub struct SearchOptions {
@@ -149,8 +171,8 @@ pub struct SearchOptions {
     pub limit: Option<usize>,
     /// Cancellation flag shared with the caller.
     pub cancel: CancelToken,
-    /// Test hook invoked after each visited block with the block
-    /// index, before the next block starts. Only present with the
+    /// Test hook invoked after a completed chunk with its chunk index.
+    /// Other admitted chunks can run concurrently. Only present with the
     /// non-default `test-hooks` feature, so normal builds neither
     /// expose it nor pay for its dispatch.
     #[cfg(feature = "test-hooks")]
@@ -168,7 +190,7 @@ impl fmt::Debug for SearchOptions {
 }
 
 /// Search outcome. `hits` are entry ids in name-sort order; on
-/// cancellation the hits found so far (in order) are still returned.
+/// cancellation an exact completed prefix of hits is returned.
 /// `visited` counts the entries actually examined, so callers (and
 /// tests) can prove that `limit`/cancellation stopped the scan early.
 #[derive(Debug)]
@@ -176,6 +198,23 @@ pub struct SearchResult {
     pub hits: Vec<u32>,
     pub cancelled: bool,
     pub visited: usize,
+}
+
+/// Disjoint wall-clock spans from one operation. Select a median-total
+/// sample, rather than adding independently selected component medians.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QueryTimings {
+    pub total: std::time::Duration,
+    pub prepare: std::time::Duration,
+    pub scan: std::time::Duration,
+    pub collect: std::time::Duration,
+}
+
+impl QueryTimings {
+    pub fn unattributed(&self) -> std::time::Duration {
+        self.total
+            .saturating_sub(self.prepare + self.scan + self.collect)
+    }
 }
 
 struct Matcher {
@@ -219,9 +258,9 @@ impl Matcher {
     }
 }
 
-/// Entries examined per parallel block; cancellation and the
-/// `test-hooks` hook act at this granularity.
-const BLOCK_SIZE: usize = 65_536;
+/// Entries admitted per worker chunk; cancellation also runs inside it.
+const BLOCK_SIZE: usize = 4_096;
+const CANCEL_INTERVAL: usize = 256;
 
 /// Block size, exposed only to the test-hooks build so integration
 /// tests can assert exact per-block behaviour.
@@ -231,78 +270,206 @@ pub const BLOCK: usize = BLOCK_SIZE;
 
 /// Run a search over the whole index, in name-sort order, in parallel.
 ///
-/// With a `limit`, the sorted order is walked in blocks (each block is
-/// matched in parallel) and the search stops as soon as enough hits are
-/// found, so a first-page query never scans the whole index.
-#[cfg_attr(
-    not(feature = "test-hooks"),
-    allow(
-        clippy::unused_enumerate_index,
-        reason = "index feeds the test-hooks hook"
-    )
-)]
+/// At most one chunk per pool worker is admitted ahead of the completed
+/// prefix. A limit stops admission as soon as that prefix has enough hits.
+/// Cancellation is checked every 256 entries, including inside a chunk.
 pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchResult {
+    search_impl::<false>(index, query, options).0
+}
+
+/// Instrumented search for CI. The normal entry point compiles timers out.
+pub fn search_with_timings(
+    index: &Index,
+    query: &Query,
+    options: &SearchOptions,
+) -> (SearchResult, QueryTimings) {
+    search_impl::<true>(index, query, options)
+}
+
+fn search_impl<const TIMED: bool>(
+    index: &Index,
+    query: &Query,
+    options: &SearchOptions,
+) -> (SearchResult, QueryTimings) {
+    let started = TIMED.then(std::time::Instant::now);
+    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
     let sorted = index.sorted();
-    let mut hits: Vec<u32> = Vec::new();
-    let mut visited = 0usize;
-    if options.limit == Some(0) {
-        return SearchResult {
-            hits,
-            cancelled: options.cancel.is_cancelled(),
-            visited,
-        };
+    let width = rayon::current_num_threads();
+    // Only a window of `width` chunks can be admitted ahead of the
+    // completed prefix. A slow early chunk cannot accumulate unbounded
+    // later results. One parallel operation owns the whole scan.
+    struct Ordered {
+        next: usize,
+        prefix: usize,
+        hits: usize,
+        stop: bool,
+        chunks: Vec<Option<Vec<u32>>>,
     }
-    for (_block_index, block) in sorted.chunks(BLOCK_SIZE).enumerate() {
-        if options.cancel.is_cancelled() {
-            return SearchResult {
-                hits,
-                cancelled: true,
-                visited,
+    let ordered = Mutex::new(Ordered {
+        next: 0,
+        prefix: 0,
+        hits: 0,
+        stop: options.limit == Some(0),
+        chunks: (0..sorted.len().div_ceil(BLOCK_SIZE))
+            .map(|_| None)
+            .collect(),
+    });
+    let ready = Condvar::new();
+    let visited = AtomicUsize::new(0);
+    if let Some(t) = started {
+        timings.prepare = t.elapsed();
+    }
+    let scan_started = TIMED.then(std::time::Instant::now);
+    (0..width).into_par_iter().for_each(|_| {
+        loop {
+            let chunk = {
+                let mut state = ordered.lock().expect("query progress poisoned");
+                loop {
+                    if state.stop
+                        || options.cancel.is_cancelled()
+                        || state.next == state.chunks.len()
+                    {
+                        return;
+                    }
+                    if state.next < state.prefix + width {
+                        let next = state.next;
+                        state.next += 1;
+                        break next;
+                    }
+                    // An admitted chunk always owns the missing prefix. Its
+                    // completion (including cancellation) wakes every waiter.
+                    state = ready.wait(state).expect("query progress poisoned");
+                }
             };
+            let start = chunk * BLOCK_SIZE;
+            let block = &sorted[start..(start + BLOCK_SIZE).min(sorted.len())];
+            let mut found = Vec::new();
+            let mut examined = 0;
+            for ids in block.chunks(CANCEL_INTERVAL) {
+                if options.cancel.is_cancelled() {
+                    break;
+                }
+                for &id in ids {
+                    if matcher.matches(index, id)
+                        && options.limit.is_none_or(|limit| found.len() < limit)
+                    {
+                        found.push(id);
+                    }
+                }
+                examined += ids.len();
+            }
+            visited.fetch_add(examined, Ordering::Relaxed);
+            #[cfg(feature = "test-hooks")]
+            if examined == block.len()
+                && let Some(hook) = &options.on_block
+            {
+                hook(chunk);
+            }
+            let mut state = ordered.lock().expect("query progress poisoned");
+            if examined == block.len() {
+                state.chunks[chunk] = Some(found);
+                while state.prefix < state.chunks.len() {
+                    let Some(hits) = &state.chunks[state.prefix] else {
+                        break;
+                    };
+                    state.hits += hits.len();
+                    state.prefix += 1;
+                }
+                if options.limit.is_some_and(|limit| state.hits >= limit) {
+                    state.stop = true;
+                }
+            }
+            if options.cancel.is_cancelled() {
+                state.stop = true;
+            }
+            ready.notify_all();
         }
-        let mut found: Vec<u32> = block
-            .par_iter()
-            .filter(|&&id| matcher.matches(index, id))
-            .copied()
-            .collect();
-        visited += block.len();
-        hits.append(&mut found);
-        #[cfg(feature = "test-hooks")]
-        if let Some(hook) = &options.on_block {
-            hook(_block_index);
-        }
-        if let Some(limit) = options.limit
-            && hits.len() >= limit
-        {
-            hits.truncate(limit);
-            break;
-        }
-        // Without a limit we still walk block by block; each block is a
-        // full parallel pass and gives cancellation a chance per block.
+    });
+    if let Some(t) = scan_started {
+        timings.scan = t.elapsed();
     }
-    SearchResult {
+    let collect_started = TIMED.then(std::time::Instant::now);
+    let state = ordered.into_inner().expect("query progress poisoned");
+    // Cancellation returns an exact sorted prefix, dropping partial chunks.
+    let mut hits: Vec<u32> = state
+        .chunks
+        .into_iter()
+        .take(state.prefix)
+        .flatten()
+        .flatten()
+        .collect();
+    if let Some(limit) = options.limit {
+        hits.truncate(limit);
+    }
+    let visited = visited.into_inner();
+    if let Some(t) = collect_started {
+        timings.collect = t.elapsed();
+    }
+    let result = SearchResult {
         hits,
         cancelled: options.cancel.is_cancelled(),
         visited,
+    };
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
     }
+    (result, timings)
 }
 
 /// Count all hits without storing them. Returns the count found and
 /// whether the count was cut short by cancellation.
 pub fn count(index: &Index, query: &Query, cancel: &CancelToken) -> (usize, bool) {
+    count_impl::<false>(index, query, cancel).0
+}
+
+pub fn count_with_timings(
+    index: &Index,
+    query: &Query,
+    cancel: &CancelToken,
+) -> ((usize, bool), QueryTimings) {
+    count_impl::<true>(index, query, cancel)
+}
+
+fn count_impl<const TIMED: bool>(
+    index: &Index,
+    query: &Query,
+    cancel: &CancelToken,
+) -> ((usize, bool), QueryTimings) {
+    let started = TIMED.then(std::time::Instant::now);
+    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
-    let mut total = 0usize;
-    for block in index.sorted().chunks(BLOCK_SIZE) {
-        if cancel.is_cancelled() {
-            return (total, true);
-        }
-        total += block
-            .par_iter()
-            .filter(|&&id| matcher.matches(index, id))
-            .count();
+    if let Some(t) = started {
+        timings.prepare = t.elapsed();
     }
-    (total, cancel.is_cancelled())
+    let scan_started = TIMED.then(std::time::Instant::now);
+    let total = (0..index.len().div_ceil(BLOCK_SIZE))
+        .into_par_iter()
+        .map(|chunk| {
+            let start = chunk * BLOCK_SIZE;
+            let end = (start + BLOCK_SIZE).min(index.len());
+            let mut total = 0;
+            for start in (start..end).step_by(CANCEL_INTERVAL) {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                total += (start..(start + CANCEL_INTERVAL).min(end))
+                    .filter(|&id| matcher.matches(index, id as u32))
+                    .count();
+            }
+            total
+        })
+        .sum();
+    if let Some(t) = scan_started {
+        timings.scan = t.elapsed();
+    }
+    let result = (total, cancel.is_cancelled());
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
+    }
+    (result, timings)
 }
 
 #[cfg(test)]

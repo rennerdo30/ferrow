@@ -330,23 +330,35 @@ impl IndexBuilder {
             arena.extend_from_slice(&e.name[..take]);
         }
 
-        // Folded arena: same offsets and lengths as `arena` (see fold_name).
-        let folded_arena: Vec<u8> = {
-            let slices: Vec<&[u8]> = (0..n)
-                .map(|i| {
+        // Release builder entries before folding/sorting the frozen columns.
+        drop(raw);
+        // Allocate the final arena once and split it only at entry boundaries.
+        // Each worker reuses scratch; no per-name Vec or slice table survives.
+        let mut folded_arena = vec![0; arena.len()];
+        let chunk = n.div_ceil(rayon::current_num_threads() * 4).max(1024);
+        let mut rest = folded_arena.as_mut_slice();
+        let mut work = Vec::new();
+        for start in (0..n).step_by(chunk) {
+            let end = (start + chunk).min(n);
+            let byte_start = name_off[start] as usize;
+            let byte_end = if end == n {
+                arena.len()
+            } else {
+                name_off[end] as usize
+            };
+            let (out, tail) = rest.split_at_mut(byte_end - byte_start);
+            rest = tail;
+            work.push((start, end, byte_start, out));
+        }
+        work.into_par_iter()
+            .for_each_init(Vec::new, |scratch, (start, end, byte_start, out)| {
+                for i in start..end {
                     let off = name_off[i] as usize;
-                    &arena[off..off + name_len[i] as usize]
-                })
-                .collect();
-            slices
-                .par_iter()
-                .flat_map_iter(|name| {
-                    let mut folded = Vec::with_capacity(name.len());
-                    fold_name(name, &mut folded);
-                    folded.into_iter()
-                })
-                .collect()
-        };
+                    let len = name_len[i] as usize;
+                    fold_name(&arena[off..off + len], scratch);
+                    out[off - byte_start..off - byte_start + len].copy_from_slice(scratch);
+                }
+            });
 
         let mut sorted: Vec<u32> = (0..n as u32).collect();
         let folded_of = |id: u32| -> &[u8] {

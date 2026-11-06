@@ -11,4 +11,5 @@ publish = false
 
 [dependencies]
 casefold = "0.1.0"
+crc32fast = "1.5.4"
 rayon = "1"

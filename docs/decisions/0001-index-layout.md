@@ -56,7 +56,10 @@ deterministic on every platform and independent of locale.
 ids), so many threads can add entries in any order and parent ids stay
 valid after `freeze()`. Freeze merges the shards, builds both arenas
 (folding in parallel), and computes the sort order with a parallel sort.
-After freeze the index is immutable and shared as `Arc<Index>`.
+Freeze drops the merged builder entries before folding/sorting. The final
+folded arena is allocated once, partitioned at entry boundaries, and filled
+with reusable worker scratch rather than per-name allocations or a per-name
+slice table. After freeze the index is immutable and shared as `Arc<Index>`.
 
 ### File format (version 1)
 
@@ -106,8 +109,8 @@ or a concurrent save never leaves a half-written index at the target
 path and no unrelated sibling file is touched.
 
 The load total covers file open and metadata through temporary payload disposal
-and file close. CRC-32 is a hand-written, table-driven implementation with no
-dependency. Cached-read measurements show checksum work can dominate load;
+and file close. CRC-32 uses `crc32fast` (MIT OR Apache-2.0), preserving the IEEE
+polynomial and version-1 bytes with runtime hardware selection and a portable fallback. Cached-read measurements show checksum work can dominate load;
 they do not establish disk throughput. Accelerating the same IEEE CRC is
 format-compatible; changing checksum semantics requires a format-version bump.
 
