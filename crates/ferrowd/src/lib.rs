@@ -267,6 +267,9 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                     "{key:?} column unavailable; enable the column and rebuild"
                 ))];
             }
+            if result.sort_status == ferrow_query::SortStatus::Failed {
+                return vec![bad_request("sort preparation failed".into())];
+            }
             if result.cancelled {
                 return vec![Response::Error {
                     code: ErrorCode::Cancelled,
@@ -305,6 +308,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                     Response::Rows {
                         rows,
                         columns: snapshot.index.columns_present().bits(),
+                        sort_pending: result.sort_status == ferrow_query::SortStatus::Pending,
                         more,
                     }
                 } else {

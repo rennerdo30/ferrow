@@ -57,7 +57,7 @@ fn configurable_columns_sorting_json_and_missing_sort() {
             0,
             ferrow_index::EntryMetadata {
                 size: Some(size),
-                modified: Some(modified),
+                modified: Some(modified * 10_000_000),
                 ..Default::default()
             },
         );
@@ -75,12 +75,15 @@ fn configurable_columns_sorting_json_and_missing_sort() {
         "--columns",
         "path,size,modified",
     ]);
-    assert_eq!(stdout(&out), "b\t1\t30\nc\t2\t20\na\t3\t10\n");
+    assert_eq!(
+        stdout(&out),
+        "b\t1\t300000000\nc\t2\t200000000\na\t3\t100000000\n"
+    );
     let out = ferrow(&["search", "", "--index", path, "--sort", "size", "--json"]);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(rows[0]["path"], "b");
     assert_eq!(rows[0]["size"], 1);
-    assert_eq!(rows[0]["modified"], 30);
+    assert_eq!(rows[0]["modified"], 300000000);
     assert!(rows[0]["created"].is_null());
     let absent = ferrow(&["search", "", "--index", path, "--sort", "created"]);
     assert!(!absent.status.success());

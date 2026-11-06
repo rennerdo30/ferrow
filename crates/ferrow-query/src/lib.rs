@@ -14,8 +14,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-pub use ferrow_index::SortKey;
 use ferrow_index::{Index, fold_name};
+pub use ferrow_index::{SortKey, SortStatus};
 use memchr::memmem;
 use rayon::prelude::*;
 
@@ -198,6 +198,8 @@ impl fmt::Debug for SearchOptions {
 /// tests) can prove that `limit`/cancellation stopped the scan early.
 #[derive(Debug)]
 pub struct SearchResult {
+    /// Pending sorts return the existing name order without waiting.
+    pub sort_status: SortStatus,
     /// Requested column was not indexed. No fallback results are returned.
     pub sort_unavailable: Option<SortKey>,
     pub hits: Vec<u32>,
@@ -299,11 +301,8 @@ fn search_impl<const TIMED: bool>(
     let started = TIMED.then(std::time::Instant::now);
     let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
-    let sorted = if options.sort == SortKey::Name {
-        index.sorted()
-    } else if let Some(order) = index.metadata_order(options.sort, options.descending) {
-        order
-    } else {
+    let sort_status = index.request_sort(options.sort);
+    if sort_status == SortStatus::Unavailable {
         if let Some(t) = started {
             timings.total = t.elapsed();
         }
@@ -313,10 +312,13 @@ fn search_impl<const TIMED: bool>(
                 cancelled: options.cancel.is_cancelled(),
                 visited: 0,
                 sort_unavailable: Some(options.sort),
+                sort_status,
             },
             timings,
         );
-    };
+    }
+    let metadata_order = index.metadata_order(options.sort, options.descending);
+    let sorted = index.sorted();
     let reverse = options.sort == SortKey::Name && options.descending;
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
@@ -368,18 +370,27 @@ fn search_impl<const TIMED: bool>(
             let start = chunk * BLOCK_SIZE;
             let block = &sorted[start..(start + BLOCK_SIZE).min(sorted.len())];
             let mut found = Vec::new();
+            let mut ordered_ids = Vec::new();
             let mut examined = 0;
             for offset in (0..block.len()).step_by(CANCEL_INTERVAL) {
                 if options.cancel.is_cancelled() {
                     break;
                 }
                 let end = (offset + CANCEL_INTERVAL).min(block.len());
-                for position in start + offset..start + end {
-                    let id = sorted[if reverse {
-                        sorted.len() - 1 - position
-                    } else {
-                        position
-                    }];
+                let ids = if let Some(order) = &metadata_order {
+                    ordered_ids.clear();
+                    ordered_ids.extend(order.range(start + offset, start + end));
+                    ordered_ids.as_slice()
+                } else if reverse {
+                    ordered_ids.clear();
+                    ordered_ids.extend(
+                        (start + offset..start + end).map(|p| sorted[sorted.len() - 1 - p]),
+                    );
+                    ordered_ids.as_slice()
+                } else {
+                    &sorted[start + offset..start + end]
+                };
+                for &id in ids {
                     if matcher.matches(index, id)
                         && options.limit.is_none_or(|limit| found.len() < limit)
                     {
@@ -436,6 +447,11 @@ fn search_impl<const TIMED: bool>(
         timings.collect = t.elapsed();
     }
     let result = SearchResult {
+        sort_status: if metadata_order.is_some() || options.sort == SortKey::Name {
+            SortStatus::Ready
+        } else {
+            sort_status
+        },
         sort_unavailable: None,
         hits,
         cancelled: options.cancel.is_cancelled(),

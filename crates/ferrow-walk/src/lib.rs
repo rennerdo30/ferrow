@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrow_index::osname::name_to_bytes;
-use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, timestamp_ticks};
+use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, metadata_timestamp};
 
 mod identity;
 
@@ -114,13 +114,13 @@ fn from_std_metadata(md: &std::fs::Metadata, set: ColumnSet) -> EntryMetadata {
         result.size = Some(md.len());
     }
     if set.contains(ColumnSet::MODIFIED) {
-        result.modified = md.modified().ok().and_then(timestamp_ticks);
+        result.modified = md.modified().ok().and_then(metadata_timestamp);
     }
     if set.contains(ColumnSet::CREATED) {
-        result.created = md.created().ok().and_then(timestamp_ticks);
+        result.created = md.created().ok().and_then(metadata_timestamp);
     }
     if set.contains(ColumnSet::ACCESSED) {
-        result.accessed = md.accessed().ok().and_then(timestamp_ticks);
+        result.accessed = md.accessed().ok().and_then(metadata_timestamp);
     }
     if set.contains(ColumnSet::ATTRIBUTES) {
         #[cfg(windows)]

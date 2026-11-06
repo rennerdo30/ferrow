@@ -7,8 +7,8 @@
 //! rebuilt from the parent chain on demand. See
 //! `docs/decisions/0001-index-layout.md`.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
@@ -16,7 +16,10 @@ mod metadata;
 pub mod osname;
 pub mod persist;
 use metadata::MetadataColumns;
-pub use metadata::{ColumnSet, EntryMetadata, SortKey, timestamp_ticks};
+pub use metadata::{
+    ColumnSet, EntryMetadata, MetadataOrder, SortKey, SortStatus, SortTicket, metadata_timestamp,
+    timestamp_ticks,
+};
 
 pub use persist::{LoadError, LoadTimings, SaveError};
 
@@ -83,7 +86,7 @@ pub struct Index {
     flags: Vec<u16>,
     arena: Vec<u8>,
     folded_arena: Vec<u8>,
-    sorted: Vec<u32>,
+    sorted: Arc<Vec<u32>>,
 }
 
 impl Index {
@@ -94,18 +97,30 @@ impl Index {
         self.metadata.get(id)
     }
     /// Ready metadata order; `None` means the column was not indexed.
-    pub fn metadata_order(&self, key: SortKey, descending: bool) -> Option<&[u32]> {
+    pub fn metadata_order(&self, key: SortKey, descending: bool) -> Option<MetadataOrder<'_>> {
         self.metadata.order(key, descending)
+    }
+    /// Start preparation once, without waiting, allocating by entry count, or
+    /// borrowing the query pool. Pending searches can keep using name order.
+    pub fn request_sort(&self, key: SortKey) -> SortStatus {
+        self.metadata.request(key, self.sorted.clone())
+    }
+    #[cfg(feature = "test-hooks")]
+    pub fn request_sort_with_hook(
+        &self,
+        key: SortKey,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> SortStatus {
+        self.metadata
+            .request_with_hook(key, self.sorted.clone(), hook)
+    }
+    pub fn sort_ticket(&self, key: SortKey) -> Option<SortTicket> {
+        self.metadata.ticket(key)
     }
     pub fn metadata_heap_bytes(&self) -> usize {
         self.metadata.heap_bytes()
     }
 
-    /// Worker-side preparation for an unpublished snapshot. Never needed by search.
-    /// Also permits measuring the work deferred by a hypothetical lazy cache.
-    pub fn rebuild_metadata_orders(&mut self) {
-        self.metadata.sort(&self.sorted);
-    }
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.parent.len()
@@ -187,6 +202,8 @@ impl Index {
             + self.folded_arena.capacity()
             + self.sorted.capacity() * 4
             + self.metadata.heap_bytes()
+            + std::mem::size_of::<Vec<u32>>()
+            + 2 * std::mem::size_of::<usize>()
     }
 
     /// Save to the versioned binary format. See [`persist`].
@@ -228,7 +245,7 @@ impl Index {
             flags: c.flags,
             arena: c.arena,
             folded_arena: c.folded_arena,
-            sorted: c.sorted,
+            sorted: Arc::new(c.sorted),
         }
     }
 }
@@ -388,7 +405,7 @@ impl IndexBuilder {
 
         // Release builder entries before folding/sorting the frozen columns.
         let t = std::time::Instant::now();
-        let mut metadata = MetadataColumns::build(&raw, self.columns);
+        let metadata = MetadataColumns::build(&raw, self.columns);
         let metadata_collect = t.elapsed();
         drop(raw);
         // Allocate the final arena once and split it only at entry boundaries.
@@ -437,9 +454,7 @@ impl IndexBuilder {
                 .then_with(|| a.cmp(&b))
         });
 
-        let t = std::time::Instant::now();
-        metadata.sort(&sorted);
-        let metadata_sort = t.elapsed();
+        let metadata_sort = std::time::Duration::ZERO;
         let index = Index {
             metadata,
             parent,
@@ -448,7 +463,7 @@ impl IndexBuilder {
             flags: ent_flags,
             arena,
             folded_arena,
-            sorted,
+            sorted: Arc::new(sorted),
         };
         (
             index,
@@ -621,7 +636,7 @@ mod tests {
         idx.flags.reserve(47);
         idx.arena.reserve(53);
         idx.folded_arena.reserve(59);
-        idx.sorted.reserve(61);
+        Arc::get_mut(&mut idx.sorted).unwrap().reserve(61);
         assert!(idx.parent.capacity() > idx.parent.len());
         assert!(idx.name_off.capacity() > idx.name_off.len());
         assert!(idx.name_len.capacity() > idx.name_len.len());
@@ -638,7 +653,9 @@ mod tests {
             + idx.flags.capacity() * 2
             + idx.arena.capacity()
             + idx.folded_arena.capacity()
-            + idx.sorted.capacity() * 4;
+            + idx.sorted.capacity() * 4
+            + std::mem::size_of::<Vec<u32>>()
+            + 2 * std::mem::size_of::<usize>();
         assert_eq!(idx.heap_bytes(), expected);
         assert_eq!(idx.arena.len(), idx.folded_arena.len());
         let live_floor = idx.len() * (4 + 4 + 2 + 2 + 4) + idx.arena.len() * 2;

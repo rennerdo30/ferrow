@@ -37,6 +37,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unknown service sort".into());
     }
     let index = Index::load(std::path::Path::new(&args[1]))?;
+    if modified {
+        index.request_sort(SortKey::Modified);
+        if index
+            .sort_ticket(SortKey::Modified)
+            .unwrap()
+            .wait_timeout(Duration::from_secs(30))
+            != ferrow_index::SortStatus::Ready
+        {
+            return Err("engine sort preparation failed".into());
+        }
+    }
     let name = format!(
         "ferrow-bench-{}-{}",
         std::process::id(),
@@ -81,6 +92,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         index.len(),
         started.elapsed().as_secs_f64() * 1000.0
     );
+    if modified {
+        let started = Instant::now();
+        loop {
+            let (_, _, pending) =
+                client.query_rows_with_status("", 1, ferrow_ipc::Sort::Modified, true)?;
+            if !pending {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                return Err("service sort preparation timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            "FERROW-MODIFIED-PREP service_ms={:.6}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     for text in [
         "a",
         "re",

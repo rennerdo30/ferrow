@@ -2,6 +2,89 @@ use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder, ROOT_PARENT};
 use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, search};
 
 #[test]
+fn pending_sort_returns_names_and_cancellation_while_worker_is_paused() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    let b = IndexBuilder::with_columns(ColumnSet::MODIFIED);
+    for i in 0..2000 {
+        b.add_with_metadata(
+            ROOT_PARENT,
+            format!("file-{i:04}").as_bytes(),
+            0,
+            EntryMetadata {
+                modified: Some(i * 10_000_000),
+                ..Default::default()
+            },
+        );
+    }
+    let index = b.freeze();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let receiver = Mutex::new(release_rx);
+    index.request_sort_with_hook(
+        SortKey::Modified,
+        Arc::new(move || {
+            started_tx.send(()).unwrap();
+            receiver
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let result = search(
+        &index,
+        &Query::default(),
+        &SearchOptions {
+            sort: SortKey::Modified,
+            descending: true,
+            limit: Some(10),
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.sort_status, ferrow_query::SortStatus::Pending);
+    assert_eq!(result.hits, index.sorted()[..10]);
+    let result = search(
+        &index,
+        &Query::default(),
+        &SearchOptions {
+            sort: SortKey::Modified,
+            cancel: CancelToken::cancelled(),
+            ..Default::default()
+        },
+    );
+    assert!(result.cancelled);
+    assert!(result.hits.is_empty());
+    let fresh = IndexBuilder::with_columns(ColumnSet::MODIFIED).freeze();
+    assert_eq!(
+        fresh.sort_ticket(SortKey::Modified).unwrap().status(),
+        ferrow_query::SortStatus::Unprepared
+    );
+    assert!(fresh.metadata_order(SortKey::Modified, false).is_none());
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        index
+            .sort_ticket(SortKey::Modified)
+            .unwrap()
+            .wait_timeout(Duration::from_secs(2)),
+        ferrow_query::SortStatus::Ready
+    );
+    let result = search(
+        &index,
+        &Query::default(),
+        &SearchOptions {
+            sort: SortKey::Modified,
+            descending: true,
+            limit: Some(10),
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.sort_status, ferrow_query::SortStatus::Ready);
+    assert_eq!(result.hits, (1990..2000).rev().collect::<Vec<_>>());
+}
+
+#[test]
 fn every_sort_matches_independent_oracle_with_name_ties_and_missing_values() {
     let builder = IndexBuilder::with_columns(ColumnSet::ALL);
     let mut rows = Vec::new();
@@ -9,9 +92,9 @@ fn every_sort_matches_independent_oracle_with_name_ties_and_missing_values() {
         let name = format!("{}{:04}", if i % 2 == 0 { "a" } else { "Z" }, 2049 - i);
         let metadata = EntryMetadata {
             size: (i % 7 != 0).then_some((i % 13) as u64),
-            modified: (i % 11 != 0).then_some((i % 19) as i64 - 9),
-            created: (i % 5 != 0).then_some((i % 17) as i64 - 8),
-            accessed: (i % 3 != 0).then_some((i % 23) as i64 - 11),
+            modified: (i % 11 != 0).then_some(((i % 19) as i64 - 9) * 10_000_000),
+            created: (i % 5 != 0).then_some(((i % 17) as i64 - 8) * 10_000_000),
+            accessed: (i % 3 != 0).then_some(((i % 23) as i64 - 11) * 10_000_000),
             attributes: None,
         };
         let id = builder.add_with_metadata(ROOT_PARENT, name.as_bytes(), 0, metadata);
@@ -25,6 +108,16 @@ fn every_sort_matches_independent_oracle_with_name_ties_and_missing_values() {
         SortKey::Created,
         SortKey::Accessed,
     ] {
+        if key != SortKey::Name {
+            index.request_sort(key);
+            assert_eq!(
+                index
+                    .sort_ticket(key)
+                    .unwrap()
+                    .wait_timeout(std::time::Duration::from_secs(2)),
+                ferrow_query::SortStatus::Ready
+            );
+        }
         for descending in [false, true] {
             for needle in ["", "a", "19", "zz-no-hit"] {
                 let mut expected: Vec<_> = rows
@@ -125,12 +218,20 @@ fn unavailable_column_is_explicit_and_available_order_stops_early() {
             b"hit",
             0,
             EntryMetadata {
-                modified: Some(i),
+                modified: Some(i * 10_000_000),
                 ..EntryMetadata::default()
             },
         );
     }
     let index = b.freeze();
+    index.request_sort(SortKey::Modified);
+    assert_eq!(
+        index
+            .sort_ticket(SortKey::Modified)
+            .unwrap()
+            .wait_timeout(std::time::Duration::from_secs(2)),
+        ferrow_query::SortStatus::Ready
+    );
     let result = search(
         &index,
         &Query::default(),
@@ -143,4 +244,66 @@ fn unavailable_column_is_explicit_and_available_order_stops_early() {
     );
     assert_eq!(result.hits, (19_990..20_000).rev().collect::<Vec<_>>());
     assert!(result.visited < index.len());
+}
+
+#[test]
+fn descending_equal_and_unknown_groups_cross_chunk_boundaries() {
+    let b = IndexBuilder::with_columns(ColumnSet::MODIFIED);
+    let mut expected = Vec::new();
+    for i in 0..20_001 {
+        let name = format!("item-{:05}", 20_001 - i);
+        let value = if i % 3 == 0 {
+            None
+        } else {
+            Some((i % 2) * 10_000_000)
+        };
+        let id = b.add_with_metadata(
+            ROOT_PARENT,
+            name.as_bytes(),
+            0,
+            EntryMetadata {
+                modified: value,
+                ..Default::default()
+            },
+        );
+        expected.push((id, name, value));
+    }
+    expected.sort_by(|a, b| {
+        match (a.2, b.2) {
+            (Some(a), Some(b)) => b.cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        }
+        .then(a.1.cmp(&b.1))
+    });
+    let index = b.freeze();
+    index.request_sort(SortKey::Modified);
+    assert_eq!(
+        index
+            .sort_ticket(SortKey::Modified)
+            .unwrap()
+            .wait_timeout(std::time::Duration::from_secs(2)),
+        ferrow_query::SortStatus::Ready
+    );
+    for limit in [None, Some(4200), Some(17_000)] {
+        let result = search(
+            &index,
+            &Query::default(),
+            &SearchOptions {
+                sort: SortKey::Modified,
+                descending: true,
+                limit,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.hits,
+            expected
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|r| r.0)
+                .collect::<Vec<_>>()
+        );
+    }
 }

@@ -1,9 +1,12 @@
-//! Optional dense metadata columns. See ADR 0003 for range and cost policies.
+//! Packed optional metadata, exact overflows and background sort preparation.
 use crate::{LoadError, RawEntry};
-use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::sync::{
+    Arc, Condvar, Mutex, OnceLock,
+    atomic::{AtomicU8, Ordering as AtomicOrdering},
+};
+use std::time::{Duration, Instant};
 
-/// Optional column presence; unknown bits are refused when loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnSet(u32);
 impl ColumnSet {
@@ -25,17 +28,11 @@ impl ColumnSet {
         self.0
     }
     pub const fn from_bits(bits: u32) -> Option<Self> {
-        if bits & !Self::ALL.0 == 0 {
+        if bits & !31 == 0 {
             Some(Self(bits))
         } else {
             None
         }
-    }
-    pub(crate) fn payload_bytes(self, n: u32) -> u64 {
-        let n = n as u64;
-        let sortable = (self.0 & 15).count_ones() as u64;
-        let attributes = u64::from(self.contains(Self::ATTRIBUTES));
-        sortable * (n * 16 + n.div_ceil(8)) + attributes * (n * 4 + n.div_ceil(8))
     }
 }
 impl Default for ColumnSet {
@@ -44,7 +41,7 @@ impl Default for ColumnSet {
     }
 }
 
-/// Timestamp values are signed 100 ns ticks since 1970-01-01 UTC.
+/// Times use signed Unix 100ns ticks. Packed dates have whole-second precision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EntryMetadata {
     pub size: Option<u64>,
@@ -53,8 +50,6 @@ pub struct EntryMetadata {
     pub accessed: Option<i64>,
     pub attributes: Option<u32>,
 }
-
-/// Primary sort column. Equal values always use ascending name order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortKey {
     #[default]
@@ -64,184 +59,364 @@ pub enum SortKey {
     Created,
     Accessed,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortStatus {
+    Unprepared,
+    Pending,
+    Ready,
+    Unavailable,
+    Failed,
+}
 
 #[derive(Debug, Default)]
-pub(crate) struct MetadataColumns {
-    size: Option<Column<u64>>,
-    modified: Option<Column<i64>>,
-    created: Option<Column<i64>>,
-    accessed: Option<Column<i64>>,
-    attributes: Option<Column<u32>>,
+struct Signal {
+    state: AtomicU8,
+    wait: Mutex<()>,
+    ready: Condvar,
 }
-
+impl Signal {
+    fn status(&self) -> SortStatus {
+        match self.state.load(AtomicOrdering::Acquire) {
+            0 => SortStatus::Unprepared,
+            1 => SortStatus::Pending,
+            2 => SortStatus::Ready,
+            _ => SortStatus::Failed,
+        }
+    }
+    fn finish(&self, state: u8) {
+        let _guard = self.wait.lock().unwrap_or_else(|e| e.into_inner());
+        self.state.store(state, AtomicOrdering::Release);
+        self.ready.notify_all();
+    }
+}
+/// Wait only on a worker, then post a GUI event. Query paths never wait on this.
+#[derive(Debug, Clone)]
+pub struct SortTicket(Arc<Signal>);
+impl SortTicket {
+    pub fn status(&self) -> SortStatus {
+        self.0.status()
+    }
+    pub fn wait_timeout(&self, timeout: Duration) -> SortStatus {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return self.status();
+        };
+        let mut guard = self.0.wait.lock().unwrap_or_else(|e| e.into_inner());
+        while self.status() == SortStatus::Pending {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, result) = self
+                .0
+                .ready
+                .wait_timeout(guard, left)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next;
+            if result.timed_out() {
+                break;
+            }
+        }
+        self.status()
+    }
+}
 #[derive(Debug)]
-struct Column<T> {
-    values: Vec<T>,
-    valid: Vec<u8>,
-    ascending: Vec<u32>,
-    descending: Vec<u32>,
+struct PackedIds {
+    bytes: Vec<u8>,
+    width: usize,
 }
-
-trait Value: Copy + Default + Ord + Send + Sync {
+impl PackedIds {
+    fn width(n: usize) -> usize {
+        if n <= 1 << 24 { 3 } else { 4 }
+    }
+    fn from_ids(ids: &[u32]) -> Self {
+        let width = Self::width(ids.len());
+        let mut bytes = Vec::with_capacity(ids.len() * width);
+        for id in ids {
+            bytes.extend_from_slice(&id.to_le_bytes()[..width]);
+        }
+        Self { bytes, width }
+    }
+    fn len(&self) -> usize {
+        self.bytes.len() / self.width
+    }
+    fn get(&self, i: usize) -> u32 {
+        let mut bytes = [0; 4];
+        bytes[..self.width].copy_from_slice(&self.bytes[i * self.width..(i + 1) * self.width]);
+        u32::from_le_bytes(bytes)
+    }
+}
+trait Value: Copy + Default + Ord + Send + Sync + 'static {
     const WIDTH: usize;
+    const RAW: usize;
+    const MAX: u64;
+    fn pack(self) -> (u64, Option<Self>);
+    fn unpack(value: u64) -> Self;
     fn write(self, out: &mut Vec<u8>);
     fn read(bytes: &[u8]) -> Self;
 }
-macro_rules! value {
-    ($t:ty, $n:expr) => {
-        impl Value for $t {
-            const WIDTH: usize = $n;
-            fn write(self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_le_bytes());
-            }
-            fn read(bytes: &[u8]) -> Self {
-                Self::from_le_bytes(bytes.try_into().expect("checked width"))
-            }
+macro_rules! raw {
+    ($width:expr) => {
+        const RAW: usize = $width;
+        fn write(self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.to_le_bytes());
+        }
+        fn read(bytes: &[u8]) -> Self {
+            Self::from_le_bytes(bytes.try_into().expect("checked width"))
         }
     };
 }
-value!(u64, 8);
-value!(i64, 8);
-value!(u32, 4);
-
+impl Value for u64 {
+    const WIDTH: usize = 5;
+    const MAX: u64 = (1 << 40) - 1;
+    raw!(8);
+    fn pack(self) -> (u64, Option<Self>) {
+        if self <= <Self as Value>::MAX {
+            (self, None)
+        } else {
+            (<Self as Value>::MAX, Some(self))
+        }
+    }
+    fn unpack(value: u64) -> Self {
+        value
+    }
+}
+impl Value for i64 {
+    const WIDTH: usize = 4;
+    const MAX: u64 = u32::MAX as u64;
+    raw!(8);
+    fn pack(self) -> (u64, Option<Self>) {
+        let seconds = self.div_euclid(10_000_000);
+        if (0..=u32::MAX as i64).contains(&seconds) {
+            (seconds as u64, None)
+        } else {
+            (<Self as Value>::MAX, Some(self))
+        }
+    }
+    fn unpack(value: u64) -> Self {
+        value as i64 * 10_000_000
+    }
+}
+impl Value for u32 {
+    const WIDTH: usize = 4;
+    const MAX: u64 = u32::MAX as u64;
+    raw!(4);
+    fn pack(self) -> (u64, Option<Self>) {
+        (u64::from(self), None)
+    }
+    fn unpack(value: u64) -> Self {
+        value as u32
+    }
+}
+#[derive(Debug)]
+struct Column<T> {
+    packed: Vec<u8>,
+    valid: Vec<u8>,
+    overflow_ids: Vec<u32>,
+    overflow_values: Vec<T>,
+    order: OnceLock<PackedIds>,
+    signal: Arc<Signal>,
+}
+fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], LoadError> {
+    let end = at
+        .checked_add(n)
+        .ok_or(LoadError::Corrupt("column size overflow"))?;
+    let result = data.get(*at..end).ok_or(LoadError::Truncated)?;
+    *at = end;
+    Ok(result)
+}
 impl<T: Value> Column<T> {
-    fn build(raw: &[RawEntry], get: impl Fn(&EntryMetadata) -> Option<T>) -> Self {
-        let mut values = Vec::with_capacity(raw.len());
-        let mut valid = vec![0; raw.len().div_ceil(8)];
+    fn build(raw: &[RawEntry], get: impl Fn(&EntryMetadata) -> Option<T>) -> Arc<Self> {
+        let mut c = Self {
+            packed: Vec::with_capacity(raw.len() * T::WIDTH),
+            valid: vec![0; raw.len().div_ceil(8)],
+            overflow_ids: Vec::new(),
+            overflow_values: Vec::new(),
+            order: OnceLock::new(),
+            signal: Arc::default(),
+        };
         for (i, e) in raw.iter().enumerate() {
-            let value = get(&e.metadata);
-            if value.is_some() {
-                valid[i / 8] |= 1 << (i % 8);
+            let (packed, overflow) = get(&e.metadata).map_or((0, None), |value| {
+                c.valid[i / 8] |= 1 << (i % 8);
+                value.pack()
+            });
+            c.packed
+                .extend_from_slice(&packed.to_le_bytes()[..T::WIDTH]);
+            if let Some(value) = overflow {
+                c.overflow_ids.push(i as u32);
+                c.overflow_values.push(value);
             }
-            values.push(value.unwrap_or_default());
         }
-        Self {
-            values,
-            valid,
-            ascending: Vec::new(),
-            descending: Vec::new(),
-        }
+        c.overflow_ids.shrink_to_fit();
+        c.overflow_values.shrink_to_fit();
+        Arc::new(c)
+    }
+    fn code(&self, id: usize) -> u64 {
+        let mut bytes = [0; 8];
+        bytes[..T::WIDTH].copy_from_slice(&self.packed[id * T::WIDTH..(id + 1) * T::WIDTH]);
+        u64::from_le_bytes(bytes)
     }
     fn get(&self, id: u32) -> Option<T> {
         let i = id as usize;
-        (self.valid[i / 8] & (1 << (i % 8)) != 0).then(|| self.values[i])
+        if self.valid[i / 8] & (1 << (i % 8)) == 0 {
+            return None;
+        }
+        let code = self.code(i);
+        if code == T::MAX
+            && let Ok(slot) = self.overflow_ids.binary_search(&id)
+        {
+            return Some(self.overflow_values[slot]);
+        }
+        Some(T::unpack(code))
     }
-    fn cmp(&self, a: u32, b: u32, desc: bool, rank: &[u32]) -> Ordering {
-        let primary = match (self.get(a), self.get(b)) {
-            (Some(a), Some(b)) => {
-                if desc {
-                    b.cmp(&a)
-                } else {
-                    a.cmp(&b)
-                }
-            }
+    fn cmp(&self, a: u32, b: u32) -> Ordering {
+        match (self.get(a), self.get(b)) {
+            (Some(a), Some(b)) => a.cmp(&b),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        };
-        primary.then_with(|| rank[a as usize].cmp(&rank[b as usize]))
-    }
-    fn sort(&mut self, rank: &[u32]) {
-        let mut asc: Vec<_> = (0..self.values.len() as u32).collect();
-        asc.par_sort_unstable_by(|&a, &b| self.cmp(a, b, false, rank));
-        let mut desc = asc.clone();
-        // Reverse value groups while retaining ascending names within ties.
-        let known = asc.partition_point(|&id| self.get(id).is_some());
-        desc[..known].reverse();
-        let mut start = 0;
-        while start < known {
-            let value = self.get(desc[start]);
-            let mut end = start + 1;
-            while end < known && self.get(desc[end]) == value {
-                end += 1;
-            }
-            desc[start..end].reverse();
-            start = end;
+            _ => Ordering::Equal,
         }
-        self.ascending = asc;
-        self.descending = desc;
+    }
+    fn request(self: &Arc<Self>, names: Arc<Vec<u32>>) -> SortStatus {
+        self.request_using(names, || {})
+    }
+    fn request_using(
+        self: &Arc<Self>,
+        names: Arc<Vec<u32>>,
+        before: impl FnOnce() + Send + 'static,
+    ) -> SortStatus {
+        if self
+            .signal
+            .state
+            .compare_exchange(0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+        {
+            let column = self.clone();
+            let launched = std::thread::Builder::new()
+                .name("ferrow-sort".into())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        before();
+                        let mut ids = (*names).clone();
+                        // Stable input name order preserves ties. This dedicated
+                        // thread never occupies or waits for the query Rayon pool.
+                        ids.sort_by(|&a, &b| column.cmp(a, b));
+                        let _ = column.order.set(PackedIds::from_ids(&ids));
+                    }));
+                    column.signal.finish(if result.is_ok() { 2 } else { 3 });
+                });
+            if launched.is_err() {
+                self.signal.finish(3);
+            }
+        }
+        self.signal.status()
     }
     fn heap_bytes(&self) -> usize {
-        self.values.capacity() * T::WIDTH
+        self.packed.capacity()
             + self.valid.capacity()
-            + (self.ascending.capacity() + self.descending.capacity()) * 4
+            + self.overflow_ids.capacity() * 4
+            + self.overflow_values.capacity() * T::RAW
+            + self.order.get().map_or(0, |o| o.bytes.capacity())
+            + std::mem::size_of::<Self>()
+            + std::mem::size_of::<Signal>()
+            + 4 * std::mem::size_of::<usize>()
+    }
+    fn serialized_len(&self) -> usize {
+        4 + self.packed.len() + self.valid.len() + self.overflow_ids.len() * (4 + T::RAW)
     }
     fn write(&self, out: &mut Vec<u8>) {
-        for &v in &self.values {
-            v.write(out);
-        }
+        out.extend_from_slice(&(self.overflow_ids.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.packed);
         out.extend_from_slice(&self.valid);
-        for ids in [&self.ascending, &self.descending] {
-            for &id in ids {
-                id.write(out);
-            }
+        for id in &self.overflow_ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        for value in &self.overflow_values {
+            value.write(out);
         }
     }
-    fn read(data: &[u8], at: &mut usize, n: usize, sortable: bool) -> Result<Self, LoadError> {
-        let mut take = |len: usize| -> Result<&[u8], LoadError> {
-            let end = at
-                .checked_add(len)
-                .ok_or(LoadError::Corrupt("column size overflow"))?;
-            let result = data.get(*at..end).ok_or(LoadError::Truncated)?;
-            *at = end;
-            Ok(result)
+    fn read(data: &[u8], at: &mut usize, n: usize) -> Result<Arc<Self>, LoadError> {
+        let k = u32::from_le_bytes(take(data, at, 4)?.try_into().expect("checked width")) as usize;
+        if k > n {
+            return Err(LoadError::Corrupt("too many metadata overflows"));
+        }
+        let packed = take(data, at, n * T::WIDTH)?.to_vec();
+        let valid = take(data, at, n.div_ceil(8))?.to_vec();
+        let overflow_ids: Vec<_> = take(data, at, k * 4)?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect();
+        let overflow_values = take(data, at, k * T::RAW)?
+            .chunks_exact(T::RAW)
+            .map(T::read)
+            .collect();
+        let c = Self {
+            packed,
+            valid,
+            overflow_ids,
+            overflow_values,
+            order: OnceLock::new(),
+            signal: Arc::default(),
         };
-        let values = take(
-            n.checked_mul(T::WIDTH)
-                .ok_or(LoadError::Corrupt("column size overflow"))?,
-        )?
-        .chunks_exact(T::WIDTH)
-        .map(T::read)
-        .collect();
-        let valid = take(n.div_ceil(8))?.to_vec();
-        if !n.is_multiple_of(8) && valid.last().is_some_and(|v| *v >> (n % 8) != 0) {
+        if !n.is_multiple_of(8) && c.valid.last().is_some_and(|v| *v >> (n % 8) != 0) {
             return Err(LoadError::Corrupt("noncanonical validity bitmap"));
         }
-        let mut ids = || -> Result<Vec<u32>, LoadError> {
-            Ok(take(n * 4)?
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| u32::from_le_bytes(*c))
-                .collect())
-        };
-        let column = Self {
-            values,
-            valid,
-            ascending: if sortable { ids()? } else { Vec::new() },
-            descending: if sortable { ids()? } else { Vec::new() },
-        };
-        for i in 0..n {
-            if column.get(i as u32).is_none() && column.values[i] != T::default() {
-                return Err(LoadError::Corrupt("noncanonical unknown metadata"));
+        for (byte, &mask) in c.valid.iter().enumerate() {
+            if mask == 255 {
+                continue;
             }
-        }
-        Ok(column)
-    }
-    fn validate(&self, rank: &[u32]) -> Result<(), LoadError> {
-        for (ids, desc) in [(&self.ascending, false), (&self.descending, true)] {
-            let mut seen = vec![false; rank.len()];
-            for &id in ids {
-                let slot = seen
-                    .get_mut(id as usize)
-                    .ok_or(LoadError::Corrupt("metadata sort id out of range"))?;
-                if *slot {
-                    return Err(LoadError::Corrupt("duplicate metadata sort id"));
+            for bit in 0..8 {
+                let i = byte * 8 + bit;
+                if i < n && mask & (1 << bit) == 0 && c.code(i) != 0 {
+                    return Err(LoadError::Corrupt("noncanonical unknown metadata"));
                 }
-                *slot = true;
-            }
-            if ids
-                .par_windows(2)
-                .any(|w| self.cmp(w[0], w[1], desc, rank).is_gt())
-            {
-                return Err(LoadError::Corrupt("metadata sort order"));
             }
         }
-        Ok(())
+        for (slot, &id) in c.overflow_ids.iter().enumerate() {
+            if id as usize >= n
+                || (slot > 0 && c.overflow_ids[slot - 1] >= id)
+                || c.valid[id as usize / 8] & (1 << (id % 8)) == 0
+                || c.code(id as usize) != T::MAX
+                || c.overflow_values[slot].pack().1.is_none()
+            {
+                return Err(LoadError::Corrupt("invalid metadata overflow"));
+            }
+        }
+        Ok(Arc::new(c))
     }
 }
-
+#[derive(Debug, Default)]
+pub(crate) struct MetadataColumns {
+    size: Option<Arc<Column<u64>>>,
+    modified: Option<Arc<Column<i64>>>,
+    created: Option<Arc<Column<i64>>>,
+    accessed: Option<Arc<Column<i64>>>,
+    attributes: Option<Arc<Column<u32>>>,
+}
 impl MetadataColumns {
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn request_with_hook(
+        &self,
+        key: SortKey,
+        names: Arc<Vec<u32>>,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> SortStatus {
+        match key {
+            SortKey::Name => SortStatus::Ready,
+            SortKey::Size => self.size.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_using(names, move || hook())
+            }),
+            SortKey::Modified => self.modified.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_using(names, move || hook())
+            }),
+            SortKey::Created => self.created.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_using(names, move || hook())
+            }),
+            SortKey::Accessed => self.accessed.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_using(names, move || hook())
+            }),
+        }
+    }
     pub(crate) fn build(raw: &[RawEntry], set: ColumnSet) -> Self {
         Self {
             size: set
@@ -279,56 +454,95 @@ impl MetadataColumns {
             attributes: self.attributes.as_ref().and_then(|c| c.get(id)),
         }
     }
-    pub(crate) fn order(&self, key: SortKey, desc: bool) -> Option<&[u32]> {
-        macro_rules! order {
-            ($c:expr) => {
-                $c.as_ref().map(|c| {
-                    if desc {
-                        c.descending.as_slice()
-                    } else {
-                        c.ascending.as_slice()
-                    }
-                })
-            };
-        }
+    pub(crate) fn request(&self, key: SortKey, names: Arc<Vec<u32>>) -> SortStatus {
         match key {
-            SortKey::Name => None,
-            SortKey::Size => order!(self.size),
-            SortKey::Modified => order!(self.modified),
-            SortKey::Created => order!(self.created),
-            SortKey::Accessed => order!(self.accessed),
+            SortKey::Name => SortStatus::Ready,
+            SortKey::Size => self
+                .size
+                .as_ref()
+                .map_or(SortStatus::Unavailable, |c| c.request(names)),
+            SortKey::Modified => self
+                .modified
+                .as_ref()
+                .map_or(SortStatus::Unavailable, |c| c.request(names)),
+            SortKey::Created => self
+                .created
+                .as_ref()
+                .map_or(SortStatus::Unavailable, |c| c.request(names)),
+            SortKey::Accessed => self
+                .accessed
+                .as_ref()
+                .map_or(SortStatus::Unavailable, |c| c.request(names)),
         }
     }
-    fn rank(sorted: &[u32]) -> Vec<u32> {
-        let mut rank = vec![0; sorted.len()];
-        for (i, &id) in sorted.iter().enumerate() {
-            rank[id as usize] = i as u32;
-        }
-        rank
+    pub(crate) fn ticket(&self, key: SortKey) -> Option<SortTicket> {
+        let signal = match key {
+            SortKey::Size => self.size.as_ref().map(|c| c.signal.clone()),
+            SortKey::Modified => self.modified.as_ref().map(|c| c.signal.clone()),
+            SortKey::Created => self.created.as_ref().map(|c| c.signal.clone()),
+            SortKey::Accessed => self.accessed.as_ref().map(|c| c.signal.clone()),
+            _ => None,
+        };
+        signal.map(SortTicket)
     }
-    pub(crate) fn sort(&mut self, sorted: &[u32]) {
-        if self.present().bits() & 15 == 0 {
-            return;
+    pub(crate) fn value(&self, key: SortKey, id: u32) -> Option<i128> {
+        match key {
+            SortKey::Size => self.size.as_ref().and_then(|c| c.get(id)).map(i128::from),
+            SortKey::Modified => self
+                .modified
+                .as_ref()
+                .and_then(|c| c.get(id))
+                .map(i128::from),
+            SortKey::Created => self
+                .created
+                .as_ref()
+                .and_then(|c| c.get(id))
+                .map(i128::from),
+            SortKey::Accessed => self
+                .accessed
+                .as_ref()
+                .and_then(|c| c.get(id))
+                .map(i128::from),
+            _ => None,
         }
-        let rank = Self::rank(sorted);
-        if let Some(c) = &mut self.size {
-            c.sort(&rank);
+    }
+    pub(crate) fn order(&self, key: SortKey, descending: bool) -> Option<MetadataOrder<'_>> {
+        let ids = match key {
+            SortKey::Size => self.size.as_ref().and_then(|c| c.order.get()),
+            SortKey::Modified => self.modified.as_ref().and_then(|c| c.order.get()),
+            SortKey::Created => self.created.as_ref().and_then(|c| c.order.get()),
+            SortKey::Accessed => self.accessed.as_ref().and_then(|c| c.order.get()),
+            _ => None,
+        }?;
+        let mut result = MetadataOrder {
+            columns: self,
+            ids,
+            key,
+            descending,
+            known: ids.len(),
+        };
+        if descending {
+            result.known = result.bound(0, ids.len(), |id| self.value(key, id).is_some());
         }
-        for c in [&mut self.modified, &mut self.created, &mut self.accessed]
-            .into_iter()
-            .flatten()
-        {
-            c.sort(&rank);
-        }
+        Some(result)
     }
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.size.as_ref().map_or(0, Column::heap_bytes)
+        self.size.as_ref().map_or(0, |c| c.heap_bytes())
+            + self.attributes.as_ref().map_or(0, |c| c.heap_bytes())
             + [&self.modified, &self.created, &self.accessed]
                 .into_iter()
                 .flatten()
-                .map(Column::heap_bytes)
+                .map(|c| c.heap_bytes())
                 .sum::<usize>()
-            + self.attributes.as_ref().map_or(0, Column::heap_bytes)
+    }
+    pub(crate) fn serialized_len(&self) -> usize {
+        self.size.as_ref().map_or(0, |c| c.serialized_len())
+            + self.attributes.as_ref().map_or(0, |c| c.serialized_len())
+            + [&self.modified, &self.created, &self.accessed]
+                .into_iter()
+                .flatten()
+                .map(|c| c.serialized_len())
+                .sum::<usize>()
     }
     pub(crate) fn write(&self, out: &mut Vec<u8>) {
         if let Some(c) = &self.size {
@@ -352,62 +566,178 @@ impl MetadataColumns {
     ) -> Result<Self, LoadError> {
         Ok(Self {
             size: if set.contains(ColumnSet::SIZE) {
-                Some(Column::read(data, at, n, true)?)
+                Some(Column::read(data, at, n)?)
             } else {
                 None
             },
             modified: if set.contains(ColumnSet::MODIFIED) {
-                Some(Column::read(data, at, n, true)?)
+                Some(Column::read(data, at, n)?)
             } else {
                 None
             },
             created: if set.contains(ColumnSet::CREATED) {
-                Some(Column::read(data, at, n, true)?)
+                Some(Column::read(data, at, n)?)
             } else {
                 None
             },
             accessed: if set.contains(ColumnSet::ACCESSED) {
-                Some(Column::read(data, at, n, true)?)
+                Some(Column::read(data, at, n)?)
             } else {
                 None
             },
             attributes: if set.contains(ColumnSet::ATTRIBUTES) {
-                Some(Column::read(data, at, n, false)?)
+                Some(Column::read(data, at, n)?)
             } else {
                 None
             },
         })
     }
-    pub(crate) fn validate(&self, sorted: &[u32]) -> Result<(), LoadError> {
-        if self.present().bits() & 15 == 0 {
-            return Ok(());
+}
+/// Prepared ids with a direction-aware range iterator. No allocation or waiting.
+#[derive(Clone, Copy)]
+pub struct MetadataOrder<'a> {
+    columns: &'a MetadataColumns,
+    ids: &'a PackedIds,
+    key: SortKey,
+    descending: bool,
+    known: usize,
+}
+impl MetadataOrder<'_> {
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn bound(&self, mut lo: usize, mut hi: usize, predicate: impl Fn(u32) -> bool) -> usize {
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if predicate(self.ids.get(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        let rank = Self::rank(sorted);
-        if let Some(c) = &self.size {
-            c.validate(&rank)?;
-        }
-        for c in [&self.modified, &self.created, &self.accessed]
-            .into_iter()
-            .flatten()
-        {
-            c.validate(&rank)?;
-        }
-        Ok(())
+        lo
+    }
+    pub fn range(&self, start: usize, end: usize) -> impl Iterator<Item = u32> + '_ {
+        assert!(start <= end && end <= self.len());
+        let mut virtual_pos = start;
+        let mut group_end = 0;
+        let mut group_pos = 0;
+        std::iter::from_fn(move || {
+            if virtual_pos == end {
+                return None;
+            }
+            let id = if !self.descending || virtual_pos >= self.known {
+                self.ids.get(virtual_pos)
+            } else {
+                if group_pos == group_end {
+                    let mirrored = self.known - 1 - virtual_pos;
+                    let value = self.columns.value(self.key, self.ids.get(mirrored));
+                    let equal = |i| self.columns.value(self.key, self.ids.get(i)) == value;
+                    let start = if mirrored > 0 && equal(mirrored - 1) {
+                        self.bound(0, mirrored, |id| self.columns.value(self.key, id) < value)
+                    } else {
+                        mirrored
+                    };
+                    group_end = if mirrored + 1 < self.known && equal(mirrored + 1) {
+                        self.bound(mirrored + 1, self.known, |id| {
+                            self.columns.value(self.key, id) <= value
+                        })
+                    } else {
+                        mirrored + 1
+                    };
+                    group_pos = start + virtual_pos - (self.known - group_end);
+                }
+                let id = self.ids.get(group_pos);
+                group_pos += 1;
+                id
+            };
+            virtual_pos += 1;
+            Some(id)
+        })
     }
 }
-
-/// Convert system timestamps without losing seconds or overflowing.
 pub fn timestamp_ticks(time: std::time::SystemTime) -> Option<i64> {
-    use std::time::UNIX_EPOCH;
-    let (duration, negative) = match time.duration_since(UNIX_EPOCH) {
+    let (duration, negative) = match time.duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => (d, false),
         Err(e) => (e.duration(), true),
     };
     let nanos = i128::try_from(duration.as_nanos()).ok()?;
-    let ticks = if negative {
+    i64::try_from(if negative {
         (-nanos).div_euclid(100)
     } else {
         nanos / 100
-    };
-    i64::try_from(ticks).ok()
+    })
+    .ok()
+}
+
+/// Whole-second precision in the packed epoch range; exact ticks outside it.
+pub fn metadata_timestamp(time: std::time::SystemTime) -> Option<i64> {
+    let ticks = timestamp_ticks(time)?;
+    let (packed, overflow) = ticks.pack();
+    Some(overflow.unwrap_or_else(|| i64::unpack(packed)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn packed_boundaries_seconds_and_exact_overflows() {
+        for value in [
+            0,
+            (1u64 << 32) - 1,
+            1 << 32,
+            (1 << 40) - 1,
+            1 << 40,
+            u64::MAX,
+        ] {
+            let (packed, overflow) = value.pack();
+            assert_eq!(overflow.unwrap_or_else(|| u64::unpack(packed)), value);
+            assert_eq!(overflow.is_some(), value >= 1 << 40);
+        }
+        for value in [
+            i64::MIN,
+            -1,
+            0,
+            10_000_001,
+            u32::MAX as i64 * 10_000_000,
+            (u32::MAX as i64 + 1) * 10_000_000,
+            i64::MAX,
+        ] {
+            let (packed, overflow) = value.pack();
+            let expected = if value >= 0 && value / 10_000_000 <= u32::MAX as i64 {
+                value / 10_000_000 * 10_000_000
+            } else {
+                value
+            };
+            assert_eq!(overflow.unwrap_or_else(|| i64::unpack(packed)), expected);
+        }
+        assert_eq!(PackedIds::width(1 << 24), 3);
+        assert_eq!(PackedIds::width((1 << 24) + 1), 4);
+        let ids = PackedIds {
+            bytes: vec![255, 255, 255, 0, 0, 0],
+            width: 3,
+        };
+        assert_eq!(ids.get(0), 0xffffff);
+        assert_eq!(ids.get(1), 0);
+        let ids = PackedIds {
+            bytes: u32::MAX.to_le_bytes().to_vec(),
+            width: 4,
+        };
+        assert_eq!(ids.get(0), u32::MAX);
+    }
+    #[test]
+    fn failed_preparation_is_explicit_and_not_retried() {
+        let column = Column::<u64>::build(&[], |m| m.size);
+        column.request_using(Arc::new(Vec::new()), || panic!("mock sort failure"));
+        let ticket = SortTicket(column.signal.clone());
+        assert_eq!(
+            ticket.wait_timeout(Duration::from_secs(2)),
+            SortStatus::Failed
+        );
+        assert_eq!(column.request(Arc::new(Vec::new())), SortStatus::Failed);
+        assert!(column.order.get().is_none());
+    }
 }

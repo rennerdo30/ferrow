@@ -83,6 +83,16 @@ fn daemon_answers_and_snapshot_swap_is_visible() {
     assert_eq!(hits.len(), 1);
     assert!(String::from_utf8_lossy(&hits[0]).ends_with("alpha-report.txt"));
     let (entries, mode, _) = client.status().unwrap();
+    let snapshot = store.get();
+    snapshot.index.request_sort(ferrow_index::SortKey::Modified);
+    assert_eq!(
+        snapshot
+            .index
+            .sort_ticket(ferrow_index::SortKey::Modified)
+            .unwrap()
+            .wait_timeout(std::time::Duration::from_secs(2)),
+        ferrow_index::SortStatus::Ready
+    );
     let (rows, columns) = client
         .query_rows("alpha", 10, ferrow_ipc::Sort::Modified, true)
         .unwrap();
@@ -124,7 +134,7 @@ fn metadata_sort_keeps_values_aligned_across_pages() {
             0,
             ferrow_index::EntryMetadata {
                 size: Some(i),
-                modified: Some(i as i64),
+                modified: Some(i as i64 * 10_000_000),
                 ..Default::default()
             },
         );
@@ -134,6 +144,16 @@ fn metadata_sort_keeps_values_aligned_across_pages() {
         mode: "fixture".into(),
         report: String::new(),
     });
+    let snapshot = store.get();
+    snapshot.index.request_sort(ferrow_index::SortKey::Modified);
+    assert_eq!(
+        snapshot
+            .index
+            .sort_ticket(ferrow_index::SortKey::Modified)
+            .unwrap()
+            .wait_timeout(std::time::Duration::from_secs(2)),
+        ferrow_index::SortStatus::Ready
+    );
     let responses = ferrowd::handle(
         &store,
         ferrow_ipc::Request::Query {
@@ -150,15 +170,17 @@ fn metadata_sort_keeps_values_aligned_across_pages() {
             rows,
             columns,
             more,
+            sort_pending,
         } = response
         else {
             panic!("{response:?}")
         };
         assert_eq!(*columns, 3);
+        assert!(!sort_pending);
         assert_eq!(*more, i + 1 < responses.len());
         for row in rows {
             assert_eq!(row.size, Some(expected));
-            assert_eq!(row.modified, Some(expected as i64));
+            assert_eq!(row.modified, Some(expected as i64 * 10_000_000));
             assert_eq!(row.path, format!("file-{expected:04}").as_bytes());
             expected = expected.saturating_sub(1);
         }

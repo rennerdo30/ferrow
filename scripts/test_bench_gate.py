@@ -26,7 +26,7 @@ def without_service(text):
 
 
 def metadata_fixture():
-    lines = ["FERROW-METADATA entries=16 seed=2026 core_heap_bytes=800 default_heap_bytes=1316 default_bytes_per_entry=82.25 metadata_bytes_per_entry=32.25 load_ms_median=200 precomputed_build_ms=20 lazy_build_ms_median=20 lazy_saved_bytes=256 freeze_ms=50",
+    lines = ["FERROW-METADATA entries=16 seed=2026 core_heap_bytes=800 default_heap_bytes=1044 cold_default_heap_bytes=948 default_bytes_per_entry=65.25 metadata_bytes_per_entry=15.25 load_ms_median=200 core_load_ms_median=200 sort_during_load=0 lazy_build_ms_median=20 lazy_saved_bytes=96 freeze_ms=50",
              "FERROW-SCAN entries=2101 errors=0 none_ms_median=10 default_ms_median=20"]
     for query in sorted(gate.QUERIES):
         for prefix in ("FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE"):
@@ -101,12 +101,27 @@ class GateTests(unittest.TestCase):
         text = metadata_fixture()
         for invalid in ("", text.replace('FERROW-MODIFIED-SERVICE query="a"', 'IGNORE query="a"'),
                         text.replace("entries=16", "entries=17"), text.replace("seed=2026", "seed=2027"),
-                        text.replace("default_heap_bytes=1316", "default_heap_bytes=1300"),
+                        text.replace("default_heap_bytes=1044", "default_heap_bytes=1300"),
                         text.replace("load_ms_median=200", "load_ms_median=nan"),
                         text.replace("page_hits=2", "page_hits=3"), text.replace("total_hits=2", "total_hits=3"),
                         text.replace("errors=0", "errors=1"), text + "\n" + text):
             with self.subTest(invalid=invalid), self.assertRaises((ValueError, KeyError)):
                 gate.metadata_observations(invalid, self.head, 16)
+
+    def test_metadata_targets_are_enforced_and_rare_pages_remain_observations(self):
+        for invalid in (metadata_fixture().replace("core_load_ms_median=200", "core_load_ms_median=100"),
+                        metadata_fixture().replace("sort_during_load=0", "sort_during_load=1"),
+                        metadata_fixture().replace("first_page_ms=1 ", "first_page_ms=16.001 "),
+                        metadata_fixture().replace("default_heap_bytes=1044", "default_heap_bytes=1072")
+                        .replace("cold_default_heap_bytes=948", "cold_default_heap_bytes=976")
+                        .replace("default_bytes_per_entry=65.25", "default_bytes_per_entry=67")
+                        .replace("metadata_bytes_per_entry=15.25", "metadata_bytes_per_entry=17")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                gate.metadata_observations(invalid, self.head, 16)
+        rare = metadata_fixture()
+        for query in ("report 2024", "zzzz-no-hit-zzzz"):
+            rare = rare.replace(f'query="{query}" first_page_ms=1 ', f'query="{query}" first_page_ms=270 ')
+        self.assertEqual(len(gate.metadata_observations(rare, self.head, 16)[0]), gate.EXPECTED_METADATA_METRICS)
 
     def test_cli_requires_metadata_when_ci_requests_it(self):
         with tempfile.TemporaryDirectory() as folder:

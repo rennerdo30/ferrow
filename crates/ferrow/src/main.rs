@@ -604,9 +604,19 @@ fn cmd_search(args: Args) -> Result<(), String> {
             SortKey::Created => ferrow_ipc::Sort::Created,
             SortKey::Accessed => ferrow_ipc::Sort::Accessed,
         };
-        let (rows, _) = client
-            .query_rows(query_text, limit, sort, args.descending)
-            .map_err(|e| e.to_string())?;
+        let prepare_started = Instant::now();
+        let rows = loop {
+            let (rows, _, pending) = client
+                .query_rows_with_status(query_text, limit, sort, args.descending)
+                .map_err(|e| e.to_string())?;
+            if !pending {
+                break rows;
+            }
+            if prepare_started.elapsed() > std::time::Duration::from_secs(5) {
+                return Err("sort preparation still pending; retry the query".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         let mut output = PathOutput::new(&mut out, args.json, args.null)?;
         for row in rows {
             output.row(
@@ -645,6 +655,17 @@ fn cmd_search(args: Args) -> Result<(), String> {
         return Ok(());
     }
 
+    // CLI preparation is bounded startup work; engine/service searches and GUI
+    // callers receive pending name-order results without waiting.
+    if args.sort != SortKey::Name {
+        index.request_sort(args.sort);
+        if let Some(ticket) = index.sort_ticket(args.sort)
+            && ticket.wait_timeout(std::time::Duration::from_secs(5))
+                != ferrow_index::SortStatus::Ready
+        {
+            return Err("sort preparation pending or failed".into());
+        }
+    }
     let result = search(
         &index,
         &query,

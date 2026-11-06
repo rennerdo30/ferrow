@@ -20,6 +20,7 @@ memchr = "2"
 rayon = "1"
 
 [dev-dependencies]
+ferrow-index = { path = "../ferrow-index", features = ["test-hooks"] }
 divan = "0.1.21"
 ferrow-fixture = { path = "../ferrow-fixture" }
 ferrow-ipc = { path = "../ferrow-ipc" }

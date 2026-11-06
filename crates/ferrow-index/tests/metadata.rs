@@ -3,6 +3,22 @@ use ferrow_index::{
 };
 use std::time::{Duration, UNIX_EPOCH};
 
+fn order(index: &Index, key: SortKey, desc: bool) -> Option<Vec<u32>> {
+    if index.request_sort(key) == ferrow_index::SortStatus::Unavailable {
+        return None;
+    }
+    assert_eq!(
+        index
+            .sort_ticket(key)
+            .unwrap()
+            .wait_timeout(Duration::from_secs(2)),
+        ferrow_index::SortStatus::Ready
+    );
+    index
+        .metadata_order(key, desc)
+        .map(|o| o.range(0, o.len()).collect())
+}
+
 fn fixture(set: ColumnSet) -> Index {
     let builder = IndexBuilder::with_columns(set);
     for (name, size, ticks) in [
@@ -56,11 +72,15 @@ fn optional_columns_and_both_directions_round_trip() {
         for id in 0..index.len() as u32 {
             assert_eq!(loaded.metadata(id), index.metadata(id));
         }
-        assert_eq!(
-            index.metadata_heap_bytes(),
-            (bits & 15).count_ones() as usize * 65
-                + usize::from(set.contains(ColumnSet::ATTRIBUTES)) * 17
-        );
+        let fixed = IndexBuilder::with_columns(set)
+            .freeze()
+            .metadata_heap_bytes();
+        let expected = fixed
+            + usize::from(set.contains(ColumnSet::SIZE)) * 33
+            + (bits & 14).count_ones() as usize * 29
+            + usize::from(set.contains(ColumnSet::ATTRIBUTES)) * 17;
+        assert_eq!(index.metadata_heap_bytes(), expected);
+        let cold = index.heap_bytes();
         for (key, column) in [
             (SortKey::Size, ColumnSet::SIZE),
             (SortKey::Modified, ColumnSet::MODIFIED),
@@ -68,46 +88,37 @@ fn optional_columns_and_both_directions_round_trip() {
             (SortKey::Accessed, ColumnSet::ACCESSED),
         ] {
             for desc in [false, true] {
-                assert_eq!(
-                    loaded.metadata_order(key, desc),
-                    index.metadata_order(key, desc)
-                );
-                assert_eq!(
-                    loaded.metadata_order(key, desc).is_some(),
-                    set.contains(column)
-                );
+                assert_eq!(order(&loaded, key, desc), order(&index, key, desc));
+                assert_eq!(order(&loaded, key, desc).is_some(), set.contains(column));
             }
         }
+        assert_eq!(
+            index.heap_bytes() - cold,
+            (bits & 15).count_ones() as usize * 12
+        );
     }
     let index = fixture(ColumnSet::ALL);
     assert_eq!(index.metadata(0).size, Some(u64::MAX));
     assert_eq!(index.metadata(0).modified, Some(i64::MIN));
     assert_eq!(index.metadata(0).attributes, Some(u32::MAX));
+    assert_eq!(order(&index, SortKey::Size, false).unwrap(), &[2, 1, 0, 3]);
+    assert_eq!(order(&index, SortKey::Size, true).unwrap(), &[0, 2, 1, 3]);
     assert_eq!(
-        index.metadata_order(SortKey::Size, false).unwrap(),
-        &[2, 1, 0, 3]
-    );
-    assert_eq!(
-        index.metadata_order(SortKey::Size, true).unwrap(),
+        order(&index, SortKey::Modified, false).unwrap(),
         &[0, 2, 1, 3]
     );
     assert_eq!(
-        index.metadata_order(SortKey::Modified, false).unwrap(),
-        &[0, 2, 1, 3]
-    );
-    assert_eq!(
-        index.metadata_order(SortKey::Modified, true).unwrap(),
+        order(&index, SortKey::Modified, true).unwrap(),
         &[2, 1, 0, 3]
     );
 }
 
 #[test]
 fn hostile_metadata_is_rejected_even_with_valid_checksum() {
-    // One entry, one sortable column: header + core + value + bitmap + two ids.
     let b = IndexBuilder::with_columns(ColumnSet::SIZE);
     b.add_with_metadata(ROOT_PARENT, b"a", 0, EntryMetadata::default());
     let bytes = save_bytes(&b.freeze());
-    for (offset, value) in [(24, 128), (46, 1), (54, 128), (55, 1), (59, 1)] {
+    for (offset, value) in [(24, 128), (28, 255), (50, 2), (54, 1), (59, 128)] {
         let mut bad = bytes.clone();
         bad[offset] = value;
         checksum(&mut bad);
@@ -119,35 +130,53 @@ fn hostile_metadata_is_rejected_even_with_valid_checksum() {
     for len in 0..bytes.len() {
         assert!(ferrow_index::persist::from_bytes(&bytes[..len]).is_err());
     }
-    let bytes = save_bytes(&fixture(ColumnSet::ALL));
-    let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-    let order = 28 + 4 * 16 + 2 * arena_len + 4 * 8 + 1;
-    for desc in [false, true] {
-        let at = order + usize::from(desc) * 16;
-        let mut duplicate = bytes.clone();
-        duplicate.copy_within(at..at + 4, at + 4);
-        checksum(&mut duplicate);
-        assert!(ferrow_index::persist::from_bytes(&duplicate).is_err());
-        let mut unsorted = bytes.clone();
-        for i in 0..4 {
-            unsorted.swap(at + i, at + 4 + i);
+    let b = IndexBuilder::with_columns(ColumnSet::SIZE);
+    for name in [b"a", b"b"] {
+        b.add_with_metadata(
+            ROOT_PARENT,
+            name,
+            0,
+            EntryMetadata {
+                size: Some(u64::MAX),
+                ..Default::default()
+            },
+        );
+    }
+    let bytes = save_bytes(&b.freeze());
+    for duplicate in [false, true] {
+        let mut bad = bytes.clone();
+        if duplicate {
+            bad.copy_within(83..87, 87);
+        } else {
+            bad[83..87].copy_from_slice(&2u32.to_le_bytes());
         }
-        checksum(&mut unsorted);
-        assert!(ferrow_index::persist::from_bytes(&unsorted).is_err());
+        checksum(&mut bad);
+        assert!(ferrow_index::persist::from_bytes(&bad).is_err());
     }
 }
 
 #[test]
-fn v1_refusal_requests_rebuild_and_time_conversion_handles_pre_epoch() {
+fn legacy_core_loads_v2_requests_rebuild_and_time_conversion_handles_pre_epoch() {
     let mut old = b"FERROWID".to_vec();
     for word in [1u32, 0, 0, 0] {
         old.extend(word.to_le_bytes());
     }
+    let core = ferrow_index::persist::from_bytes(&old).unwrap();
+    assert!(core.is_empty());
+    assert_eq!(core.columns_present(), ColumnSet::NONE);
+    let mut bytes = save_bytes(&fixture(ColumnSet::NONE));
+    bytes.drain(24..32);
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    checksum(&mut bytes);
+    let core = ferrow_index::persist::from_bytes(&bytes).unwrap();
+    assert_eq!(core.len(), 4);
+    assert_eq!(core.columns_present(), ColumnSet::NONE);
+    old[8..12].copy_from_slice(&2u32.to_le_bytes());
     let error = ferrow_index::persist::from_bytes(&old)
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("version 1") && error.contains("rebuild"),
+        error.contains("version 2") && error.contains("rebuild"),
         "{error}"
     );
     assert_eq!(timestamp_ticks(UNIX_EPOCH), Some(0));

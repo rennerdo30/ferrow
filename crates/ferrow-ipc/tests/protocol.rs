@@ -90,6 +90,7 @@ fn every_message_round_trips() {
         round_trip(
             13,
             Message::Response(Response::Rows {
+                sort_pending: false,
                 rows: vec![ferrow_ipc::FileRow {
                     path: vec![b'a', 0xff],
                     size: (mask & 1 != 0).then_some(u64::MAX),
@@ -164,6 +165,7 @@ fn metadata_rows_refuse_invalid_masks_versions_and_truncation() {
     let frame = encode_frame(
         7,
         &Message::Response(Response::Rows {
+            sort_pending: false,
             rows: vec![ferrow_ipc::FileRow {
                 path: b"x".to_vec(),
                 size: Some(3),
@@ -177,7 +179,7 @@ fn metadata_rows_refuse_invalid_masks_versions_and_truncation() {
     for len in 0..frame.len() - 4 {
         assert!(decode_payload(&frame[4..4 + len]).is_err());
     }
-    for (offset, value) in [(4, 1), (11, 128), (24, 128)] {
+    for (offset, value) in [(4, 1), (11, 128), (15, 128), (25, 128)] {
         let mut invalid = frame.clone();
         invalid[offset] = value;
         assert!(
@@ -189,6 +191,7 @@ fn metadata_rows_refuse_invalid_masks_versions_and_truncation() {
         encode_frame(
             0,
             &Message::Response(Response::Rows {
+                sort_pending: false,
                 rows: vec![ferrow_ipc::FileRow {
                     size: Some(1),
                     ..Default::default()

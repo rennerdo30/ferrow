@@ -112,7 +112,7 @@ def metadata_observations(text, head, expected_entries=5_000_000):
                 raise ValueError("duplicate modified-sort query")
             target[query] = {key: number(fields[key]) for key in ("first_page_ms", "full_count_ms", "page_hits", "total_hits")}
     required = {"entries", "seed", "core_heap_bytes", "default_heap_bytes", "default_bytes_per_entry",
-                "metadata_bytes_per_entry", "load_ms_median", "precomputed_build_ms", "lazy_build_ms_median", "lazy_saved_bytes", "freeze_ms"}
+                "metadata_bytes_per_entry", "load_ms_median", "core_load_ms_median", "cold_default_heap_bytes", "sort_during_load", "lazy_build_ms_median", "lazy_saved_bytes", "freeze_ms"}
     if not required <= scalars.keys() or set(engine) != QUERIES or set(ipc) != QUERIES:
         raise ValueError("missing metadata observations")
     if not {"entries", "errors", "none_ms_median", "default_ms_median"} <= scan.keys() or scan["entries"] != 2101 or scan["errors"] != 0:
@@ -123,23 +123,34 @@ def metadata_observations(text, head, expected_entries=5_000_000):
         raise ValueError("metadata core heap changed")
     total = scalars["default_heap_bytes"] / expected_entries
     extra = (scalars["default_heap_bytes"] - scalars["core_heap_bytes"]) / expected_entries
-    expected_extra = 32 + 2 * ((expected_entries + 7) // 8) / expected_entries
-    if abs(total-scalars["default_bytes_per_entry"]) > 0.000001 or abs(extra-expected_extra) > 0.000001 or abs(extra-scalars["metadata_bytes_per_entry"]) > 0.000001:
+    if abs(total-scalars["default_bytes_per_entry"]) > 0.000001 or abs(extra-scalars["metadata_bytes_per_entry"]) > 0.000001:
         raise ValueError("inconsistent default-column heap evidence")
-    if scalars["lazy_saved_bytes"] != 16*expected_entries:
+    cold = scalars["cold_default_heap_bytes"]
+    if not scalars["core_heap_bytes"] <= cold <= scalars["default_heap_bytes"]:
+        raise ValueError("invalid cold metadata heap")
+    cached = (6 if expected_entries <= 2**24 else 8)*expected_entries
+    if scalars["lazy_saved_bytes"] != cached or scalars["default_heap_bytes"]-cold != cached:
         raise ValueError("inconsistent lazy-cache saving")
+    if total > 66 or extra > 16.5:
+        raise ValueError("default-column memory target exceeded")
+    if scalars["core_load_ms_median"] <= 0 or scalars["load_ms_median"] > scalars["core_load_ms_median"]*1.15:
+        raise ValueError("default-column load target exceeded (core + 15%)")
+    if scalars["sort_during_load"] != 0:
+        raise ValueError("metadata sort built during load")
     rows = [("default columns bytes/entry", total), ("default columns load ms", scalars["load_ms_median"])]
     for label, observations, core in (("in-process", engine, head[1]), ("IPC", ipc, head[2])):
         for query in sorted(QUERIES):
             for key in ("page_hits", "total_hits"):
                 if observations[query][key] != core[query][key]:
                     raise ValueError(f"modified sort changed {key}: {label} {query!r}")
+            if query in {"a", "re", "!tmp log", "文書"} and observations[query]["first_page_ms"] > 16:
+                raise ValueError(f"modified-sort first-page target exceeded: {label} {query!r}")
             rows.extend((f"modified descending {label} {query!r} {key}", observations[query][key]) for key in ("first_page_ms", "full_count_ms"))
     if len(rows) != EXPECTED_METADATA_METRICS:
         raise ValueError("incomplete metadata metric inventory")
     report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
     report += "".join(f"| {name} | {value:.6f} |\n" for name, value in rows)
-    report += f"\nPrecompute: {scalars['precomputed_build_ms']:.6f} ms; deferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
+    report += f"\nDeferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
     report += f"\nSame-tree scan, none/default columns: {scan['none_ms_median']:.6f}/{scan['default_ms_median']:.6f} ms (five alternating samples per arm, 2101 entries).\n"
     return rows, report
 

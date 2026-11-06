@@ -19,7 +19,7 @@
 use std::io::{Read, Write};
 
 /// The only protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const QUERY_DESCENDING: u32 = 1;
 pub const QUERY_METADATA: u32 = 2;
 /// Hard cap on one frame's payload. Results are paged to fit.
@@ -126,6 +126,7 @@ pub enum Response {
     Rows {
         rows: Vec<FileRow>,
         columns: u32,
+        sort_pending: bool,
         more: bool,
     },
     Count {
@@ -299,6 +300,7 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
         Message::Response(Response::Rows {
             rows,
             columns,
+            sort_pending,
             more,
         }) => {
             if *columns & !31 != 0 {
@@ -307,7 +309,7 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             if rows.len() > MAX_PATHS_PER_PAGE {
                 return Err(ProtocolError::TooLarge);
             }
-            rows.iter().try_fold(15usize, |size, row| {
+            rows.iter().try_fold(16usize, |size, row| {
                 if row.path.len() > MAX_PATH_BYTES || size + row.path.len() + 41 > MAX_FRAME_BYTES {
                     return Err(ProtocolError::TooLarge);
                 }
@@ -318,6 +320,7 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             })?;
             w.u8(u8::from(*more));
             w.u32(*columns);
+            w.u8(u8::from(*sort_pending));
             w.u32(rows.len() as u32);
             for row in rows {
                 w.bytes(&row.path)?;
@@ -512,6 +515,11 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             if columns & !31 != 0 {
                 return Err(ProtocolError::InvalidValue("columns"));
             }
+            let sort_pending = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ProtocolError::InvalidValue("sort pending flag")),
+            };
             let n = r.u32()? as usize;
             if n > MAX_PATHS_PER_PAGE {
                 return Err(ProtocolError::TooLarge);
@@ -555,6 +563,7 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             Message::Response(Response::Rows {
                 rows,
                 columns,
+                sort_pending,
                 more,
             })
         }
