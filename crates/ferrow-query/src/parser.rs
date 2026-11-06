@@ -46,10 +46,38 @@ impl Eq for RegexPlan {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
     Literal,
+    WordLiteral(RegexPlan),
     Wildcard,
     Regex(RegexPlan),
     Filter(Filter),
     EntryType,
+}
+
+fn compile_regex(text: &str, case: bool, word: bool) -> Result<RegexPlan, String> {
+    let pattern = if word {
+        format!(r"(?u:\b{{start-half}})(?:{text})(?u:\b{{end-half}})")
+    } else {
+        text.to_owned()
+    };
+    let compiled = RegexBuilder::new(&pattern)
+        .case_insensitive(!case)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .nest_limit(32)
+        .build()
+        .map_err(|e| format!("invalid regex: {e}"))?;
+    let hir = regex_syntax::ParserBuilder::new()
+        .case_insensitive(!case)
+        .utf8(false)
+        .nest_limit(32)
+        .build()
+        .parse(&pattern)
+        .map_err(|e| format!("invalid regex: {e}"))?;
+    let seq = Extractor::new().extract(&hir);
+    Ok(RegexPlan {
+        regex: Arc::new(compiled),
+        prefix: seq.longest_common_prefix().unwrap_or_default().to_vec(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,27 +347,22 @@ impl Parser<'_> {
                 })?),
             })
         } else if regex {
-            let compiled = RegexBuilder::new(&text)
-                .case_insensitive(!case)
-                .size_limit(1 << 20)
-                .dfa_size_limit(1 << 20)
-                .nest_limit(32)
-                .build()
-                .map_err(|e| self.error(value_start, self.at, &format!("invalid regex: {e}")))?;
-            let hir = regex_syntax::ParserBuilder::new()
-                .case_insensitive(!case)
-                .utf8(false)
-                .nest_limit(32)
-                .build()
-                .parse(&text)
-                .map_err(|e| self.error(value_start, self.at, &format!("invalid regex: {e}")))?;
-            let seq = Extractor::new().extract(&hir);
-            Pattern::Regex(RegexPlan {
-                regex: Arc::new(compiled),
-                prefix: seq.longest_common_prefix().unwrap_or_default().to_vec(),
-            })
+            Pattern::Regex(
+                compile_regex(&text, case, word)
+                    .map_err(|e| self.error(value_start, self.at, &e))?,
+            )
         } else if !quoted && text.contains(['*', '?']) {
             Pattern::Wildcard
+        } else if word {
+            let mut literal = text.as_bytes().to_vec();
+            if !case {
+                ferrow_index::fold_name(text.as_bytes(), &mut literal);
+            }
+            let escaped = regex::escape(&String::from_utf8_lossy(&literal));
+            Pattern::WordLiteral(
+                compile_regex(&escaped, true, true)
+                    .map_err(|e| self.error(value_start, self.at, &e))?,
+            )
         } else {
             Pattern::Literal
         };

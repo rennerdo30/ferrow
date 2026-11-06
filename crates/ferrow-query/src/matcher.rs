@@ -16,6 +16,50 @@ fn finder(bytes: &[u8]) -> memmem::Finder<'static> {
     memmem::Finder::new(bytes).into_owned()
 }
 
+/// Maximum regex target length: UTF-16 units on Windows, bytes on Unix.
+#[cfg(windows)]
+pub const MAX_REGEX_INPUT_UNITS: usize = 32_767;
+#[cfg(target_os = "macos")]
+pub const MAX_REGEX_INPUT_UNITS: usize = 1_023;
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const MAX_REGEX_INPUT_UNITS: usize = 4_095;
+
+fn regex_input_allowed(hay: &[u8], cancel: &CancelToken) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    if hay.len() <= MAX_REGEX_INPUT_UNITS {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if hay.len() > MAX_REGEX_INPUT_UNITS * 3 {
+            return false;
+        }
+        let (mut at, mut units) = (0, 0usize);
+        while at < hay.len() {
+            if units.is_multiple_of(256) && cancel.is_cancelled() {
+                return false;
+            }
+            let scalar = width(&hay[at..]);
+            let surrogate = hay.get(at..at + 3).is_some_and(|b| {
+                b[0] == 0xed && (0xa0..=0xbf).contains(&b[1]) && (0x80..=0xbf).contains(&b[2])
+            });
+            let bytes = scalar.unwrap_or(if surrogate { 3 } else { 1 });
+            units += if bytes == 4 { 2 } else { 1 };
+            if units > MAX_REGEX_INPUT_UNITS {
+                return false;
+            }
+            at += bytes;
+        }
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 struct Prepared {
     term: Term,
     needle: Vec<u8>,
@@ -55,10 +99,7 @@ impl Prepared {
     }
     fn text_match(&self, hay: &[u8], cancel: &CancelToken) -> bool {
         match &self.term.pattern {
-            Pattern::Literal => self
-                .finder
-                .find_iter(hay)
-                .any(|at| !self.term.wholeword || boundaries(hay, at..at + self.needle.len())),
+            Pattern::Literal => self.finder.find(hay).is_some(),
             Pattern::Wildcard => {
                 let prefix = self
                     .needle
@@ -82,11 +123,10 @@ impl Prepared {
                 }
                 !self.needle.contains(&b'?') || glob(&self.needle, hay, cancel)
             }
-            Pattern::Regex(r) => {
-                self.finder.find(hay).is_some()
-                    && r.regex
-                        .find_iter(hay)
-                        .any(|m| !self.term.wholeword || boundaries(hay, m.range()))
+            Pattern::WordLiteral(r) | Pattern::Regex(r) => {
+                regex_input_allowed(hay, cancel)
+                    && self.finder.find(hay).is_some()
+                    && r.regex.is_match(hay)
             }
             _ => false,
         }
@@ -155,6 +195,14 @@ pub(crate) enum Matcher {
     Plain(PlainMatcher),
     General(GeneralMatcher),
 }
+#[cfg(feature = "test-hooks")]
+thread_local! { static COMPACT_PLAN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+/// Consume this thread's last planner decision. No normal-build dispatch cost.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub fn take_compact_plan_for_test() -> Option<bool> {
+    COMPACT_PLAN.with(|plan| plan.take())
+}
 pub(crate) trait EntryMatcher: Sync {
     const CANCELLABLE_TERM: bool;
     fn candidates<'a>(&self, index: &'a Index) -> &'a [u32] {
@@ -197,6 +245,8 @@ impl Matcher {
                     && t.directory.is_none()
             })
         {
+            #[cfg(feature = "test-hooks")]
+            COMPACT_PLAN.with(|plan| plan.set(Some(true)));
             return Self::Plain(PlainMatcher {
                 finders: query
                     .terms
@@ -211,6 +261,8 @@ impl Matcher {
                     .collect(),
             });
         }
+        #[cfg(feature = "test-hooks")]
+        COMPACT_PLAN.with(|plan| plan.set(Some(false)));
         Self::General(GeneralMatcher::new(query))
     }
 }
@@ -465,21 +517,18 @@ fn glob(pattern: &[u8], hay: &[u8], cancel: &CancelToken) -> bool {
     }
     p == pattern.len()
 }
-fn boundaries(hay: &[u8], range: Range<usize>) -> bool {
-    let word = |c: char| c.is_alphanumeric() || c == '_';
-    let left = std::str::from_utf8(&hay[..range.start])
-        .ok()
-        .and_then(|s| s.chars().next_back());
-    let right = std::str::from_utf8(&hay[range.end..])
-        .ok()
-        .and_then(|s| s.chars().next());
-    left.is_none_or(|c| !word(c)) && right.is_none_or(|c| !word(c))
-}
 
 /// Positive matching name ranges for visible rows. Path/filter/NOT terms
 /// contribute no ranges. Unicode folding preserves original byte offsets.
+/// At most 256 candidate ranges per query/row bound regex iteration work.
 pub fn highlight_ranges(query: &Query, name: &[u8]) -> Vec<Range<usize>> {
+    if !regex_input_allowed(name, &CancelToken::new()) {
+        return Vec::new();
+    }
     fn visit(expr: &Expr, negated: bool, query: &Query, name: &[u8], out: &mut Vec<Range<usize>>) {
+        if out.len() >= 256 {
+            return;
+        }
         match expr {
             Expr::Not(e) => visit(e, !negated, query, name, out),
             Expr::And(v) | Expr::Or(v) => {
@@ -506,9 +555,7 @@ pub fn highlight_ranges(query: &Query, name: &[u8]) -> Vec<Range<usize>> {
                     Pattern::Literal => out.extend(
                         p.finder
                             .find_iter(hay)
-                            .filter(|at| {
-                                !term.wholeword || boundaries(hay, *at..at + p.needle.len())
-                            })
+                            .take(256 - out.len())
                             .map(|at| at..at + p.needle.len()),
                     ),
                     Pattern::Wildcard => {
@@ -516,10 +563,10 @@ pub fn highlight_ranges(query: &Query, name: &[u8]) -> Vec<Range<usize>> {
                             out.push(0..name.len());
                         }
                     }
-                    Pattern::Regex(r) => out.extend(
+                    Pattern::WordLiteral(r) | Pattern::Regex(r) => out.extend(
                         r.regex
                             .find_iter(hay)
-                            .filter(|m| !term.wholeword || boundaries(hay, m.range()))
+                            .take(256 - out.len())
                             .map(|m| m.range()),
                     ),
                     _ => (),

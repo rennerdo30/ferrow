@@ -53,7 +53,7 @@ fn fold(bytes: &[u8], case: bool) -> Vec<u8> {
     out
 }
 fn word_edges(hay: &[u8], start: usize, end: usize) -> bool {
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let is_word = regex_syntax::is_word_character;
     std::str::from_utf8(&hay[..start])
         .ok()
         .and_then(|s| s.chars().last())
@@ -115,18 +115,29 @@ fn oracle(index: &Index, query: &Query) -> Vec<u32> {
                 let directory = index.flags(id) & flags::DIR != 0;
                 let found = term.directory.is_none_or(|d| d == directory)
                     && match &term.pattern {
-                        Pattern::Literal => {
+                        Pattern::Literal | Pattern::WordLiteral(_) => {
                             text.windows(needles[*i].len()).enumerate().any(|(at, w)| {
                                 w == needles[*i]
                                     && (!term.wholeword || word_edges(&text, at, at + w.len()))
                             })
                         }
                         Pattern::Wildcard => wildcard(&needles[*i], &text),
-                        Pattern::Regex(_) => regexes[*i]
-                            .as_ref()
-                            .unwrap()
-                            .find_iter(raw)
-                            .any(|m| !term.wholeword || word_edges(raw, m.start(), m.end())),
+                        Pattern::Regex(_) => {
+                            let regex = regexes[*i].as_ref().unwrap();
+                            if term.wholeword {
+                                // Naive oracle tries each scalar boundary, independently
+                                // of production's compiled half-boundary assertions.
+                                (0..=raw.len())
+                                    .filter(|at| std::str::from_utf8(&raw[..*at]).is_ok())
+                                    .any(|at| {
+                                        regex
+                                            .find_at(raw, at)
+                                            .is_some_and(|m| word_edges(raw, m.start(), m.end()))
+                                    })
+                            } else {
+                                regex.is_match(raw)
+                            }
+                        }
                         Pattern::EntryType => true,
                         Pattern::Filter(Filter::Depth(want)) => {
                             let mut depth = 0;
@@ -382,6 +393,112 @@ fn wildcard_and_path_cancellation_preserve_the_completed_prefix() {
         assert!(result.hits.is_empty() && result.cancelled);
         assert_eq!(ferrow_query::count(&index, &query, &cancelled), (0, true));
     }
+}
+
+#[test]
+fn wholeword_retries_overlapping_candidates_and_highlights_them() {
+    for (name, literal, span) in [("a--- ", "--", 2..4), ("xa-a-a ", "a-a", 3..6)] {
+        let b = IndexBuilder::new();
+        b.add_root(name.as_bytes(), 0);
+        let index = b.freeze();
+        for text in [
+            format!("wholeword:{literal}"),
+            format!("wholeword:regex:{literal}"),
+        ] {
+            let query = Query::parse(&text).unwrap();
+            assert_eq!(
+                search(&index, &query, &SearchOptions::default()).hits,
+                vec![0],
+                "{text}"
+            );
+            assert_eq!(
+                search(&index, &query, &SearchOptions::default()).hits,
+                oracle(&index, &query)
+            );
+            assert_eq!(
+                ferrow_query::highlight_ranges(&query, name.as_bytes()),
+                vec![span.clone()],
+                "{text}"
+            );
+            assert_eq!(
+                ferrow_query::count(&index, &query, &ferrow_query::CancelToken::new()),
+                (1, false)
+            );
+        }
+    }
+    let b = IndexBuilder::new();
+    b.add_root("été\u{301}".as_bytes(), 0);
+    b.add_root("pré été post".as_bytes(), 0);
+    b.add_root("été".as_bytes(), 0);
+    let index = b.freeze();
+    for text in ["wholeword:été", "wholeword:regex:été"] {
+        let query = Query::parse(text).unwrap();
+        let hits = search(&index, &query, &SearchOptions::default()).hits;
+        assert_eq!(hits, vec![1, 2], "{text}");
+        assert_eq!(hits, oracle(&index, &query), "{text}");
+        assert_eq!(
+            ferrow_query::highlight_ranges(&query, "pré été post".as_bytes()),
+            vec![5..10]
+        );
+        assert!(ferrow_query::highlight_ranges(&query, "été\u{301}".as_bytes()).is_empty());
+    }
+    for text in ["a|b", "regex:a|regex:b", "wholeword:a"] {
+        let query = Query::parse(text).unwrap();
+        let ranges = ferrow_query::highlight_ranges(&query, "a b ".repeat(600).as_bytes());
+        assert_eq!(ranges.len(), 256, "{text}");
+    }
+}
+
+#[test]
+fn bounded_regex_on_maximum_path_cancels_and_counts_the_100k_fixture() {
+    use ferrow_query::{CancelToken, MAX_REGEX_INPUT_UNITS, count};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let b = IndexBuilder::new();
+    let mut parent = b.add_root(b"AA", flags::DIR);
+    let mut length = 2;
+    while length + 256 < MAX_REGEX_INPUT_UNITS {
+        parent = b.add(parent, &[b'A'; 255], flags::DIR);
+        length += 256;
+    }
+    let leaf = b.add(parent, &vec![b'A'; MAX_REGEX_INPUT_UNITS - length - 1], 0);
+    let overlong = b.add(leaf, b"A", 0);
+    ferrow_fixture::generate_into(&b, 100_000 - b.len(), 2026);
+    let index = b.freeze();
+    assert_eq!(index.len(), 100_000);
+    let mut path = Vec::new();
+    index.path_bytes(leaf, &mut path);
+    assert_eq!(path.len(), MAX_REGEX_INPUT_UNITS);
+    let query = Query::parse(r#"wholeword:case:path:regex:".*[^A-Z/\\]|[A-Z]""#).unwrap();
+    let (n, cancelled) = count(&index, &query, &CancelToken::new());
+    assert!(!cancelled && n <= index.len());
+    let token = CancelToken::new();
+    let stop = token.clone();
+    let cancelled_at = Arc::new(Mutex::new(None));
+    let timestamp = cancelled_at.clone();
+    let result = search(
+        &index,
+        &query,
+        &SearchOptions {
+            cancel: token,
+            on_block: Some(Arc::new(move |block| {
+                if block == 0 {
+                    *timestamp.lock().unwrap() = Some(Instant::now());
+                    stop.cancel();
+                }
+            })),
+            ..SearchOptions::default()
+        },
+    );
+    assert!(result.cancelled);
+    assert!(cancelled_at.lock().unwrap().unwrap().elapsed() <= Duration::from_secs(2));
+    let any = Query::parse("path:regex:.").unwrap();
+    let result = search(&index, &any, &SearchOptions::default());
+    assert!(result.hits.contains(&leaf));
+    assert!(
+        !result.hits.contains(&overlong),
+        "over-limit regex inputs must be refused"
+    );
 }
 
 fn names(index: &Index, text: &str) -> Vec<String> {

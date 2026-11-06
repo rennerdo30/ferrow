@@ -126,8 +126,10 @@ impl QueryTimings {
 }
 
 mod matcher;
-pub use matcher::highlight_ranges;
+#[cfg(feature = "test-hooks")]
+pub use matcher::take_compact_plan_for_test;
 use matcher::{EntryMatcher, Matcher, Scratch};
+pub use matcher::{MAX_REGEX_INPUT_UNITS, highlight_ranges};
 
 /// Entries admitted per worker chunk; cancellation also runs inside it.
 const BLOCK_SIZE: usize = 4_096;

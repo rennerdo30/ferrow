@@ -33,7 +33,12 @@ directory flag (using both is an error). They may stand alone as type
 predicates. `path:` selects the indexed full path, joined with the native
 separator, without filesystem I/O or path canonicalization. `wholeword:`
 requires both match edges to be next to the start/end or a non-word scalar;
-letters, numbers and underscore are word characters. Regex syntax and
+Unicode letters, combining marks, decimal numbers, connector punctuation
+(including underscore) and join controls are word characters, matching the
+regex crate's Unicode `\w`. Wholeword patterns compile Unicode
+`\b{start-half}` and `\b{end-half}` assertions, including escaped, folded
+literal terms. A memmem literal prefilter runs before that regex. This finds
+valid overlapping candidates without an external retry loop. Regex syntax and
 matching use the permissively licensed Rust `regex` crate, including its
 Unicode case-insensitive semantics and inline flags. Plain and wildcard
 terms retain the index fold; regex character classes follow the crate's
@@ -52,7 +57,9 @@ The AST has term leaves, AND, OR and NOT. Each term carries its source byte
 span and typed pattern/predicate; parse errors expose `span()` for GUI
 underlining. `highlight_ranges(query, name)` returns original name byte ranges
 for positive matching name terms; path/type/filter/negated terms do not
-invent name highlights. The caller runs it only on visible rows.
+invent name highlights. The caller runs it only on visible rows. Highlighting
+examines at most 256 candidate ranges per query and row; this bounds regex
+iteration and storage even for hostile names. The plain matcher is unchanged.
 
 Part 2 adds a `Filter` variant for each typed metadata predicate:
 
@@ -89,6 +96,14 @@ SearchOptions changes. Check cancellation while traversing parent chains.
 Keep existing ordered first-page admission and cancellation contracts.
 Scalar wildcard retry checks cancellation every 256 steps, so an adversarial
 pattern can be interrupted inside a single long name.
+Regex search makes one engine call per term and entry, with no rejected-match
+iteration. Targets longer than the platform path limit are refused: 32767
+UTF-16 units on Windows (including WTF-8 surrogate handling), 4095 bytes on
+Linux, 1023 on macOS. The regex crate's linear bound for a size-limited pattern
+and this explicit target bound cap one uncancellable engine call. Cancellation
+is checked before every regex entry/term and between scan batches; no custom
+regex evaluator or fallback is used. Highlight iteration is separately capped
+at 256 candidates per query/row.
 An anchored wildcard's required name prefix also narrows the existing sorted
 name order by two binary searches. AND may use any required prefix; OR only
 uses a shared required prefix, and NOT never narrows. Non-ASCII sensitive
