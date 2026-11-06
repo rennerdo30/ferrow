@@ -13,8 +13,10 @@
 //! - [`Client`] and [`serve_stream`]: the handshake and
 //!   request/response plumbing over any stream.
 
+mod dispatch;
 pub mod protocol;
 pub mod transport;
+pub use dispatch::{RequestContext, serve_cancellable};
 
 use std::io::{Read, Write};
 
@@ -35,12 +37,27 @@ fn version_mismatch(peer: u16) -> Message {
     })
 }
 
+fn server_read<S: Read + Write>(stream: &mut S) -> std::io::Result<Option<Envelope>> {
+    match read_message(stream) {
+        Err(error) => {
+            if let Some(ProtocolError::VersionMismatch { version, id }) = error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<ProtocolError>())
+            {
+                write_message(stream, *id, &version_mismatch(u16::from(*version)))?;
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
 /// Server side of the `Hello` handshake: the first message must be
 /// `Hello` with a supported version. On a version mismatch an
 /// `Error{VersionMismatch}` reply is written before failing, so
 /// the client can say why it was refused.
 pub fn server_handshake<S: Read + Write>(stream: &mut S) -> std::io::Result<()> {
-    let Some(envelope) = read_message(stream)? else {
+    let Some(envelope) = server_read(stream)? else {
         return Err(io_invalid("connection closed before Hello".into()));
     };
     match envelope.message {
@@ -74,7 +91,7 @@ where
     F: FnMut(Request) -> Vec<Response>,
 {
     server_handshake(&mut stream)?;
-    while let Some(envelope) = read_message(&mut stream)? {
+    while let Some(envelope) = server_read(&mut stream)? {
         let Message::Request(request) = envelope.message else {
             write_message(
                 &mut stream,
@@ -97,7 +114,12 @@ where
             )?;
             continue;
         }
+        // Cancel is one-way. Its target request owns any cancellation reply.
+        let cancel = matches!(request, Request::Cancel { .. });
         let mut responses = handler(request);
+        if cancel {
+            continue;
+        }
         if responses.is_empty() {
             responses.push(Response::Error {
                 code: ErrorCode::Internal,
@@ -189,12 +211,22 @@ impl<S: Read + Write> Client<S> {
     /// Run a query, collecting every `Results` page. `limit = 0`
     /// means no limit.
     pub fn query(&mut self, text: &str, limit: u32) -> std::io::Result<Vec<Vec<u8>>> {
-        let id = self.send(Request::Query {
+        let id = self.start_query(text, limit)?;
+        self.finish_query(id)
+    }
+
+    /// Start a query without borrowing the client until completion; its id can
+    /// be passed to `cancel` before `finish_query` receives its final response.
+    pub fn start_query(&mut self, text: &str, limit: u32) -> std::io::Result<u32> {
+        self.send(Request::Query {
             text: text.to_owned(),
             limit,
             sort: Sort::Name,
             flags: 0,
-        })?;
+        })
+    }
+
+    pub fn finish_query(&mut self, id: u32) -> std::io::Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         loop {
             match Self::check(self.expect(id)?)? {

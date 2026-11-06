@@ -8,6 +8,38 @@ use ferrow_ipc::protocol::{
 };
 use ferrow_ipc::{Envelope, ErrorCode};
 
+#[test]
+fn every_frame_rejects_an_unsupported_wire_version() {
+    for message in [
+        Message::Request(Request::Hello {
+            version: PROTOCOL_VERSION,
+        }),
+        Message::Request(Request::Status),
+        Message::Request(Request::Query {
+            text: "x".into(),
+            limit: 1,
+            sort: Sort::Name,
+            flags: 0,
+        }),
+        Message::Response(Response::HelloOk {
+            version: PROTOCOL_VERSION,
+        }),
+        Message::Response(Response::Count { n: 7 }),
+    ] {
+        let mut frame = encode_frame(42, &message).unwrap();
+        frame[4] = 99;
+        assert!(decode_payload(&frame[4..]).is_err(), "accepted {message:?}");
+        // Refuse the header even when an incompatible body cannot be decoded.
+        frame.truncate(10);
+        assert!(
+            decode_payload(&frame[4..])
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+    }
+}
+
 fn round_trip(id: u32, message: Message) {
     let frame = encode_frame(id, &message).unwrap();
     assert_eq!(

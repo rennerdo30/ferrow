@@ -258,6 +258,11 @@ fn cmd_index(args: Args) -> Result<(), String> {
     for sample in &report.error_samples {
         eprintln!("warning: {sample}");
     }
+    // Fail closed (N6): an unresolvable existing exclude aborted the
+    // scan. Write nothing; an existing index file stays unchanged.
+    if let Some(fatal) = report.fatal_error {
+        return Err(fatal);
+    }
     if let Some(parent) = out.parent()
         && !parent.as_os_str().is_empty()
     {

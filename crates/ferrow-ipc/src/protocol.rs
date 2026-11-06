@@ -116,8 +116,7 @@ pub enum Message {
     Response(Response),
 }
 
-/// A decoded frame: the wire version byte (not yet validated
-/// against [`PROTOCOL_VERSION`]; the handshake does that), the
+/// A decoded frame: the validated wire version byte, the
 /// request id the message belongs to, and the message itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
@@ -129,6 +128,10 @@ pub struct Envelope {
 /// A protocol-level decode or encode failure. Never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
+    VersionMismatch {
+        version: u8,
+        id: u32,
+    },
     /// A length field exceeds a hard limit.
     TooLarge,
     /// Input ended before a complete value could be read.
@@ -143,6 +146,9 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProtocolError::VersionMismatch { version, .. } => {
+                write!(f, "unsupported frame version {version}")
+            }
             ProtocolError::TooLarge => f.write_str("message exceeds a size limit"),
             ProtocolError::Truncated => f.write_str("message is truncated"),
             ProtocolError::TrailingBytes => f.write_str("trailing bytes after message"),
@@ -231,6 +237,17 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             if paths.len() > MAX_PATHS_PER_PAGE {
                 return Err(ProtocolError::TooLarge);
             }
+            // Include the six-byte envelope and five-byte page header.
+            // Check before allocating/copying any handler-owned path data.
+            paths.iter().try_fold(11usize, |size, path| {
+                if path.len() > MAX_PATH_BYTES {
+                    return Err(ProtocolError::TooLarge);
+                }
+                size.checked_add(4)
+                    .and_then(|n| n.checked_add(path.len()))
+                    .filter(|&n| n <= MAX_FRAME_BYTES)
+                    .ok_or(ProtocolError::TooLarge)
+            })?;
             w.u8(u8::from(*more));
             w.u32(paths.len() as u32);
             for path in paths {
@@ -359,6 +376,9 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
     let version = r.u8()?;
     let kind = r.u8()?;
     let id = r.u32()?;
+    if u16::from(version) != PROTOCOL_VERSION {
+        return Err(ProtocolError::VersionMismatch { version, id });
+    }
     let message = match kind {
         KIND_HELLO => Message::Request(Request::Hello { version: r.u16()? }),
         KIND_QUERY => {
@@ -450,4 +470,27 @@ pub fn read_message<R: Read>(r: &mut R) -> std::io::Result<Option<Envelope>> {
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload)?;
     Ok(Some(decode_payload(&payload)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_page_is_rejected_before_copying_paths() {
+        let message = Message::Response(Response::Results {
+            paths: vec![vec![b'x'; MAX_PATH_BYTES]; 65],
+            more: false,
+        });
+        let mut body = Writer(Vec::new());
+        assert_eq!(
+            encode_kind(&message, &mut body),
+            Err(ProtocolError::TooLarge)
+        );
+        assert!(
+            body.0.is_empty(),
+            "copied {} bytes before refusal",
+            body.0.len()
+        );
+    }
 }
