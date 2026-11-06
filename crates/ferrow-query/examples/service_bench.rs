@@ -29,12 +29,16 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 && args.len() != 3 {
-        return Err("usage: service_bench <ferrow> <index> [modified]".into());
-    }
-    let modified = args.get(2).is_some_and(|s| s == "modified");
-    if args.len() == 3 && !modified {
-        return Err("unknown service sort".into());
+    let modified = args.iter().skip(2).any(|s| s == "modified");
+    let legacy = args.iter().skip(2).any(|s| s == "--legacy-queries");
+    if args.len() < 2
+        || args.len() > 4
+        || args
+            .iter()
+            .skip(2)
+            .any(|s| s != "modified" && s != "--legacy-queries")
+    {
+        return Err("usage: service_bench <ferrow> <index> [modified] [--legacy-queries]".into());
     }
     let index = Index::load(std::path::Path::new(&args[1]))?;
     if modified {
@@ -110,14 +114,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             started.elapsed().as_secs_f64() * 1000.0
         );
     }
-    for text in [
+    let queries = [
         "a",
         "re",
         "report 2024",
         "!tmp log",
         "zzzz-no-hit-zzzz",
         "文書",
-    ] {
+        "*.log",
+        "report*2024*",
+        "path:docs report",
+        "ext:txt;md",
+        "<a|re> !tmp",
+    ];
+    let queries = if legacy || modified {
+        &queries[..6]
+    } else {
+        &queries[..]
+    };
+    for &text in queries {
         let query = Query::parse(text)?;
         let expected = search(
             &index,

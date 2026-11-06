@@ -18,6 +18,8 @@ test-hooks = []
 ferrow-index = { path = "../ferrow-index" }
 memchr = "2"
 rayon = "1"
+regex = "1.13.1"
+regex-syntax = "0.8.11"
 
 [dev-dependencies]
 ferrow-index = { path = "../ferrow-index", features = ["test-hooks"] }
