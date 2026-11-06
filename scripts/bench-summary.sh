@@ -23,6 +23,10 @@ load_checksum_ms=$(get load_checksum_ms FERROW-MEASURE)
 load_decode_ms=$(get load_decode_ms FERROW-MEASURE)
 load_structure_ms=$(get load_structure_ms FERROW-MEASURE)
 load_derived_ms=$(get load_derived_ms FERROW-MEASURE)
+load_buffer_ms=$(get load_buffer_ms FERROW-MEASURE)
+load_cleanup_ms=$(get load_cleanup_ms FERROW-MEASURE)
+load_fold_ms=$(get load_fold_ms FERROW-MEASURE)
+load_sort_ms=$(get load_sort_ms FERROW-MEASURE)
 load_unattributed_ms=$(get load_unattributed_ms FERROW-MEASURE)
 
 emit() {
@@ -41,7 +45,10 @@ emit() {
     echo "| Load: checksum | ${load_checksum_ms} ms |"
     echo "| Load: decode | ${load_decode_ms} ms |"
     echo "| Load: structure validation | ${load_structure_ms} ms |"
-    echo "| Load: derived-data validation | ${load_derived_ms} ms |"
+    echo "| Load: folded-data validation | ${load_fold_ms} ms |"
+    echo "| Load: sort validation | ${load_sort_ms} ms |"
+    echo "| Load: payload buffer | ${load_buffer_ms} ms |"
+    echo "| Load: payload cleanup | ${load_cleanup_ms} ms |"
     echo "| Load: unattributed | ${load_unattributed_ms} ms |"
     echo
     echo "Query latency, median of 5 (one-shot measures; divan detail below):"

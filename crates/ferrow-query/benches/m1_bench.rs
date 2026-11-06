@@ -91,7 +91,7 @@ fn measures() {
     println!(
         "FERROW-MEASURE file_bytes={file_bytes} load_ms_median={:.1} \
          load_read_ms={:.1} load_checksum_ms={:.1} load_decode_ms={:.1} \
-         load_structure_ms={:.1} load_derived_ms={:.1} load_unattributed_ms={:.1}",
+         load_structure_ms={:.1} load_derived_ms={:.1} load_unattributed_ms={:.1} load_buffer_ms={:.1} load_cleanup_ms={:.1} load_fold_ms={:.1} load_sort_ms={:.1}",
         ms(load.total),
         ms(load.read),
         ms(load.checksum),
@@ -99,6 +99,10 @@ fn measures() {
         ms(load.structure),
         ms(load.derived),
         ms(load.unattributed()),
+        ms(load.buffer),
+        ms(load.cleanup),
+        ms(load.derived_fold),
+        ms(load.derived_sort),
     );
 
     // Query latency: first page (limit 100) and full count, median of 5.

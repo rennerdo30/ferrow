@@ -259,6 +259,10 @@ pub struct LoadTimings {
     pub total: Duration,
     /// Reading the header and payload from the source.
     pub read: Duration,
+    /// Reserving and initializing the payload buffer, excluding I/O.
+    pub buffer: Duration,
+    /// Releasing the payload buffer after decoding and validation.
+    pub cleanup: Duration,
     /// CRC-32 over the payload.
     pub checksum: Duration,
     /// Decoding columns and arenas out of the payload bytes.
@@ -269,13 +273,23 @@ pub struct LoadTimings {
     /// Derived-data validation: folded-arena consistency and
     /// adjacent sort-order checks (parallel, in chunks).
     pub derived: Duration,
+    /// Disjoint subspans of `derived`; do not add the parent again.
+    pub derived_fold: Duration,
+    pub derived_sort: Duration,
 }
 
 impl LoadTimings {
     /// Total time not covered by the named parts.
     pub fn unattributed(&self) -> Duration {
-        self.total
-            .saturating_sub(self.read + self.checksum + self.decode + self.structure + self.derived)
+        self.total.saturating_sub(
+            self.read
+                + self.buffer
+                + self.cleanup
+                + self.checksum
+                + self.decode
+                + self.structure
+                + self.derived,
+        )
     }
 }
 
@@ -321,16 +335,20 @@ fn load_from<R: std::io::Read>(
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
     let total = usize::try_from(expected).map_err(|_| LoadError::Corrupt("size overflow"))?;
+    let t = Instant::now();
     data.try_reserve_exact(total - data.len())
         .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
     data.resize(total, 0);
+    timings.buffer += t.elapsed();
     let t = Instant::now();
     reader
         .read_exact(&mut data[head_len..])
         .map_err(LoadError::Io)?;
     timings.read += t.elapsed();
     let index = from_bytes_inner(&data, &mut timings)?;
+    let t = Instant::now();
     drop(data);
+    timings.cleanup += t.elapsed();
     timings.total = started.elapsed();
     Ok((index, timings))
 }
@@ -481,6 +499,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
             }
             Ok(())
         })?;
+    timings.derived_fold = derived_started.elapsed();
     let key_cmp = |a: u32, b: u32| {
         name_at(&folded_arena, &name_off, &name_len, a as usize)
             .cmp(name_at(&folded_arena, &name_off, &name_len, b as usize))
@@ -501,6 +520,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
             Ok(())
         })?;
     timings.derived += derived_started.elapsed();
+    timings.derived_sort = timings.derived - timings.derived_fold;
 
     Ok(Index::from_columns(OwnedColumns {
         parent,
@@ -940,7 +960,8 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         // The parts are disjoint measured spans of the total, so they
         // must add up to at most the total (the rest is unattributed).
-        let parts = t.read + t.checksum + t.decode + t.structure + t.derived;
+        let parts = t.read + t.buffer + t.cleanup + t.checksum + t.decode + t.structure + t.derived;
+        assert_eq!(t.derived, t.derived_fold + t.derived_sort);
         assert!(
             parts <= t.total,
             "parts {parts:?} exceed total {:?}",
