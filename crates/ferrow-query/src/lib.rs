@@ -178,6 +178,23 @@ pub struct SearchResult {
     pub visited: usize,
 }
 
+/// Disjoint wall-clock spans from one operation. Select a median-total
+/// sample, rather than adding independently selected component medians.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QueryTimings {
+    pub total: std::time::Duration,
+    pub prepare: std::time::Duration,
+    pub scan: std::time::Duration,
+    pub collect: std::time::Duration,
+}
+
+impl QueryTimings {
+    pub fn unattributed(&self) -> std::time::Duration {
+        self.total
+            .saturating_sub(self.prepare + self.scan + self.collect)
+    }
+}
+
 struct Matcher {
     finders: Vec<(memmem::Finder<'static>, bool, bool)>, // finder, negated, case_sensitive
 }
@@ -242,30 +259,69 @@ pub const BLOCK: usize = BLOCK_SIZE;
     )
 )]
 pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchResult {
+    search_impl::<false>(index, query, options).0
+}
+
+/// Instrumented search for CI. The normal entry point compiles timers out.
+pub fn search_with_timings(
+    index: &Index,
+    query: &Query,
+    options: &SearchOptions,
+) -> (SearchResult, QueryTimings) {
+    search_impl::<true>(index, query, options)
+}
+
+fn search_impl<const TIMED: bool>(
+    index: &Index,
+    query: &Query,
+    options: &SearchOptions,
+) -> (SearchResult, QueryTimings) {
+    let started = TIMED.then(std::time::Instant::now);
+    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
     let sorted = index.sorted();
     let mut hits: Vec<u32> = Vec::new();
     let mut visited = 0usize;
+    if let Some(t) = started {
+        timings.prepare = t.elapsed();
+    }
     if options.limit == Some(0) {
-        return SearchResult {
-            hits,
-            cancelled: options.cancel.is_cancelled(),
-            visited,
-        };
+        if let Some(t) = started {
+            timings.total = t.elapsed();
+        }
+        return (
+            SearchResult {
+                hits,
+                cancelled: options.cancel.is_cancelled(),
+                visited,
+            },
+            timings,
+        );
     }
     for (_block_index, block) in sorted.chunks(BLOCK_SIZE).enumerate() {
         if options.cancel.is_cancelled() {
-            return SearchResult {
-                hits,
-                cancelled: true,
-                visited,
-            };
+            if let Some(t) = started {
+                timings.total = t.elapsed();
+            }
+            return (
+                SearchResult {
+                    hits,
+                    cancelled: true,
+                    visited,
+                },
+                timings,
+            );
         }
+        let scan_started = TIMED.then(std::time::Instant::now);
         let mut found: Vec<u32> = block
             .par_iter()
             .filter(|&&id| matcher.matches(index, id))
             .copied()
             .collect();
+        if let Some(t) = scan_started {
+            timings.scan += t.elapsed();
+        }
+        let collect_started = TIMED.then(std::time::Instant::now);
         visited += block.len();
         hits.append(&mut found);
         #[cfg(feature = "test-hooks")]
@@ -276,33 +332,77 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
             && hits.len() >= limit
         {
             hits.truncate(limit);
+            if let Some(t) = collect_started {
+                timings.collect += t.elapsed();
+            }
             break;
+        }
+        if let Some(t) = collect_started {
+            timings.collect += t.elapsed();
         }
         // Without a limit we still walk block by block; each block is a
         // full parallel pass and gives cancellation a chance per block.
     }
-    SearchResult {
+    let result = SearchResult {
         hits,
         cancelled: options.cancel.is_cancelled(),
         visited,
+    };
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
     }
+    (result, timings)
 }
 
 /// Count all hits without storing them. Returns the count found and
 /// whether the count was cut short by cancellation.
 pub fn count(index: &Index, query: &Query, cancel: &CancelToken) -> (usize, bool) {
+    count_impl::<false>(index, query, cancel).0
+}
+
+pub fn count_with_timings(
+    index: &Index,
+    query: &Query,
+    cancel: &CancelToken,
+) -> ((usize, bool), QueryTimings) {
+    count_impl::<true>(index, query, cancel)
+}
+
+fn count_impl<const TIMED: bool>(
+    index: &Index,
+    query: &Query,
+    cancel: &CancelToken,
+) -> ((usize, bool), QueryTimings) {
+    let started = TIMED.then(std::time::Instant::now);
+    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
+    if let Some(t) = started {
+        timings.prepare = t.elapsed();
+    }
     let mut total = 0usize;
     for block in index.sorted().chunks(BLOCK_SIZE) {
         if cancel.is_cancelled() {
-            return (total, true);
+            if let Some(t) = started {
+                timings.total = t.elapsed();
+            }
+            return ((total, true), timings);
         }
+        let scan_started = TIMED.then(std::time::Instant::now);
         total += block
             .par_iter()
             .filter(|&&id| matcher.matches(index, id))
             .count();
+        if let Some(t) = scan_started {
+            timings.scan += t.elapsed();
+        }
     }
-    (total, cancel.is_cancelled())
+    let result = (total, cancel.is_cancelled());
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
+    }
+    (result, timings)
 }
 
 #[cfg(test)]

@@ -12,7 +12,10 @@ use std::time::Instant;
 
 use ferrow_fixture::generate_into;
 use ferrow_index::{Index, IndexBuilder};
-use ferrow_query::{CancelToken, Query, SearchOptions, count, search};
+use ferrow_query::{
+    CancelToken, Query, QueryTimings, SearchOptions, count, count_with_timings, search,
+    search_with_timings,
+};
 
 static INDEX: OnceLock<Index> = OnceLock::new();
 
@@ -33,9 +36,21 @@ fn entries() -> usize {
         .unwrap_or(5_000_000)
 }
 
-fn median_ms(mut runs: Vec<f64>) -> f64 {
-    runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+fn median(mut runs: Vec<QueryTimings>) -> QueryTimings {
+    runs.sort_by_key(|t| t.total);
     runs[runs.len() / 2]
+}
+
+fn breakdown(text: &str, operation: &str, t: QueryTimings) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    println!(
+        "FERROW-QUERY-PARTS query={text:?} operation={operation} total_ms={:.6} prepare_ms={:.6} scan_ms={:.6} collect_ms={:.6} unattributed_ms={:.6}",
+        ms(t.total),
+        ms(t.prepare),
+        ms(t.scan),
+        ms(t.collect),
+        ms(t.unattributed())
+    );
 }
 
 fn measures() {
@@ -92,8 +107,7 @@ fn measures() {
         let mut page = Vec::new();
         let mut hits = 0usize;
         for _ in 0..5 {
-            let t = Instant::now();
-            let r = search(
+            let (r, timings) = search_with_timings(
                 &index,
                 &query,
                 &SearchOptions {
@@ -101,22 +115,25 @@ fn measures() {
                     ..SearchOptions::default()
                 },
             );
-            page.push(t.elapsed().as_secs_f64() * 1000.0);
+            page.push(timings);
             hits = r.hits.len();
         }
         let mut full = Vec::new();
         let mut total = 0usize;
         for _ in 0..5 {
-            let t = Instant::now();
-            let (c, _) = count(&index, &query, &CancelToken::new());
-            full.push(t.elapsed().as_secs_f64() * 1000.0);
+            let ((c, _), timings) = count_with_timings(&index, &query, &CancelToken::new());
+            full.push(timings);
             total = c;
         }
+        let page = median(page);
+        let full = median(full);
+        breakdown(text, "page", page);
+        breakdown(text, "count", full);
         println!(
             "FERROW-QUERY query={text:?} first_page_ms={:.3} page_hits={hits} \
              full_count_ms={:.3} total_hits={total}",
-            median_ms(page),
-            median_ms(full)
+            page.total.as_secs_f64() * 1000.0,
+            full.total.as_secs_f64() * 1000.0
         );
     }
 
@@ -151,6 +168,7 @@ fn full_count(bencher: divan::Bencher, text: &str) {
 }
 
 fn main() {
+    println!("FERROW-ACTIVE query=sorted-blocks crc=ieee-table derived=per-name freeze=per-name");
     measures();
     divan::main();
 }
