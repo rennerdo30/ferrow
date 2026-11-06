@@ -1,0 +1,12 @@
+[package]
+name = "ferrow"
+description = "Find any file by name, as fast as you type. Cross-platform."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

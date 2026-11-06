@@ -1,0 +1,16 @@
+# Optional machine-local Cargo settings. Copy to .cargo/config.toml (gitignored) and adjust.
+# Contributors need none of this; plain `cargo build` works.
+[build]
+# Use an sccache binary as compile cache (path to your own install).
+# rustc-wrapper = "/path/to/sccache"
+# Keep build output outside the repository.
+# target-dir = "/path/to/cargo-target/ferrow"
+# sccache cannot cache incremental builds.
+# incremental = false
+
+[env]
+# SCCACHE_DIR = { value = "/path/to/sccache-cache", force = true }
+
+# Faster linking on Windows.
+# [target.x86_64-pc-windows-msvc]
+# linker = "rust-lld.exe"

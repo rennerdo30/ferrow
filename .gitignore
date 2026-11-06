@@ -1,0 +1,8 @@
+/target/
+# Machine-local cargo config (see .cargo/config.example.toml)
+/.cargo/config.toml
+/fixtures/
+*.pdb
+# Agent rule files reference private machine setup; kept local only
+/AGENTS.md
+/CLAUDE.md

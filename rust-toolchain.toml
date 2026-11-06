@@ -1,0 +1,5 @@
+# Current stable on 2026-11-05 (static.rust-lang.org channel-rust-stable, 2026-10-15).
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
