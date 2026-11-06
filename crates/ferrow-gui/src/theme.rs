@@ -288,5 +288,9 @@ pub fn apply_style(ctx: &egui::Context, palette: &Palette) {
         style.spacing.menu_margin = Margin::same(4);
         style.spacing.interact_size.y = 32.0;
         style.interaction.selectable_labels = false;
+        // No animations at all: every animated frame is a repaint, which
+        // costs CPU locally and bandwidth over remote desktop.
+        style.animation_time = 0.0;
+        style.scroll_animation = egui::style::ScrollAnimation::none();
     });
 }

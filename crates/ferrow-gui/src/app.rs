@@ -80,6 +80,8 @@ pub struct FerrowApp {
     accent: Option<[u8; 3]>,
     focus_search: bool,
     title_logo: TitleLogo,
+    /// Running inside a Remote Desktop session.
+    remote: bool,
     page: Page,
     settings: Settings,
     folder_pick: Option<(PickTarget, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
@@ -126,6 +128,7 @@ impl FerrowApp {
             accent,
             focus_search: true,
             title_logo: TitleLogo::new(),
+            remote: platform::is_remote_session(),
             page: Page::Results,
             settings,
             folder_pick: None,
@@ -531,6 +534,8 @@ impl FerrowApp {
         let max_scroll = (rows as f64 - visible as f64).max(0.0);
         let list_resp = ui.interact(list, egui::Id::unique("list"), Sense::click());
         if ui.rect_contains_pointer(list) {
+            // Scroll animation is off (theme.rs), so this is the raw wheel
+            // delta: one repaint per notch, no animated frames.
             let dy = ui.input(|i| i.smooth_scroll_delta.y);
             if dy != 0.0 {
                 self.scroll -= (dy / ROW_HEIGHT) as f64;
@@ -624,7 +629,8 @@ impl FerrowApp {
                     vec2(3.0, 16.0),
                 );
                 row_painter.rect_filled(pill, CornerRadius::same(2), p.accent_text);
-            } else if is_hover {
+            } else if is_hover && !self.remote {
+                // No hover fills over RDP: each hover change is a repaint.
                 row_painter.rect_filled(rect, CornerRadius::same(4), p.row_hover);
             }
             if is_hover {

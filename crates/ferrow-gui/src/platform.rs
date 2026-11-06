@@ -87,6 +87,22 @@ fn read_from(mut command: Command) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// True inside a Remote Desktop (RDP) session. Other remote tools
+/// (VNC, TeamViewer) mirror the console and cannot be detected; the UI
+/// is kept cheap to update everywhere for them.
+pub fn is_remote_session() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+        // SAFETY: GetSystemMetrics has no preconditions.
+        unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// The user's accent colour as RGB, where the OS exposes one.
 pub fn accent_color() -> Option<[u8; 3]> {
     #[cfg(windows)]
