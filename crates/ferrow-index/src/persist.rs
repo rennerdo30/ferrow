@@ -197,10 +197,6 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
-    let base = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "index".to_string());
     let pid = std::process::id();
     for _ in 0..100 {
         let seq = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -208,7 +204,10 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let tmp = parent.join(format!(".{base}.ferrow-tmp-{pid}-{seq}-{nonce:x}"));
+        // Bounded, destination-independent basename: embedding the
+        // destination name would push near-limit valid names over the
+        // filesystem component limit.
+        let tmp = parent.join(format!(".ferrow-{pid}-{seq}-{nonce:016x}.tmp"));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -770,6 +769,37 @@ mod tests {
         }
         // SAFETY: umask always succeeds and takes the mask by value.
         unsafe { umask(mask) }
+    }
+
+    #[test]
+    fn save_accepts_near_limit_basenames() {
+        // 230 ASCII chars and a multibyte name near the 255-byte Unix
+        // component limit (120 * 2 bytes + 4). Both are valid
+        // destinations; the temp name must not push them over the limit.
+        for (tag, base) in [
+            ("long-ascii", format!("{}.bin", "a".repeat(226))),
+            ("long-multibyte", format!("{}.bin", "ä".repeat(120))),
+        ] {
+            let dir = test_dir(tag);
+            let dest = dir.join(&base);
+            std::fs::write(&dest, b"existing target").unwrap();
+            let sibling = dir.join("keep.txt");
+            std::fs::write(&sibling, b"keep").unwrap();
+            tiny_index(b"a.txt")
+                .save(&dest)
+                .unwrap_or_else(|e| panic!("valid existing destination {base:?} refused: {e}"));
+            let loaded = Index::load(&dest).unwrap();
+            assert_eq!(loaded.len(), 2);
+            assert_eq!(loaded.name(1), b"a.txt");
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"keep");
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path() != dest && e.path() != sibling)
+                .collect();
+            assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
