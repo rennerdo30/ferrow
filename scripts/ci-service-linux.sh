@@ -20,7 +20,10 @@ trap 'result=$?; trap - EXIT; cleanup || exit 1; exit "$result"' EXIT
 tree="$RUNNER_TEMP/svc-tree"
 mkdir -p "$tree"
 echo x > "$tree/ci-needle.txt"
-timeout 25s sudo "$bin/ferrow" service install
+timeout 25s sudo sh -c 'umask 0000; exec "$1" service install' sh "$bin/ferrow"
+test "$(stat -c '%u:%a' /etc/systemd/system/ferrowd.service)" = '0:644'
+test "$(stat -c '%u:%a' /usr/local/libexec/ferrow)" = '0:755'
+test "$(stat -c '%u:%a' /usr/local/libexec/ferrow/ferrowd)" = '0:755'
 timeout 10s sudo "$bin/ferrow" index "$tree" --out /var/lib/ferrow/index.bin
 test "$(stat -c '%u:%a' /var/lib/ferrow)" = '0:700'
 test "$(sudo stat -c '%u:%a' /var/lib/ferrow/index.bin)" = '0:600'

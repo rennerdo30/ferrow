@@ -53,6 +53,10 @@ delete-child and other write rights, including inherited grants to new files.
 The binary refuses non-admin write, append, delete, WRITE_DAC and WRITE_OWNER.
 Constructed security descriptors test these rules, including create-only roots.
 No user-supplied executable path is substituted into systemd or launchd files.
+Unix unit and plist files are atomically published through protected root-owned
+parents with an explicit, verified 0644 mode. Exclusive no-follow temporary
+creation, ACL validation and final owner/mode/link checks apply independently of
+umask. Unsafe existing definitions are refused before any manager action.
 
 Ferrow never elevates itself: run the command from an elevated
 terminal / with sudo, as it tells you.

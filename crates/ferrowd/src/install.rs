@@ -288,7 +288,8 @@ fn root_hint(action: &str, e: &std::io::Error) -> String {
 #[cfg(target_os = "linux")]
 pub fn install() -> Result<String, String> {
     let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
-    std::fs::write(UNIT_PATH, systemd_unit()).map_err(|e| root_hint("install", &e))?;
+    crate::definition::write(std::path::Path::new(UNIT_PATH), &systemd_unit())
+        .map_err(|e| root_hint("install", &e))?;
     crate::protection::state_directory(
         crate::default_service_index_path()
             .map_err(|e| e.to_string())?
@@ -387,7 +388,8 @@ fn plist_path() -> String {
 pub fn install() -> Result<String, String> {
     let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     let path = plist_path();
-    std::fs::write(&path, launchd_plist()).map_err(|e| root_hint("install", &e))?;
+    crate::definition::write(std::path::Path::new(&path), &launchd_plist())
+        .map_err(|e| root_hint("install", &e))?;
     crate::protection::state_directory(
         crate::default_service_index_path()
             .map_err(|e| e.to_string())?

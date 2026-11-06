@@ -104,7 +104,7 @@ pub fn state_file(path: &Path) -> io::Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
         let meta = unix::metadata(path, false)?;
-        if meta.mode() & 0o777 != 0o600 {
+        if meta.mode() & 0o7777 != 0o600 {
             return Err(refused("service index must be root-owned 0600"));
         }
         Ok(())
@@ -178,7 +178,7 @@ pub(crate) mod unix {
                 }
             }
             let meta = metadata_role(&current, true, current != path)?;
-            if current == path && meta.mode() & 0o777 != mode {
+            if current == path && meta.mode() & 0o7777 != mode {
                 return Err(refused("incorrect service directory mode"));
             }
         }
@@ -187,7 +187,7 @@ pub(crate) mod unix {
 
     pub fn binary(path: &Path) -> io::Result<()> {
         let meta = metadata(path, false)?;
-        if meta.mode() & 0o777 != 0o755 {
+        if meta.mode() & 0o7777 != 0o755 {
             return Err(refused("service binary must be 0755"));
         }
         Ok(())
