@@ -136,7 +136,7 @@ jobs:
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Test regression comparison and CLI on trivial inputs
-        run: python3 -m unittest discover -s scripts -p 'test_bench_gate.py'
+        run: python3 -m unittest discover -s scripts -p 'test_bench*.py'
       - name: Test compact persisted-cache prototype on four entries
         run: cargo test -p ferrow-query --example metadata_bench --locked -j 8
       - name: Prepare the identical selective retry driver for both arms
@@ -368,6 +368,14 @@ jobs:
         working-directory: .bench-base
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
+          FERROW_MEASURES_ONLY: "1"
+        run: |
+          git rev-parse HEAD
+          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee "$GITHUB_WORKSPACE/fixture-output.txt"
+      - name: Prepare head core fixture on main pushes (profiling only)
+        if: github.event_name == 'push'
+        env:
           FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
           FERROW_MEASURES_ONLY: "1"
         run: |
