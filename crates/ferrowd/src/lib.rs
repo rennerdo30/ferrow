@@ -11,8 +11,8 @@
 //! development replies require the starting user. Refusals contain no index data.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 use ferrow_index::{Index, IndexBuilder};
 use ferrow_ipc::{
@@ -64,27 +64,34 @@ impl Snapshot {
 }
 
 /// The current snapshot, swap-able without blocking readers:
-/// `get` clones one `Arc` under a short read lock.
+/// `get` acquires an immutable Arc through ArcSwap's nonblocking reader path.
 #[derive(Clone)]
 pub struct SnapshotStore {
-    inner: Arc<RwLock<Arc<Snapshot>>>,
+    inner: Arc<arc_swap::ArcSwap<Snapshot>>,
 }
 
 impl SnapshotStore {
     pub fn new(snapshot: Snapshot) -> SnapshotStore {
         SnapshotStore {
-            inner: Arc::new(RwLock::new(Arc::new(snapshot))),
+            inner: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
         }
     }
 
     pub fn get(&self) -> Arc<Snapshot> {
-        self.inner.read().expect("snapshot lock poisoned").clone()
+        self.inner.load_full()
     }
 
     /// Replace the current snapshot. Readers that already hold
     /// the old `Arc` keep querying it to completion.
     pub fn swap(&self, snapshot: Snapshot) {
-        *self.inner.write().expect("snapshot lock poisoned") = Arc::new(snapshot);
+        self.publish(snapshot, drop);
+    }
+
+    fn publish(&self, snapshot: Snapshot, retire: impl FnOnce(Arc<Snapshot>)) {
+        // swap returns the old Arc: reclamation happens after publication,
+        // without holding a reader/writer or application publication lock.
+        let old = self.inner.swap(Arc::new(snapshot));
+        retire(old);
     }
 
     /// Scan and swap in the result.
@@ -354,6 +361,35 @@ pub fn serve(
 #[cfg(test)]
 mod shutdown_tests {
     use super::*;
+
+    #[test]
+    fn readers_continue_while_old_snapshot_reclamation_is_paused() {
+        let store = SnapshotStore::new(Snapshot::empty());
+        let writer = store.clone();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            writer.publish(Snapshot::empty(), |old| {
+                paused_tx.send(()).unwrap();
+                resume_rx
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap();
+                drop(old);
+            })
+        });
+        paused_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            read_tx.send(store.get()).unwrap();
+        });
+        let result = read_rx.recv_timeout(std::time::Duration::from_millis(150));
+        resume_tx.send(()).unwrap();
+        thread.join().unwrap();
+        reader.join().unwrap();
+        assert!(result.is_ok(), "reader waited for reclamation");
+    }
 
     #[test]
     fn stop_before_listener_registration_cannot_be_lost() {

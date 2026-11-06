@@ -10,6 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+arc-swap = "1.9.3"
 ferrow-index = { path = "../ferrow-index" }
 ferrow-ipc = { path = "../ferrow-ipc" }
 ferrow-query = { path = "../ferrow-query" }
