@@ -157,7 +157,16 @@ exclude — goes through the one location/exclude decision. If an identity
 or location lookup needed for that decision fails, exclusion cannot be
 determined: the candidate is **not indexed** (nor descended), and the
 failure is counted once in the scan report. A counted error never admits
-an entry whose exclusion status is unknown. Scans with **no excludes**
+an entry whose exclusion status is unknown. The same rule applies at
+exclude setup (N6; same owner decision, 2026-11-06): an **existing**
+exclude that cannot be fully resolved — a metadata error other than
+`NotFound`, its identity, its canonical location, or the identity of a
+file exclude's parent — **aborts the scan** before any root is walked.
+Nothing is indexed, the report carries a fatal error naming the exclude
+and the reason, and the CLI `index` command exits non-zero without
+writing or replacing the index file. A genuinely absent exclude keeps
+the behaviour above: reported as `exclude not found: …` and ignored.
+Scans with **no excludes**
 keep a separate, weaker policy: identity lookups then only feed
 symlink-cycle detection, so a lookup failure is counted and the entry is
 kept (as a leaf when following), because there is nothing to exclude.
