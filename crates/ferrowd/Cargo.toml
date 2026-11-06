@@ -1,0 +1,20 @@
+[package]
+name = "ferrowd"
+description = "Ferrow background index service: holds the index and answers queries over ferrow-ipc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ferrow-index = { path = "../ferrow-index" }
+ferrow-ipc = { path = "../ferrow-ipc" }
+ferrow-query = { path = "../ferrow-query" }
+ferrow-walk = { path = "../ferrow-walk" }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }

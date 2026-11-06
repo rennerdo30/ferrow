@@ -288,7 +288,8 @@ mod platform {
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+        PIPE_WAIT, WaitNamedPipeW,
     };
 
     /// SDDL_REVISION_1.
@@ -308,6 +309,11 @@ mod platform {
 
     /// An owned pipe handle; disconnected and closed on drop.
     struct PipeHandle(HANDLE);
+
+    // SAFETY: the handle is owned exclusively by this struct and
+    // Windows handles may be used from any thread; moving the
+    // owner moves the sole right to use or close it.
+    unsafe impl Send for PipeHandle {}
 
     impl Drop for PipeHandle {
         fn drop(&mut self) {
@@ -464,7 +470,10 @@ mod platform {
                     self.name.as_ptr(),
                     PIPE_ACCESS_DUPLEX,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                    1,
+                    // Unlimited instances so a new instance can be
+                    // created while earlier connections are still
+                    // being served on their own instances.
+                    PIPE_UNLIMITED_INSTANCES,
                     super::MAX_PIPE_BUFFER as u32,
                     super::MAX_PIPE_BUFFER as u32,
                     0,
