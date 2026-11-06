@@ -105,10 +105,11 @@ writes and syncs it, then renames it over the destination, so a crash
 or a concurrent save never leaves a half-written index at the target
 path and no unrelated sibling file is touched.
 
-CRC-32 is a hand-written, table-driven implementation: it is short, has
-no dependency, and easily outruns the disk on load. If load ever becomes
-CPU-bound at larger sizes, switching the checksum is a format-version
-bump.
+The load total covers file open and metadata through temporary payload disposal
+and file close. CRC-32 is a hand-written, table-driven implementation with no
+dependency. Cached-read measurements show checksum work can dominate load;
+they do not establish disk throughput. Accelerating the same IEEE CRC is
+format-compatible; changing checksum semantics requires a format-version bump.
 
 ### Exclude matching (`ferrow-walk`)
 

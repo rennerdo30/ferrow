@@ -307,9 +307,15 @@ pub(crate) fn load(path: &Path) -> Result<Index, LoadError> {
 }
 
 pub(crate) fn load_with_timings(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
+    let started = Instant::now();
     let mut file = std::fs::File::open(path).map_err(LoadError::Io)?;
     let file_len = file.metadata().map_err(LoadError::Io)?.len();
-    load_from(&mut file, file_len)
+    let (index, mut timings) = load_from(&mut file, file_len)?;
+    drop(file);
+    // Include open/metadata, temporary payload disposal and file close in
+    // the API wall interval; the named parts remain disjoint subsets.
+    timings.total = started.elapsed();
+    Ok((index, timings))
 }
 
 /// Read an index from `reader`, where `file_len` is the total source
@@ -347,6 +353,7 @@ fn load_from<R: std::io::Read>(
         .map_err(LoadError::Io)?;
     timings.read += t.elapsed();
     let index = from_bytes_inner(&data, &mut timings)?;
+    drop(data);
     timings.total = started.elapsed();
     Ok((index, timings))
 }
