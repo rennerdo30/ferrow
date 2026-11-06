@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ferrow_index::Index;
-use ferrow_query::{CancelToken, Query, SearchOptions};
+use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, SortStatus};
 
 /// Hits shown before the full result list is ready.
 const FIRST_PAGE: usize = 200;
@@ -62,7 +62,14 @@ pub enum Event {
         hits: Hits,
         complete: bool,
         elapsed: Duration,
+        /// The requested sort order is still being prepared in the
+        /// background; these hits are in name order for now.
+        sort_pending: bool,
+        /// The index has no data for the requested sort column.
+        sort_unavailable: bool,
     },
+    /// A background sort order became ready: search again.
+    SortReady,
     /// The query text does not parse.
     QueryError {
         generation: u64,
@@ -77,6 +84,8 @@ enum Command {
         generation: u64,
         text: String,
         cancel: Arc<AtomicBool>,
+        sort: SortKey,
+        descending: bool,
     },
     Scan(ferrow_walk::WalkOptions),
     /// Pass an event from a background thread to the UI (with a wake).
@@ -124,7 +133,7 @@ impl Engine {
 
     /// Start a search for `text`; the previous one is cancelled.
     /// Returns the generation that its results will carry.
-    pub fn search(&mut self, text: &str) -> u64 {
+    pub fn search(&mut self, text: &str, sort: SortKey, descending: bool) -> u64 {
         if let Some(old) = self.in_flight.take() {
             old.store(true, Ordering::Relaxed);
         }
@@ -135,6 +144,8 @@ impl Engine {
             generation: self.generation,
             text: text.to_owned(),
             cancel,
+            sort,
+            descending,
         });
         self.generation
     }
@@ -203,7 +214,9 @@ impl<W: Fn()> Worker<W> {
                 generation,
                 text,
                 cancel,
-            } => self.search(generation, &text, cancel),
+                sort,
+                descending,
+            } => self.search(generation, &text, cancel, sort, descending),
             Command::Scan(options) => self.scan(options),
             Command::ScanDone {
                 index,
@@ -290,7 +303,14 @@ impl<W: Fn()> Worker<W> {
         clippy::needless_update,
         reason = "SearchOptions gains fields under ferrow-query's test-hooks feature"
     )]
-    fn search(&self, generation: u64, text: &str, cancel: Arc<AtomicBool>) {
+    fn search(
+        &self,
+        generation: u64,
+        text: &str,
+        cancel: Arc<AtomicBool>,
+        sort: SortKey,
+        descending: bool,
+    ) {
         let Some(index) = &self.index else { return };
         let started = Instant::now();
         let query = match Query::parse(text) {
@@ -304,50 +324,51 @@ impl<W: Fn()> Worker<W> {
                 return;
             }
         };
-        if query.terms.is_empty() {
+        let plain_order = sort == SortKey::Name && !descending;
+        if query.terms.is_empty() && query.expression.is_none() && plain_order {
             self.send(Event::Results {
                 generation,
                 hits: Hits::All,
                 complete: true,
                 elapsed: started.elapsed(),
+                sort_pending: false,
+                sort_unavailable: false,
             });
             return;
         }
         let token = CancelToken::from_flag(cancel);
+        let options = |limit| SearchOptions {
+            limit,
+            cancel: token.clone(),
+            sort,
+            descending,
+            // Other fields exist with the workspace's test-hooks feature.
+            ..Default::default()
+        };
         // First page: stops early, so typing feels instant even when
         // the full list takes longer.
-        let first = ferrow_query::search(
-            index,
-            &query,
-            &SearchOptions {
-                limit: Some(FIRST_PAGE),
-                cancel: token.clone(),
-                // Other fields exist with the workspace's test-hooks feature.
-                ..Default::default()
-            },
-        );
+        let first = ferrow_query::search(index, &query, &options(Some(FIRST_PAGE)));
         if first.cancelled {
             return;
         }
+        let pending = first.sort_status == SortStatus::Pending;
+        if pending {
+            self.notify_when_sorted(index, sort);
+        }
+        let unavailable = first.sort_unavailable.is_some();
         let first_is_all = first.hits.len() < FIRST_PAGE;
         self.send(Event::Results {
             generation,
             hits: Hits::Some(Arc::new(first.hits)),
             complete: first_is_all,
             elapsed: started.elapsed(),
+            sort_pending: pending,
+            sort_unavailable: unavailable,
         });
         if first_is_all {
             return;
         }
-        let full = ferrow_query::search(
-            index,
-            &query,
-            &SearchOptions {
-                limit: None,
-                cancel: token,
-                ..Default::default()
-            },
-        );
+        let full = ferrow_query::search(index, &query, &options(None));
         if full.cancelled {
             return;
         }
@@ -356,7 +377,42 @@ impl<W: Fn()> Worker<W> {
             hits: Hits::Some(Arc::new(full.hits)),
             complete: true,
             elapsed: started.elapsed(),
+            sort_pending: full.sort_status == SortStatus::Pending,
+            sort_unavailable: full.sort_unavailable.is_some(),
         });
+    }
+
+    /// Ask for a wake-up when a background sort order is ready. A small
+    /// helper thread waits on the index's sort ticket, so neither the UI
+    /// nor this worker ever blocks. It gives up if the index is replaced.
+    fn notify_when_sorted(&self, index: &Arc<Index>, sort: SortKey) {
+        let Some(commands) = self.commands.clone() else {
+            return;
+        };
+        let _ = index.request_sort(sort);
+        let Some(ticket) = index.sort_ticket(sort) else {
+            return;
+        };
+        let weak = Arc::downgrade(index);
+        let _ = std::thread::Builder::new()
+            .name("ferrow-sort-wait".into())
+            .spawn(move || {
+                loop {
+                    match ticket.wait_timeout(Duration::from_secs(1)) {
+                        SortStatus::Pending => {
+                            // Stop waiting for a retired index.
+                            if weak.strong_count() == 0 {
+                                return;
+                            }
+                        }
+                        SortStatus::Ready => {
+                            let _ = commands.send(Command::Forward(Event::SortReady));
+                            return;
+                        }
+                        _ => return,
+                    }
+                }
+            });
     }
 }
 
@@ -425,14 +481,26 @@ mod tests {
     #[test]
     fn empty_query_is_all_without_copy() {
         let (w, rx) = worker();
-        w.search(1, "  ", Arc::new(AtomicBool::new(false)));
+        w.search(
+            1,
+            "  ",
+            Arc::new(AtomicBool::new(false)),
+            SortKey::Name,
+            false,
+        );
         assert!(matches!(final_hits(&rx), Some(Hits::All)));
     }
 
     #[test]
     fn query_hits_in_name_order() {
         let (w, rx) = worker();
-        w.search(1, "alpha", Arc::new(AtomicBool::new(false)));
+        w.search(
+            1,
+            "alpha",
+            Arc::new(AtomicBool::new(false)),
+            SortKey::Name,
+            false,
+        );
         let index = w.index.clone().unwrap();
         let Some(Hits::Some(ids)) = final_hits(&rx) else {
             panic!("no hits")
@@ -444,14 +512,26 @@ mod tests {
     #[test]
     fn cancelled_search_sends_nothing() {
         let (w, rx) = worker();
-        w.search(1, "a", Arc::new(AtomicBool::new(true)));
+        w.search(
+            1,
+            "a",
+            Arc::new(AtomicBool::new(true)),
+            SortKey::Name,
+            false,
+        );
         assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn bad_query_reports_error() {
         let (w, rx) = worker();
-        w.search(7, "\"open", Arc::new(AtomicBool::new(false)));
+        w.search(
+            7,
+            "\"open",
+            Arc::new(AtomicBool::new(false)),
+            SortKey::Name,
+            false,
+        );
         match rx.try_recv() {
             Ok(Event::QueryError { generation: 7, .. }) => {}
             _ => panic!("expected a query error"),

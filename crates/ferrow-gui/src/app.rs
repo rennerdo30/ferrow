@@ -14,7 +14,10 @@ use ferrow_index::{Index, flags};
 
 use crate::engine::{Engine, Event, Hits, home_dir};
 use crate::logo::TitleLogo;
-use crate::settings::Settings;
+use crate::settings::{ColumnId, Settings};
+
+#[path = "columns.rs"]
+mod columns;
 
 #[path = "settings_page.rs"]
 mod settings_page;
@@ -73,7 +76,6 @@ pub struct FerrowApp {
     selected: Option<usize>,
     /// Keep the selection in view after keyboard moves.
     follow_selection: bool,
-    name_width: f32,
     palette: Palette,
     backdrop: bool,
     dark: bool,
@@ -95,6 +97,12 @@ pub struct FerrowApp {
     network_input: Option<String>,
     /// The on-start automatic rebuild already ran in this session.
     auto_started: bool,
+    /// Shown columns need metadata the loaded index does not have.
+    columns_need_rebuild: bool,
+    /// The chosen sort is still being prepared (results in name order).
+    sort_pending: bool,
+    /// The index has no data for the chosen sort column.
+    sort_unavailable: bool,
 }
 
 impl FerrowApp {
@@ -128,7 +136,6 @@ impl FerrowApp {
             scroll: 0.0,
             selected: None,
             follow_selection: false,
-            name_width: 0.0,
             palette,
             backdrop,
             dark,
@@ -145,6 +152,9 @@ impl FerrowApp {
             drives_rx: None,
             network_input: None,
             auto_started: false,
+            columns_need_rebuild: false,
+            sort_pending: false,
+            sort_unavailable: false,
         })
     }
 
@@ -156,6 +166,8 @@ impl FerrowApp {
                     elapsed,
                     source,
                 } => {
+                    let present = index.columns_present();
+                    self.columns_need_rebuild = !present.contains(self.settings.index_columns());
                     self.index = Some(index);
                     self.scan_status = None;
                     self.load_time = elapsed;
@@ -179,12 +191,20 @@ impl FerrowApp {
                     }
                     self.scan_status = Some(msg);
                 }
+                Event::SortReady => {
+                    // The background sort order is ready: search again.
+                    self.sent_query = None;
+                }
                 Event::Results {
                     generation,
                     hits,
                     complete,
                     elapsed,
+                    sort_pending,
+                    sort_unavailable,
                 } => {
+                    self.sort_pending = sort_pending;
+                    self.sort_unavailable = sort_unavailable;
                     if generation < self.shown_generation {
                         continue;
                     }
@@ -593,66 +613,22 @@ impl FerrowApp {
         let header = Rect::from_min_size(inner.min, vec2(inner.width(), HEADER_HEIGHT));
         let list = Rect::from_min_max(pos2(inner.left(), header.bottom()), inner.max);
         let content_w = list.width() - SCROLLBAR_WIDTH;
-        if self.name_width <= 0.0 {
-            self.name_width = (content_w * 0.36).clamp(180.0, 420.0);
+        let present = index.columns_present();
+        let cols = columns::layout(self, inner.left() + 4.0, inner.left() + content_w - 2.0);
+        if self.column_header(ui, header, &cols, present) {
+            // A new sort order: search again, from the top.
+            self.sent_query = None;
+            self.scroll = 0.0;
+            self.selected = None;
         }
-        let type_w = 120.0_f32.min(content_w * 0.2);
-        let name_w = self
-            .name_width
-            .clamp(140.0, (content_w - type_w - 120.0).max(140.0));
-        let col_name = inner.left() + 12.0;
-        let col_path = col_name + name_w;
-        let col_type = inner.left() + content_w - type_w;
-
-        let header_font = FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into()));
-        painter.text(
-            pos2(col_name + 28.0, header.center().y),
-            Align2::LEFT_CENTER,
-            "Name",
-            header_font.clone(),
-            p.text_secondary,
-        );
-        icon_sort_up(
-            &painter,
-            pos2(col_name + 28.0 + 44.0, header.center().y),
-            p.text_tertiary,
-        );
-        painter.text(
-            pos2(col_path + 8.0, header.center().y),
-            Align2::LEFT_CENTER,
-            "Folder",
-            header_font.clone(),
-            p.text_secondary,
-        );
-        painter.text(
-            pos2(col_type + 8.0, header.center().y),
-            Align2::LEFT_CENTER,
-            "Type",
-            header_font,
-            p.text_secondary,
-        );
-        // Column dividers in the header, resizable name column.
-        for x in [col_path, col_type] {
-            painter.line_segment(
-                [pos2(x, header.top() + 8.0), pos2(x, header.bottom() - 8.0)],
-                Stroke::new(1.0, p.divider),
+        if self.sort_unavailable {
+            return self.placeholder(
+                ui,
+                list,
+                "This index has no data for that column",
+                Some("Rebuild the index in Settings to add it, or sort by another column."),
             );
         }
-        let grip =
-            Rect::from_center_size(pos2(col_path, header.center().y), vec2(8.0, HEADER_HEIGHT));
-        let grip_resp = ui
-            .interact(grip, egui::Id::unique("name-col"), Sense::drag())
-            .on_hover_cursor(CursorIcon::ResizeColumn);
-        if grip_resp.dragged() {
-            self.name_width += grip_resp.drag_delta().x;
-        }
-        painter.line_segment(
-            [
-                pos2(inner.left(), header.bottom()),
-                pos2(inner.right(), header.bottom()),
-            ],
-            Stroke::new(1.0, p.divider),
-        );
 
         // Scrolling, in rows (f64 so millions of rows stay precise).
         let visible = (list.height() / ROW_HEIGHT).max(1.0);
@@ -763,72 +739,115 @@ impl FerrowApp {
             }
             let cy = rect.center().y;
             let is_dir = index.flags(id) & flags::DIR != 0;
-            if is_dir {
-                icon_folder(&row_painter, pos2(col_name + 8.0, cy), &p);
-            } else {
-                icon_file(&row_painter, pos2(col_name + 8.0, cy), &p);
-            }
             let name = String::from_utf8_lossy(index.name(id));
-            let name_clip = Rect::from_min_max(
-                pos2(col_name + 28.0, rect.top()),
-                pos2(col_path - 8.0, rect.bottom()),
-            );
-            // Highlight with the engine's own match ranges, so wildcards,
-            // phrases and `case:` highlight exactly what matched. Ranges are
-            // byte offsets into the raw name, so only use them when the name
-            // is shown unchanged (valid UTF-8).
-            let ranges = match (&parsed, &name) {
-                (Some(q), std::borrow::Cow::Borrowed(_)) => {
-                    ferrow_query::highlight_ranges(q, index.name(id))
-                }
-                _ => Vec::new(),
-            };
-            let mut job = highlighted(&name, &ranges, name_font.clone(), p.text, p.accent_text);
-            job.wrap.max_width = name_clip.width();
-            job.wrap.overflow_character = Some('…');
-            job.wrap.break_anywhere = true;
-            let galley = ui.fonts_mut(|f| f.layout_job(job));
-            row_painter.with_clip_rect(name_clip).galley(
-                pos2(name_clip.left(), cy - galley.size().y / 2.0),
-                galley,
-                p.text,
-            );
-
-            let parent = index.parent(id);
-            let folder = if parent == ferrow_index::ROOT_PARENT {
-                String::new()
+            let needs_meta = cols.iter().any(|c| {
+                matches!(
+                    c.id,
+                    ColumnId::Size
+                        | ColumnId::Modified
+                        | ColumnId::Created
+                        | ColumnId::Accessed
+                        | ColumnId::Attributes
+                )
+            });
+            let meta = if needs_meta {
+                index.metadata(id)
             } else {
-                index.path(parent).display().to_string()
+                Default::default()
             };
-            let folder_clip = Rect::from_min_max(
-                pos2(col_path + 8.0, rect.top()),
-                pos2(col_type - 8.0, rect.bottom()),
-            );
-            let galley = ellipsized(
-                ui,
-                folder,
-                sub_font.clone(),
-                p.text_secondary,
-                folder_clip.width(),
-            );
-            row_painter.with_clip_rect(folder_clip).galley(
-                pos2(folder_clip.left(), cy - galley.size().y / 2.0),
-                galley,
-                p.text_secondary,
-            );
-
-            let kind = type_label(&name, is_dir);
-            let type_clip = Rect::from_min_max(
-                pos2(col_type + 8.0, rect.top()),
-                pos2(rect.right(), rect.bottom()),
-            );
-            row_painter.with_clip_rect(type_clip).text(
-                pos2(type_clip.left(), cy),
-                Align2::LEFT_CENTER,
-                kind,
-                sub_font.clone(),
-                p.text_secondary,
-            );
+            for col in &cols {
+                let clip = Rect::from_min_max(
+                    pos2(col.left + 8.0, rect.top()),
+                    pos2(col.right - 8.0, rect.bottom()),
+                );
+                match col.id {
+                    ColumnId::Name => {
+                        let icon_c = pos2(col.left + 16.0, cy);
+                        if is_dir {
+                            icon_folder(&row_painter, icon_c, &p);
+                        } else {
+                            icon_file(&row_painter, icon_c, &p);
+                        }
+                        let name_clip = Rect::from_min_max(
+                            pos2(col.left + 32.0, rect.top()),
+                            pos2(col.right - 8.0, rect.bottom()),
+                        );
+                        // Highlight with the engine's own match ranges, so
+                        // wildcards, phrases and `case:` highlight exactly
+                        // what matched. Ranges are byte offsets into the raw
+                        // name, so only use them when it is shown unchanged.
+                        let ranges = match (&parsed, &name) {
+                            (Some(q), std::borrow::Cow::Borrowed(_)) => {
+                                ferrow_query::highlight_ranges(q, index.name(id))
+                            }
+                            _ => Vec::new(),
+                        };
+                        let mut job =
+                            highlighted(&name, &ranges, name_font.clone(), p.text, p.accent_text);
+                        job.wrap.max_width = name_clip.width();
+                        job.wrap.overflow_character = Some('…');
+                        job.wrap.break_anywhere = true;
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        row_painter.with_clip_rect(name_clip).galley(
+                            pos2(name_clip.left(), cy - galley.size().y / 2.0),
+                            galley,
+                            p.text,
+                        );
+                    }
+                    ColumnId::Folder => {
+                        let parent = index.parent(id);
+                        let folder = if parent == ferrow_index::ROOT_PARENT {
+                            String::new()
+                        } else {
+                            index.path(parent).display().to_string()
+                        };
+                        let galley = ellipsized(
+                            ui,
+                            folder,
+                            sub_font.clone(),
+                            p.text_secondary,
+                            clip.width(),
+                        );
+                        row_painter.with_clip_rect(clip).galley(
+                            pos2(clip.left(), cy - galley.size().y / 2.0),
+                            galley,
+                            p.text_secondary,
+                        );
+                    }
+                    ColumnId::Type => {
+                        row_painter.with_clip_rect(clip).text(
+                            pos2(clip.left(), cy),
+                            Align2::LEFT_CENTER,
+                            type_label(&name, is_dir),
+                            sub_font.clone(),
+                            p.text_secondary,
+                        );
+                    }
+                    other => {
+                        let (text, color) = if !columns::column_present(present, other) {
+                            let (t, c) = columns::missing_text(&p);
+                            (t.to_owned(), c)
+                        } else {
+                            match columns::cell_text(other, &meta, is_dir) {
+                                Some(t) => (t, p.text_secondary),
+                                None => continue,
+                            }
+                        };
+                        let (x, align) = if columns::right_aligned(other) {
+                            (clip.right(), Align2::RIGHT_CENTER)
+                        } else {
+                            (clip.left(), Align2::LEFT_CENTER)
+                        };
+                        row_painter.with_clip_rect(clip).text(
+                            pos2(x, cy),
+                            align,
+                            text,
+                            sub_font.clone(),
+                            color,
+                        );
+                    }
+                }
+            }
         }
 
         // Mouse: click selects, double-click opens, right-click menu.
@@ -1063,7 +1082,16 @@ impl FerrowApp {
                 } else {
                     format!("{}+ results", group(rows))
                 };
-                format!("{results}   ·   {}", fmt_ms(self.search_time))
+                let mut line = format!("{results}   ·   {}", fmt_ms(self.search_time));
+                if self.sort_pending {
+                    line.push_str(&format!(
+                        "   ·   Preparing sort by {}…",
+                        self.settings.sort.label()
+                    ));
+                } else if self.columns_need_rebuild {
+                    line.push_str("   ·   Rebuild the index to fill the new columns");
+                }
+                line
             }
             _ => String::new(),
         };
@@ -1118,7 +1146,11 @@ impl eframe::App for FerrowApp {
         if matches!(self.state, State::Ready)
             && self.sent_query.as_deref() != Some(self.query.as_str())
         {
-            self.engine.search(&self.query);
+            self.engine.search(
+                &self.query,
+                self.settings.sort.key(),
+                self.settings.sort_descending,
+            );
             self.sent_query = Some(self.query.clone());
         }
 
@@ -1392,12 +1424,6 @@ fn icon_close(painter: &egui::Painter, c: Pos2, color: Color32) {
     let stroke = Stroke::new(1.3, color);
     painter.line_segment([c + vec2(-s, -s), c + vec2(s, s)], stroke);
     painter.line_segment([c + vec2(-s, s), c + vec2(s, -s)], stroke);
-}
-
-fn icon_sort_up(painter: &egui::Painter, c: Pos2, color: Color32) {
-    let stroke = Stroke::new(1.2, color);
-    painter.line_segment([c + vec2(-3.5, 1.5), c + vec2(0.0, -2.0)], stroke);
-    painter.line_segment([c + vec2(0.0, -2.0), c + vec2(3.5, 1.5)], stroke);
 }
 
 fn icon_folder(painter: &egui::Painter, c: Pos2, p: &Palette) {

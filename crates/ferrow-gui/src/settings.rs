@@ -83,6 +83,129 @@ impl AutoRebuild {
     }
 }
 
+/// A result-list column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnId {
+    Name,
+    Folder,
+    Size,
+    Modified,
+    Created,
+    Accessed,
+    Type,
+    Attributes,
+}
+
+impl ColumnId {
+    pub const ALL: [ColumnId; 8] = [
+        ColumnId::Name,
+        ColumnId::Folder,
+        ColumnId::Size,
+        ColumnId::Modified,
+        ColumnId::Created,
+        ColumnId::Accessed,
+        ColumnId::Type,
+        ColumnId::Attributes,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ColumnId::Name => "Name",
+            ColumnId::Folder => "Folder",
+            ColumnId::Size => "Size",
+            ColumnId::Modified => "Date modified",
+            ColumnId::Created => "Date created",
+            ColumnId::Accessed => "Date accessed",
+            ColumnId::Type => "Type",
+            ColumnId::Attributes => "Attributes",
+        }
+    }
+
+    pub fn default_width(self) -> f32 {
+        match self {
+            ColumnId::Name => 320.0,
+            ColumnId::Folder => 0.0, // flexible: takes the remaining width
+            ColumnId::Size => 90.0,
+            ColumnId::Modified | ColumnId::Created | ColumnId::Accessed => 150.0,
+            ColumnId::Type => 110.0,
+            ColumnId::Attributes => 90.0,
+        }
+    }
+
+    /// The sort key, for sortable columns.
+    pub fn sort_key(self) -> Option<SortChoice> {
+        match self {
+            ColumnId::Name => Some(SortChoice::Name),
+            ColumnId::Size => Some(SortChoice::Size),
+            ColumnId::Modified => Some(SortChoice::Modified),
+            ColumnId::Created => Some(SortChoice::Created),
+            ColumnId::Accessed => Some(SortChoice::Accessed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ColumnConfig {
+    pub id: ColumnId,
+    pub visible: bool,
+    pub width: f32,
+}
+
+pub fn default_columns() -> Vec<ColumnConfig> {
+    ColumnId::ALL
+        .iter()
+        .map(|&id| ColumnConfig {
+            id,
+            visible: matches!(
+                id,
+                ColumnId::Name
+                    | ColumnId::Folder
+                    | ColumnId::Size
+                    | ColumnId::Modified
+                    | ColumnId::Type
+            ),
+            width: id.default_width(),
+        })
+        .collect()
+}
+
+/// Sort order of the result list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortChoice {
+    #[default]
+    Name,
+    Size,
+    Modified,
+    Created,
+    Accessed,
+}
+
+impl SortChoice {
+    pub fn key(self) -> ferrow_query::SortKey {
+        use ferrow_query::SortKey;
+        match self {
+            SortChoice::Name => SortKey::Name,
+            SortChoice::Size => SortKey::Size,
+            SortChoice::Modified => SortKey::Modified,
+            SortChoice::Created => SortKey::Created,
+            SortChoice::Accessed => SortKey::Accessed,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortChoice::Name => "name",
+            SortChoice::Size => "size",
+            SortChoice::Modified => "date modified",
+            SortChoice::Created => "date created",
+            SortChoice::Accessed => "date accessed",
+        }
+    }
+}
+
 /// Windows-only options.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -91,7 +214,7 @@ pub struct WindowsSettings {
     pub all_fixed_drives: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
@@ -107,6 +230,28 @@ pub struct Settings {
     /// Unix seconds of the last completed rebuild started by the app.
     pub last_rebuild: Option<u64>,
     pub windows: WindowsSettings,
+    /// Result-list columns, in display order.
+    pub columns: Vec<ColumnConfig>,
+    pub sort: SortChoice,
+    pub sort_descending: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            theme: ThemeChoice::default(),
+            sources: Vec::new(),
+            roots: Vec::new(),
+            excludes: Vec::new(),
+            follow_symlinks: false,
+            auto_rebuild: AutoRebuild::default(),
+            last_rebuild: None,
+            windows: WindowsSettings::default(),
+            columns: default_columns(),
+            sort: SortChoice::default(),
+            sort_descending: false,
+        }
+    }
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -125,6 +270,21 @@ impl Settings {
     }
 
     fn migrate(&mut self) {
+        // Keep every known column exactly once, appending new ones.
+        let mut seen = Vec::new();
+        self.columns.retain(|c| {
+            let new = !seen.contains(&c.id);
+            seen.push(c.id);
+            new
+        });
+        for d in default_columns() {
+            if !self.columns.iter().any(|c| c.id == d.id) {
+                self.columns.push(d);
+            }
+        }
+        if let Some(name) = self.columns.iter_mut().find(|c| c.id == ColumnId::Name) {
+            name.visible = true;
+        }
         for root in std::mem::take(&mut self.roots) {
             if !self.sources.iter().any(|s| s.path == root) {
                 let kind = crate::platform::classify_location(&root);
@@ -164,6 +324,22 @@ impl Settings {
             }
         }
         roots
+    }
+
+    /// Metadata the scanner collects: size and modified always (the
+    /// defaults), plus any other date or attribute column that is shown.
+    pub fn index_columns(&self) -> ferrow_index::ColumnSet {
+        use ferrow_index::ColumnSet;
+        let mut set = ColumnSet::DEFAULT;
+        for c in self.columns.iter().filter(|c| c.visible) {
+            set = set.union(match c.id {
+                ColumnId::Created => ColumnSet::CREATED,
+                ColumnId::Accessed => ColumnSet::ACCESSED,
+                ColumnId::Attributes => ColumnSet::ATTRIBUTES,
+                _ => ColumnSet::NONE,
+            });
+        }
+        set
     }
 
     pub fn has_locations(&self) -> bool {
@@ -207,6 +383,7 @@ mod tests {
         let partial: Settings = serde_json::from_str(r#"{"theme":"light","future":1}"#).unwrap();
         assert_eq!(partial.theme, ThemeChoice::Light);
         assert!(partial.sources.is_empty());
+        assert_eq!(partial.columns, default_columns());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -227,5 +404,26 @@ mod tests {
         s.windows.all_fixed_drives = true;
         let expected = if cfg!(windows) { 2 } else { 1 };
         assert_eq!(s.scan_roots(&drives).len(), expected);
+    }
+
+    #[test]
+    fn columns_migrate_and_drive_index_columns() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"columns":[{"id":"name","visible":false,"width":200.0},{"id":"created","visible":true,"width":150.0},{"id":"created","visible":false,"width":1.0}]}"#,
+        )
+        .unwrap();
+        s.migrate();
+        assert_eq!(s.columns.len(), ColumnId::ALL.len());
+        assert!(s.columns[0].visible, "name is always shown");
+        assert!(s.index_columns().contains(ferrow_index::ColumnSet::CREATED));
+        assert!(
+            !s.index_columns()
+                .contains(ferrow_index::ColumnSet::ACCESSED)
+        );
+        assert!(
+            Settings::default()
+                .index_columns()
+                .contains(ferrow_index::ColumnSet::MODIFIED)
+        );
     }
 }
