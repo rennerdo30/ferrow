@@ -113,6 +113,20 @@ fn search_uses_service_and_index_flag_bypasses_it() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
 
+    for (format, expected) in [
+        ("--json", b"[]\n".as_slice()),
+        ("--null", b"".as_slice()),
+        ("--count", b"0\n".as_slice()),
+    ] {
+        let out = fx
+            .ferrow()
+            .args(["search", "service-needle", "--limit", "0", format])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, expected, "explicit zero with {format}");
+    }
+
     // An explicit --index bypasses the service: this file does
     // not exist, so the command must fail instead of answering
     // from the daemon.

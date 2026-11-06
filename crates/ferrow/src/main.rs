@@ -374,6 +374,15 @@ fn cmd_search(args: Args) -> Result<(), String> {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
+    // Zero is an explicit empty result, while protocol zero means unlimited.
+    if args.limit == Some(0) {
+        if args.count {
+            writeln!(out, "0").map_err(|e| e.to_string())?;
+            return out.flush().map_err(|e| e.to_string());
+        }
+        return emit_paths(&mut out, &[], args.json, args.null);
+    }
+
     // Service first (M2b), unless --index pins an index file.
     // Only a connection failure falls back; an answer (or a
     // typed service error) from a reachable service is final.
