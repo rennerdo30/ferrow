@@ -15,6 +15,8 @@ COMMON_WILDCARDS = {"*.log", "report*2024*"}
 # load + memory, then first page and full count per query, in-process and IPC.
 PAIRED_METRICS = 2 + 2 * 2 * len(QUERIES)
 EXPECTED_METRICS = PAIRED_METRICS + 2 * 2 * len(NEW_QUERIES)
+EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES)
+EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
 
 
 def number(value):
@@ -114,6 +116,70 @@ def render(rows):
     lines += [f"| {name.replace('|', chr(92) + '|')} | {cell(b)} | {h:.6f} | {cell(limit)} | {'FAIL' if bad else 'pass'} |"
               for name, b, h, limit, bad in rows]
     return "\n".join(lines) + "\n"
+
+
+def metadata_observations(text, head, expected_entries=5_000_000):
+    scalars, engine, ipc, scan = {}, {}, {}, {}
+    for line in text.splitlines():
+        prefix, _, body = line.partition(" ")
+        if prefix not in {"FERROW-METADATA", "FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE", "FERROW-SCAN"}:
+            continue
+        fields = dict(word.split("=", 1) for word in shlex.split(body))
+        if prefix in {"FERROW-METADATA", "FERROW-SCAN"}:
+            target = scalars if prefix == "FERROW-METADATA" else scan
+            if target.keys() & fields.keys():
+                raise ValueError("duplicate metadata/scan scalar")
+            target.update({key: number(value) for key, value in fields.items()})
+        else:
+            query = fields.pop("query")
+            target = engine if prefix == "FERROW-MODIFIED-QUERY" else ipc
+            if query in target:
+                raise ValueError("duplicate modified-sort query")
+            target[query] = {key: number(fields[key]) for key in ("first_page_ms", "full_count_ms", "page_hits", "total_hits")}
+    required = {"entries", "seed", "core_heap_bytes", "default_heap_bytes", "default_bytes_per_entry",
+                "metadata_bytes_per_entry", "load_ms_median", "core_load_ms_median", "cold_default_heap_bytes", "sort_during_load", "lazy_build_ms_median", "persisted_load_ms_median", "lazy_saved_bytes", "freeze_ms"}
+    if not required <= scalars.keys() or set(engine) != QUERIES or set(ipc) != QUERIES:
+        raise ValueError("missing metadata observations")
+    if not {"entries", "errors", "none_ms_median", "default_ms_median"} <= scan.keys() or scan["entries"] != 2101 or scan["errors"] != 0:
+        raise ValueError("invalid scan-cost observations")
+    if scalars["entries"] != expected_entries or scalars["seed"] != 2026:
+        raise ValueError("wrong metadata fixture")
+    if scalars["core_heap_bytes"] != head[0]["heap_bytes"]:
+        raise ValueError("metadata core heap changed")
+    total = scalars["default_heap_bytes"] / expected_entries
+    extra = (scalars["default_heap_bytes"] - scalars["core_heap_bytes"]) / expected_entries
+    if abs(total-scalars["default_bytes_per_entry"]) > 0.000001 or abs(extra-scalars["metadata_bytes_per_entry"]) > 0.000001:
+        raise ValueError("inconsistent default-column heap evidence")
+    cold = scalars["cold_default_heap_bytes"]
+    if not scalars["core_heap_bytes"] <= cold <= scalars["default_heap_bytes"]:
+        raise ValueError("invalid cold metadata heap")
+    cached = (6 if expected_entries <= 2**23 else 8 if expected_entries <= 2**31 else 10)*expected_entries
+    if scalars["lazy_saved_bytes"] != cached or scalars["default_heap_bytes"]-cold != cached:
+        raise ValueError("inconsistent lazy-cache saving")
+    if total > 66 or extra > 16.5:
+        raise ValueError("default-column memory target exceeded")
+    if scalars["core_load_ms_median"] <= 0 or scalars["load_ms_median"] > scalars["core_load_ms_median"]*1.15:
+        raise ValueError("default-column load target exceeded (core + 15%)")
+    if scalars["sort_during_load"] != 0:
+        raise ValueError("metadata sort built during load")
+    rows = [("default columns bytes/entry", total), ("default columns load ms", scalars["load_ms_median"])]
+    for label, observations, core in (("in-process", engine, head[1]), ("IPC", ipc, head[2])):
+        for query in sorted(QUERIES):
+            for key in ("page_hits", "total_hits"):
+                if observations[query][key] != core[query][key]:
+                    raise ValueError(f"modified sort changed {key}: {label} {query!r}")
+            if query in {"a", "re", "!tmp log", "文書"} and observations[query]["first_page_ms"] > 16:
+                raise ValueError(f"modified-sort first-page target exceeded: {label} {query!r}")
+            rows.extend((f"modified descending {label} {query!r} {key}", observations[query][key]) for key in ("first_page_ms", "full_count_ms"))
+    if len(rows) != EXPECTED_METADATA_METRICS:
+        raise ValueError("incomplete metadata metric inventory")
+    report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
+    report += "".join(f"| {name} | {value:.6f} |\n" for name, value in rows)
+    report += f"\nDeferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
+    report += f"\nCore/lazy/persisted load samples warm each arm, then cycle ABC/BCA/CAB. Persisted compact-cache prototype load (full validation, no sorting): {scalars['persisted_load_ms_median']:.6f} ms.\n"
+    report += f"\nCore/default load: {scalars['core_load_ms_median']:.6f}/{scalars['load_ms_median']:.6f} ms; limit core + 15%. Cold/warm default heap: {scalars['cold_default_heap_bytes']/expected_entries:.6f}/{total:.6f} B/entry; limit 66 B/entry with both sorts ready.\n"
+    report += f"\nSame-tree scan, none/default columns: {scan['none_ms_median']:.6f}/{scan['default_ms_median']:.6f} ms (five alternating samples per arm, 2101 entries).\n"
+    return rows, report
 
 
 def interleaved(measure, kind, query, operation, expected=None, trace=None, observation=None):
@@ -251,6 +317,8 @@ def main():
     parser.add_argument("base", type=Path)
     parser.add_argument("head", type=Path)
     parser.add_argument("--entries", type=int, default=5_000_000)
+    parser.add_argument("--require-metadata", action="store_true")
+    parser.add_argument("--head-observations", type=Path)
     parser.add_argument("--measure", action="store_true", help="collect initial interleaved medians before comparison")
     for arm in ("base", "head"):
         for field in ("probe", "binary", "index"):
@@ -265,10 +333,19 @@ def main():
         if args.measure:
             trace.append("| Initial phase | Warm both arms, then interleave samples |")
             measure_pair(args, lambda *metric: probe(args, *metric), trace)
+        if args.head_observations:
+            args.head.write_text(args.head.read_text(encoding="utf-8") + "\n" +
+                                 args.head_observations.read_text(encoding="utf-8"), encoding="utf-8")
         base = parse(args.base.read_text(encoding="utf-8"), require_new=False)
         head = parse(args.head.read_text(encoding="utf-8"))
         rows = compare(base, head, args.entries)
         report = render(rows)
+        if args.require_metadata:
+            observations = args.head.read_text(encoding="utf-8")
+            metadata_rows, metadata_report = metadata_observations(observations, head, args.entries)
+            if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
+                raise ValueError("incomplete combined metric inventory")
+            report += metadata_report
         if any(retry_paths):
             if not all(retry_paths):
                 raise ValueError("all paired retry paths are required")

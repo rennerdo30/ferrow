@@ -136,7 +136,9 @@ jobs:
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Test regression comparison and CLI on trivial inputs
-        run: python3 -m unittest discover -s scripts -p 'test_bench_gate.py'
+        run: python3 -m unittest discover -s scripts -p 'test_bench*.py'
+      - name: Test compact persisted-cache prototype on four entries
+        run: cargo test -p ferrow-query --example metadata_bench --locked -j 8
       - name: Prepare the identical selective retry driver for both arms
         run: |
           cat > crates/ferrow-query/examples/latency_probe.rs <<'RUST'
@@ -319,6 +321,8 @@ jobs:
         run: |
           test "$(id -u)" -ne 0
           cargo build --release --locked -p ferrow
+          cargo build --release --locked -p ferrow-query --example metadata_bench
+          cargo build --release --locked -p ferrow-walk --example scan_cost
           cargo build --release --locked -p ferrow-query --example service_bench
           cargo build --release --locked -p ferrow-query --example latency_probe
           cargo bench --no-run -p ferrow-query --bench m1_bench --locked
@@ -332,6 +336,7 @@ jobs:
           cp ../crates/ferrow-query/examples/latency_probe.rs crates/ferrow-query/examples/latency_probe.rs
           cargo build --release --locked -p ferrow
           cargo build --release --locked -p ferrow-query --example latency_probe
+          cargo build --release --locked -p ferrow-query --example service_bench
           cargo bench --no-run -p ferrow-query --bench m1_bench --locked
       - name: Smoke benchmark chain with 16 entries
         env:
@@ -341,10 +346,13 @@ jobs:
         run: |
           cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
           timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin"
+          timeout -k 5s 120s target/release/examples/metadata_bench "$RUNNER_TEMP/ferrow-small-metadata.bin"
+          timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small-metadata.bin" modified
       - name: Smoke interleaved collection on the shared 16-entry fixture
         if: github.event_name == 'pull_request'
         run: |
-          timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin" --legacy-queries
+          CARGO_TARGET_DIR="$RUNNER_TEMP/ferrow-base-target" FERROW_BENCH_ENTRIES=16 FERROW_BENCH_INDEX_PATH="$RUNNER_TEMP/ferrow-small-shared.bin" FERROW_MEASURES_ONLY=1 timeout -k 5s 120s cargo bench --manifest-path .bench-base/Cargo.toml -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
+          timeout -k 5s 120s "$RUNNER_TEMP/ferrow-base-target/release/examples/service_bench" "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-small-shared.bin" --legacy-queries
           echo '## 16-entry chain smoke (latency outcomes informational)' >> "$GITHUB_STEP_SUMMARY"
           result=0
           timeout -k 5s 300s python3 scripts/bench-gate.py base-smoke.txt head-smoke.txt --measure --entries 16 \
@@ -352,16 +360,33 @@ jobs:
             --head-probe "$PWD/target/release/examples/latency_probe" \
             --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
             --head-binary "$PWD/target/release/ferrow" \
-            --base-index "$RUNNER_TEMP/ferrow-small.bin" --head-index "$RUNNER_TEMP/ferrow-small.bin" || result=$?
+            --base-index "$RUNNER_TEMP/ferrow-small-shared.bin" --head-index "$RUNNER_TEMP/ferrow-small-shared.bin" || result=$?
           # Smoke validates producers/content/completeness, not tiny-fixture latency.
           test "$result" -le 1
-      - name: Prepare one shared fixture (profiling only, not paired evidence)
+      - name: Prepare one shared main-format fixture (profiling only)
+        if: github.event_name == 'pull_request'
+        working-directory: .bench-base
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
+          FERROW_MEASURES_ONLY: "1"
+        run: |
+          git rev-parse HEAD
+          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee "$GITHUB_WORKSPACE/fixture-output.txt"
+      - name: Prepare head core fixture on main pushes (profiling only)
+        if: github.event_name == 'push'
         env:
           FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
           FERROW_MEASURES_ONLY: "1"
         run: |
           git rev-parse HEAD
-          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee fixture-output.txt
+          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee "$GITHUB_WORKSPACE/fixture-output.txt"
+      - name: Observe default columns and modified newest-first queries
+        run: |
+          git rev-parse HEAD
+          timeout -k 5s 600s target/release/examples/metadata_bench "$RUNNER_TEMP/ferrow-metadata.bin" 2>&1 | tee metadata-output.txt
+          timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-metadata.bin" modified 2>&1 | tee -a metadata-output.txt
+          timeout -k 5s 120s target/release/examples/scan_cost "$RUNNER_TEMP/ferrow-scan-fixture" 2>&1 | tee -a metadata-output.txt
       - name: Write fixture profiling summary (separate from paired samples)
         if: always()
         run: ./scripts/bench-summary.sh fixture-output.txt
@@ -370,7 +395,7 @@ jobs:
         run: |
           # 26 legacy pairs use ABBA; 20 head-only observations run between
           # head legacy samples (C), with excluded warm-ups and no base comparison.
-          python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure \
+          python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure --require-metadata --head-observations metadata-output.txt \
             --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
             --head-probe "$PWD/target/release/examples/latency_probe" \
             --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \

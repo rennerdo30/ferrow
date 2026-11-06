@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ferrow_index::Index;
+use ferrow_index::{ColumnSet, EntryMetadata, Index};
 use ferrow_ipc::{Client, Endpoint, Stream};
-use ferrow_query::{Query, SearchOptions, search};
+use ferrow_query::{Query, SearchOptions, SortKey, search};
 use ferrow_walk::{WalkOptions, scan};
 
 const USAGE: &str = "\
@@ -29,6 +29,10 @@ ferrow - find any file by name, as fast as you type
 Usage:
   ferrow index <root>... [--exclude <path>]... [--follow-symlinks] [--out <file>]
   ferrow search <query> [--index <file>] [--limit N] [--json | --null] [--count]
+  Search options: --sort name|size|modified|created|accessed --desc
+                  --columns path,size,modified,created,accessed,attributes
+  Index options: --index-columns none|size,modified,created,accessed,attributes
+  Times in output are signed 100 ns ticks since 1970-01-01 UTC.
   ferrow stats [--index <file>]
   ferrow status
   ferrow service install | uninstall | status
@@ -118,6 +122,10 @@ fn default_index_path() -> Option<PathBuf> {
 }
 
 struct Args {
+    sort: SortKey,
+    descending: bool,
+    columns: Vec<String>,
+    index_columns: ColumnSet,
     positional: Vec<std::ffi::OsString>,
     out: Option<PathBuf>,
     index: Option<PathBuf>,
@@ -137,6 +145,10 @@ struct Args {
 fn parse_args(rest: &[std::ffi::OsString]) -> Result<Args, String> {
     use ferrow_index::osname::{bytes_to_os, name_to_bytes};
     let mut args = Args {
+        sort: SortKey::Name,
+        descending: false,
+        columns: vec!["path".into()],
+        index_columns: ColumnSet::DEFAULT,
         positional: Vec::new(),
         out: None,
         index: None,
@@ -178,6 +190,52 @@ fn parse_args(rest: &[std::ffi::OsString]) -> Result<Args, String> {
             }
         };
         match flag {
+            b"--sort" => {
+                args.sort = match take_value(&mut i)?.to_str() {
+                    Some("name") => SortKey::Name,
+                    Some("size") => SortKey::Size,
+                    Some("modified") => SortKey::Modified,
+                    Some("created") => SortKey::Created,
+                    Some("accessed") => SortKey::Accessed,
+                    _ => return Err("--sort needs name|size|modified|created|accessed".into()),
+                };
+            }
+            b"--desc" => args.descending = true,
+            b"--columns" => {
+                args.columns = take_value(&mut i)?
+                    .to_str()
+                    .ok_or("--columns needs UTF-8")?
+                    .split(',')
+                    .map(str::to_owned)
+                    .collect();
+                if args.columns.iter().any(|c| {
+                    !matches!(
+                        c.as_str(),
+                        "path" | "size" | "modified" | "created" | "accessed" | "attributes"
+                    )
+                }) {
+                    return Err("unknown output column".into());
+                }
+            }
+            b"--index-columns" => {
+                let text = take_value(&mut i)?;
+                args.index_columns = ColumnSet::NONE;
+                for column in text
+                    .to_str()
+                    .ok_or("--index-columns needs UTF-8")?
+                    .split(',')
+                {
+                    args.index_columns = args.index_columns.union(match column {
+                        "none" => ColumnSet::NONE,
+                        "size" => ColumnSet::SIZE,
+                        "modified" => ColumnSet::MODIFIED,
+                        "created" => ColumnSet::CREATED,
+                        "accessed" => ColumnSet::ACCESSED,
+                        "attributes" => ColumnSet::ATTRIBUTES,
+                        _ => return Err("unknown index column".into()),
+                    });
+                }
+            }
             b"--out" => args.out = Some(PathBuf::from(take_value(&mut i)?)),
             b"--index" => args.index = Some(PathBuf::from(take_value(&mut i)?)),
             b"--exclude" => args.excludes.push(PathBuf::from(take_value(&mut i)?)),
@@ -252,6 +310,7 @@ fn cmd_index(args: Args) -> Result<(), String> {
     }
     let out = index_path(&args.out)?;
     let (index, report) = scan(&WalkOptions {
+        columns: args.index_columns,
         roots: args
             .positional
             .iter()
@@ -366,6 +425,70 @@ struct PathOutput<'a, W: Write> {
 }
 
 impl<'a, W: Write> PathOutput<'a, W> {
+    fn row(
+        &mut self,
+        path: &[u8],
+        metadata: EntryMetadata,
+        columns: &[String],
+    ) -> Result<(), String> {
+        fn value(
+            out: &mut impl Write,
+            value: Option<impl std::fmt::Display>,
+            json: bool,
+        ) -> std::io::Result<()> {
+            match value {
+                Some(v) => write!(out, "{v}"),
+                None => out.write_all(if json { b"null" } else { b"-" }),
+            }
+        }
+        if self.json {
+            self.escaped.clear();
+            if !self.first {
+                self.escaped.push(',');
+            }
+            self.escaped.push_str("{\"path\":\"");
+            json_escape(&String::from_utf8_lossy(path), &mut self.escaped);
+            self.escaped.push_str("\",\"size\":");
+            self.out
+                .write_all(self.escaped.as_bytes())
+                .map_err(|e| e.to_string())?;
+            value(self.out, metadata.size, true).map_err(|e| e.to_string())?;
+            for (name, v) in [
+                ("modified", metadata.modified),
+                ("created", metadata.created),
+                ("accessed", metadata.accessed),
+            ] {
+                write!(self.out, ",\"{name}\":").map_err(|e| e.to_string())?;
+                value(self.out, v, true).map_err(|e| e.to_string())?;
+            }
+            self.out
+                .write_all(b",\"attributes\":")
+                .map_err(|e| e.to_string())?;
+            value(self.out, metadata.attributes, true).map_err(|e| e.to_string())?;
+            self.out.write_all(b"}").map_err(|e| e.to_string())?;
+        } else if self.null || (columns.len() == 1 && columns[0] == "path") {
+            return self.path(path);
+        } else {
+            for (i, column) in columns.iter().enumerate() {
+                if i > 0 {
+                    self.out.write_all(b"\t").map_err(|e| e.to_string())?;
+                }
+                match column.as_str() {
+                    "path" => self.out.write_all(path),
+                    "size" => value(self.out, metadata.size, false),
+                    "modified" => value(self.out, metadata.modified, false),
+                    "created" => value(self.out, metadata.created, false),
+                    "accessed" => value(self.out, metadata.accessed, false),
+                    "attributes" => value(self.out, metadata.attributes, false),
+                    _ => unreachable!("validated columns"),
+                }
+                .map_err(|e| e.to_string())?;
+            }
+            self.out.write_all(b"\n").map_err(|e| e.to_string())?;
+        }
+        self.first = false;
+        Ok(())
+    }
     fn new(out: &'a mut W, json: bool, null: bool) -> Result<Self, String> {
         if json {
             out.write_all(b"[").map_err(|e| e.to_string())?;
@@ -426,12 +549,13 @@ fn emit_hits<W: Write>(
     hits: impl IntoIterator<Item = u32>,
     json: bool,
     null: bool,
+    columns: &[String],
 ) -> Result<(), String> {
     let mut output = PathOutput::new(out, json, null)?;
     let mut buf = Vec::new();
     for id in hits {
         index.path_bytes(id, &mut buf);
-        output.path(&buf)?;
+        output.row(&buf, index.metadata(id), columns)?;
     }
     output.finish()
 }
@@ -479,8 +603,41 @@ fn cmd_search(args: Args) -> Result<(), String> {
             return out.flush().map_err(|e| e.to_string());
         }
         let limit = u32::try_from(args.limit.unwrap_or(0)).unwrap_or(u32::MAX);
-        let paths = client.query(query_text, limit).map_err(|e| e.to_string())?;
-        return emit_paths(&mut out, &paths, args.json, args.null);
+        let sort = match args.sort {
+            SortKey::Name => ferrow_ipc::Sort::Name,
+            SortKey::Size => ferrow_ipc::Sort::Size,
+            SortKey::Modified => ferrow_ipc::Sort::Modified,
+            SortKey::Created => ferrow_ipc::Sort::Created,
+            SortKey::Accessed => ferrow_ipc::Sort::Accessed,
+        };
+        let prepare_started = Instant::now();
+        let rows = loop {
+            let (rows, _, pending) = client
+                .query_rows_with_status(query_text, limit, sort, args.descending)
+                .map_err(|e| e.to_string())?;
+            if !pending {
+                break rows;
+            }
+            if prepare_started.elapsed() > std::time::Duration::from_secs(5) {
+                return Err("sort preparation still pending; retry the query".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut output = PathOutput::new(&mut out, args.json, args.null)?;
+        for row in rows {
+            output.row(
+                &row.path,
+                EntryMetadata {
+                    size: row.size,
+                    modified: row.modified,
+                    created: row.created,
+                    accessed: row.accessed,
+                    attributes: row.attributes,
+                },
+                &args.columns,
+            )?;
+        }
+        return output.finish();
     }
 
     for failure in failures {
@@ -504,10 +661,23 @@ fn cmd_search(args: Args) -> Result<(), String> {
         return Ok(());
     }
 
+    // CLI preparation is bounded startup work; engine/service searches and GUI
+    // callers receive pending name-order results without waiting.
+    if args.sort != SortKey::Name {
+        index.request_sort(args.sort);
+        if let Some(ticket) = index.sort_ticket(args.sort)
+            && ticket.wait_timeout(std::time::Duration::from_secs(5))
+                != ferrow_index::SortStatus::Ready
+        {
+            return Err("sort preparation pending or failed".into());
+        }
+    }
     let result = search(
         &index,
         &query,
         &SearchOptions {
+            sort: args.sort,
+            descending: args.descending,
             limit: args.limit,
             ..SearchOptions::default()
         },
@@ -515,8 +685,20 @@ fn cmd_search(args: Args) -> Result<(), String> {
     if result.cancelled {
         return Err("search cancelled".to_string());
     }
+    if let Some(key) = result.sort_unavailable {
+        return Err(format!(
+            "{key:?} column unavailable; enable --index-columns and rebuild"
+        ));
+    }
 
-    emit_hits(&mut out, &index, result.hits, args.json, args.null)
+    emit_hits(
+        &mut out,
+        &index,
+        result.hits,
+        args.json,
+        args.null,
+        &args.columns,
+    )
 }
 
 fn cmd_stats(args: Args) -> Result<(), String> {
@@ -763,7 +945,15 @@ mod streaming_tests {
                 );
                 second
             }));
-            emit_hits(&mut Writer(bytes), &index, hits, json, null).unwrap();
+            emit_hits(
+                &mut Writer(bytes),
+                &index,
+                hits,
+                json,
+                null,
+                &["path".into()],
+            )
+            .unwrap();
         }
     }
 }

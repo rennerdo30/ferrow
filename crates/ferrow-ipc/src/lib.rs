@@ -41,8 +41,8 @@ fn operation<S: DeadlineIo>(stream: &mut S) -> std::io::Result<()> {
 }
 
 pub use protocol::{
-    Envelope, ErrorCode, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, ProtocolError, Request,
-    Response, Sort, read_message, write_message,
+    Envelope, ErrorCode, FileRow, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, ProtocolError,
+    Request, Response, Sort, read_message, write_message,
 };
 pub use transport::{CallerIdentity, Endpoint, Listener, Stream};
 
@@ -301,6 +301,74 @@ impl<S: DeadlineIo> Client<S> {
     pub fn query(&mut self, text: &str, limit: u32) -> std::io::Result<Vec<Vec<u8>>> {
         let id = self.start_query(text, limit)?;
         self.finish_query(id)
+    }
+
+    /// Query with metadata and explicit sort. Returns rows and indexed-column mask.
+    pub fn query_rows(
+        &mut self,
+        text: &str,
+        limit: u32,
+        sort: Sort,
+        descending: bool,
+    ) -> std::io::Result<(Vec<FileRow>, u32)> {
+        let (rows, columns, pending) =
+            self.query_rows_with_status(text, limit, sort, descending)?;
+        if pending {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "requested sort is preparing; name-order results available via query_rows_with_status",
+            ));
+        }
+        Ok((rows, columns))
+    }
+
+    /// Pending sorts return name-order rows immediately. A later request uses
+    /// the prepared order. The pending flag is consistent across all pages.
+    pub fn query_rows_with_status(
+        &mut self,
+        text: &str,
+        limit: u32,
+        sort: Sort,
+        descending: bool,
+    ) -> std::io::Result<(Vec<FileRow>, u32, bool)> {
+        let id = self.send(Request::Query {
+            text: text.to_owned(),
+            limit,
+            sort,
+            flags: protocol::QUERY_METADATA
+                | if descending {
+                    protocol::QUERY_DESCENDING
+                } else {
+                    0
+                },
+        })?;
+        let mut out = Vec::new();
+        let mut present = None;
+        let mut sort_state = None;
+        loop {
+            match Self::check(self.expect(id)?)? {
+                Response::Rows {
+                    rows,
+                    columns,
+                    sort_pending,
+                    more,
+                } => {
+                    if present.is_some_and(|mask| mask != columns) {
+                        return Err(io_invalid("changed column mask between pages".into()));
+                    }
+                    present = Some(columns);
+                    if sort_state.is_some_and(|value| value != sort_pending) {
+                        return Err(io_invalid("changed sort state between pages".into()));
+                    }
+                    sort_state = Some(sort_pending);
+                    out.extend(rows);
+                    if !more {
+                        return Ok((out, columns, sort_pending));
+                    }
+                }
+                _ => return Err(io_invalid("expected metadata Rows".into())),
+            }
+        }
     }
 
     /// Start a query without borrowing the client until completion; its id can

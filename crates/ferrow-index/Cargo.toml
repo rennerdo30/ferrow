@@ -9,6 +9,10 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+test-hooks = []
+bench-internals = []
+
 [dependencies]
 casefold = "0.1.0"
 crc32fast = "1.5.4"

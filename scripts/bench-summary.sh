@@ -4,11 +4,20 @@
 # Appends Markdown to $GITHUB_STEP_SUMMARY (or stdout when unset).
 set -eu
 
+if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ ! -s "$1" ]; then
+    echo 'Missing or empty fixture profiling input' >&2
+    exit 1
+fi
 out_file="$1"
 
 get() {
     # get <key> <line-prefix> - keys are unique, so match on the key itself.
-    grep -a "$2" "$out_file" | grep "$1=" | sed -n "s/.*$1=\\([^ ]*\\).*/\\1/p" | tr -d '\r' | head -1
+    value=$(grep -a "$2" "$out_file" | grep "$1=" | sed -n "s/.*$1=\\([^ ]*\\).*/\\1/p" | tr -d '\r' | head -1)
+    if [ -z "$value" ]; then
+        echo "Missing fixture profiling measurement: $1" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
 }
 
 entries=$(get entries FERROW-MEASURE)
@@ -28,6 +37,15 @@ load_cleanup_ms=$(get load_cleanup_ms FERROW-MEASURE)
 load_fold_ms=$(get load_fold_ms FERROW-MEASURE)
 load_sort_ms=$(get load_sort_ms FERROW-MEASURE)
 load_unattributed_ms=$(get load_unattributed_ms FERROW-MEASURE)
+
+# Validate before opening the summary for append. A failed producer must not
+# publish a plausible-looking table of empty measurements.
+for prefix in 'FERROW-QUERY query=' 'FERROW-QUERY-PARTS query='; do
+    if ! grep -aq "^$prefix" "$out_file"; then
+        echo "Missing fixture profiling rows: $prefix" >&2
+        exit 1
+    fi
+done
 
 emit() {
     echo "## Ferrow M1 benchmark"

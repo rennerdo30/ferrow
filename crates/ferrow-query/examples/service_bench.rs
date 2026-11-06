@@ -2,7 +2,7 @@
 //! Usage: service_bench <ferrow binary> <saved fixture index>.
 use ferrow_index::Index;
 use ferrow_ipc::{Client, Endpoint};
-use ferrow_query::{CancelToken, Query, SearchOptions, count, search};
+use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, count, search};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -29,11 +29,29 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    let legacy = args.len() == 3 && args[2] == "--legacy-queries";
-    if args.len() != 2 && !legacy {
-        return Err("usage: service_bench <ferrow> <index> [--legacy-queries]".into());
+    let modified = args.iter().skip(2).any(|s| s == "modified");
+    let legacy = args.iter().skip(2).any(|s| s == "--legacy-queries");
+    if args.len() < 2
+        || args.len() > 4
+        || args
+            .iter()
+            .skip(2)
+            .any(|s| s != "modified" && s != "--legacy-queries")
+    {
+        return Err("usage: service_bench <ferrow> <index> [modified] [--legacy-queries]".into());
     }
     let index = Index::load(std::path::Path::new(&args[1]))?;
+    if modified {
+        index.request_sort(SortKey::Modified);
+        if index
+            .sort_ticket(SortKey::Modified)
+            .unwrap()
+            .wait_timeout(Duration::from_secs(30))
+            != ferrow_index::SortStatus::Ready
+        {
+            return Err("engine sort preparation failed".into());
+        }
+    }
     let name = format!(
         "ferrow-bench-{}-{}",
         std::process::id(),
@@ -78,6 +96,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         index.len(),
         started.elapsed().as_secs_f64() * 1000.0
     );
+    if modified {
+        let started = Instant::now();
+        loop {
+            let (_, _, pending) =
+                client.query_rows_with_status("", 1, ferrow_ipc::Sort::Modified, true)?;
+            if !pending {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                return Err("service sort preparation timed out".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            "FERROW-MODIFIED-PREP service_ms={:.6}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let queries = [
         "a",
         "re",
@@ -91,17 +127,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "ext:txt;md",
         "<a|re> !tmp",
     ];
-    let queries = if legacy { &queries[..6] } else { &queries[..] };
+    let queries = if legacy || modified {
+        &queries[..6]
+    } else {
+        &queries[..]
+    };
     for &text in queries {
         let query = Query::parse(text)?;
         let expected = search(
             &index,
             &query,
             &SearchOptions {
+                sort: if modified {
+                    SortKey::Modified
+                } else {
+                    SortKey::Name
+                },
+                descending: modified,
                 limit: Some(100),
                 ..SearchOptions::default()
             },
         );
+        if expected.sort_unavailable.is_some() {
+            return Err("missing sort column".into());
+        }
         let expected_paths: Vec<Vec<u8>> = expected
             .hits
             .iter()
@@ -119,7 +168,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut full = Vec::new();
         for _ in 0..5 {
             let t = Instant::now();
-            let paths = client.query(text, 100)?;
+            let paths = if modified {
+                let (rows, columns) =
+                    client.query_rows(text, 100, ferrow_ipc::Sort::Modified, true)?;
+                if columns != index.columns_present().bits() {
+                    return Err("IPC columns mismatch".into());
+                }
+                for (row, &id) in rows.iter().zip(&expected.hits) {
+                    let m = index.metadata(id);
+                    if row.size != m.size
+                        || row.modified != m.modified
+                        || row.created != m.created
+                        || row.accessed != m.accessed
+                        || row.attributes != m.attributes
+                    {
+                        return Err("IPC metadata mismatch".into());
+                    }
+                }
+                rows.into_iter().map(|row| row.path).collect()
+            } else {
+                client.query(text, 100)?
+            };
             page.push(t.elapsed());
             if paths != expected_paths {
                 return Err(format!("IPC order/content for {text:?}").into());
@@ -132,7 +201,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!(
-            "FERROW-SERVICE query={text:?} first_page_ms={:.6} page_hits={} full_count_ms={:.6} total_hits={total}",
+            "{} query={text:?} first_page_ms={:.6} page_hits={} full_count_ms={:.6} total_hits={total}",
+            if modified {
+                "FERROW-MODIFIED-SERVICE"
+            } else {
+                "FERROW-SERVICE"
+            },
             median(page),
             expected_paths.len(),
             median(full)

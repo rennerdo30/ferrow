@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use ferrow_index::Index;
+pub use ferrow_index::{SortKey, SortStatus};
 
 use rayon::prelude::*;
 
@@ -75,6 +76,8 @@ impl QuerySession {
 /// Search options.
 #[derive(Clone, Default)]
 pub struct SearchOptions {
+    pub sort: SortKey,
+    pub descending: bool,
     /// Stop after this many hits (in name-sort order).
     pub limit: Option<usize>,
     /// Cancellation flag shared with the caller.
@@ -103,6 +106,10 @@ impl fmt::Debug for SearchOptions {
 /// tests) can prove that `limit`/cancellation stopped the scan early.
 #[derive(Debug)]
 pub struct SearchResult {
+    /// Pending sorts return the existing name order without waiting.
+    pub sort_status: SortStatus,
+    /// Requested column was not indexed. No fallback results are returned.
+    pub sort_unavailable: Option<SortKey>,
     pub hits: Vec<u32>,
     pub cancelled: bool,
     pub visited: usize,
@@ -184,7 +191,55 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
     started: Option<std::time::Instant>,
 ) -> (SearchResult, QueryTimings) {
     let mut timings = QueryTimings::default();
-    let sorted = matcher.candidates(index);
+    if options.cancel.is_cancelled() {
+        let sort_status = index.sort_ticket(options.sort).map_or(
+            if options.sort == SortKey::Name {
+                SortStatus::Ready
+            } else {
+                SortStatus::Unavailable
+            },
+            |ticket| ticket.status(),
+        );
+        return (
+            SearchResult {
+                hits: Vec::new(),
+                cancelled: true,
+                visited: 0,
+                sort_unavailable: (sort_status == SortStatus::Unavailable).then_some(options.sort),
+                sort_status,
+            },
+            timings,
+        );
+    }
+    let sort_status = if options.sort == SortKey::Name {
+        SortStatus::Ready
+    } else {
+        index.request_sort_cancellable(options.sort, options.cancel.flag.clone())
+    };
+    if sort_status == SortStatus::Unavailable {
+        if let Some(t) = started {
+            timings.total = t.elapsed();
+        }
+        return (
+            SearchResult {
+                hits: Vec::new(),
+                cancelled: options.cancel.is_cancelled(),
+                visited: 0,
+                sort_unavailable: Some(options.sort),
+                sort_status,
+            },
+            timings,
+        );
+    }
+    let metadata_order = index.metadata_order(options.sort, options.descending);
+    // Name-prefix candidates are ordered by name. A prepared metadata order
+    // addresses the complete index, so its positions must never use that slice.
+    let sorted = if metadata_order.is_some() {
+        index.sorted()
+    } else {
+        matcher.candidates(index)
+    };
+    let reverse = options.sort == SortKey::Name && options.descending;
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
     // completed prefix. A slow early chunk cannot accumulate unbounded
@@ -236,11 +291,26 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
             let start = chunk * BLOCK_SIZE;
             let block = &sorted[start..(start + BLOCK_SIZE).min(sorted.len())];
             let mut found = Vec::new();
+            let mut ordered_ids = Vec::new();
             let mut examined = 0;
-            for ids in block.chunks(CANCEL_INTERVAL) {
+            for offset in (0..block.len()).step_by(CANCEL_INTERVAL) {
                 if options.cancel.is_cancelled() {
                     break;
                 }
+                let end = (offset + CANCEL_INTERVAL).min(block.len());
+                let ids = if let Some(order) = &metadata_order {
+                    ordered_ids.clear();
+                    ordered_ids.extend(order.range(start + offset, start + end));
+                    ordered_ids.as_slice()
+                } else if reverse {
+                    ordered_ids.clear();
+                    ordered_ids.extend(
+                        (start + offset..start + end).map(|p| sorted[sorted.len() - 1 - p]),
+                    );
+                    ordered_ids.as_slice()
+                } else {
+                    &sorted[start + offset..start + end]
+                };
                 for &id in ids {
                     if matcher.matches(index, id, &mut scratch, &options.cancel)
                         && options.limit.is_none_or(|limit| found.len() < limit)
@@ -251,7 +321,7 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
                 if M::CANCELLABLE_TERM && options.cancel.is_cancelled() {
                     break;
                 }
-                examined += ids.len();
+                examined += end - offset;
             }
             visited.fetch_add(examined, Ordering::Relaxed);
             #[cfg(feature = "test-hooks")]
@@ -301,6 +371,12 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
         timings.collect = t.elapsed();
     }
     let result = SearchResult {
+        sort_status: if metadata_order.is_some() || options.sort == SortKey::Name {
+            SortStatus::Ready
+        } else {
+            sort_status
+        },
+        sort_unavailable: None,
         hits,
         cancelled: options.cancel.is_cancelled(),
         visited,

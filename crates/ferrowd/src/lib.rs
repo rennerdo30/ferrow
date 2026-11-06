@@ -186,6 +186,7 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
     }
     if !config.roots.is_empty() {
         let options = WalkOptions {
+            columns: Default::default(),
             roots: config.roots.clone(),
             excludes: config.excludes.clone(),
             follow_symlinks: config.follow_symlinks,
@@ -226,12 +227,37 @@ pub fn handle(store: &SnapshotStore, request: Request) -> Vec<Response> {
 fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -> Vec<Response> {
     let snapshot = store.get();
     match request {
-        Request::Query { text, limit, .. } => {
+        Request::Query {
+            text,
+            limit,
+            sort,
+            flags,
+        } => {
+            if flags
+                & !(ferrow_ipc::protocol::QUERY_DESCENDING | ferrow_ipc::protocol::QUERY_METADATA)
+                != 0
+            {
+                return vec![bad_request("unsupported query flags".into())];
+            }
+            let metadata = flags & ferrow_ipc::protocol::QUERY_METADATA != 0;
+            if sort != ferrow_ipc::Sort::Name && !metadata {
+                return vec![bad_request(
+                    "non-name sorts require metadata rows with readiness status".into(),
+                )];
+            }
             let query = match Query::parse(&text) {
                 Ok(q) => q,
                 Err(e) => return vec![bad_request(e.to_string())],
             };
             let options = SearchOptions {
+                sort: match sort {
+                    ferrow_ipc::Sort::Name => ferrow_query::SortKey::Name,
+                    ferrow_ipc::Sort::Size => ferrow_query::SortKey::Size,
+                    ferrow_ipc::Sort::Modified => ferrow_query::SortKey::Modified,
+                    ferrow_ipc::Sort::Created => ferrow_query::SortKey::Created,
+                    ferrow_ipc::Sort::Accessed => ferrow_query::SortKey::Accessed,
+                },
+                descending: flags & ferrow_ipc::protocol::QUERY_DESCENDING != 0,
                 limit: Some(if limit == 0 {
                     MAX_QUERY_RESULTS + 1
                 } else {
@@ -241,6 +267,14 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 ..SearchOptions::default()
             };
             let result = ferrow_query::search(&snapshot.index, &query, &options);
+            if let Some(key) = result.sort_unavailable {
+                return vec![bad_request(format!(
+                    "{key:?} column unavailable; enable the column and rebuild"
+                ))];
+            }
+            if result.sort_status == ferrow_query::SortStatus::Failed {
+                return vec![bad_request("sort preparation failed".into())];
+            }
             if result.cancelled {
                 return vec![Response::Error {
                     code: ErrorCode::Cancelled,
@@ -258,9 +292,37 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
             let mut page: Vec<Vec<u8>> = Vec::new();
             let mut page_bytes = 0usize;
             let mut buf: Vec<u8> = Vec::new();
-            for &id in &result.hits {
+            let mut page_start = 0;
+            let response = |paths: Vec<Vec<u8>>, ids: &[u32], more| {
+                if metadata {
+                    let rows = paths
+                        .into_iter()
+                        .zip(ids)
+                        .map(|(path, &id)| {
+                            let m = snapshot.index.metadata(id);
+                            ferrow_ipc::FileRow {
+                                path,
+                                size: m.size,
+                                modified: m.modified,
+                                created: m.created,
+                                accessed: m.accessed,
+                                attributes: m.attributes,
+                            }
+                        })
+                        .collect();
+                    Response::Rows {
+                        rows,
+                        columns: snapshot.index.columns_present().bits(),
+                        sort_pending: result.sort_status == ferrow_query::SortStatus::Pending,
+                        more,
+                    }
+                } else {
+                    Response::Results { paths, more }
+                }
+            };
+            for (position, &id) in result.hits.iter().enumerate() {
                 snapshot.index.path_bytes(id, &mut buf);
-                total_bytes = total_bytes.saturating_add(buf.len() + 4);
+                total_bytes = total_bytes.saturating_add(buf.len() + if metadata { 41 } else { 4 });
                 if total_bytes > ferrow_ipc::MAX_FRAME_BYTES
                     || buf.len() > ferrow_ipc::protocol::MAX_PATH_BYTES
                 {
@@ -272,19 +334,18 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 if !page.is_empty()
                     && (page.len() >= PAGE_MAX_PATHS || page_bytes + buf.len() > PAGE_MAX_BYTES)
                 {
-                    pages.push(Response::Results {
-                        paths: std::mem::take(&mut page),
-                        more: true,
-                    });
+                    pages.push(response(
+                        std::mem::take(&mut page),
+                        &result.hits[page_start..position],
+                        true,
+                    ));
+                    page_start = position;
                     page_bytes = 0;
                 }
-                page_bytes += buf.len();
+                page_bytes += buf.len() + if metadata { 41 } else { 4 };
                 page.push(buf.clone());
             }
-            pages.push(Response::Results {
-                paths: page,
-                more: false,
-            });
+            pages.push(response(page, &result.hits[page_start..], false));
             pages
         }
         Request::Count { text } => {
