@@ -97,9 +97,9 @@ fn measures() {
     let load = load_runs[load_runs.len() / 2];
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     println!(
-        "FERROW-MEASURE file_bytes={file_bytes} load_ms_median={:.1} \
-         load_read_ms={:.1} load_checksum_ms={:.1} load_decode_ms={:.1} \
-         load_structure_ms={:.1} load_derived_ms={:.1} load_unattributed_ms={:.1} load_buffer_ms={:.1} load_cleanup_ms={:.1} load_fold_ms={:.1} load_sort_ms={:.1}",
+        "FERROW-MEASURE file_bytes={file_bytes} load_ms_median={:.6} \
+         load_read_ms={:.6} load_checksum_ms={:.6} load_decode_ms={:.6} \
+         load_structure_ms={:.6} load_derived_ms={:.6} load_unattributed_ms={:.6} load_buffer_ms={:.6} load_cleanup_ms={:.6} load_fold_ms={:.6} load_sort_ms={:.6}",
         ms(load.total),
         ms(load.read),
         ms(load.checksum),
