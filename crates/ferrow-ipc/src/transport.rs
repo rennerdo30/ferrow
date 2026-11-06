@@ -383,8 +383,9 @@ mod platform {
         }
         let sid = token_user(token).and_then(|buf| {
             let _ = &buf;
-            // SAFETY: `buf` holds a valid TOKEN_USER for `token`
-            // and outlives the parse below.
+            // SAFETY: GetTokenInformation initialized at least TOKEN_USER bytes.
+            // Vec<usize> provides TOKEN_USER's pointer alignment, and `buf`
+            // keeps both the structure and its embedded SID alive below.
             let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
             let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
             // SAFETY: the SID pointer comes from the token buffer;
@@ -410,18 +411,19 @@ mod platform {
         sid
     }
 
-    fn token_user(token: HANDLE) -> Option<Vec<u8>> {
+    fn token_user(token: HANDLE) -> Option<Vec<usize>> {
         use windows_sys::Win32::Security::{GetTokenInformation, TokenUser};
         let mut len = 0u32;
         // SAFETY: sizing call; a null buffer with length 0 is the
         // documented way to learn the required buffer size.
         unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut len) };
-        if len == 0 {
+        if (len as usize) < size_of::<windows_sys::Win32::Security::TOKEN_USER>() {
             return None;
         }
-        let mut buf = vec![0u8; len as usize];
-        // SAFETY: buffer pointer and length describe `buf`
-        // exactly and it outlives the call.
+        let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: storage is pointer-aligned and holds at least len bytes.
+        // The API writes only len bytes, including its embedded SID; all
+        // allocated words are initialized and the buffer outlives parsing.
         let ok = unsafe {
             GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &raw mut len)
         };
@@ -606,6 +608,26 @@ mod platform {
             // pipe would block until the peer reads, which a
             // streaming writer must not require.)
             Ok(())
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn token_buffer_has_token_user_allocation_alignment() {
+            use windows_sys::Win32::Security::{TOKEN_QUERY, TOKEN_USER};
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+            let mut token = std::ptr::null_mut();
+            // SAFETY: pseudo-process handle is valid; output is live, closed below.
+            assert_ne!(
+                unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) },
+                0
+            );
+            let buffer = token_user(token).unwrap();
+            // SAFETY: this test owns the token handle.
+            unsafe { CloseHandle(token) };
+            assert!(std::mem::align_of_val(&buffer[0]) >= align_of::<TOKEN_USER>());
         }
     }
 }
