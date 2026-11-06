@@ -37,6 +37,12 @@ Installation copies `ferrowd` into `%ProgramFiles%\Ferrow\` on Windows
 or `/usr/local/libexec/ferrow/` on Unix and registers only that fixed path.
 Unix directories and binaries must be root-owned 0755, with no group/other
 write access or symbolic-link component. Existing unsafe paths are refused.
+On Linux and macOS the install directory, binary, state directory, index and
+socket directory must have no extended ACL entries (including inherited and
+default ACLs). Ancestor ACLs may grant reads or root-only changes, but must grant
+no non-root write, delete or permission-changing rights. ACL query failures
+refuse use. Checks inspect opened, no-follow descriptors together with ownership
+and mode, so chmod alone cannot make a hostile ACL acceptable.
 
 Windows components must be owned by SYSTEM, Administrators or TrustedInstaller
 and contain no reparse points. Non-admin ACEs must grant no WRITE_DAC,

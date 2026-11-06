@@ -16,6 +16,8 @@
 mod dispatch;
 pub mod protocol;
 pub mod transport;
+#[cfg(any(unix, test))]
+pub mod unix_acl;
 pub use dispatch::{RequestContext, serve_cancellable};
 
 use std::io::{Read, Write};

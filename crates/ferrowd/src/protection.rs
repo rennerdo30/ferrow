@@ -117,7 +117,23 @@ pub(crate) mod unix {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
     pub fn metadata(path: &Path, directory: bool) -> io::Result<std::fs::Metadata> {
-        let meta = std::fs::symlink_metadata(path)?;
+        metadata_role(path, directory, false)
+    }
+
+    fn metadata_role(
+        path: &Path,
+        directory: bool,
+        ancestor: bool,
+    ) -> io::Result<std::fs::Metadata> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | if directory { libc::O_DIRECTORY } else { 0 },
+        );
+        let file = options.open(path)?;
+        let meta = file.metadata()?;
         if meta.file_type().is_symlink()
             || meta.uid() != 0
             || meta.mode() & 0o022 != 0
@@ -128,6 +144,7 @@ pub(crate) mod unix {
                 "service path must be root-owned, protected, and link-free",
             ));
         }
+        ferrow_ipc::unix_acl::validate(&file, ancestor)?;
         Ok(meta)
     }
 
@@ -160,7 +177,7 @@ pub(crate) mod unix {
                     Err(e) => return Err(e),
                 }
             }
-            let meta = metadata(&current, true)?;
+            let meta = metadata_role(&current, true, current != path)?;
             if current == path && meta.mode() & 0o777 != mode {
                 return Err(refused("incorrect service directory mode"));
             }
