@@ -492,30 +492,40 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         .try_for_each(|(start, end)| -> Result<(), LoadError> {
             let mut folded_buf: Vec<u8> = Vec::new();
             for i in start..end {
-                fold_name(name_at(&arena, &name_off, &name_len, i), &mut folded_buf);
-                if folded_buf != name_at(&folded_arena, &name_off, &name_len, i) {
+                let raw = name_at(&arena, &name_off, &name_len, i);
+                let expected = name_at(&folded_arena, &name_off, &name_len, i);
+                let consistent = if raw.is_ascii() {
+                    raw.iter()
+                        .zip(expected)
+                        .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+                } else {
+                    fold_name(raw, &mut folded_buf);
+                    folded_buf == expected
+                };
+                if !consistent {
                     return Err(LoadError::Corrupt("folded arena inconsistent with names"));
                 }
             }
             Ok(())
         })?;
     timings.derived_fold = derived_started.elapsed();
-    let key_cmp = |a: u32, b: u32| {
-        name_at(&folded_arena, &name_off, &name_len, a as usize)
-            .cmp(name_at(&folded_arena, &name_off, &name_len, b as usize))
-            .then_with(|| {
-                name_at(&arena, &name_off, &name_len, a as usize)
-                    .cmp(name_at(&arena, &name_off, &name_len, b as usize))
-            })
-            .then_with(|| a.cmp(&b))
+    // Construct each key once, carrying it across adjacent comparisons.
+    // Both arenas share the validated offset/length, including tie breakers.
+    let key = |id: u32| {
+        let off = name_off[id as usize] as usize;
+        let end = off + name_len[id as usize] as usize;
+        (&folded_arena[off..end], &arena[off..end], id)
     };
     chunk_ranges(n.saturating_sub(1))
         .into_par_iter()
         .try_for_each(|(start, end)| -> Result<(), LoadError> {
-            for i in start..end {
-                if key_cmp(sorted[i], sorted[i + 1]) != std::cmp::Ordering::Less {
+            let mut previous = key(sorted[start]);
+            for &id in &sorted[start + 1..=end] {
+                let next = key(id);
+                if previous >= next {
                     return Err(LoadError::Corrupt("sort order is not sorted"));
                 }
+                previous = next;
             }
             Ok(())
         })?;
