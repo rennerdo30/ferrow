@@ -45,4 +45,7 @@ grep -q Unauthorized "$RUNNER_TEMP/ordinary.err"
 read -r u1 s1 < <(awk '{print $14, $15}' "/proc/$service_pid/stat")
 sleep 3
 read -r u2 s2 < <(awk '{print $14, $15}' "/proc/$service_pid/stat")
-test "$((u2+s2-u1-s1))" -le 10
+clock_ticks=$(getconf CLK_TCK)
+delta=$((u2+s2-u1-s1))
+echo "PID $service_pid idle CPU delta=$delta ticks; clock=$clock_ticks ticks/second; budget=1 quantization tick"
+test "$delta" -le 1
