@@ -555,3 +555,20 @@ fn wildcard_boolean_modifiers_and_filters() {
         assert_eq!(names(&index, text), expected, "{text}");
     }
 }
+
+#[test]
+fn wholeword_regex_keeps_verbose_mode_comments_valid() {
+    let b = IndexBuilder::new();
+    b.add_root(b"a foo b", 0);
+    b.add_root(b"foobar", 0);
+    let index = b.freeze();
+    for text in [
+        "wholeword:regex:(?x)foo#comment",
+        r#"wholeword:regex:"(?x) f o o # spaced""#,
+    ] {
+        let query = Query::parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        let hits = search(&index, &query, &SearchOptions::default()).hits;
+        assert_eq!(hits, vec![0], "{text}");
+        assert_eq!(hits, oracle(&index, &query), "{text}");
+    }
+}

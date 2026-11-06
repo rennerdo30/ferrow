@@ -55,7 +55,18 @@ pub enum Pattern {
 
 fn compile_regex(text: &str, case: bool, word: bool) -> Result<RegexPlan, String> {
     let pattern = if word {
-        format!(r"(?u:\b{{start-half}})(?:{text})(?u:\b{{end-half}})")
+        // Wrap the parsed form, not the raw text: in verbose mode
+        // (`(?x)`) a `#` comment would otherwise swallow the closing
+        // group. The HIR's display is an equivalent pattern without
+        // comments or verbose whitespace.
+        let inner = regex_syntax::ParserBuilder::new()
+            .case_insensitive(!case)
+            .utf8(false)
+            .nest_limit(32)
+            .build()
+            .parse(text)
+            .map_err(|e| format!("invalid regex: {e}"))?;
+        format!(r"(?u:\b{{start-half}})(?:{inner})(?u:\b{{end-half}})")
     } else {
         text.to_owned()
     };
