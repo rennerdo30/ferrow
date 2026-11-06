@@ -103,7 +103,11 @@ fn cli_accepts_non_unicode_root_argument() {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let root = base.join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'x']));
-    std::fs::create_dir_all(&root).unwrap();
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        // macOS (APFS) rejects non-UTF-8 names outright; skip loudly.
+        eprintln!("SKIP: non-UTF-8 directory creation refused ({e}); test not run");
+        return;
+    }
     std::fs::write(root.join("needle.txt"), b"x").unwrap();
     let index = base.join("index.bin");
     let out = Command::new(env!("CARGO_BIN_EXE_ferrow"))

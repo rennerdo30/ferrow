@@ -588,7 +588,11 @@ mod tests {
         let root = dir
             .0
             .join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'x']));
-        std::fs::create_dir_all(&root).unwrap();
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            // macOS (APFS) rejects non-UTF-8 names outright; skip loudly.
+            eprintln!("SKIP: non-UTF-8 directory creation refused ({e}); test not run");
+            return;
+        }
         std::fs::write(root.join("file.txt"), b"x").unwrap();
         let (idx, report) = scan(&WalkOptions {
             roots: vec![root.clone()],
