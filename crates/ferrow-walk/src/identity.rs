@@ -8,6 +8,32 @@
 
 use std::path::Path;
 
+/// Test seam (N5): when set, identity queries for an entry named
+/// [`TEST_REFUSED_NAME`] fail with `PermissionDenied`, so tests can
+/// prove the walker's fail-closed exclude behaviour. Compiled only
+/// under `cfg(test)`; never part of the release API or behaviour.
+#[cfg(test)]
+pub static TEST_IDENTITY_REFUSAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub const TEST_REFUSED_NAME: &str = "deny-identity";
+
+/// Identity of the object at `path`, following symlinks and junctions
+/// to their target.
+pub fn file_id(path: &Path) -> std::io::Result<FileId> {
+    #[cfg(test)]
+    if TEST_IDENTITY_REFUSAL.load(std::sync::atomic::Ordering::Relaxed)
+        && path.file_name().is_some_and(|n| n == TEST_REFUSED_NAME)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected identity refusal (test seam)",
+        ));
+    }
+    platform_file_id(path)
+}
+
 /// Inspect the reparse point itself: the name-surrogate bit also covers
 /// junctions and mount points, independently of Rust's symlink classification.
 #[cfg(windows)]
@@ -54,10 +80,8 @@ pub struct FileId {
     id: u128,
 }
 
-/// Identity of the object at `path`, following symlinks and junctions
-/// to their target.
 #[cfg(unix)]
-pub fn file_id(path: &Path) -> std::io::Result<FileId> {
+fn platform_file_id(path: &Path) -> std::io::Result<FileId> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::metadata(path)?;
     Ok(FileId {
@@ -67,10 +91,8 @@ pub fn file_id(path: &Path) -> std::io::Result<FileId> {
     })
 }
 
-/// Identity of the object at `path`, following symlinks and junctions
-/// to their target.
 #[cfg(windows)]
-pub fn file_id(path: &Path) -> std::io::Result<FileId> {
+fn platform_file_id(path: &Path) -> std::io::Result<FileId> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -136,6 +158,6 @@ unsafe fn file_id_from_handle(
 
 /// Identity of the object at `path`.
 #[cfg(not(any(unix, windows)))]
-pub fn file_id(_path: &Path) -> std::io::Result<FileId> {
+fn platform_file_id(_path: &Path) -> std::io::Result<FileId> {
     Err(std::io::ErrorKind::Unsupported.into())
 }

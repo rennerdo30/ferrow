@@ -277,6 +277,74 @@ struct Walker<'a> {
 }
 
 impl<'x> Walker<'x> {
+    /// The single exclude decision for one enumerated candidate,
+    /// shared by ordinary directories, links and aliases (followed
+    /// or leaf) and the parent-scoped file case. Returns whether the
+    /// candidate must be skipped before it is added, plus its
+    /// resolved identity when one was obtained (for descent, cycle
+    /// detection and contained file excludes).
+    ///
+    /// Fail-closed (N5, owner decision 2026-11-06): while excludes
+    /// are active, an identity or location error means exclusion
+    /// cannot be determined, so the candidate is skipped and the
+    /// error is counted exactly once here. With no excludes the
+    /// lookup only feeds symlink-cycle detection; an error is
+    /// counted and the candidate is kept (as a leaf when following,
+    /// handled by the caller).
+    fn candidate_excluded(
+        self,
+        path: &Path,
+        is_dir: bool,
+        is_symlink: bool,
+        dir_identity: Option<FileId>,
+    ) -> (bool, Option<FileId>) {
+        if is_dir || is_symlink {
+            // Directories are resolved once, before descending: the
+            // same lookup serves the exclude check, symlink-cycle
+            // detection and contained file excludes in the child.
+            if !(self.follow_symlinks || !self.excludes.is_empty()) {
+                return (false, None);
+            }
+            match file_id(path) {
+                Ok(id) => {
+                    if is_symlink {
+                        match self.excludes.excluded_location(path, Some(id)) {
+                            Ok(excluded) => (excluded, Some(id)),
+                            Err(e) => {
+                                self.errors.add(format!("{}: {e}", path.display()));
+                                (true, Some(id))
+                            }
+                        }
+                    } else {
+                        // A real parent-to-child edge inherits the
+                        // already-checked parent chain: one lookup.
+                        (self.excludes.dirs.contains(&id), Some(id))
+                    }
+                }
+                Err(e) => {
+                    self.errors.add(format!("{}: {e}", path.display()));
+                    (!self.excludes.is_empty(), None)
+                }
+            }
+        } else if let Some(parent_id) = dir_identity
+            && let Some(files) = self.excludes.files_by_parent.get(&parent_id)
+        {
+            // Files are only resolved when their containing
+            // directory holds a file exclude, so excludes are
+            // active here by construction: an identity error
+            // fails closed.
+            match file_id(path) {
+                Ok(id) => (files.contains(&id), None),
+                Err(e) => {
+                    self.errors.add(format!("{}: {e}", path.display()));
+                    (true, None)
+                }
+            }
+        } else {
+            (false, None)
+        }
+    }
+
     /// `ancestors` holds the filesystem identities of the directory
     /// chain from the root down to and including `dir`. It is only
     /// populated when following symlinks, where it bounds cycles: a
@@ -358,47 +426,12 @@ impl<'x> Walker<'x> {
             if is_hidden(&name, &entry) {
                 ent_flags |= flags::HIDDEN;
             }
-            // Exclude matching by filesystem identity. Directories
-            // are resolved once, before descending: the same lookup
-            // serves the exclude check, symlink-cycle detection and
-            // contained file excludes in the child. Files are only
-            // resolved when their containing directory holds a file
-            // exclude.
-            let need_identity = self.follow_symlinks || !self.excludes.is_empty();
-            let mut child_identity: Option<FileId> = None;
-            if is_dir || is_symlink {
-                if need_identity {
-                    match file_id(&path) {
-                        Ok(id) => {
-                            child_identity = Some(id);
-                            if is_symlink {
-                                match self.excludes.excluded_location(&path, Some(id)) {
-                                    Ok(true) => continue,
-                                    Ok(false) => {}
-                                    Err(e) => {
-                                        self.errors.add(format!("{}: {e}", path.display()));
-                                        continue;
-                                    }
-                                }
-                            } else if self.excludes.dirs.contains(&id) {
-                                // A real parent-to-child edge inherits the
-                                // already-checked parent chain: one lookup.
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            self.errors.add(format!("{}: {e}", path.display()));
-                        }
-                    }
-                }
-            } else if let Some(parent_id) = dir_identity
-                && let Some(files) = self.excludes.files_by_parent.get(&parent_id)
-            {
-                match file_id(&path) {
-                    Ok(id) if files.contains(&id) => continue,
-                    Ok(_) => {}
-                    Err(e) => self.errors.add(format!("{}: {e}", path.display())),
-                }
+            // Exclude matching by filesystem identity, through the
+            // single fail-closed decision (see `candidate_excluded`).
+            let (skip, child_identity) =
+                self.candidate_excluded(&path, is_dir, is_symlink, dir_identity);
+            if skip {
+                continue;
             }
             let id = self.builder.add(dir_id, &name, ent_flags);
             if is_dir {
@@ -494,8 +527,14 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         if let Some(Err(e)) = &identity_result {
             // The root exists but its identity could not be resolved;
             // excludes and cycle detection cannot see it. Counted,
-            // never silent.
+            // never silent. With excludes active this fails closed
+            // (N5): the root is not indexed. Without excludes the
+            // root is kept; when following, the missing identity
+            // still stops descent below.
             errors.add(format!("{}: {e}", root.display()));
+            if !excludes.is_empty() {
+                continue;
+            }
         }
         let is_symlink = match is_link(&abs, &link_md) {
             Ok(value) => value,
@@ -891,6 +930,157 @@ mod tests {
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
         assert!(!names.contains_key("secret.txt"));
+    }
+
+    /// Serializes the N5 identity-refusal seam across parallel tests
+    /// and always clears it, even on panic.
+    struct IdentityRefusal {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl IdentityRefusal {
+        fn new(inject: bool) -> IdentityRefusal {
+            static LOCK: Mutex<()> = Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            identity::TEST_IDENTITY_REFUSAL.store(inject, Ordering::Relaxed);
+            IdentityRefusal { _lock: lock }
+        }
+    }
+
+    impl Drop for IdentityRefusal {
+        fn drop(&mut self) {
+            identity::TEST_IDENTITY_REFUSAL.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn make_symlink_file(original: &Path, link: &Path) {
+        #[cfg(windows)]
+        let result = std::os::windows::fs::symlink_file(original, link);
+        #[cfg(unix)]
+        let result = std::os::unix::fs::symlink(original, link);
+        result.expect("symlink fixture creation refused");
+    }
+
+    /// N5 fixture: a `deny-identity` directory under `root` (holding
+    /// `private.txt`), the same directory reached as alias
+    /// `aliases/deny-identity`, and an exclude spelled through a
+    /// separate alias (`exclude-alias`) so exclude resolution at scan
+    /// start succeeds while candidate identity queries are refused.
+    struct N5Fixture {
+        _root_dir: TestDir,
+        _alias_dir: TestDir,
+        _exclude_dir: TestDir,
+        root: PathBuf,
+        aliases: PathBuf,
+        exclude: PathBuf,
+    }
+
+    fn n5_fixture(tag: &str) -> N5Fixture {
+        let root_dir = TestDir::new(&format!("n5-{tag}-root"));
+        let private = root_dir.0.join(identity::TEST_REFUSED_NAME);
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(private.join("private.txt"), b"x").unwrap();
+        let exclude_dir = TestDir::new(&format!("n5-{tag}-exclude"));
+        let exclude = exclude_dir.0.join("exclude-alias");
+        make_symlink_dir(&private, &exclude);
+        let alias_dir = TestDir::new(&format!("n5-{tag}-aliases"));
+        make_symlink_dir(&private, &alias_dir.0.join(identity::TEST_REFUSED_NAME));
+        N5Fixture {
+            root: root_dir.0.clone(),
+            aliases: alias_dir.0.clone(),
+            exclude,
+            _root_dir: root_dir,
+            _alias_dir: alias_dir,
+            _exclude_dir: exclude_dir,
+        }
+    }
+
+    #[test]
+    fn identity_refusal_fails_closed_for_excluded_directory() {
+        let _refusal = IdentityRefusal::new(true);
+        let fx = n5_fixture("dir");
+        for follow in [false, true] {
+            let (idx, report) = scan(&WalkOptions {
+                roots: vec![fx.root.clone()],
+                excludes: vec![fx.exclude.clone()],
+                follow_symlinks: follow,
+            });
+            assert_eq!(
+                report.errors, 1,
+                "follow={follow}: only the candidate identity is refused: {report:?}"
+            );
+            assert_eq!(
+                idx.len(),
+                1,
+                "follow={follow}: excluded directory admitted after identity error"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_refusal_fails_closed_for_excluded_alias() {
+        let _refusal = IdentityRefusal::new(true);
+        let fx = n5_fixture("alias");
+        for follow in [false, true] {
+            let (idx, report) = scan(&WalkOptions {
+                roots: vec![fx.aliases.clone()],
+                excludes: vec![fx.exclude.clone()],
+                follow_symlinks: follow,
+            });
+            assert_eq!(
+                report.errors, 1,
+                "follow={follow}: only the candidate identity is refused: {report:?}"
+            );
+            assert_eq!(
+                idx.len(),
+                1,
+                "follow={follow}: excluded alias admitted after identity error"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_refusal_fails_closed_for_excluded_file() {
+        let _refusal = IdentityRefusal::new(true);
+        let root_dir = TestDir::new("n5-file-root");
+        let file = root_dir.0.join(identity::TEST_REFUSED_NAME);
+        std::fs::write(&file, b"x").unwrap();
+        let exclude_dir = TestDir::new("n5-file-exclude");
+        let exclude = exclude_dir.0.join("exclude-file");
+        make_symlink_file(&file, &exclude);
+        for follow in [false, true] {
+            let (idx, report) = scan(&WalkOptions {
+                roots: vec![root_dir.0.clone()],
+                excludes: vec![exclude.clone()],
+                follow_symlinks: follow,
+            });
+            assert_eq!(
+                report.errors, 1,
+                "follow={follow}: only the candidate identity is refused: {report:?}"
+            );
+            assert_eq!(
+                idx.len(),
+                1,
+                "follow={follow}: excluded file admitted after identity error"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_refusal_control_without_refusal_is_unchanged() {
+        let _refusal = IdentityRefusal::new(false);
+        let fx = n5_fixture("control");
+        for root in [fx.root.clone(), fx.aliases.clone()] {
+            for follow in [false, true] {
+                let (idx, report) = scan(&WalkOptions {
+                    roots: vec![root.clone()],
+                    excludes: vec![fx.exclude.clone()],
+                    follow_symlinks: follow,
+                });
+                assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
+                assert_eq!(idx.len(), 1, "follow={follow}");
+            }
+        }
     }
 
     #[cfg(unix)]
