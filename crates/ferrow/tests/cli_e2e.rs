@@ -133,6 +133,70 @@ fn cli_accepts_non_unicode_root_argument() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// JSON escaping and NUL output must reproduce tricky names exactly.
+/// Parsed with serde_json; expected values are the real paths.
+#[test]
+fn json_and_nul_escape_tricky_names_exactly() {
+    static NEXT: AtomicUsize = AtomicUsize::new(200);
+    let base = std::env::temp_dir().join(format!(
+        "ferrow-cli-escape-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let root = base.join("tree");
+    std::fs::create_dir_all(&root).unwrap();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut names: Vec<String> = vec!["O'Brien & [x].txt".to_string(), "Grüße ß.txt".to_string()];
+    #[cfg(unix)]
+    names.push("Quote \"Q\" back\\slash.txt".to_string());
+    for name in &names {
+        std::fs::write(root.join(name), b"x").unwrap();
+    }
+    let index = base.join("index.bin");
+    let out = ferrow(&[
+        "index",
+        root.to_str().unwrap(),
+        "--out",
+        index.to_str().unwrap(),
+    ]);
+    stdout(&out);
+
+    let out = ferrow(&[
+        "search",
+        "txt",
+        "--index",
+        index.to_str().unwrap(),
+        "--json",
+    ]);
+    let parsed: Vec<String> = serde_json::from_str(&stdout(&out)).expect("valid JSON array");
+    let mut expected: Vec<String> = names
+        .iter()
+        .map(|n| root.join(n).to_string_lossy().into_owned())
+        .collect();
+    let mut sorted_parsed = parsed.clone();
+    sorted_parsed.sort();
+    expected.sort();
+    assert_eq!(sorted_parsed, expected);
+
+    let out = ferrow(&[
+        "search",
+        "txt",
+        "--index",
+        index.to_str().unwrap(),
+        "--null",
+    ]);
+    assert!(out.status.success());
+    let mut parts: Vec<String> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8(p.to_vec()).unwrap())
+        .collect();
+    parts.sort();
+    assert_eq!(parts, expected);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn index_then_search_all_modes() {
     let tree = TestTree::new();
@@ -159,24 +223,37 @@ fn index_then_search_all_modes() {
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains("Report 2024.txt"));
 
-    // JSON output.
+    // JSON output, parsed with a real JSON parser.
     let out = ferrow(&["search", "budget", "--index", index, "--json"]);
     let text = stdout(&out);
-    assert!(
-        text.starts_with('[') && text.contains("Budget.xlsx"),
-        "{text}"
+    let parsed: Vec<String> = serde_json::from_str(&text).expect("valid JSON array");
+    assert_eq!(
+        parsed,
+        vec![tree.root.join("Budget.xlsx").to_string_lossy().into_owned()]
     );
-    assert!(text.trim_end().ends_with(']'), "{text}");
 
-    // NUL-separated output.
+    // NUL-separated output: exact paths, NUL-terminated.
     let out = ferrow(&["search", "report", "--index", index, "--null"]);
     assert!(out.status.success());
-    let parts: Vec<&[u8]> = out
+    assert_eq!(out.stdout.last(), Some(&0), "missing trailing NUL");
+    let parts: Vec<String> = out
         .stdout
         .split(|b| *b == 0)
         .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8(p.to_vec()).unwrap())
         .collect();
-    assert_eq!(parts.len(), 3);
+    let mut expected_nul: Vec<String> = [
+        tree.root.join("Report 2024.txt"),
+        tree.root.join("report draft.txt"),
+        tree.root.join("sub").join("deep report.log"),
+    ]
+    .iter()
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect();
+    let mut sorted_parts = parts.clone();
+    sorted_parts.sort();
+    expected_nul.sort();
+    assert_eq!(sorted_parts, expected_nul);
 
     // Count only.
     let out = ferrow(&["search", "report", "--index", index, "--count"]);

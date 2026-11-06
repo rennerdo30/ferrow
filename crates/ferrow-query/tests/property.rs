@@ -168,27 +168,79 @@ fn cancellation_stops_and_is_reported() {
         &SearchOptions {
             limit: None,
             cancel: CancelToken::cancelled(),
+            on_block: None,
         },
     );
     assert!(got.cancelled);
     assert!(got.hits.is_empty());
+    assert_eq!(got.visited, 0);
+}
 
-    // Cancelled mid-flight from another thread: the result is a prefix of
-    // the full hit list (blocks are appended in sort order).
+/// Deterministic cancellation: the `on_block` hook cancels the token
+/// after the first block, so the search must stop before the second
+/// block — cancelled flag set, exactly one block visited, and the hits
+/// are exactly the reference hits inside that first block.
+#[test]
+fn cancellation_after_first_chunk_stops_before_second() {
+    let index = generate(100_000, 11);
+    assert!(index.len() > ferrow_query::BLOCK, "fixture needs 2+ blocks");
+    let query = Query::parse("a").unwrap();
     let token = CancelToken::new();
-    let t2 = token.clone();
-    let handle = std::thread::spawn(move || {
-        t2.cancel();
-    });
+    let hook_token = token.clone();
     let got = search(
         &index,
         &query,
         &SearchOptions {
             limit: None,
             cancel: token,
+            on_block: Some(std::sync::Arc::new(move |block: usize| {
+                if block == 0 {
+                    hook_token.cancel();
+                }
+            })),
         },
     );
-    handle.join().unwrap();
-    let full = reference_search(&index, &query, None);
-    assert_eq!(&full[..got.hits.len()], &got.hits[..]);
+    assert!(got.cancelled, "cancellation was not reported");
+    assert_eq!(
+        got.visited,
+        ferrow_query::BLOCK,
+        "extra work past the first block: visited {}",
+        got.visited
+    );
+    // Correct prefix: reference hits restricted to the first block.
+    let first_block: std::collections::HashSet<u32> = index.sorted()[..ferrow_query::BLOCK]
+        .iter()
+        .copied()
+        .collect();
+    let want: Vec<u32> = reference_search(&index, &query, None)
+        .into_iter()
+        .filter(|id| first_block.contains(id))
+        .collect();
+    assert_eq!(got.hits, want);
+}
+
+/// `limit` must stop the scan early: the visited counter proves the
+/// whole index was not examined for a first-page query.
+#[test]
+fn limit_stops_early_and_reports_visited() {
+    let index = generate(100_000, 3);
+    let got = search(
+        &index,
+        &Query::parse("").unwrap(),
+        &SearchOptions {
+            limit: Some(10),
+            ..SearchOptions::default()
+        },
+    );
+    assert_eq!(got.hits.len(), 10);
+    assert_eq!(got.visited, ferrow_query::BLOCK);
+    assert!(got.visited < index.len());
+    // Without a limit everything is visited.
+    let got = search(
+        &index,
+        &Query::parse("zzzz-no-hit-zzzz").unwrap(),
+        &SearchOptions::default(),
+    );
+    assert_eq!(got.visited, index.len());
+    assert!(got.hits.is_empty());
 }

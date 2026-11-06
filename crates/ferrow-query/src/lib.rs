@@ -138,20 +138,36 @@ impl CancelToken {
 }
 
 /// Search options.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SearchOptions {
     /// Stop after this many hits (in name-sort order).
     pub limit: Option<usize>,
     /// Cancellation flag shared with the caller.
     pub cancel: CancelToken,
+    /// Diagnostic/test hook invoked after each visited block with the
+    /// block index, before the next block starts. `None` in normal use.
+    pub on_block: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+}
+
+impl fmt::Debug for SearchOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SearchOptions")
+            .field("limit", &self.limit)
+            .field("cancel", &self.cancel)
+            .field("on_block", &self.on_block.is_some())
+            .finish()
+    }
 }
 
 /// Search outcome. `hits` are entry ids in name-sort order; on
 /// cancellation the hits found so far (in order) are still returned.
+/// `visited` counts the entries actually examined, so callers (and
+/// tests) can prove that `limit`/cancellation stopped the scan early.
 #[derive(Debug)]
 pub struct SearchResult {
     pub hits: Vec<u32>,
     pub cancelled: bool,
+    pub visited: usize,
 }
 
 struct Matcher {
@@ -195,7 +211,10 @@ impl Matcher {
     }
 }
 
-const BLOCK: usize = 65_536;
+/// Entries examined per parallel block; cancellation and the
+/// `on_block` hook act at this granularity.
+#[doc(hidden)]
+pub const BLOCK: usize = 65_536;
 
 /// Run a search over the whole index, in name-sort order, in parallel.
 ///
@@ -206,17 +225,20 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
     let matcher = Matcher::new(query);
     let sorted = index.sorted();
     let mut hits: Vec<u32> = Vec::new();
+    let mut visited = 0usize;
     if options.limit == Some(0) {
         return SearchResult {
             hits,
             cancelled: options.cancel.is_cancelled(),
+            visited,
         };
     }
-    for block in sorted.chunks(BLOCK) {
+    for (block_index, block) in sorted.chunks(BLOCK).enumerate() {
         if options.cancel.is_cancelled() {
             return SearchResult {
                 hits,
                 cancelled: true,
+                visited,
             };
         }
         let mut found: Vec<u32> = block
@@ -224,7 +246,11 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
             .filter(|&&id| matcher.matches(index, id))
             .copied()
             .collect();
+        visited += block.len();
         hits.append(&mut found);
+        if let Some(hook) = &options.on_block {
+            hook(block_index);
+        }
         if let Some(limit) = options.limit
             && hits.len() >= limit
         {
@@ -237,6 +263,7 @@ pub fn search(index: &Index, query: &Query, options: &SearchOptions) -> SearchRe
     SearchResult {
         hits,
         cancelled: options.cancel.is_cancelled(),
+        visited,
     }
 }
 
@@ -432,6 +459,7 @@ mod tests {
         let opts = SearchOptions {
             limit: None,
             cancel: CancelToken::cancelled(),
+            on_block: None,
         };
         let r = search(&idx, &Query::parse("report").unwrap(), &opts);
         assert!(r.cancelled);

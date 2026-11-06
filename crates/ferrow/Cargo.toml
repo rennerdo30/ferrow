@@ -13,3 +13,6 @@ publish = false
 ferrow-index = { path = "../ferrow-index" }
 ferrow-query = { path = "../ferrow-query" }
 ferrow-walk = { path = "../ferrow-walk" }
+
+[dev-dependencies]
+serde_json = "1.0.154"

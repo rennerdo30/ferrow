@@ -516,6 +516,24 @@ mod tests {
     #[test]
     fn heap_bytes_counts_all_columns() {
         let idx = small_index();
-        assert!(idx.heap_bytes() > idx.len() * 16);
+        // Exact per-column capacity accounting: 4+4+2+2 bytes of fixed
+        // columns plus 4 bytes of sort order per entry, plus both
+        // arenas. Dropping a column (or using len instead of capacity)
+        // breaks this assertion.
+        let expected = idx.parent.capacity() * 4
+            + idx.name_off.capacity() * 4
+            + idx.name_len.capacity() * 2
+            + idx.flags.capacity() * 2
+            + idx.arena.capacity()
+            + idx.folded_arena.capacity()
+            + idx.sorted.capacity() * 4;
+        assert_eq!(idx.heap_bytes(), expected);
+        // Every column contributes, and capacities cover the live data.
+        assert!(idx.parent.capacity() >= idx.len());
+        assert!(idx.sorted.capacity() >= idx.len());
+        assert!(idx.arena.capacity() >= idx.arena.len());
+        assert_eq!(idx.arena.len(), idx.folded_arena.len());
+        let live_floor = idx.len() * (4 + 4 + 2 + 2 + 4) + idx.arena.len() * 2;
+        assert!(idx.heap_bytes() >= live_floor);
     }
 }
