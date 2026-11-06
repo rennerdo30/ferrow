@@ -1,0 +1,30 @@
+[package]
+name = "ferrow-gui"
+description = "Ferrow desktop app: find any file by name, as fast as you type."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "ferrow-gui"
+path = "src/main.rs"
+
+[dependencies]
+ferrow-index = { path = "../ferrow-index" }
+ferrow-query = { path = "../ferrow-query" }
+ferrow-walk = { path = "../ferrow-walk" }
+# default_fonts is off on purpose: the bundled fonts are not under a
+# licence on the deny.toml allow list. The app loads the OS UI font.
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "accesskit", "wayland", "x11"] }
+
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+window-vibrancy = "0.8.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
