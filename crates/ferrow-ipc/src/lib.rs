@@ -142,6 +142,17 @@ pub struct Client<S> {
 }
 
 impl Client<Stream> {
+    pub fn connect_deadline(
+        endpoint: &Endpoint,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Client<Stream>> {
+        Client::new(Stream::connect_deadline(endpoint, deadline)?)
+    }
+
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) -> std::io::Result<()> {
+        self.stream.set_deadline(deadline)
+    }
+
     /// Connect to a service endpoint and perform the handshake.
     pub fn connect(endpoint: &Endpoint) -> std::io::Result<Client<Stream>> {
         Client::new(Stream::connect(endpoint)?)

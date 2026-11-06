@@ -276,12 +276,74 @@ mod platform {
         }
 
         pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
-            let inner = UnixStream::connect(&endpoint.path)?;
+            Self::connect_deadline(endpoint, super::io_deadline())
+        }
+
+        pub fn connect_deadline(
+            endpoint: &Endpoint,
+            deadline: std::time::Instant,
+        ) -> std::io::Result<Stream> {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::ffi::OsStrExt;
+            let path = endpoint.path.as_os_str().as_bytes();
+            // SAFETY: all-zero sockaddr_un is valid before filling family/path.
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            if path.len() >= address.sun_path.len() || path.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid Unix endpoint path",
+                ));
+            }
+            address.sun_family = libc::AF_UNIX as _;
+            for (out, byte) in address.sun_path.iter_mut().zip(path) {
+                *out = *byte as _;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                address.sun_len = size_of::<libc::sockaddr_un>() as u8;
+            }
+            // SAFETY: valid socket domain/type, ownership captured immediately.
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: newly returned fd is uniquely owned.
+            let inner = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
             inner.set_nonblocking(true)?;
+            // SAFETY: initialized sockaddr_un and its exact size remain live.
+            if unsafe {
+                libc::connect(
+                    inner.as_raw_fd(),
+                    (&raw const address).cast(),
+                    size_of::<libc::sockaddr_un>() as _,
+                )
+            } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINPROGRESS) {
+                    return Err(error);
+                }
+                wait_io(&inner, libc::POLLOUT, deadline)?;
+                if let Some(error) = inner.take_error()? {
+                    return Err(error);
+                }
+            }
+            let server = peer_identity(&inner)?;
+            let expected = if *endpoint == Endpoint::default_service() {
+                Some(0)
+            } else {
+                current_identity()?.uid
+            };
+            if server.uid != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "untrusted Unix server uid",
+                ));
+            }
             Ok(Stream {
                 inner,
                 caller: None,
-                deadline: super::io_deadline(),
+                deadline,
             })
         }
 
@@ -824,8 +886,16 @@ mod platform {
         }
 
         pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
+            Self::connect_deadline(endpoint, super::io_deadline())
+        }
+
+        pub fn connect_deadline(
+            endpoint: &Endpoint,
+            deadline: std::time::Instant,
+        ) -> std::io::Result<Stream> {
             let name = wide(&endpoint.pipe_name);
-            for _attempt in 0..50 {
+            loop {
+                let budget = super::remaining(deadline)?;
                 // SAFETY: name outlives the call; the returned
                 // handle is owned by PipeHandle on success.
                 let handle = unsafe {
@@ -848,7 +918,7 @@ mod platform {
                         handle: Some(owned),
                         caller: None,
                         cancelled: event()?,
-                        deadline: super::io_deadline(),
+                        deadline,
                     });
                 }
                 let err = last_error();
@@ -856,12 +926,13 @@ mod platform {
                     return Err(err);
                 }
                 // SAFETY: name outlives the bounded wait.
-                unsafe { WaitNamedPipeW(name.as_ptr(), 2_000) };
+                unsafe {
+                    WaitNamedPipeW(
+                        name.as_ptr(),
+                        budget.as_millis().max(1).min(u32::MAX as u128 - 1) as u32,
+                    )
+                };
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "named pipe stays busy",
-            ))
         }
 
         pub fn set_deadline(&mut self, deadline: std::time::Instant) -> std::io::Result<()> {
@@ -1199,6 +1270,15 @@ impl Stream {
 
     pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
         Ok(Stream(platform::Stream::connect(endpoint)?))
+    }
+
+    pub fn connect_deadline(
+        endpoint: &Endpoint,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Stream> {
+        Ok(Stream(platform::Stream::connect_deadline(
+            endpoint, deadline,
+        )?))
     }
 
     /// Absolute budget shared by every read/write until explicitly renewed.

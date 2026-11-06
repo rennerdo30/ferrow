@@ -314,22 +314,40 @@ fn service_candidates() -> Vec<Endpoint> {
     vec![Endpoint::default_service(), Endpoint::user_service()]
 }
 
-/// Connect to the first reachable service, if any.
-fn service_client() -> Option<(Client<Stream>, Endpoint)> {
+struct DiscoveryFailure {
+    endpoint: Endpoint,
+    error: std::io::Error,
+}
+
+struct Discovery {
+    connected: Option<(Client<Stream>, Endpoint)>,
+    failures: Vec<DiscoveryFailure>,
+}
+
+fn service_client() -> Discovery {
+    let mut failures = Vec::new();
     for endpoint in service_candidates() {
-        if let Ok(mut client) = Client::connect(&endpoint) {
-            match client.status() {
-                Ok(_) => return Some((client, endpoint)),
-                Err(e) if e.to_string().contains("Unauthorized") => {
-                    eprintln!(
-                        "ferrow: service at {endpoint} refused access ({e}); falling back to the per-user in-process index"
-                    );
-                }
-                Err(e) => eprintln!("ferrow: service at {endpoint}: {e}"),
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let result = (|| {
+            let mut client = Client::connect_deadline(&endpoint, deadline)?;
+            client.status()?; // includes the interim visibility authorization check
+            client.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5))?;
+            Ok::<_, std::io::Error>(client)
+        })();
+        match result {
+            Ok(client) => {
+                return Discovery {
+                    connected: Some((client, endpoint)),
+                    failures,
+                };
             }
+            Err(error) => failures.push(DiscoveryFailure { endpoint, error }),
         }
     }
-    None
+    Discovery {
+        connected: None,
+        failures,
+    }
 }
 
 /// Write result paths in the selected output mode. Shared by the
@@ -386,9 +404,15 @@ fn cmd_search(args: Args) -> Result<(), String> {
     // Service first (M2b), unless --index pins an index file.
     // Only a connection failure falls back; an answer (or a
     // typed service error) from a reachable service is final.
-    if args.index.is_none()
-        && let Some((mut client, _endpoint)) = service_client()
-    {
+    let discovery = if args.index.is_none() {
+        Some(service_client())
+    } else {
+        None
+    };
+    let (connected, failures) = discovery
+        .map(|d| (d.connected, d.failures))
+        .unwrap_or_default();
+    if let Some((mut client, _endpoint)) = connected {
         if args.count {
             let n = client.count(query_text).map_err(|e| e.to_string())?;
             let n = match args.limit {
@@ -403,6 +427,12 @@ fn cmd_search(args: Args) -> Result<(), String> {
         return emit_paths(&mut out, &paths, args.json, args.null);
     }
 
+    for failure in failures {
+        eprintln!(
+            "ferrow: service at {}: {}; falling back to the per-user in-process index",
+            failure.endpoint, failure.error
+        );
+    }
     let (index, _) = load(&args)?;
 
     if args.count {
@@ -456,7 +486,8 @@ fn cmd_stats(args: Args) -> Result<(), String> {
 /// `ferrow status` / `ferrow service status`: which mode is
 /// active and why (SPEC section 5).
 fn cmd_status() -> Result<(), String> {
-    match service_client() {
+    let discovery = service_client();
+    match discovery.connected {
         Some((mut client, endpoint)) => {
             let (entries, mode, report) = client.status().map_err(|e| e.to_string())?;
             println!("mode: service ({endpoint})");
@@ -464,6 +495,9 @@ fn cmd_status() -> Result<(), String> {
             println!("backend: {mode} - {report}");
         }
         None => {
+            for failure in discovery.failures {
+                println!("service at {}: {}", failure.endpoint, failure.error);
+            }
             let tried: Vec<String> = service_candidates().iter().map(|e| e.display()).collect();
             println!(
                 "mode: in-process (no service reachable at {})",

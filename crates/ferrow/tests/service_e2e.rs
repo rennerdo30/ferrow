@@ -143,3 +143,49 @@ fn search_uses_service_and_index_flag_bypasses_it() {
         .unwrap();
     assert!(!out.status.success(), "--index must bypass the service");
 }
+
+#[test]
+fn discovery_retains_protocol_refusal_reason() {
+    let fx = Fixture::new();
+    let listener =
+        ferrow_ipc::Listener::bind(&ferrow_ipc::Endpoint::named(&fx.endpoint_name)).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let hello = ferrow_ipc::read_message(&mut stream).unwrap().unwrap();
+        ferrow_ipc::write_message(
+            &mut stream,
+            hello.id,
+            &ferrow_ipc::Message::Response(ferrow_ipc::Response::Error {
+                code: ferrow_ipc::ErrorCode::VersionMismatch,
+                msg: "different service protocol".into(),
+            }),
+        )
+        .unwrap();
+    });
+    let output = fx.ferrow().args(["status"]).output().unwrap();
+    server.join().unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("VersionMismatch"));
+}
+
+#[test]
+fn stalled_hello_falls_back_within_discovery_budget() {
+    let fx = Fixture::new();
+    let listener =
+        ferrow_ipc::Listener::bind(&ferrow_ipc::Endpoint::named(&fx.endpoint_name)).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        ferrow_ipc::read_message(&mut stream).unwrap().unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(2));
+    });
+    let started = std::time::Instant::now();
+    let output = fx.ferrow().args(["status"]).output().unwrap();
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "selection stalled for {elapsed:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("deadline"));
+}
