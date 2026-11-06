@@ -37,6 +37,111 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check licenses
+  service:
+    name: service (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show active-toolchain
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - run: cargo build --locked -p ferrow -p ferrowd
+      # Windows: install, start, query through the service, stop, uninstall.
+      # Hosted runners are elevated.
+      - name: Windows service end-to-end
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = Join-Path $PWD "target\debug"
+          $tree = Join-Path $env:RUNNER_TEMP "svc-tree"
+          New-Item -ItemType Directory -Force $tree | Out-Null
+          Set-Content (Join-Path $tree "ci-needle.txt") "x"
+          & "$bin\ferrow.exe" index $tree --out "C:\ProgramData\ferrow\index.bin"
+          if ($LASTEXITCODE -ne 0) { throw "index failed" }
+          & "$bin\ferrow.exe" service install
+          if ($LASTEXITCODE -ne 0) { throw "install failed" }
+          sc.exe start ferrowd
+          if ($LASTEXITCODE -ne 0) { throw "sc start failed" }
+          $ok = $false
+          foreach ($i in 1..30) {
+            $status = & "$bin\ferrow.exe" status 2>$null
+            if ($status -match "mode: service") { $ok = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ok) { throw "service never answered status" }
+          $hits = & "$bin\ferrow.exe" search ci-needle
+          if ($hits -notmatch "ci-needle.txt") { throw "service search missed: $hits" }
+          $proc = Get-Process ferrowd
+          $cpu1 = $proc.CPU
+          Start-Sleep -Seconds 3
+          $cpu2 = (Get-Process -Id $proc.Id).CPU
+          if (($cpu2 - $cpu1) -gt 0.5) { throw "idle CPU too high: $($cpu2 - $cpu1)s in 3s" }
+          sc.exe stop ferrowd
+          & "$bin\ferrow.exe" service uninstall
+          if ($LASTEXITCODE -ne 0) { throw "uninstall failed" }
+      # Linux: same flow through systemd (sudo on hosted runners).
+      - name: Linux service end-to-end
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/debug"
+          tree="$RUNNER_TEMP/svc-tree"
+          mkdir -p "$tree"
+          echo x > "$tree/ci-needle.txt"
+          sudo install -d -m 0700 /var/lib/ferrow
+          sudo "$bin/ferrow" index "$tree" --out /var/lib/ferrow/index.bin
+          sudo "$bin/ferrow" service install
+          sudo systemctl start ferrowd
+          systemctl is-active ferrowd
+          ok=""
+          for i in $(seq 1 30); do
+            if "$bin/ferrow" status 2>/dev/null | grep -q "mode: service"; then ok=1; break; fi
+            sleep 0.5
+          done
+          test -n "$ok"
+          "$bin/ferrow" search ci-needle | grep -q "ci-needle.txt"
+          pid=$(pidof ferrowd)
+          read -r _ _ _ _ _ _ _ _ _ _ _ _ _ u1 s1 _ < "/proc/$pid/stat"
+          sleep 3
+          read -r _ _ _ _ _ _ _ _ _ _ _ _ _ u2 s2 _ < "/proc/$pid/stat"
+          delta=$(( (u2 + s2) - (u1 + s1) ))
+          echo "idle jiffies in 3s: $delta"
+          test "$delta" -le 10
+          sudo systemctl stop ferrowd
+          sudo "$bin/ferrow" service uninstall
+          test ! -e /etc/systemd/system/ferrowd.service
+      # macOS: run mode only, plus a plist lint (per M2 acceptance).
+      - name: macOS run mode and plist lint
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          plutil -lint packaging/launchd/com.github.rennerdo30.ferrowd.plist
+          bin="$PWD/target/debug"
+          tree="$RUNNER_TEMP/svc-tree"
+          mkdir -p "$tree"
+          echo x > "$tree/ci-needle.txt"
+          export FERROW_ENDPOINT_NAME="ferrow-ci-$RANDOM"
+          "$bin/ferrow" service run "$tree" &
+          daemon_pid=$!
+          trap 'kill $daemon_pid 2>/dev/null || true' EXIT
+          ok=""
+          for i in $(seq 1 30); do
+            if "$bin/ferrow" status 2>/dev/null | grep -q "mode: service"; then ok=1; break; fi
+            sleep 0.5
+          done
+          test -n "$ok"
+          "$bin/ferrow" search ci-needle | grep -q "ci-needle.txt"
+          kill $daemon_pid
   bench:
     name: bench (5M fixture)
     runs-on: ubuntu-latest
