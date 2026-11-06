@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location("gate", Path(__file__).with_name("bench-gate.py"))
 gate = importlib.util.module_from_spec(spec)
@@ -79,6 +81,52 @@ class GateTests(unittest.TestCase):
         self.head[2]["a"]["full_count_ms"] = 12
         self.assertTrue(any(row[-1] for row in self.rows()))
         self.assertEqual(len(self.rows()), gate.EXPECTED_METRICS)
+
+    def test_retry_only_failed_latency_once_paired(self):
+        self.head[2]["report 2024"]["first_page_ms"] = 4
+        calls = []
+        def measure(*args):
+            calls.append(args)
+            return (1 if args[0] == "base" else 1.05), 2
+        rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
+        self.assertFalse(any(row[-1] for row in rows))
+        self.assertEqual(calls, [(arm, "IPC", "report 2024", "first_page_ms") for arm in ("base", "head")])
+        calls.clear()
+        self.head[0]["heap_bytes"] = 1000
+        self.assertTrue(any(row[-1] for row in gate.retry_failures(self.rows(), self.base, self.head, measure)))
+        self.assertEqual(calls, [])
+
+    def test_retry_repeat_breach_fails_and_bad_evidence_refuses(self):
+        self.head[0]["load_ms_median"] = 200
+        rows = gate.retry_failures(self.rows(), self.base, self.head,
+                                   lambda arm, *_: (100 if arm == "base" else 111, 16))
+        self.assertTrue(any(row[-1] for row in rows))
+        for bad in ((float("nan"), 16), (100, 17), (-1, 16)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: bad)
+
+    def test_retry_pass_does_not_run_producers(self):
+        def unexpected(*_):
+            self.fail("passing metrics must not be remeasured")
+        self.assertEqual(gate.retry_failures(self.rows(), self.base, self.head, unexpected), self.rows())
+
+    def test_retry_producer_failure_and_timeout_are_not_retry_passes(self):
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"))
+        for error in (subprocess.CalledProcessError(42, "probe"), subprocess.TimeoutExpired("probe", 120)):
+            with self.subTest(error=error), patch.object(gate.subprocess, "run", side_effect=error) as run:
+                with self.assertRaises(subprocess.SubprocessError):
+                    gate.probe(args, "base", "IPC", "a", "first_page_ms")
+                self.assertEqual(run.call_count, 1)
+                self.assertTrue(run.call_args.kwargs["check"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_retry_receipt_must_be_complete_finite_and_unique(self):
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"))
+        receipt = "FERROW-RETRY value_ms=1 hits=2\n"
+        for stdout in ("", receipt*2, receipt.replace("value_ms=1", "value_ms=NaN"), "FERROW-RETRY value_ms=1\n"):
+            with self.subTest(stdout=stdout), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+                with self.assertRaises((ValueError, KeyError)):
+                    gate.probe(args, "base", "IPC", "a", "first_page_ms")
 
     def test_service_set_is_required_in_every_arm(self):
         # Missing in one arm, in both arms, or only partly present: refused.
