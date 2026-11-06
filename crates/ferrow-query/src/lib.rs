@@ -127,7 +127,7 @@ impl QueryTimings {
 
 mod matcher;
 pub use matcher::highlight_ranges;
-use matcher::{Matcher, Scratch};
+use matcher::{EntryMatcher, Matcher, Scratch};
 
 /// Entries admitted per worker chunk; cancellation also runs inside it.
 const BLOCK_SIZE: usize = 4_096;
@@ -163,8 +163,25 @@ fn search_impl<const TIMED: bool>(
     options: &SearchOptions,
 ) -> (SearchResult, QueryTimings) {
     let started = TIMED.then(std::time::Instant::now);
-    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
+    let (result, mut timings) = match &matcher {
+        Matcher::Plain(m) => search_prepared::<TIMED, _>(index, m, options, started),
+        Matcher::General(m) => search_prepared::<TIMED, _>(index, m, options, started),
+    };
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
+    }
+    (result, timings)
+}
+
+fn search_prepared<const TIMED: bool, M: EntryMatcher>(
+    index: &Index,
+    matcher: &M,
+    options: &SearchOptions,
+    started: Option<std::time::Instant>,
+) -> (SearchResult, QueryTimings) {
+    let mut timings = QueryTimings::default();
     let sorted = matcher.candidates(index);
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
@@ -229,7 +246,7 @@ fn search_impl<const TIMED: bool>(
                         found.push(id);
                     }
                 }
-                if options.cancel.is_cancelled() {
+                if M::CANCELLABLE_TERM && options.cancel.is_cancelled() {
                     break;
                 }
                 examined += ids.len();
@@ -286,7 +303,6 @@ fn search_impl<const TIMED: bool>(
         cancelled: options.cancel.is_cancelled(),
         visited,
     };
-    drop(matcher);
     if let Some(t) = started {
         timings.total = t.elapsed();
     }
@@ -313,8 +329,25 @@ fn count_impl<const TIMED: bool>(
     cancel: &CancelToken,
 ) -> ((usize, bool), QueryTimings) {
     let started = TIMED.then(std::time::Instant::now);
-    let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
+    let (result, mut timings) = match &matcher {
+        Matcher::Plain(m) => count_prepared::<TIMED, _>(index, m, cancel, started),
+        Matcher::General(m) => count_prepared::<TIMED, _>(index, m, cancel, started),
+    };
+    drop(matcher);
+    if let Some(t) = started {
+        timings.total = t.elapsed();
+    }
+    (result, timings)
+}
+
+fn count_prepared<const TIMED: bool, M: EntryMatcher>(
+    index: &Index,
+    matcher: &M,
+    cancel: &CancelToken,
+    started: Option<std::time::Instant>,
+) -> ((usize, bool), QueryTimings) {
+    let mut timings = QueryTimings::default();
     if let Some(t) = started {
         timings.prepare = t.elapsed();
     }
@@ -341,7 +374,6 @@ fn count_impl<const TIMED: bool>(
         timings.scan = t.elapsed();
     }
     let result = (total, cancel.is_cancelled());
-    drop(matcher);
     if let Some(t) = started {
         timings.total = t.elapsed();
     }

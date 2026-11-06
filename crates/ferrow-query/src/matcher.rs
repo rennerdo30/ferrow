@@ -150,12 +150,87 @@ impl Scratch {
     }
 }
 
-pub(crate) struct Matcher {
-    terms: Vec<Prepared>,
-    expression: Option<Expr>,
-    simple: bool,
+/// Static dispatch is selected once per operation, outside the entry loop.
+pub(crate) enum Matcher {
+    Plain(PlainMatcher),
+    General(GeneralMatcher),
+}
+pub(crate) trait EntryMatcher: Sync {
+    const CANCELLABLE_TERM: bool;
+    fn candidates<'a>(&self, index: &'a Index) -> &'a [u32] {
+        index.sorted()
+    }
+    fn matches(&self, index: &Index, id: u32, scratch: &mut Scratch, cancel: &CancelToken) -> bool;
+}
+pub(crate) struct PlainMatcher {
+    // Preserve main's compact layout and exact memmem loop.
+    finders: Vec<(memmem::Finder<'static>, bool, bool)>,
+}
+impl EntryMatcher for PlainMatcher {
+    const CANCELLABLE_TERM: bool = false;
+    #[inline]
+    fn matches(&self, index: &Index, id: u32, _: &mut Scratch, _: &CancelToken) -> bool {
+        self.finders
+            .iter()
+            .all(|(finder, negated, case_sensitive)| {
+                let haystack = if *case_sensitive {
+                    index.name(id)
+                } else {
+                    index.folded_name(id)
+                };
+                finder.find(haystack).is_some() != *negated
+            })
+    }
 }
 impl Matcher {
+    pub(crate) fn new(query: &Query) -> Self {
+        let flat = match &query.expression {
+            None | Some(Expr::Term(_)) => true,
+            Some(Expr::And(v)) => v.iter().all(|e| matches!(e, Expr::Term(_))),
+            _ => false,
+        };
+        if flat
+            && query.terms.iter().all(|t| {
+                matches!(t.pattern, Pattern::Literal)
+                    && !t.path
+                    && !t.wholeword
+                    && t.directory.is_none()
+            })
+        {
+            return Self::Plain(PlainMatcher {
+                finders: query
+                    .terms
+                    .iter()
+                    .map(|t| {
+                        (
+                            finder(&folded(t.text.as_bytes(), t.case_sensitive)),
+                            t.negated,
+                            t.case_sensitive,
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        Self::General(GeneralMatcher::new(query))
+    }
+}
+pub(crate) struct GeneralMatcher {
+    terms: Vec<Prepared>,
+    expression: Option<Expr>,
+}
+impl EntryMatcher for GeneralMatcher {
+    const CANCELLABLE_TERM: bool = true;
+    fn candidates<'a>(&self, index: &'a Index) -> &'a [u32] {
+        self.candidates(index)
+    }
+    fn matches(&self, index: &Index, id: u32, scratch: &mut Scratch, cancel: &CancelToken) -> bool {
+        scratch.ready = None;
+        self.expression
+            .as_ref()
+            .is_none_or(|e| self.eval(e, index, id, scratch, cancel))
+    }
+}
+impl GeneralMatcher {
     /// A required anchored name prefix narrows the existing sorted order.
     /// OR keeps only a common prefix; NOT never narrows candidates.
     pub(crate) fn candidates<'a>(&self, index: &'a Index) -> &'a [u32] {
@@ -244,45 +319,10 @@ impl Matcher {
         if let Some(e) = &mut expression {
             order(e, &query.terms);
         }
-        let flat = match &expression {
-            None | Some(Expr::Term(_)) => true,
-            Some(Expr::And(v)) => v.iter().all(|e| matches!(e, Expr::Term(_))),
-            _ => false,
-        };
-        let simple = flat
-            && query.terms.iter().all(|t| {
-                matches!(t.pattern, Pattern::Literal)
-                    && !t.path
-                    && !t.wholeword
-                    && t.directory.is_none()
-            });
         Self {
             terms: query.terms.iter().map(Prepared::new).collect(),
             expression,
-            simple,
         }
-    }
-    pub(crate) fn matches(
-        &self,
-        index: &Index,
-        id: u32,
-        scratch: &mut Scratch,
-        cancel: &CancelToken,
-    ) -> bool {
-        if self.simple {
-            return self.terms.iter().all(|p| {
-                let hay = if p.term.case_sensitive {
-                    index.name(id)
-                } else {
-                    index.folded_name(id)
-                };
-                p.finder.find(hay).is_some() != p.term.negated
-            });
-        }
-        scratch.ready = None;
-        self.expression
-            .as_ref()
-            .is_none_or(|e| self.eval(e, index, id, scratch, cancel))
     }
     fn eval(
         &self,
@@ -511,12 +551,52 @@ mod tests {
     use ferrow_index::IndexBuilder;
 
     #[test]
+    fn ordinary_queries_select_the_compact_literal_matcher() {
+        for text in [
+            "",
+            "a",
+            "!tmp log",
+            "report 2024",
+            "case:Report",
+            "\"a phrase\"",
+            "!case:\"Foo Bar\"",
+        ] {
+            assert!(
+                matches!(
+                    Matcher::new(&Query::parse(text).unwrap()),
+                    Matcher::Plain(_)
+                ),
+                "{text}"
+            );
+        }
+        for text in [
+            "a|b",
+            "*.log",
+            "path:docs",
+            "wholeword:report",
+            "regex:report",
+            "file:",
+        ] {
+            assert!(
+                matches!(
+                    Matcher::new(&Query::parse(text).unwrap()),
+                    Matcher::General(_)
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn name_prefilters_precede_path_work_and_paths_are_cancellable() {
         let b = IndexBuilder::new();
         let root = b.add_root(b"root", flags::DIR);
         let leaf = b.add(root, b"leaf", 0);
         let index = b.freeze();
-        let matcher = Matcher::new(&Query::parse("path:root absent").unwrap());
+        let Matcher::General(matcher) = Matcher::new(&Query::parse("path:root absent").unwrap())
+        else {
+            panic!("path requires general matcher");
+        };
         let mut scratch = Scratch::default();
         assert!(!matcher.matches(&index, leaf, &mut scratch, &CancelToken::new()));
         assert!(

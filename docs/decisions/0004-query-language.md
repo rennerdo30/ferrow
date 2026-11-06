@@ -71,7 +71,11 @@ Do not silently reinterpret a reserved filter as a filename substring.
 
 ## Performance and bounded work
 
-Keep the plain AND substring fast path. Compile regexes at parse time once
+Keep the plain AND/NOT substring fast path in main's compact
+`Vec<(Finder, negated, case_sensitive)>` layout. Dispatch once per operation
+to statically specialized search/count loops; ordinary entries do no tree
+walk, syntax dispatch, scratch allocation or per-term cancellation check.
+Compile regexes at parse time once
 per query with a 1 MiB compiled-size and DFA-cache limit. A required literal
 prefix, when available, is extracted from regex syntax and checked by memmem
 before regex work; alternations/optional prefixes must never cause rejection
