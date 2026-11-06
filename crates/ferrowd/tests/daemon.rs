@@ -7,6 +7,39 @@ use ferrowd::{DaemonConfig, Shutdown, Snapshot, SnapshotStore, serve};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn service_plain_count_and_query_use_the_compact_factory() {
+    use ferrow_ipc::{Request, Response};
+    use ferrow_query::take_compact_plan_for_test;
+    let b = ferrow_index::IndexBuilder::new();
+    let root = b.add_root(b"root", ferrow_index::flags::DIR);
+    b.add(root, b"Report 2024.txt", 0);
+    let store = SnapshotStore::new(Snapshot {
+        index: std::sync::Arc::new(b.freeze()),
+        mode: "fixture".into(),
+        report: "fixture".into(),
+    });
+    for text in ["report 2024", "!tmp log", "case:Report", "\"Report 2024\""] {
+        take_compact_plan_for_test();
+        assert!(matches!(
+            &ferrowd::handle(&store, Request::Count { text: text.into() })[..],
+            [Response::Count { .. }]
+        ));
+        assert_eq!(take_compact_plan_for_test(), Some(true), "Count: {text}");
+        let request = Request::Query {
+            text: text.into(),
+            limit: 100,
+            sort: ferrow_ipc::protocol::Sort::Name,
+            flags: 0,
+        };
+        assert!(matches!(
+            &ferrowd::handle(&store, request)[..],
+            [Response::Results { .. }]
+        ));
+        assert_eq!(take_compact_plan_for_test(), Some(true), "Query: {text}");
+    }
+}
+
 struct TestDir(PathBuf);
 
 impl TestDir {

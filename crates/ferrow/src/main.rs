@@ -49,9 +49,15 @@ Build an index first, then search it:
   ferrow search \"report 2024\"
   ferrow search \"!tmp log\" --limit 20
 
-Query syntax: space = AND, !term = NOT, \"quoted phrase\" is literal,
-case:term is case-sensitive. Matching is a case-insensitive substring
-test on the file name by default.
+Query syntax: space = AND, | = OR, ! = NOT, <...> groups terms.
+\"quoted phrase\" is literal. Plain terms are case-insensitive substrings.
+Wildcards match the whole name: * = any run, ? = one Unicode scalar.
+Modifiers stack: case:, path:, wholeword:, file:, folder:, regex:.
+Filters: ext:txt;md, parent:\"/folder\", depth:2 (root depth is zero).
+Size, date and attribute filters are reserved for a later milestone.
+Quote the query for your shell, for example:
+  ferrow search \"*.log\"
+  ferrow search \"<report*|draft> !tmp\"
 
 The default index file lives in the platform data directory.
 ";
@@ -790,6 +796,10 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
             Ok(())
         }
         "index" => cmd_index(parse_args(&argv[1..])?),
+        "search" if argv.len() == 2 && matches!(argv[1].to_str(), Some("--help" | "-h")) => {
+            print!("{USAGE}");
+            Ok(())
+        }
         "search" => cmd_search(parse_args(&argv[1..])?),
         "stats" => cmd_stats(parse_args(&argv[1..])?),
         "status" => cmd_status(),

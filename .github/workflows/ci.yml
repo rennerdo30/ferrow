@@ -168,9 +168,27 @@ jobs:
           }
 
           fn main() -> Result<(), Box<dyn std::error::Error>> {
-              let args: Vec<_> = std::env::args().skip(1).collect();
+              let mut args: Vec<_> = std::env::args().skip(1).collect();
+              let legacy = args.last().is_some_and(|arg| arg == "--legacy-queries");
+              if legacy {
+                  args.pop();
+              }
               if args.len() != 5 {
-                  return Err("expected binary, index, kind, query, operation".into());
+                  return Err("expected binary, index, kind, query, operation [--legacy-queries]".into());
+              }
+              if legacy
+                  && args[2] != "load"
+                  && ![
+                      "a",
+                      "re",
+                      "report 2024",
+                      "!tmp log",
+                      "zzzz-no-hit-zzzz",
+                      "文書",
+                  ]
+                  .contains(&args[3].as_str())
+              {
+                  return Err("base probe accepts only legacy queries".into());
               }
               let path = std::path::Path::new(&args[1]);
               eprintln!(
@@ -333,6 +351,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           CARGO_TARGET_DIR="$RUNNER_TEMP/ferrow-base-target" FERROW_BENCH_ENTRIES=16 FERROW_BENCH_INDEX_PATH="$RUNNER_TEMP/ferrow-small-shared.bin" FERROW_MEASURES_ONLY=1 timeout -k 5s 120s cargo bench --manifest-path .bench-base/Cargo.toml -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
+          timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-small-shared.bin" --legacy-queries
           echo '## 16-entry chain smoke (latency outcomes informational)' >> "$GITHUB_STEP_SUMMARY"
           result=0
           timeout -k 5s 300s python3 scripts/bench-gate.py base-smoke.txt head-smoke.txt --measure --entries 16 \
@@ -360,11 +379,13 @@ jobs:
           timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-metadata.bin" modified 2>&1 | tee -a metadata-output.txt
           timeout -k 5s 120s target/release/examples/scan_cost "$RUNNER_TEMP/ferrow-scan-fixture" 2>&1 | tee -a metadata-output.txt
       - name: Write fixture profiling summary (separate from paired samples)
-        if: always() && github.event_name == 'pull_request'
+        if: always()
         run: ./scripts/bench-summary.sh fixture-output.txt
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
         run: |
+          # 26 legacy pairs use ABBA; 20 head-only observations run between
+          # head legacy samples (C), with excluded warm-ups and no base comparison.
           python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure --require-metadata --head-observations metadata-output.txt \
             --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
             --head-probe "$PWD/target/release/examples/latency_probe" \
