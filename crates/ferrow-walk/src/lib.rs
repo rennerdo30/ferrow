@@ -443,7 +443,12 @@ mod tests {
             Ok(()) => true,
             Err(e) => {
                 // Windows without Developer Mode refuses symlink
-                // creation; skip loudly instead of faking a pass.
+                // creation. That capability is present on GitHub CI, so
+                // a refusal there is a real failure, never a silent
+                // pass; locally the test reports the skip and returns.
+                if std::env::var_os("CI").is_some() {
+                    panic!("symlink creation refused on CI: {e}");
+                }
                 eprintln!("SKIP: symlink creation refused ({e}); test not run");
                 false
             }
@@ -669,7 +674,11 @@ mod tests {
         assert_eq!(idx.path(0), root);
     }
 
+    // APFS rejects non-UTF-8 names outright, so on macOS this is a
+    // real ignored test in CI output, not a silent pass. Everywhere
+    // else a creation error fails the test.
     #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore = "APFS rejects non-UTF-8 file names")]
     #[test]
     fn unix_root_with_invalid_utf8_name_is_lossless() {
         use std::os::unix::ffi::OsStringExt;
@@ -677,11 +686,7 @@ mod tests {
         let root = dir
             .0
             .join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'x']));
-        if let Err(e) = std::fs::create_dir_all(&root) {
-            // macOS (APFS) rejects non-UTF-8 names outright; skip loudly.
-            eprintln!("SKIP: non-UTF-8 directory creation refused ({e}); test not run");
-            return;
-        }
+        std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file.txt"), b"x").unwrap();
         let (idx, report) = scan(&WalkOptions {
             roots: vec![root.clone()],

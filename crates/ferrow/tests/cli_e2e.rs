@@ -92,7 +92,11 @@ fn cli_accepts_non_unicode_root_argument() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+// APFS rejects non-UTF-8 names outright, so on macOS this is a real
+// ignored test in CI output, not a silent pass. Everywhere else a
+// creation error fails the test.
 #[cfg(unix)]
+#[cfg_attr(target_os = "macos", ignore = "APFS rejects non-UTF-8 file names")]
 #[test]
 fn cli_accepts_non_unicode_root_argument() {
     use std::os::unix::ffi::OsStringExt;
@@ -103,11 +107,7 @@ fn cli_accepts_non_unicode_root_argument() {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let root = base.join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'x']));
-    if let Err(e) = std::fs::create_dir_all(&root) {
-        // macOS (APFS) rejects non-UTF-8 names outright; skip loudly.
-        eprintln!("SKIP: non-UTF-8 directory creation refused ({e}); test not run");
-        return;
-    }
+    std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("needle.txt"), b"x").unwrap();
     let index = base.join("index.bin");
     let out = Command::new(env!("CARGO_BIN_EXE_ferrow"))
