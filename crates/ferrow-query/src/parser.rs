@@ -53,34 +53,49 @@ pub enum Pattern {
     EntryType,
 }
 
+/// User regexes may nest groups this deep.
+const REGEX_NEST_LIMIT: u32 = 32;
+/// Bound for the normalised wholeword form: its HIR display adds
+/// non-capturing groups around concatenations, so it needs more depth
+/// than the user's source, but stays bounded.
+const NORMALISED_NEST_LIMIT: u32 = 4 * REGEX_NEST_LIMIT + 8;
+
 fn compile_regex(text: &str, case: bool, word: bool) -> Result<RegexPlan, String> {
-    let pattern = if word {
+    // `fold` is the default case-insensitivity applied to user syntax.
+    // The normalised wholeword form already has every case decision
+    // (defaults and inline flags) applied, so it is compiled with no
+    // default folding at all.
+    let (pattern, fold, nest) = if word {
         // Wrap the parsed form, not the raw text: in verbose mode
         // (`(?x)`) a `#` comment would otherwise swallow the closing
-        // group. The HIR's display is an equivalent pattern without
-        // comments or verbose whitespace.
+        // group. The user's syntax is validated at the normal depth;
+        // the generated form gets its own bound.
         let inner = regex_syntax::ParserBuilder::new()
             .case_insensitive(!case)
             .utf8(false)
-            .nest_limit(32)
+            .nest_limit(REGEX_NEST_LIMIT)
             .build()
             .parse(text)
             .map_err(|e| format!("invalid regex: {e}"))?;
-        format!(r"(?u:\b{{start-half}})(?:{inner})(?u:\b{{end-half}})")
+        (
+            format!(r"(?u:\b{{start-half}})(?:{inner})(?u:\b{{end-half}})"),
+            false,
+            NORMALISED_NEST_LIMIT,
+        )
     } else {
-        text.to_owned()
+        (text.to_owned(), !case, REGEX_NEST_LIMIT)
     };
     let compiled = RegexBuilder::new(&pattern)
-        .case_insensitive(!case)
+        .case_insensitive(fold)
         .size_limit(1 << 20)
         .dfa_size_limit(1 << 20)
-        .nest_limit(32)
+        .nest_limit(nest)
         .build()
         .map_err(|e| format!("invalid regex: {e}"))?;
     let hir = regex_syntax::ParserBuilder::new()
-        .case_insensitive(!case)
+        .case_insensitive(fold)
         .utf8(false)
-        .nest_limit(32)
+        .nest_limit(nest)
         .build()
         .parse(&pattern)
         .map_err(|e| format!("invalid regex: {e}"))?;

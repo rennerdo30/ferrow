@@ -572,3 +572,44 @@ fn wholeword_regex_keeps_verbose_mode_comments_valid() {
         assert_eq!(hits, oracle(&index, &query), "{text}");
     }
 }
+
+#[test]
+fn wholeword_regex_keeps_inline_case_flags() {
+    let b = IndexBuilder::new();
+    b.add_root(b"foo", 0);
+    b.add_root(b"FOO", 0);
+    b.add_root(b"FOObar", 0);
+    b.add_root(b"fooBAR", 0);
+    let index = b.freeze();
+    let cases: [(&str, Vec<u32>); 4] = [
+        (r#"wholeword:regex:"(?-i:foo)""#, vec![0]),
+        (r#"wholeword:regex:"(?i:foo)(?-i:bar)""#, vec![2]),
+        ("wholeword:regex:foo", vec![0, 1]),
+        ("case:wholeword:regex:(?i)foo", vec![0, 1]),
+    ];
+    for (text, expected) in cases {
+        let query = Query::parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        let mut hits = search(&index, &query, &SearchOptions::default()).hits;
+        hits.sort_unstable();
+        assert_eq!(hits, expected, "{text}");
+    }
+    let query = Query::parse(r#"wholeword:regex:"(?-i:foo)""#).unwrap();
+    assert!(ferrow_query::highlight_ranges(&query, b"FOO").is_empty());
+    assert_eq!(ferrow_query::highlight_ranges(&query, b"foo"), vec![0..3]);
+}
+
+#[test]
+fn wholeword_regex_accepts_previously_valid_nesting() {
+    let b = IndexBuilder::new();
+    b.add_root(b"abbbbbbbb", 0);
+    let index = b.freeze();
+    let query = Query::parse(r#"case:wholeword:regex:"((((((((ab)?b)?b)?b)?b)?b)?b)?b)?""#)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(
+        search(&index, &query, &SearchOptions::default()).hits,
+        vec![0]
+    );
+    // Genuinely over-limit user nesting is still a parse error.
+    let deep = format!("wholeword:regex:{}a{}", "(".repeat(40), ")".repeat(40));
+    assert!(Query::parse(&deep).is_err());
+}
