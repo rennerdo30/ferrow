@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location("gate", Path(__file__).with_name("bench-gate.py"))
 gate = importlib.util.module_from_spec(spec)
@@ -27,15 +29,28 @@ def without_service(text):
 
 class GateTests(unittest.TestCase):
     def setUp(self):
-        self.base = gate.parse(fixture())
-        self.head = copy.deepcopy(self.base)
+        self.base = gate.parse(fixture(language=False), require_new=False)
+        self.head = gate.parse(fixture())
 
     def rows(self):
         return gate.compare(self.base, self.head, 16)
 
     def test_metric_inventory_includes_twenty_required_language_observations(self):
+        self.assertEqual(gate.PAIRED_METRICS, 26)
         self.assertEqual(gate.EXPECTED_METRICS, 46)
-        self.assertEqual(len(self.rows()), 46)
+        rows = self.rows()
+        self.assertEqual(sum(row[1] is not None for row in rows), 26)
+        self.assertEqual(sum(row[1] is None for row in rows), 20)
+        # Refuse each missing scalar, query operation, count or entire query,
+        # in either arm. A shared omission cannot shrink the paired inventory.
+        for language in (False, True):
+            lines = fixture(language).splitlines()
+            for i, line in enumerate(lines):
+                for omitted in [line] + line.split()[1:]:
+                    broken = lines.copy()
+                    broken[i] = line.replace(omitted, "", 1)
+                    with self.subTest(language=language, omitted=omitted), self.assertRaises((ValueError, KeyError)):
+                        gate.parse("\n".join(broken), require_new=language)
 
     def test_legacy_baseline_accepts_only_explicit_legacy_queries(self):
         base = gate.parse(fixture(language=False), require_new=False)
@@ -66,7 +81,7 @@ class GateTests(unittest.TestCase):
         self.head[2]["*.log"]["total_hits"] = 3
         with self.assertRaises(ValueError):
             self.rows()
-        self.head = copy.deepcopy(self.base)
+        self.head = gate.parse(fixture())
         for readings in self.head[1:]:
             readings["*.log"].update(page_hits=0, total_hits=200)
         with self.assertRaises(ValueError):
@@ -88,7 +103,7 @@ class GateTests(unittest.TestCase):
         for query in gate.QUERIES:
             for metric in ("first_page_ms", "full_count_ms"):
                 with self.subTest(query=query, metric=metric):
-                    head = copy.deepcopy(self.base)
+                    head = copy.deepcopy(self.head)
                     head[1][query][metric] += 2
                     self.assertTrue(any(row[-1] for row in gate.compare(self.base, head, 16)))
 
@@ -118,6 +133,174 @@ class GateTests(unittest.TestCase):
         self.head[2]["a"]["full_count_ms"] = 12
         self.assertTrue(any(row[-1] for row in self.rows()))
         self.assertEqual(len(self.rows()), gate.EXPECTED_METRICS)
+
+    def test_retry_only_failed_latency_once_paired(self):
+        self.head[2]["report 2024"]["first_page_ms"] = 4
+        calls = []
+        def measure(*args):
+            calls.append(args)
+            return (1 if args[0] == "base" else 1.05), 2, 42, 800, 16
+        rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
+        self.assertFalse(any(row[-1] for row in rows))
+        self.assertEqual([call[0] for call in calls], ["base", "head", "base", "head", "head", "base", "base", "head", "head", "base", "base", "head"])
+        self.assertTrue(all(call[1:] == ("IPC", "report 2024", "first_page_ms") for call in calls))
+        calls.clear()
+        self.head[0]["heap_bytes"] = 1000
+        self.assertTrue(any(row[-1] for row in gate.retry_failures(self.rows(), self.base, self.head, measure)))
+        self.assertEqual(calls, [])
+
+    def test_retry_repeat_breach_fails_and_bad_evidence_refuses(self):
+        self.head[0]["load_ms_median"] = 200
+        rows = gate.retry_failures(self.rows(), self.base, self.head,
+                                   lambda arm, *_: (100 if arm == "base" else 111, 16, 0, 800, 16))
+        self.assertTrue(any(row[-1] for row in rows))
+        for bad in ((float("nan"), 16), (100, 17), (-1, 16)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: (*bad, 0, 800, 16))
+
+    def test_retry_pass_does_not_run_producers(self):
+        def unexpected(*_):
+            self.fail("passing metrics must not be remeasured")
+        self.assertEqual(gate.retry_failures(self.rows(), self.base, self.head, unexpected), self.rows())
+
+    def test_interleaved_samples_exclude_warmups_and_take_medians(self):
+        calls, trace = [], []
+        values = {"base": iter([999, 1, 50, 2, 100, 3]), "head": iter([999, 2, 60, 3, 90, 4])}
+        def measure(arm, *_):
+            calls.append(arm)
+            return next(values[arm]), 2, 42, 800, 16
+        result = gate.interleaved(measure, "IPC", "a", "first_page_ms", trace=trace)
+        self.assertEqual(calls, ["base", "head", "base", "head", "head", "base", "base", "head", "head", "base", "base", "head"])
+        self.assertEqual((result["base"][0], result["head"][0]), (3, 4))
+        self.assertIn("warm A warm B A B B A A B B A A B", trace[0])
+
+    def test_every_interleaved_sample_must_keep_counts_and_content(self):
+        for slot in (1, 2, 4):
+            calls = 0
+            def measure(*_):
+                nonlocal calls
+                calls += 1
+                sample = [1, 2, 42, 800, 16]
+                if calls == 3:
+                    sample[slot] += 1
+                return tuple(sample)
+            with self.subTest(slot=slot), self.assertRaises(ValueError):
+                gate.interleaved(measure, "IPC", "a", "first_page_ms")
+            self.assertEqual(calls, 3)
+
+    def test_initial_interleaved_measurement_produces_all_46_metrics(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = SimpleNamespace(base=Path(folder)/"base.txt", head=Path(folder)/"head.txt",
+                                   base_index=Path(folder)/"fixture", head_index=Path(folder)/"fixture", entries=16)
+            calls, trace = [], []
+            def measure(arm, kind, query, operation):
+                calls.append((arm, kind, query, operation))
+                return 1, 16 if kind == "load" else 2, 42, 800, 16
+            gate.measure_pair(args, measure, trace)
+            rows = gate.compare(gate.parse(args.base.read_text(encoding="utf-8"), require_new=False), gate.parse(args.head.read_text(encoding="utf-8")), 16)
+            self.assertEqual(len(rows), 46)
+            self.assertFalse(any(row[-1] for row in rows))
+            self.assertEqual(len(trace), 25)
+            self.assertEqual(len(calls), 8 + 24*12 + 20*6)
+            self.assertTrue(all(arm == "head" or kind == "load" or query in gate.QUERIES
+                                for arm, kind, query, _ in calls))
+            for query in gate.NEW_QUERIES:
+                for kind in ("IPC", "in-process"):
+                    for operation in ("first_page_ms", "full_count_ms"):
+                        self.assertEqual(calls.count(("head", kind, query, operation)), 6)
+            args.head_index = Path(folder)/"different-fixture"
+            with self.assertRaises(ValueError):
+                gate.measure_pair(args, measure, trace)
+
+    def test_head_only_samples_are_interleaved_warmed_and_validated(self):
+        calls = []
+        values = iter([999, 1, 50, 2, 100, 3])
+        def measure(arm, kind, query, operation):
+            calls.append((arm, query))
+            return (next(values), 3, 99, 800, 16) if query == "*.log" else (1, 2, 42, 800, 16)
+        result = gate.interleaved(measure, "IPC", "a", "first_page_ms",
+                                  observation=("IPC", "*.log", "first_page_ms"))
+        a, b, c = ("base", "a"), ("head", "a"), ("head", "*.log")
+        self.assertEqual(calls, [a,b,c, a,b,c, c,b,a, a,b,c, c,b,a, a,b,c])
+        self.assertEqual(result["observation"][0], 3)
+        for slot in (0, 1, 2, 3, 4):
+            observed = 0
+            def broken(arm, kind, query, operation):
+                nonlocal observed
+                sample = [1, 2, 42, 800, 16]
+                if query == "*.log":
+                    observed += 1
+                    if observed == 3:
+                        sample[slot] = float("nan") if slot == 0 else sample[slot] + 1
+                return tuple(sample)
+            with self.subTest(slot=slot), self.assertRaises(ValueError):
+                gate.interleaved(broken, "IPC", "a", "first_page_ms",
+                                 observation=("IPC", "*.log", "first_page_ms"))
+
+    def test_observation_failure_never_compares_or_retries_against_base(self):
+        # The absolute limit also holds when the fixture has fewer than 100 hits.
+        self.head[1]["*.log"]["first_page_ms"] = 16.001
+        original = self.rows()
+        with patch.object(gate, "interleaved") as retry:
+            self.assertEqual(gate.retry_failures(original, self.base, self.head, None), original)
+            retry.assert_not_called()
+        self.head[2]["a"]["first_page_ms"] = 4
+        calls = []
+        def measure(arm, kind, query, operation):
+            calls.append((arm, kind, query, operation))
+            return 1, 2, 42, 800, 16
+        rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
+        self.assertTrue(any(row[-1] for row in rows))
+        self.assertEqual(len(calls), 12)
+        self.assertTrue(all(call[2] == "a" for call in calls))
+        self.assertEqual([row for row in rows if row[1] is None],
+                         [row for row in original if row[1] is None])
+
+    def test_probe_enforces_legacy_only_base(self):
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
+        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt)) as run:
+            gate.probe(args, "base", "IPC", "a", "first_page_ms")
+            self.assertEqual(run.call_args.args[0][-1], "--legacy-queries")
+            for kind in ("IPC", "in-process"):
+                for query in gate.NEW_QUERIES:
+                    with self.subTest(kind=kind, query=query), self.assertRaises(ValueError):
+                        gate.probe(args, "base", kind, query, "first_page_ms")
+            self.assertEqual(run.call_count, 1)
+
+    def test_main_retries_with_legacy_only_base_and_preserves_observations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
+            base.write_text(fixture(language=False), encoding="utf-8")
+            head.write_text(fixture().replace("load_ms_median=100", "load_ms_median=200"), encoding="utf-8")
+            argv = ["bench-gate.py", str(base), str(head), "--entries", "16"]
+            for arm in ("base", "head"):
+                for field in ("probe", "binary", "index"):
+                    argv += [f"--{arm}-{field}", "dummy"]
+            with patch.object(sys, "argv", argv), patch.object(gate, "publish") as publish, \
+                    patch.object(gate, "probe", side_effect=lambda *args: (100, 16, 0, 800, 16)) as probe:
+                self.assertEqual(gate.main(), 0)
+                self.assertEqual(probe.call_count, 8)
+                self.assertIn("One paired latency remeasurement", publish.call_args.args[0])
+                self.assertIn("new-language", publish.call_args.args[0])
+
+    def test_retry_producer_failure_and_timeout_are_not_retry_passes(self):
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
+        for error in (subprocess.CalledProcessError(42, "probe"), subprocess.TimeoutExpired("probe", 120)):
+            with self.subTest(error=error), patch.object(gate.subprocess, "run", side_effect=error) as run:
+                with self.assertRaises(subprocess.SubprocessError):
+                    gate.probe(args, "base", "IPC", "a", "first_page_ms")
+                self.assertEqual(run.call_count, 1)
+                self.assertTrue(run.call_args.kwargs["check"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 120)
+
+    def test_retry_receipt_must_be_complete_finite_and_unique(self):
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
+        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
+        for stdout in ("", receipt*2, receipt.replace("value_ms=1", "value_ms=NaN"), "FERROW-RETRY value_ms=1\n"):
+            with self.subTest(stdout=stdout), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+                with self.assertRaises((ValueError, KeyError)):
+                    gate.probe(args, "base", "IPC", "a", "first_page_ms")
 
     def test_service_set_is_required_in_every_arm(self):
         # Missing in one arm, in both arms, or only partly present: refused.
