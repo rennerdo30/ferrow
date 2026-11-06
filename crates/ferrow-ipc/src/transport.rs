@@ -12,7 +12,10 @@
 //!   (M2c), never from anything the client claims.
 //!
 //! Caller identity comes only from the OS: Windows
-//! `GetNamedPipeClientProcessId` plus the client token's user SID,
+//! a retained effective token obtained by impersonating the last pipe read;
+//! `GetNamedPipeClientProcessId` is diagnostic only. Clients use static
+//! identification tracking. Capture refreshes after each successful read,
+//! before a complete frame is dispatched, and errors fail closed.
 //! Linux `SO_PEERCRED`, macOS `getpeereid`.
 
 use std::io::{Read, Write};
@@ -123,12 +126,31 @@ impl std::fmt::Display for Endpoint {
 /// platform cannot provide stay `None`; `pid` is present on
 /// Windows and Linux, `uid`/`gid` on Unix, `user_sid` (the token
 /// user, e.g. `S-1-5-21-…`) on Windows.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CallerIdentity {
     pub pid: Option<u32>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub user_sid: Option<String>,
+    #[cfg(windows)]
+    token: Option<std::sync::Arc<std::os::windows::io::OwnedHandle>>,
+}
+
+impl CallerIdentity {
+    /// Owned effective token from the last successful pipe read; absent before
+    /// reading and on any capture failure. Retains groups and restrictions for M2c.
+    #[cfg(windows)]
+    pub fn access_token(&self) -> Option<&std::os::windows::io::OwnedHandle> {
+        self.token.as_deref()
+    }
+
+    pub fn current() -> std::io::Result<Self> {
+        platform::current_identity()
+    }
+
+    pub fn is_system_administrator(&self) -> bool {
+        platform::is_privileged(self)
+    }
 }
 
 #[cfg(unix)]
@@ -272,6 +294,20 @@ mod platform {
         fn flush(&mut self) -> std::io::Result<()> {
             self.inner.flush()
         }
+    }
+
+    pub fn current_identity() -> std::io::Result<CallerIdentity> {
+        // SAFETY: credential getters have no preconditions or output pointers.
+        Ok(CallerIdentity {
+            uid: Some(unsafe { libc::geteuid() }),
+            gid: Some(unsafe { libc::getegid() }),
+            pid: Some(std::process::id()),
+            user_sid: None,
+        })
+    }
+
+    pub fn is_privileged(caller: &CallerIdentity) -> bool {
+        caller.uid == Some(0)
     }
 
     #[cfg(target_os = "linux")]
@@ -425,29 +461,33 @@ mod platform {
         ))
     }
 
-    /// Best-effort user SID string from the client process token.
-    /// The pid stays authoritative when this fails (for example
-    /// for a protected process).
     fn token_user_sid(pid: u32) -> Option<String> {
-        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-        use windows_sys::Win32::Security::{TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::Security::TOKEN_QUERY;
         use windows_sys::Win32::System::Threading::{
             OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
         };
-        // SAFETY: returns a handle we own and close, or null.
+        // SAFETY: used only for the current process, not peer authorization.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
             return None;
         }
-        let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: `process` is live; `token` is a live output.
+        let mut token = std::ptr::null_mut();
+        // SAFETY: live owned process handle and output; close exactly once.
         let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) };
-        // SAFETY: `process` is owned here and closed once.
+        // SAFETY: unique process handle, no longer used.
         unsafe { CloseHandle(process) };
-        if ok == 0 || token.is_null() {
+        if ok == 0 {
             return None;
         }
-        let sid = token_user(token).and_then(|buf| {
+        // SAFETY: token handle ownership returned above transfers to OwnedHandle.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        token_sid(token.as_raw_handle())
+    }
+
+    fn token_sid(token: HANDLE) -> Option<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::TOKEN_USER;
+        token_user(token).and_then(|buf| {
             let _ = &buf;
             // SAFETY: GetTokenInformation initialized at least TOKEN_USER bytes.
             // Vec<usize> provides TOKEN_USER's pointer alignment, and `buf`
@@ -471,10 +511,129 @@ mod platform {
             // SAFETY: frees the string allocated by the convert call.
             unsafe { LocalFree(text.cast()) };
             Some(out)
-        });
-        // SAFETY: `token` is owned here and closed once.
-        unsafe { CloseHandle(token) };
-        sid
+        })
+    }
+
+    fn owned_identity(token: OwnedHandle, pid: Option<u32>) -> std::io::Result<CallerIdentity> {
+        let sid = token_sid(token.as_raw_handle()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot query effective caller token",
+            )
+        })?;
+        Ok(CallerIdentity {
+            pid,
+            user_sid: Some(sid),
+            token: Some(Arc::new(token)),
+            ..Default::default()
+        })
+    }
+
+    pub fn current_identity() -> std::io::Result<CallerIdentity> {
+        use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = std::ptr::null_mut();
+        // SAFETY: pseudo-handle is valid; output is owned on success.
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &raw mut token,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        // SAFETY: takes sole ownership of the newly returned token handle.
+        owned_identity(
+            unsafe { OwnedHandle::from_raw_handle(token) },
+            Some(std::process::id()),
+        )
+    }
+
+    pub fn is_privileged(caller: &CallerIdentity) -> bool {
+        use windows_sys::Win32::Security::{
+            CheckTokenMembership, CreateWellKnownSid, IsTokenRestricted,
+            WinBuiltinAdministratorsSid,
+        };
+        let Some(token) = caller.access_token() else {
+            return false;
+        };
+        // SAFETY: valid retained token; restricted tokens are conservatively refused.
+        if unsafe { IsTokenRestricted(token.as_raw_handle()) } != 0 {
+            return false;
+        }
+        if caller.user_sid.as_deref() == Some("S-1-5-18") {
+            return true;
+        }
+        let mut sid = [0usize; 16];
+        let mut len = std::mem::size_of_val(&sid) as u32;
+        let mut member = 0;
+        // SAFETY: aligned SID buffer (128 bytes > SECURITY_MAX_SID_SIZE), valid
+        // impersonation token and output; failed checks never authorize.
+        unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAdministratorsSid,
+                std::ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &raw mut len,
+            ) != 0
+                && CheckTokenMembership(
+                    token.as_raw_handle(),
+                    sid.as_mut_ptr().cast(),
+                    &raw mut member,
+                ) != 0
+                && member != 0
+        }
+    }
+
+    fn capture_identity(handle: HANDLE, pid: Option<u32>) -> std::io::Result<CallerIdentity> {
+        use windows_sys::Win32::Security::{
+            DuplicateToken, RevertToSelf, SecurityIdentification, TOKEN_DUPLICATE, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                // SAFETY: only created following successful impersonation. A
+                // failed revert must never permit subsequent work in this context.
+                if unsafe { RevertToSelf() } == 0 {
+                    std::process::abort();
+                }
+            }
+        }
+        // SAFETY: called only after reading from this connected server pipe.
+        if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
+            return Err(last_error());
+        }
+        let revert = Revert;
+        let mut token = std::ptr::null_mut();
+        // SAFETY: current impersonating thread; query output is owned on success.
+        if unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                1,
+                &raw mut token,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        // SAFETY: unique owned token handle from OpenThreadToken.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut copy = std::ptr::null_mut();
+        // SAFETY: duplicate preserves effective groups/restrictions independently
+        // of subsequent client changes; identification suffices for access checks.
+        if unsafe { DuplicateToken(token.as_raw_handle(), SecurityIdentification, &raw mut copy) }
+            == 0
+        {
+            return Err(last_error());
+        }
+        drop(revert);
+        // SAFETY: duplicate returned unique ownership of this valid token handle.
+        owned_identity(unsafe { OwnedHandle::from_raw_handle(copy) }, pid)
     }
 
     fn token_user(token: HANDLE) -> Option<Vec<usize>> {
@@ -508,7 +667,7 @@ mod platform {
             pid: Some(pid),
             uid: None,
             gid: None,
-            user_sid: token_user_sid(pid),
+            ..Default::default()
         })
     }
 
@@ -618,7 +777,9 @@ mod platform {
                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                         std::ptr::null(),
                         OPEN_EXISTING,
-                        FILE_FLAG_OVERLAPPED,
+                        FILE_FLAG_OVERLAPPED
+                            | windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT
+                            | windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION,
                         std::ptr::null_mut(),
                     )
                 };
@@ -739,6 +900,14 @@ mod platform {
                     )
                 }
             });
+            if let Ok(n) = result
+                && n > 0
+                && self.caller.is_some()
+            {
+                let pid = self.caller.as_ref().and_then(|c| c.pid);
+                self.caller = None; // token-query failure must not retain an earlier grant
+                self.caller = Some(capture_identity(self.raw(), pid)?);
+            }
             match result {
                 Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => Ok(0),
                 other => other.map(|n| n as usize),
@@ -949,7 +1118,9 @@ impl Listener {
         Ok(Listener(platform::Listener::bind(endpoint)?))
     }
 
-    /// Accept one connection, with the caller's OS identity.
+    /// Accept a connection. On Windows the returned identity is diagnostic only:
+    /// authorization must use `stream.caller()` after reading a complete frame.
+    /// The stream retains the effective token and clears it on capture failure.
     pub fn accept(&self) -> std::io::Result<(Stream, CallerIdentity)> {
         let (stream, caller) = self.0.accept()?;
         Ok((Stream(stream), caller))

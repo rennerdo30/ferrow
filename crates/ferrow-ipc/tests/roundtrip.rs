@@ -82,6 +82,32 @@ fn incomplete_frames_expire_at_a_total_deadline() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn identity_is_captured_only_after_reading_client_data() {
+    use std::io::{Read, Write};
+    let endpoint = test_endpoint("identity");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, diagnostic) = listener.accept().unwrap();
+        assert!(
+            diagnostic.user_sid.is_none(),
+            "primary process token was treated as caller identity"
+        );
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        let caller = stream.caller().unwrap();
+        assert_eq!(
+            caller.user_sid,
+            ferrow_ipc::CallerIdentity::current().unwrap().user_sid
+        );
+        assert!(caller.access_token().is_some());
+    });
+    let mut stream = Stream::connect(&endpoint).unwrap();
+    stream.write_all(&[1]).unwrap();
+    server.join().unwrap();
+}
+
 #[test]
 fn refusal_cleanup_does_not_wait_for_a_reader() {
     let endpoint = test_endpoint("nonreader");
@@ -168,10 +194,6 @@ fn client_server_round_trip_and_caller_identity() {
                 Some(std::process::id()),
                 "caller identity: {caller:?}"
             );
-        }
-        if cfg!(windows) {
-            let sid = caller.user_sid.as_deref().unwrap_or_default();
-            assert!(sid.starts_with("S-1-"), "token user SID: {caller:?}");
         }
         if cfg!(unix) {
             assert!(caller.uid.is_some(), "caller identity: {caller:?}");
