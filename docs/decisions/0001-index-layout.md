@@ -106,8 +106,8 @@ or a concurrent save never leaves a half-written index at the target
 path and no unrelated sibling file is touched.
 
 The load total covers file open and metadata through temporary payload disposal
-and file close. CRC-32 is a hand-written, table-driven implementation with no
-dependency. Cached-read measurements show checksum work can dominate load;
+and file close. CRC-32 uses `crc32fast` (MIT OR Apache-2.0), preserving the IEEE
+polynomial and version-1 bytes with runtime hardware selection and a portable fallback. Cached-read measurements show checksum work can dominate load;
 they do not establish disk throughput. Accelerating the same IEEE CRC is
 format-compatible; changing checksum semantics requires a format-version bump.
 

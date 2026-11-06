@@ -121,33 +121,10 @@ impl fmt::Display for LoadError {
 }
 impl std::error::Error for LoadError {}
 
-// CRC-32 (IEEE 802.3, reflected) with a const-generated table.
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB88320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
+// IEEE CRC-32, unchanged on disk. crc32fast (MIT OR Apache-2.0)
+// selects hardware acceleration when available, with a portable fallback.
 fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in data {
-        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    !c
+    crc32fast::hash(data)
 }
 
 pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
@@ -1001,5 +978,19 @@ mod tests {
     #[test]
     fn crc32_known_vector() {
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
+        assert_eq!(crc32(b""), 0);
+        // Independent bit-at-a-time IEEE oracle: exercise hardware-sized
+        // inputs, tails and unaligned slices without timing or load loops.
+        let data: Vec<u8> = (0..513).map(|i| (i * 37) as u8).collect();
+        for bytes in [&data[..], &data[1..], &data[3..510], &data[..17]] {
+            let mut expected = !0u32;
+            for &b in bytes {
+                expected ^= u32::from(b);
+                for _ in 0..8 {
+                    expected = (expected >> 1) ^ (0xEDB88320 & 0u32.wrapping_sub(expected & 1));
+                }
+            }
+            assert_eq!(crc32(bytes), !expected);
+        }
     }
 }

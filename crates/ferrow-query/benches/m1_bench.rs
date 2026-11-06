@@ -168,7 +168,7 @@ fn full_count(bencher: divan::Bencher, text: &str) {
 }
 
 fn main() {
-    println!("FERROW-ACTIVE query=sorted-blocks crc=ieee-table derived=per-name freeze=per-name");
+    println!("FERROW-ACTIVE query=sorted-blocks crc=crc32fast derived=per-name freeze=per-name");
     measures();
     divan::main();
 }
