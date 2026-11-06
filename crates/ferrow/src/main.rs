@@ -36,9 +36,32 @@ test on the file name by default.
 The default index file lives in the platform data directory.
 ";
 
+/// Default index file in the platform per-user data directory.
+///
+/// Hand-rolled from environment variables instead of a `directories`
+/// dependency: that crate's tree pulls in an MPL-2.0 crate, and Ferrow
+/// only allows permissive licences (see `deny.toml`).
 fn default_index_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "ferrow")?;
-    Some(dirs.data_dir().join("index.bin"))
+    let data_dir: PathBuf = if cfg!(windows) {
+        // %LOCALAPPDATA%\ferrow
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("ferrow")
+    } else if cfg!(target_os = "macos") {
+        // ~/Library/Application Support/ferrow
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join("Library")
+            .join("Application Support")
+            .join("ferrow")
+    } else {
+        // $XDG_DATA_HOME/ferrow or ~/.local/share/ferrow
+        match std::env::var_os("XDG_DATA_HOME") {
+            Some(x) if !x.is_empty() => PathBuf::from(x).join("ferrow"),
+            _ => PathBuf::from(std::env::var_os("HOME")?)
+                .join(".local")
+                .join("share")
+                .join("ferrow"),
+        }
+    };
+    Some(data_dir.join("index.bin"))
 }
 
 struct Args {
