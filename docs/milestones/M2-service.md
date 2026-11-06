@@ -19,6 +19,7 @@ Each package gets its own branch and PR, stacked in this order. Each one is revi
 - **Windows transport:** a named pipe `\\.\pipe\ferrowd` with an explicit security descriptor. The service account and administrators get full control; authenticated users may connect, read and write. Remote clients are rejected (`PIPE_REJECT_REMOTE_CLIENTS`).
 - **Unix transport:** Linux `/run/ferrow/ferrowd.sock`, macOS `/private/var/run/ferrow/ferrowd.sock` (the real directory behind `/var/run`). System endpoint directories are root-owned 0755; development endpoints live in a uid-owned 0700 directory under the canonical temporary directory. Ancestors must be trusted and not writable by others, except root-owned sticky temporary ancestors. Symlinked ancestors are refused. A lifetime lease serializes binds; only owned, stale sockets can be reclaimed, and drop unlinks only the original socket inode.
 - **Caller identity comes from the OS, never from the client's own claim:**
+- **Unix server authentication:** before Hello, clients validate the socket directory and its ancestors, then check the connected server's OS peer uid: root for the system endpoint, current effective uid for development. The directory must have that same owner and no other writers. Failure is a connection refusal with a reason, allowing the CLI's explained in-process fallback.
   - Windows: `GetNamedPipeClientProcessId`, then the client token (or `ImpersonateNamedPipeClient`).
   - Linux: `SO_PEERCRED`.
   - macOS: `getpeereid` / `LOCAL_PEERCRED`.

@@ -30,6 +30,10 @@ mod unix_security;
 #[path = "unix_connect.rs"]
 mod unix_connect;
 
+#[cfg(any(unix, test))]
+#[path = "server_policy.rs"]
+mod server_policy;
+
 /// Where a service listens and clients connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -283,7 +287,18 @@ mod platform {
             endpoint: &Endpoint,
             deadline: std::time::Instant,
         ) -> std::io::Result<Stream> {
+            // Authenticate before Hello or query bytes. System servers belong
+            // to root; development servers belong to the current effective uid.
+            let expected = if *endpoint == Endpoint::default_service() {
+                0
+            } else {
+                // SAFETY: geteuid has no preconditions.
+                unsafe { libc::geteuid() }
+            };
+            super::unix_security::client_directory(&endpoint.path, expected)?;
             let inner = super::unix_connect::connect(&endpoint.path, deadline)?;
+            super::server_policy::server_uid(expected, peer_identity(&inner)?.uid)?;
+            super::unix_security::client_directory(&endpoint.path, expected)?;
             Ok(Stream {
                 inner,
                 caller: None,
@@ -1217,6 +1232,7 @@ impl Stream {
         endpoint: &Endpoint,
         deadline: std::time::Instant,
     ) -> std::io::Result<Stream> {
+        remaining(deadline)?;
         Ok(Stream(platform::Stream::connect(endpoint, deadline)?))
     }
 
