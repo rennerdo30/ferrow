@@ -172,12 +172,10 @@ fn cancellation_stops_and_is_reported() {
     assert_eq!(got.visited, 0);
 }
 
-/// Deterministic cancellation: the `on_block` hook cancels the token
-/// after the first block, so the search must stop before the second
-/// block — cancelled flag set, exactly one block visited, and the hits
-/// are exactly the reference hits inside that first block.
+/// Cancellation after the first chunk admits at most one chunk per worker.
+/// The result remains an exact prefix of the independent ordered oracle.
 #[test]
-fn cancellation_after_first_chunk_stops_before_second() {
+fn cancellation_after_first_chunk_bounds_admitted_work() {
     let index = generate(100_000, 11);
     assert!(index.len() > ferrow_query::BLOCK, "fixture needs 2+ blocks");
     let query = Query::parse("a").unwrap();
@@ -197,12 +195,8 @@ fn cancellation_after_first_chunk_stops_before_second() {
         },
     );
     assert!(got.cancelled, "cancellation was not reported");
-    assert_eq!(
-        got.visited,
-        ferrow_query::BLOCK,
-        "extra work past the first block: visited {}",
-        got.visited
-    );
+    assert!(got.visited >= ferrow_query::BLOCK);
+    assert!(got.visited <= ferrow_query::BLOCK * rayon::current_num_threads());
     // Correct prefix: reference hits restricted to the first block.
     let first_block: std::collections::HashSet<u32> = index.sorted()[..ferrow_query::BLOCK]
         .iter()
@@ -212,7 +206,11 @@ fn cancellation_after_first_chunk_stops_before_second() {
         .into_iter()
         .filter(|id| first_block.contains(id))
         .collect();
-    assert_eq!(got.hits, want);
+    assert!(got.hits.starts_with(&want));
+    assert_eq!(
+        got.hits,
+        reference_search(&index, &query, None)[..got.hits.len()]
+    );
 }
 
 /// `limit` must stop the scan early: the visited counter proves the
@@ -229,7 +227,7 @@ fn limit_stops_early_and_reports_visited() {
         },
     );
     assert_eq!(got.hits.len(), 10);
-    assert_eq!(got.visited, ferrow_query::BLOCK);
+    assert!(got.visited <= ferrow_query::BLOCK * rayon::current_num_threads());
     assert!(got.visited < index.len());
     // Without a limit everything is visited.
     let got = search(
@@ -239,4 +237,74 @@ fn limit_stops_early_and_reports_visited() {
     );
     assert_eq!(got.visited, index.len());
     assert!(got.hits.is_empty());
+}
+
+/// A channel pauses an admitted stage until a replacement query cancels it.
+/// No CPU load or timing race is needed to establish mid-scan cancellation.
+#[test]
+fn replacement_query_cancels_in_flight_within_two_seconds() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+    let index = Arc::new(generate(20_000, 11));
+    let session = ferrow_query::QuerySession::default();
+    let old = session.start();
+    let (started_tx, started) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let released = Mutex::new(released);
+    let (done_tx, done) = mpsc::channel();
+    let old_index = index.clone();
+    let worker = std::thread::spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let result = pool.install(|| {
+            search(
+                &old_index,
+                &Query::parse("a").unwrap(),
+                &SearchOptions {
+                    cancel: old,
+                    on_block: Some(Arc::new(move |chunk| {
+                        if chunk == 0 {
+                            started_tx.send(()).unwrap();
+                            let _ = released
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(2));
+                        }
+                    })),
+                    ..SearchOptions::default()
+                },
+            )
+        });
+        done_tx.send(result).unwrap();
+    });
+    started.recv_timeout(Duration::from_secs(2)).unwrap();
+    let t = Instant::now();
+    let current = session.start();
+    release.send(()).unwrap();
+    let old_result = done.recv_timeout(Duration::from_secs(2));
+    worker.join().unwrap();
+    let old_result = old_result.expect("old query did not cancel within 2 seconds");
+    assert!(t.elapsed() < Duration::from_secs(2));
+    assert!(old_result.cancelled);
+    assert!(old_result.visited <= 2 * ferrow_query::BLOCK);
+    assert_eq!(
+        old_result.hits,
+        reference_search(&index, &Query::parse("a").unwrap(), None)[..old_result.hits.len()]
+    );
+    let result = search(
+        &index,
+        &Query::parse("re").unwrap(),
+        &SearchOptions {
+            cancel: current,
+            limit: Some(100),
+            ..SearchOptions::default()
+        },
+    );
+    assert!(!result.cancelled);
+    assert_eq!(
+        result.hits,
+        reference_search(&index, &Query::parse("re").unwrap(), Some(100))
+    );
 }

@@ -121,33 +121,10 @@ impl fmt::Display for LoadError {
 }
 impl std::error::Error for LoadError {}
 
-// CRC-32 (IEEE 802.3, reflected) with a const-generated table.
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 {
-                0xEDB88320 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
+// IEEE CRC-32, unchanged on disk. crc32fast (MIT OR Apache-2.0)
+// selects hardware acceleration when available, with a portable fallback.
 fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in data {
-        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
-    }
-    !c
+    crc32fast::hash(data)
 }
 
 pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
@@ -282,6 +259,10 @@ pub struct LoadTimings {
     pub total: Duration,
     /// Reading the header and payload from the source.
     pub read: Duration,
+    /// Reserving and initializing the payload buffer, excluding I/O.
+    pub buffer: Duration,
+    /// Releasing the payload buffer after decoding and validation.
+    pub cleanup: Duration,
     /// CRC-32 over the payload.
     pub checksum: Duration,
     /// Decoding columns and arenas out of the payload bytes.
@@ -292,13 +273,23 @@ pub struct LoadTimings {
     /// Derived-data validation: folded-arena consistency and
     /// adjacent sort-order checks (parallel, in chunks).
     pub derived: Duration,
+    /// Disjoint subspans of `derived`; do not add the parent again.
+    pub derived_fold: Duration,
+    pub derived_sort: Duration,
 }
 
 impl LoadTimings {
     /// Total time not covered by the named parts.
     pub fn unattributed(&self) -> Duration {
-        self.total
-            .saturating_sub(self.read + self.checksum + self.decode + self.structure + self.derived)
+        self.total.saturating_sub(
+            self.read
+                + self.buffer
+                + self.cleanup
+                + self.checksum
+                + self.decode
+                + self.structure
+                + self.derived,
+        )
     }
 }
 
@@ -344,16 +335,20 @@ fn load_from<R: std::io::Read>(
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
     let total = usize::try_from(expected).map_err(|_| LoadError::Corrupt("size overflow"))?;
+    let t = Instant::now();
     data.try_reserve_exact(total - data.len())
         .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
     data.resize(total, 0);
+    timings.buffer += t.elapsed();
     let t = Instant::now();
     reader
         .read_exact(&mut data[head_len..])
         .map_err(LoadError::Io)?;
     timings.read += t.elapsed();
     let index = from_bytes_inner(&data, &mut timings)?;
+    let t = Instant::now();
     drop(data);
+    timings.cleanup += t.elapsed();
     timings.total = started.elapsed();
     Ok((index, timings))
 }
@@ -497,33 +492,45 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         .try_for_each(|(start, end)| -> Result<(), LoadError> {
             let mut folded_buf: Vec<u8> = Vec::new();
             for i in start..end {
-                fold_name(name_at(&arena, &name_off, &name_len, i), &mut folded_buf);
-                if folded_buf != name_at(&folded_arena, &name_off, &name_len, i) {
+                let raw = name_at(&arena, &name_off, &name_len, i);
+                let expected = name_at(&folded_arena, &name_off, &name_len, i);
+                let consistent = if raw.is_ascii() {
+                    raw.iter()
+                        .zip(expected)
+                        .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+                } else {
+                    fold_name(raw, &mut folded_buf);
+                    folded_buf == expected
+                };
+                if !consistent {
                     return Err(LoadError::Corrupt("folded arena inconsistent with names"));
                 }
             }
             Ok(())
         })?;
-    let key_cmp = |a: u32, b: u32| {
-        name_at(&folded_arena, &name_off, &name_len, a as usize)
-            .cmp(name_at(&folded_arena, &name_off, &name_len, b as usize))
-            .then_with(|| {
-                name_at(&arena, &name_off, &name_len, a as usize)
-                    .cmp(name_at(&arena, &name_off, &name_len, b as usize))
-            })
-            .then_with(|| a.cmp(&b))
+    timings.derived_fold = derived_started.elapsed();
+    // Construct each key once, carrying it across adjacent comparisons.
+    // Both arenas share the validated offset/length, including tie breakers.
+    let key = |id: u32| {
+        let off = name_off[id as usize] as usize;
+        let end = off + name_len[id as usize] as usize;
+        (&folded_arena[off..end], &arena[off..end], id)
     };
     chunk_ranges(n.saturating_sub(1))
         .into_par_iter()
         .try_for_each(|(start, end)| -> Result<(), LoadError> {
-            for i in start..end {
-                if key_cmp(sorted[i], sorted[i + 1]) != std::cmp::Ordering::Less {
+            let mut previous = key(sorted[start]);
+            for &id in &sorted[start + 1..=end] {
+                let next = key(id);
+                if previous >= next {
                     return Err(LoadError::Corrupt("sort order is not sorted"));
                 }
+                previous = next;
             }
             Ok(())
         })?;
     timings.derived += derived_started.elapsed();
+    timings.derived_sort = timings.derived - timings.derived_fold;
 
     Ok(Index::from_columns(OwnedColumns {
         parent,
@@ -963,7 +970,8 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         // The parts are disjoint measured spans of the total, so they
         // must add up to at most the total (the rest is unattributed).
-        let parts = t.read + t.checksum + t.decode + t.structure + t.derived;
+        let parts = t.read + t.buffer + t.cleanup + t.checksum + t.decode + t.structure + t.derived;
+        assert_eq!(t.derived, t.derived_fold + t.derived_sort);
         assert!(
             parts <= t.total,
             "parts {parts:?} exceed total {:?}",
@@ -1001,5 +1009,19 @@ mod tests {
     #[test]
     fn crc32_known_vector() {
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
+        assert_eq!(crc32(b""), 0);
+        // Independent bit-at-a-time IEEE oracle: exercise hardware-sized
+        // inputs, tails and unaligned slices without timing or load loops.
+        let data: Vec<u8> = (0..513).map(|i| (i * 37) as u8).collect();
+        for bytes in [&data[..], &data[1..], &data[3..510], &data[..17]] {
+            let mut expected = !0u32;
+            for &b in bytes {
+                expected ^= u32::from(b);
+                for _ in 0..8 {
+                    expected = (expected >> 1) ^ (0xEDB88320 & 0u32.wrapping_sub(expected & 1));
+                }
+            }
+            assert_eq!(crc32(bytes), !expected);
+        }
     }
 }

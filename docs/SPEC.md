@@ -105,7 +105,9 @@ launchers ────┘     (daemon)       └─ backend-macos   (FSEvents)
 ## 7. Quality bar
 
 - `cargo fmt`, `clippy -D warnings`, tests on all three OSes in CI (GitHub-hosted runners, public repo).
-- Benchmarks on a generated fixture tree (a synthetic 5 M-entry index) are tracked per PR. A regression against the §3 targets fails CI once the targets are confirmed.
+- PR benchmarks use a synthetic 5 M-entry index (seed 2026). The benchmark job measures current `main` and the PR head in the same job on the same runner, with separate build directories and a fixed two-thread query pool. Each arm reports the median of three loads and five first-page/count samples per query. The same saved fixture is also queried through each arm's real unprivileged `service run` process.
+- The regression gate fails when load total, full count or first page for any fixture query exceeds `main + max(10% of main, 0.1 ms)`. The absolute allowance dominates below 1 ms. Bytes per entry (actual retained heap divided by entries) may increase by at most 10%, with no timing allowance. Both in-process and IPC query numbers are gated. Missing measurements, changed fixture metadata or changed result counts fail closed. `scripts/bench-gate.py` contains the unit-tested comparison rule.
+- The §3 absolute targets stay reported goals. Reached targets become hard limits in a follow-up; this regression gate does not silently enforce unreached goals.
 - Fuzzing for the query parser and the index persistence format.
 - Dependencies: permissive licences only (MIT, Apache-2.0, BSD, Zlib, ISC, Unicode), checked by `cargo-deny` in CI.
 
@@ -124,13 +126,14 @@ launchers ────┘     (daemon)       └─ backend-macos   (FSEvents)
 - 2026-11-07: **high performance is the most important property of the app.** Every milestone measures its effect on the §3 numbers in CI. The speed work (M2e) comes next after M2a/M2b land, before per-user visibility (M2c) and the MFT/USN backend (M2d). The query path through the service is benchmarked like the in-process path.
 - 2026-11-07: **never freeze.** Freezes in existing tools are why Ferrow exists. No code path may block the UI, a search or the service on indexing, disk I/O, a slow or unreachable volume, a lock or a large result set. Work is bounded and cancellable, and freeze resistance is tested (for example with mocked slow stages).
 - 2026-11-07: **perfect performance in remote desktop sessions** (RDP, VNC, TeamViewer and similar). The UI repaints only what changed and only when something changed: no animations, no blinking caret, no idle redraws. The renderer must work without a GPU, for example over RDP.
+- 2026-11-07: **benchmark regressions fail CI on PRs.** Compare current `main` and head on the same runner/job using medians; allow about 10% regression, with an absolute tolerance for sub-millisecond timings. Gate load total, every fixture query's full count and first page, and bytes per entry (§7). The §3 targets remain goals until reached, then become hard limits in a follow-up.
 
 ## 10. Open decisions for the owner
 
 1. **GUI toolkit:**
    - **Recommendation:** decide after a short spike that measures the 5 M-row virtual list and the start time.
    - Candidates: Slint, egui, iced, or a custom winit + softbuffer/wgpu renderer like kwil.
-2. **Confirm the §3 targets** (or set others).
+2. **Promote reached §3 targets to hard limits** in a follow-up.
 3. **v1 scope in §4:** add or remove items.
 4. **Pair Desk project** `ferrow` for issues and the handoff.
 5. **When to create the public GitHub repository** `rennerdo30/ferrow`. That is a publication, so it needs the owner's yes.

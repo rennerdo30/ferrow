@@ -17,6 +17,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # Explicit bash runs with -eo pipefail, so a failing or timed-out
+    # measurement is not hidden behind `| tee`.
+    defaults:
+      run:
+        shell: bash
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -45,6 +50,11 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # Explicit bash runs with -eo pipefail, so a failing or timed-out
+    # measurement is not hidden behind `| tee`.
+    defaults:
+      run:
+        shell: bash
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -103,18 +113,76 @@ jobs:
     name: bench (5M fixture)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Informational until the owner confirms the SPEC section 3 targets.
-    continue-on-error: true
+    # Explicit bash runs with -eo pipefail, so a failing or timed-out
+    # measurement is not hidden behind `| tee`.
+    defaults:
+      run:
+        shell: bash
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: "0"
+      RAYON_NUM_THREADS: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # Stack layers still compare to main, not to their feature-branch base.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          ref: main
+          path: .bench-base
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      - name: Run the 5M-entry benchmark
-        run: cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee bench-output.txt
-      - name: Write the job summary table
+      - name: Test regression comparison and CLI on trivial inputs
+        run: python3 -m unittest discover -s scripts -p 'test_bench_gate.py'
+      - name: Build head before either measured arm
+        run: |
+          test "$(id -u)" -ne 0
+          cargo build --release --locked -p ferrow
+          cargo build --release --locked -p ferrow-query --example service_bench
+          cargo bench --no-run -p ferrow-query --bench m1_bench --locked
+      - name: Build main in a separate target directory
+        if: github.event_name == 'pull_request'
+        working-directory: .bench-base
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
+        run: |
+          cargo build --release --locked -p ferrow
+          cargo bench --no-run -p ferrow-query --bench m1_bench --locked
+      - name: Smoke benchmark chain with 16 entries
+        env:
+          FERROW_BENCH_ENTRIES: "16"
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-small.bin
+          FERROW_MEASURES_ONLY: "1"
+        run: |
+          cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
+          timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin"
+      - name: Measure main in-process
+        if: github.event_name == 'pull_request'
+        working-directory: .bench-base
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
+          FERROW_MEASURES_ONLY: "1"
+        run: |
+          git rev-parse HEAD
+          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee "$GITHUB_WORKSPACE/base-output.txt"
+      - name: Measure head in-process
+        env:
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
+          FERROW_MEASURES_ONLY: "1"
+        run: |
+          git rev-parse HEAD
+          timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee bench-output.txt
+      - name: Measure main service through the same IPC harness and fixture
+        if: github.event_name == 'pull_request'
+        run: timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a base-output.txt
+      - name: Measure head service IPC
+        run: timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a bench-output.txt
+      - name: Write additive head summary
         if: always()
         run: ./scripts/bench-summary.sh bench-output.txt
+      - name: Gate paired main and head medians
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/bench-gate.py base-output.txt bench-output.txt

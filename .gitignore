@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 # Machine-local cargo config (see .cargo/config.example.toml)
 /.cargo/config.toml
 /fixtures/
