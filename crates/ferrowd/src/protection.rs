@@ -286,6 +286,9 @@ pub(crate) mod windows {
                 }
                 // SAFETY: OS-validated ACE storage; unaligned value reads avoid Rust references.
                 let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+                if state && header.AceType == 1 {
+                    return Err(refused("state DACL must not deny required full control"));
+                }
                 if (header.AceFlags & INHERIT_ONLY_ACE as u8 != 0
                     && !matches!(role, Role::Directory | Role::StateDirectory))
                     || header.AceType == 1
@@ -297,6 +300,8 @@ pub(crate) mod windows {
                 }
                 // SAFETY: basic ACCESS_ALLOWED_ACE established above; SID stays in descriptor.
                 let allowed = unsafe { std::ptr::read_unaligned(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+                // SAFETY: basic allow ACE established above; embedded SID is
+                // OS-validated and retained by this live descriptor.
                 let sid = unsafe {
                     ace.cast::<u8>()
                         .add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
@@ -534,6 +539,7 @@ pub(crate) mod windows {
                 "O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)",
                 "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)",
                 "O:SYD:P(A;;FA;;;SY)",
+                "O:SYD:P(D;;FR;;;BA)(A;;FA;;;SY)(A;;FA;;;BA)",
             ] {
                 assert!(
                     Descriptor::sddl(sddl)
