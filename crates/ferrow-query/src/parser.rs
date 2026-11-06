@@ -132,7 +132,8 @@ struct Parser<'a> {
 impl Parser<'_> {
     fn error(&self, start: usize, end: usize, message: &str) -> ParseError {
         ParseError::Syntax {
-            span: start..end.min(self.input.len()),
+            span: self.input.floor_char_boundary(start.min(self.input.len()))
+                ..self.input.ceil_char_boundary(end.min(self.input.len())),
             message: message.into(),
         }
     }

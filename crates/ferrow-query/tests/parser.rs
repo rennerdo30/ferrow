@@ -49,9 +49,21 @@ fn random_unicode_input_never_panics_and_errors_stay_in_input() {
         if let Err(error) = Query::parse(&input) {
             let span = error.span();
             assert!(
-                span.start <= span.end && span.end <= input.len(),
+                span.start <= span.end
+                    && span.end <= input.len()
+                    && input.is_char_boundary(span.start)
+                    && input.is_char_boundary(span.end),
                 "{input:?}: {span:?}"
             );
         }
     }
+}
+
+#[test]
+fn error_spans_cover_complete_unicode_scalars_including_nesting_errors() {
+    let input = "\"a\"文";
+    assert_eq!(Query::parse(input).unwrap_err().span(), 3..6);
+    let input = "!".repeat(32) + "文";
+    assert_eq!(Query::parse(&input).unwrap_err().span(), 32..35);
+    assert_eq!(Query::parse("a|").unwrap_err().span(), 2..2);
 }
