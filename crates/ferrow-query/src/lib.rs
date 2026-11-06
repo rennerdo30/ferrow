@@ -9,8 +9,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use ferrow_index::{Index, fold_name};
-use memchr::memmem;
+use ferrow_index::Index;
 
 use rayon::prelude::*;
 
@@ -126,46 +125,9 @@ impl QueryTimings {
     }
 }
 
-struct Matcher {
-    finders: Vec<(memmem::Finder<'static>, bool, bool)>, // finder, negated, case_sensitive
-}
-
-impl Matcher {
-    fn new(query: &Query) -> Matcher {
-        let finders = query
-            .terms
-            .iter()
-            .map(|t| {
-                let needle: Vec<u8> = if t.case_sensitive {
-                    t.text.as_bytes().to_vec()
-                } else {
-                    let mut folded = Vec::new();
-                    fold_name(t.text.as_bytes(), &mut folded);
-                    folded
-                };
-                (
-                    memmem::Finder::new(&needle).into_owned(),
-                    t.negated,
-                    t.case_sensitive,
-                )
-            })
-            .collect();
-        Matcher { finders }
-    }
-
-    fn matches(&self, index: &Index, id: u32) -> bool {
-        self.finders
-            .iter()
-            .all(|(finder, negated, case_sensitive)| {
-                let haystack = if *case_sensitive {
-                    index.name(id)
-                } else {
-                    index.folded_name(id)
-                };
-                finder.find(haystack).is_some() != *negated
-            })
-    }
-}
+mod matcher;
+pub use matcher::highlight_ranges;
+use matcher::{Matcher, Scratch};
 
 /// Entries admitted per worker chunk; cancellation also runs inside it.
 const BLOCK_SIZE: usize = 4_096;
@@ -203,7 +165,7 @@ fn search_impl<const TIMED: bool>(
     let started = TIMED.then(std::time::Instant::now);
     let mut timings = QueryTimings::default();
     let matcher = Matcher::new(query);
-    let sorted = index.sorted();
+    let sorted = matcher.candidates(index);
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
     // completed prefix. A slow early chunk cannot accumulate unbounded
@@ -231,6 +193,7 @@ fn search_impl<const TIMED: bool>(
     }
     let scan_started = TIMED.then(std::time::Instant::now);
     (0..width).into_par_iter().for_each(|_| {
+        let mut scratch = Scratch::default();
         loop {
             let chunk = {
                 let mut state = ordered.lock().expect("query progress poisoned");
@@ -260,11 +223,14 @@ fn search_impl<const TIMED: bool>(
                     break;
                 }
                 for &id in ids {
-                    if matcher.matches(index, id)
+                    if matcher.matches(index, id, &mut scratch, &options.cancel)
                         && options.limit.is_none_or(|limit| found.len() < limit)
                     {
                         found.push(id);
                     }
+                }
+                if options.cancel.is_cancelled() {
+                    break;
                 }
                 examined += ids.len();
             }
@@ -356,6 +322,7 @@ fn count_impl<const TIMED: bool>(
     let total = (0..index.len().div_ceil(BLOCK_SIZE))
         .into_par_iter()
         .map(|chunk| {
+            let mut scratch = Scratch::default();
             let start = chunk * BLOCK_SIZE;
             let end = (start + BLOCK_SIZE).min(index.len());
             let mut total = 0;
@@ -364,7 +331,7 @@ fn count_impl<const TIMED: bool>(
                     break;
                 }
                 total += (start..(start + CANCEL_INTERVAL).min(end))
-                    .filter(|&id| matcher.matches(index, id as u32))
+                    .filter(|&id| matcher.matches(index, id as u32, &mut scratch, cancel))
                     .count();
             }
             total
