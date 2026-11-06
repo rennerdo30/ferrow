@@ -14,6 +14,48 @@ fn accepted_stream_can_move_to_a_worker() {
     assert_send::<Stream>();
 }
 
+#[cfg(windows)]
+#[test]
+fn bind_reserves_pipe_name_until_listener_drop() {
+    let endpoint = test_endpoint("reservation");
+    let listener = Listener::bind(&endpoint).unwrap();
+    assert!(
+        Listener::bind(&endpoint).is_err(),
+        "second bind stole pipe name"
+    );
+    drop(listener);
+    assert!(Listener::bind(&endpoint).is_ok());
+}
+
+#[test]
+fn two_clients_complete_requests_before_either_closes() {
+    let endpoint = test_endpoint("two");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let ep = endpoint.clone();
+    let server = std::thread::spawn(move || {
+        let (a, _) = listener.accept().unwrap();
+        let a = std::thread::spawn(move || serve_stream(a, handler).unwrap());
+        let (b, _) = listener.accept().unwrap();
+        let b = std::thread::spawn(move || serve_stream(b, handler).unwrap());
+        a.join().unwrap();
+        b.join().unwrap();
+        #[cfg(windows)]
+        assert!(
+            Listener::bind(&ep).is_err(),
+            "last closed session lost name reservation"
+        );
+        #[cfg(not(windows))]
+        let _ = ep;
+    });
+    let mut a = Client::connect(&endpoint).unwrap();
+    let mut b = Client::connect(&endpoint).unwrap();
+    assert_eq!(a.count("first").unwrap(), 5);
+    assert_eq!(b.count("second").unwrap(), 6);
+    drop(a);
+    drop(b);
+    server.join().unwrap();
+}
+
 #[test]
 fn refusal_cleanup_does_not_wait_for_a_reader() {
     let endpoint = test_endpoint("nonreader");

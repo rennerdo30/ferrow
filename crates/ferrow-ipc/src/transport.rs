@@ -277,14 +277,14 @@ mod platform {
     use super::{CallerIdentity, Endpoint};
     use std::io::{Read, Write};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+        INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-        ReadFile, WriteFile,
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_READ_DATA, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
@@ -296,7 +296,10 @@ mod platform {
     /// Service pipe DACL: LocalSystem (SY) and built-in
     /// administrators (BA) full control; authenticated users (AU)
     /// generic read/write (connect). Nobody else gets access.
-    const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)";
+    // AU data/attribute/synchronization rights exclude FILE_CREATE_PIPE_INSTANCE.
+    // Owner rights allow an unprivileged dev listener to create successors.
+    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;AU)";
+    const PIPE_INSTANCES: u32 = 33; // 32 connected streams plus one pending instance
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -330,7 +333,13 @@ mod platform {
     /// descriptor must be freed with LocalFree after the pipe
     /// instance is created (the kernel copies it at creation).
     fn security_attributes() -> std::io::Result<(SECURITY_ATTRIBUTES, *mut core::ffi::c_void)> {
-        let sddl = wide(PIPE_SDDL);
+        let owner = token_user_sid(std::process::id()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot identify pipe owner",
+            )
+        })?;
+        let sddl = wide(&format!("O:{owner}{PIPE_SDDL}"));
         let mut sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: `sddl` is a NUL-terminated wide string that
         // outlives the call; `sd` is a live output pointer.
@@ -444,6 +453,7 @@ mod platform {
 
     pub struct Listener {
         name: Vec<u16>,
+        pending: std::sync::Mutex<PipeHandle>,
     }
 
     pub struct Stream {
@@ -453,44 +463,28 @@ mod platform {
 
     impl Listener {
         pub fn bind(endpoint: &Endpoint) -> std::io::Result<Listener> {
+            let name = wide(&endpoint.pipe_name);
+            let pending = create_instance(&name, true)?;
             Ok(Listener {
-                name: wide(&endpoint.pipe_name),
+                name,
+                pending: std::sync::Mutex::new(pending),
             })
         }
 
         pub fn accept(&self) -> std::io::Result<(Stream, CallerIdentity)> {
-            let (mut attrs, sd) = security_attributes()?;
-            // SAFETY: name and attributes outlive the call; the
-            // returned handle is owned by PipeHandle on success.
-            let handle = unsafe {
-                CreateNamedPipeW(
-                    self.name.as_ptr(),
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                    1,
-                    super::MAX_PIPE_BUFFER as u32,
-                    super::MAX_PIPE_BUFFER as u32,
-                    0,
-                    &raw mut attrs,
-                )
-            };
-            // SAFETY: frees the descriptor allocated above; the
-            // kernel copied it during pipe creation.
-            unsafe { LocalFree(sd) };
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(last_error());
-            }
-            // SAFETY: `handle` is a live server pipe instance.
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| std::io::Error::other("listener poisoned"))?;
+            let handle = pending.0;
+            // SAFETY: the mutex exclusively owns this live pending instance.
             let ok = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
-            if ok == 0
-                && std::io::Error::last_os_error().raw_os_error()
-                    != Some(ERROR_PIPE_CONNECTED as i32)
-            {
-                // SAFETY: owned, unconnected, closed once here.
-                unsafe { CloseHandle(handle) };
+            if ok == 0 && last_error().raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
                 return Err(last_error());
             }
-            let owned = PipeHandle(handle);
+            // Retain continuous name ownership before handing off this stream.
+            let next = create_instance(&self.name, false)?;
+            let owned = std::mem::replace(&mut *pending, next);
             let caller = client_identity(handle)?;
             Ok((
                 Stream {
@@ -499,6 +493,37 @@ mod platform {
                 },
                 caller,
             ))
+        }
+    }
+
+    fn create_instance(name: &[u16], first: bool) -> std::io::Result<PipeHandle> {
+        let (mut attrs, sd) = security_attributes()?;
+        // SAFETY: NUL-terminated name and descriptor live through creation;
+        // successful handle ownership transfers to PipeHandle.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX
+                    | if first {
+                        FILE_FLAG_FIRST_PIPE_INSTANCE
+                    } else {
+                        0
+                    },
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_INSTANCES,
+                super::MAX_PIPE_BUFFER as u32,
+                super::MAX_PIPE_BUFFER as u32,
+                0,
+                &raw mut attrs,
+            )
+        };
+        let error = last_error();
+        // SAFETY: descriptor was allocated by ConvertStringSecurityDescriptor.
+        unsafe { LocalFree(sd) };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(error)
+        } else {
+            Ok(PipeHandle(handle))
         }
     }
 
@@ -511,7 +536,7 @@ mod platform {
                 let handle = unsafe {
                     CreateFileW(
                         name.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_READ_DATA | FILE_WRITE_DATA | 0x120000,
                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                         std::ptr::null(),
                         OPEN_EXISTING,
@@ -520,8 +545,10 @@ mod platform {
                     )
                 };
                 if handle != INVALID_HANDLE_VALUE {
+                    let owned = PipeHandle(handle);
+                    authenticate_server(handle, endpoint)?;
                     return Ok(Stream {
-                        handle: Some(PipeHandle(handle)),
+                        handle: Some(owned),
                         caller: None,
                     });
                 }
@@ -552,6 +579,65 @@ mod platform {
                 .map(|h| h.0)
                 .unwrap_or(std::ptr::null_mut())
         }
+    }
+
+    fn authenticate_server(handle: HANDLE, endpoint: &Endpoint) -> std::io::Result<()> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
+        };
+        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+        let mut owner = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: live pipe handle with READ_CONTROL; all outputs live through call.
+        let code = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &raw mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut sd,
+            )
+        };
+        if code != 0 {
+            return Err(std::io::Error::from_raw_os_error(code as i32));
+        }
+        let mut text = std::ptr::null_mut();
+        // SAFETY: owner points into the returned descriptor, retained below.
+        let ok = unsafe { ConvertSidToStringSidW(owner, &raw mut text) };
+        let mut actual = String::new();
+        if ok != 0 {
+            let mut len = 0;
+            // SAFETY: conversion returns a NUL-terminated allocated SID string.
+            unsafe {
+                while *text.add(len) != 0 {
+                    len += 1;
+                }
+                actual = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                LocalFree(text.cast());
+            }
+        }
+        // SAFETY: GetSecurityInfo allocated this descriptor; owner is no longer used.
+        unsafe { LocalFree(sd) };
+        let expected = if *endpoint == Endpoint::default_service() {
+            "S-1-5-18".to_owned()
+        } else {
+            token_user_sid(std::process::id()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cannot identify client",
+                )
+            })?
+        };
+        if ok == 0 || actual != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "untrusted pipe server owner",
+            ));
+        }
+        Ok(())
     }
 
     impl Read for Stream {
