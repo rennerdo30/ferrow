@@ -12,8 +12,11 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
+mod metadata;
 pub mod osname;
 pub mod persist;
+use metadata::MetadataColumns;
+pub use metadata::{ColumnSet, EntryMetadata, SortKey, timestamp_ticks};
 
 pub use persist::{LoadError, LoadTimings, SaveError};
 
@@ -73,6 +76,7 @@ pub fn fold_name(name: &[u8], out: &mut Vec<u8>) {
 /// Immutable, query-ready index. Share it as `Arc<Index>`.
 #[derive(Debug)]
 pub struct Index {
+    metadata: MetadataColumns,
     parent: Vec<u32>,
     name_off: Vec<u32>,
     name_len: Vec<u16>,
@@ -83,6 +87,19 @@ pub struct Index {
 }
 
 impl Index {
+    pub fn columns_present(&self) -> ColumnSet {
+        self.metadata.present()
+    }
+    pub fn metadata(&self, id: u32) -> EntryMetadata {
+        self.metadata.get(id)
+    }
+    /// Ready metadata order; `None` means the column was not indexed.
+    pub fn metadata_order(&self, key: SortKey, descending: bool) -> Option<&[u32]> {
+        self.metadata.order(key, descending)
+    }
+    pub fn metadata_heap_bytes(&self) -> usize {
+        self.metadata.heap_bytes()
+    }
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.parent.len()
@@ -163,6 +180,7 @@ impl Index {
             + self.arena.capacity()
             + self.folded_arena.capacity()
             + self.sorted.capacity() * 4
+            + self.metadata.heap_bytes()
     }
 
     /// Save to the versioned binary format. See [`persist`].
@@ -197,6 +215,7 @@ impl Index {
 
     pub(crate) fn from_columns(c: OwnedColumns) -> Index {
         Index {
+            metadata: MetadataColumns::default(),
             parent: c.parent,
             name_off: c.name_off,
             name_len: c.name_len,
@@ -229,6 +248,7 @@ pub(crate) struct OwnedColumns {
 }
 
 struct RawEntry {
+    metadata: EntryMetadata,
     id: u32,
     parent: u32,
     name: Vec<u8>,
@@ -242,6 +262,7 @@ const SHARDS: usize = 16;
 /// so parent ids returned by [`IndexBuilder::add`] stay valid after
 /// [`IndexBuilder::freeze`].
 pub struct IndexBuilder {
+    columns: ColumnSet,
     shards: Vec<Mutex<Vec<RawEntry>>>,
     next_id: AtomicU32,
     next_shard: AtomicUsize,
@@ -255,7 +276,12 @@ impl Default for IndexBuilder {
 
 impl IndexBuilder {
     pub fn new() -> IndexBuilder {
+        Self::with_columns(ColumnSet::NONE)
+    }
+
+    pub fn with_columns(columns: ColumnSet) -> IndexBuilder {
         IndexBuilder {
+            columns,
             shards: (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect(),
             next_id: AtomicU32::new(0),
             next_shard: AtomicUsize::new(0),
@@ -272,6 +298,16 @@ impl IndexBuilder {
     /// Names longer than `u16::MAX` bytes are truncated to fit the column
     /// (real file systems cap components far below that).
     pub fn add(&self, parent: u32, name: &[u8], flags: u16) -> u32 {
+        self.add_with_metadata(parent, name, flags, EntryMetadata::default())
+    }
+
+    pub fn add_with_metadata(
+        &self,
+        parent: u32,
+        name: &[u8],
+        flags: u16,
+        metadata: EntryMetadata,
+    ) -> u32 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let shard = self.next_shard.fetch_add(1, Ordering::Relaxed) % SHARDS;
         let mut flags = flags;
@@ -279,6 +315,7 @@ impl IndexBuilder {
             flags |= flags::NAME_NOT_UTF8;
         }
         let entry = RawEntry {
+            metadata,
             id,
             parent,
             name: name.to_vec(),
@@ -331,6 +368,7 @@ impl IndexBuilder {
         }
 
         // Release builder entries before folding/sorting the frozen columns.
+        let mut metadata = MetadataColumns::build(&raw, self.columns);
         drop(raw);
         // Allocate the final arena once and split it only at entry boundaries.
         // Each worker reuses scratch; no per-name Vec or slice table survives.
@@ -378,7 +416,9 @@ impl IndexBuilder {
                 .then_with(|| a.cmp(&b))
         });
 
+        metadata.sort(&sorted);
         Index {
+            metadata,
             parent,
             name_off,
             name_len,

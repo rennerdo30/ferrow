@@ -27,16 +27,19 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::{Index, OwnedColumns, ROOT_PARENT, fold_name};
+use crate::metadata::MetadataColumns;
+use crate::{ColumnSet, Index, OwnedColumns, ROOT_PARENT, fold_name};
 
 pub const MAGIC: [u8; 8] = *b"FERROWID";
-pub const VERSION: u32 = 1;
-const HEADER_LEN: usize = 8 + 4 + 4 + 4 + 4;
+pub const VERSION: u32 = 2;
+const HEADER_LEN: usize = 8 + 4 + 4 + 4 + 4 + 4;
+const CHECKSUM_START: usize = 24;
 /// Sane ceiling for one index file (16 GiB). A header claiming more is
 /// rejected before any payload is read or allocated.
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 struct Header {
+    columns: ColumnSet,
     entry_count: u32,
     arena_len: u32,
     checksum: u32,
@@ -44,11 +47,20 @@ struct Header {
 
 /// Exact total file length for the given counts, in `u64` so the math is
 /// overflow-free on 32-bit targets too.
-fn expected_len(entry_count: u32, arena_len: u32) -> u64 {
-    HEADER_LEN as u64 + entry_count as u64 * 16 + arena_len as u64 * 2
+fn expected_len(entry_count: u32, arena_len: u32, columns: ColumnSet) -> u64 {
+    HEADER_LEN as u64
+        + entry_count as u64 * 16
+        + arena_len as u64 * 2
+        + columns.payload_bytes(entry_count)
 }
 
 fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
+    if data.len() >= 12 && data[..8] == MAGIC {
+        let version = u32::from_le_bytes(data[8..12].try_into().expect("checked header"));
+        if version != VERSION {
+            return Err(LoadError::UnsupportedVersion(version));
+        }
+    }
     if data.len() < HEADER_LEN {
         // Too short for a header: bad magic if the prefix disagrees, else truncated.
         if data.len() >= MAGIC.len() && data[..MAGIC.len()] != MAGIC {
@@ -66,11 +78,13 @@ fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
         return Err(LoadError::UnsupportedVersion(version));
     }
     let header = Header {
+        columns: ColumnSet::from_bits(u32at(24))
+            .ok_or(LoadError::Corrupt("unknown metadata columns"))?,
         entry_count: u32at(12),
         arena_len: u32at(16),
         checksum: u32at(20),
     };
-    if expected_len(header.entry_count, header.arena_len) > MAX_INDEX_BYTES {
+    if expected_len(header.entry_count, header.arena_len, header.columns) > MAX_INDEX_BYTES {
         return Err(LoadError::Corrupt("index size exceeds limit"));
     }
     Ok(header)
@@ -110,7 +124,7 @@ impl fmt::Display for LoadError {
             LoadError::UnsupportedVersion(v) => {
                 write!(
                     f,
-                    "unsupported index version {v} (this build reads {VERSION})"
+                    "unsupported index version {v} (this build reads {VERSION}); rebuild the index"
                 )
             }
             LoadError::Truncated => write!(f, "index file is truncated"),
@@ -133,7 +147,9 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
     let n32 = u32::try_from(n).map_err(|_| SaveError::TooLarge("entry count"))?;
     let arena32 = u32::try_from(c.arena.len()).map_err(|_| SaveError::TooLarge("name arena"))?;
 
-    let payload_len = n * (4 + 4 + 2 + 2 + 4) + c.arena.len() * 2;
+    let payload_len = usize::try_from(expected_len(n32, arena32, index.columns_present()))
+        .map_err(|_| SaveError::TooLarge("metadata columns"))?
+        - HEADER_LEN;
     let mut buf = Vec::with_capacity(HEADER_LEN + payload_len);
     buf.extend_from_slice(&MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -141,6 +157,7 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
     buf.extend_from_slice(&arena32.to_le_bytes());
     let checksum_at = buf.len();
     buf.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    buf.extend_from_slice(&index.columns_present().bits().to_le_bytes());
 
     for v in c.parent {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -160,7 +177,8 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
         buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    let sum = crc32(&buf[HEADER_LEN..]);
+    index.metadata.write(&mut buf);
+    let sum = crc32(&buf[CHECKSUM_START..]);
     buf[checksum_at..checksum_at + 4].copy_from_slice(&sum.to_le_bytes());
 
     write_atomically(path, &buf).map_err(SaveError::Io)
@@ -327,7 +345,7 @@ fn load_from<R: std::io::Read>(
     reader.read_exact(&mut data).map_err(LoadError::Io)?;
     timings.read += t.elapsed();
     let header = parse_header(&data)?;
-    let expected = expected_len(header.entry_count, header.arena_len);
+    let expected = expected_len(header.entry_count, header.arena_len, header.columns);
     if file_len < expected {
         return Err(LoadError::Truncated);
     }
@@ -362,7 +380,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     let header = parse_header(data)?;
     let n = header.entry_count as usize;
     let arena_len = header.arena_len as usize;
-    let expected = expected_len(header.entry_count, header.arena_len);
+    let expected = expected_len(header.entry_count, header.arena_len, header.columns);
     if (data.len() as u64) < expected {
         return Err(LoadError::Truncated);
     }
@@ -370,7 +388,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
     let t = Instant::now();
-    let sum_ok = crc32(&data[HEADER_LEN..]) == header.checksum;
+    let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
     timings.checksum += t.elapsed();
     if !sum_ok {
         return Err(LoadError::ChecksumMismatch);
@@ -385,6 +403,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     let arena = take(data, &mut at, arena_len)?.to_vec();
     let folded_arena = take(data, &mut at, arena_len)?.to_vec();
     let sorted = read_u32s(data, &mut at, n)?;
+    let metadata = MetadataColumns::read(data, &mut at, n, header.columns)?;
     timings.decode += t.elapsed();
     let structure_started = Instant::now();
 
@@ -532,7 +551,12 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     timings.derived += derived_started.elapsed();
     timings.derived_sort = timings.derived - timings.derived_fold;
 
-    Ok(Index::from_columns(OwnedColumns {
+    let t = Instant::now();
+    metadata.validate(&sorted)?;
+    let metadata_validation = t.elapsed();
+    timings.derived_sort += metadata_validation;
+    timings.derived += metadata_validation;
+    let mut index = Index::from_columns(OwnedColumns {
         parent,
         name_off,
         name_len,
@@ -540,7 +564,9 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         arena,
         folded_arena,
         sorted,
-    }))
+    });
+    index.metadata = metadata;
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -655,7 +681,7 @@ mod tests {
     }
 
     fn fix_checksum(bytes: &mut [u8]) {
-        let sum = crc32(&bytes[HEADER_LEN..]);
+        let sum = crc32(&bytes[CHECKSUM_START..]);
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
     }
 
@@ -711,7 +737,7 @@ mod tests {
         let a = 255u32;
         let mut b = Vec::new();
         b.extend_from_slice(b"FERROWID");
-        for v in [1, n, a, 0] {
+        for v in [VERSION, n, a, 0, 0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         for _ in 0..n {
@@ -789,7 +815,7 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
         // Point entry 1's parent at itself (parent column starts at HEADER_LEN).
         bytes[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&1u32.to_le_bytes());
-        let sum = crc32(&bytes[HEADER_LEN..]);
+        let sum = crc32(&bytes[CHECKSUM_START..]);
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
         assert!(matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))));
     }
