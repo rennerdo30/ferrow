@@ -96,3 +96,31 @@ fn daemon_answers_and_snapshot_swap_is_visible() {
     shutdown.request(&endpoint);
     server.join().unwrap().unwrap();
 }
+
+#[test]
+fn unknown_callers_cannot_read_any_snapshot_data() {
+    let store = SnapshotStore::new(Snapshot::empty());
+    let owner = ferrow_ipc::CallerIdentity::current().unwrap();
+    let unknown = ferrow_ipc::CallerIdentity::default();
+    for system in [false, true] {
+        for request in [
+            ferrow_ipc::Request::Status,
+            ferrow_ipc::Request::Count { text: "".into() },
+            ferrow_ipc::Request::Query {
+                text: "".into(),
+                limit: 0,
+                sort: ferrow_ipc::protocol::Sort::Name,
+                flags: 0,
+            },
+        ] {
+            let response = ferrowd::handle_authorized(&store, request, &unknown, &owner, system);
+            assert!(matches!(
+                &response[..],
+                [ferrow_ipc::Response::Error {
+                    code: ferrow_ipc::ErrorCode::Unauthorized,
+                    ..
+                }]
+            ));
+        }
+    }
+}

@@ -317,8 +317,16 @@ fn service_candidates() -> Vec<Endpoint> {
 /// Connect to the first reachable service, if any.
 fn service_client() -> Option<(Client<Stream>, Endpoint)> {
     for endpoint in service_candidates() {
-        if let Ok(client) = Client::connect(&endpoint) {
-            return Some((client, endpoint));
+        if let Ok(mut client) = Client::connect(&endpoint) {
+            match client.status() {
+                Ok(_) => return Some((client, endpoint)),
+                Err(e) if e.to_string().contains("Unauthorized") => {
+                    eprintln!(
+                        "ferrow: service at {endpoint} refused access ({e}); falling back to the per-user in-process index"
+                    );
+                }
+                Err(e) => eprintln!("ferrow: service at {endpoint}: {e}"),
+            }
         }
     }
     None

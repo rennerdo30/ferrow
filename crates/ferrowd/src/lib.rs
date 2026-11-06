@@ -7,16 +7,17 @@
 //! the only parked thread, so an idle daemon burns 0 % CPU
 //! (no polling timers anywhere).
 //!
-//! Note on privacy: until M2c lands, the service returns every
-//! indexed entry to any local caller the transport admits. The
-//! per-user visibility filter is specified work, not done here.
+//! Until M2c, system replies require an OS-authenticated privileged caller;
+//! development replies require the starting user. Refusals contain no index data.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use ferrow_index::{Index, IndexBuilder};
-use ferrow_ipc::{Endpoint, ErrorCode, Listener, Request, Response, Stream, serve_stream};
+use ferrow_ipc::{
+    CallerIdentity, Endpoint, ErrorCode, Listener, Request, Response, Stream, serve_cancellable,
+};
 use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
@@ -244,6 +245,36 @@ pub fn handle(store: &SnapshotStore, request: Request) -> Vec<Response> {
     }
 }
 
+/// Interim M2b boundary, removed when M2c provides per-user visibility.
+/// The caller must come from the stream after a complete OS-authenticated read.
+pub fn handle_authorized(
+    store: &SnapshotStore,
+    request: Request,
+    caller: &CallerIdentity,
+    owner: &CallerIdentity,
+    system: bool,
+) -> Vec<Response> {
+    let allowed = if system {
+        caller.is_system_administrator()
+    } else {
+        #[cfg(windows)]
+        {
+            caller.access_token().is_some()
+                && caller.user_sid.is_some()
+                && caller.user_sid == owner.user_sid
+        }
+        #[cfg(unix)]
+        {
+            caller.uid.is_some() && caller.uid == owner.uid
+        }
+    };
+    if !allowed {
+        return vec![Response::Error { code: ErrorCode::Unauthorized,
+            msg: "per-user visibility not yet available; system access requires SYSTEM/Administrators or root; development access requires its owner".into() }];
+    }
+    handle(store, request)
+}
+
 /// Cooperative shutdown for the accept loop. `request` also
 /// wakes the parked `accept` with a throwaway connection, so
 /// stopping never needs a polling timer.
@@ -275,6 +306,8 @@ pub fn serve(
     shutdown: Shutdown,
 ) -> std::io::Result<()> {
     let listener = Listener::bind(&config.endpoint)?;
+    let owner = CallerIdentity::current()?;
+    let system = config.endpoint == Endpoint::default_service();
     eprintln!("ferrowd: listening on {}", config.endpoint);
     while !shutdown.is_requested() {
         let (stream, _caller) = listener.accept()?;
@@ -283,8 +316,11 @@ pub fn serve(
             break;
         }
         let store = store.clone();
+        let owner = owner.clone();
         std::thread::spawn(move || {
-            let _ = serve_stream(stream, move |request| handle(&store, request));
+            let _ = serve_cancellable(stream, move |context, request| {
+                handle_authorized(&store, request, &context.caller, &owner, system)
+            });
         });
     }
     Ok(())

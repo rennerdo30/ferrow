@@ -19,15 +19,17 @@ Windows MFT/USN journal).
 Endpoints: Windows named pipe `\\.\pipe\ferrowd` (remote clients
 rejected; LocalSystem and administrators full control,
 authenticated users connect/read/write), Linux
-`/run/ferrow/ferrowd.sock`, macOS `/var/run/ferrow/ferrowd.sock`.
-Caller identity always comes from the OS (Windows client PID and
-token, Linux `SO_PEERCRED`, macOS `getpeereid`), never from the
+`/run/ferrow/ferrowd.sock`, macOS `/private/var/run/ferrow/ferrowd.sock`.
+Caller identity always comes from the OS (Windows effective pipe
+token after reads, Linux `SO_PEERCRED`, macOS `getpeereid`), never from the
 client's own claim.
 
-**Privacy status:** per-user result filtering is milestone M2c
-and is **not implemented yet**. Until it lands, any local user
-who can connect can see every indexed file name. Do not run the
-system service on a shared multi-user machine yet.
+**Interim privacy rule, removed by M2c:** the system service answers
+only OS-authenticated SYSTEM or enabled Administrators on Windows,
+and root (uid 0) on Unix. All others receive `Error{Unauthorized}`
+without paths, counts or status data. The CLI explains the refusal
+and falls back to the per-user saved index. Development mode serves
+only the OS user who started it. Per-user result filtering remains M2c.
 
 ## Install (needs admin/root once)
 
