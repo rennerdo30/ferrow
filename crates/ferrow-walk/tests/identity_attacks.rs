@@ -119,3 +119,58 @@ fn dotdot_detour_is_not_an_excluded_ancestor() {
     assert!(contains(&index, b"keep.txt"));
     assert_eq!(index.path(0), detour);
 }
+
+#[cfg(windows)]
+#[test]
+fn excludes_support_long_paths_that_std_can_scan() {
+    use ferrow_walk::{WalkOptions, scan};
+    let mut f = Fixture::new("long-path");
+    let root = f.path.join("a".repeat(130)).join("b".repeat(130));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("private.txt"), b"x").unwrap();
+    assert!(root.as_os_str().len() > 260);
+    assert_eq!(run(&root, vec![], false).len(), 2, "std can scan this path");
+    let verbatim = std::fs::canonicalize(&root).unwrap();
+    assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+    let mut failures = Vec::new();
+    for scan_root in [&root, &verbatim] {
+        for exclude in [&root, &verbatim] {
+            for follow in [false, true] {
+                let (index, report) = scan(&WalkOptions {
+                    roots: vec![scan_root.clone()],
+                    excludes: vec![exclude.clone()],
+                    follow_symlinks: follow,
+                });
+                if !index.is_empty() || report.errors != 0 {
+                    failures.push(format!("root={scan_root:?}, exclude={exclude:?}, follow={follow}: {} entries, {report:?}", index.len()));
+                }
+            }
+        }
+    }
+    // A followed child alias reaches the long target, then a second alias
+    // loops back to it. Long-path identities must also bound that cycle.
+    let scan_root = f.path.join("scan");
+    std::fs::create_dir(&scan_root).unwrap();
+    f.link(&verbatim, &scan_root.join("alias"));
+    f.link(&verbatim, &verbatim.join("loop"));
+    for (scan_root, expected) in [(&scan_root, 4), (&root, 3), (&verbatim, 3)] {
+        let (index, report) = scan(&WalkOptions {
+            roots: vec![scan_root.clone()],
+            excludes: vec![],
+            follow_symlinks: true,
+        });
+        if index.len() != expected
+            || report.errors != 1
+            || !report
+                .error_samples
+                .iter()
+                .any(|s| s.contains("symlink cycle"))
+        {
+            failures.push(format!(
+                "long-path cycle at {scan_root:?}: {} entries, {report:?}",
+                index.len()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

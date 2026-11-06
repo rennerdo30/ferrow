@@ -197,8 +197,10 @@ impl ExcludeSet {
 fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
     let mut set = ExcludeSet::default();
     for path in paths {
-        let id = match file_id(path) {
-            Ok(id) => id,
+        // Establish existence independently of identity opening: a provider
+        // may fail an identity query with NotFound even for an existing path.
+        let md = match std::fs::metadata(path) {
+            Ok(md) => md,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 errors.add(format!("exclude not found: {}", path.display()));
                 continue;
@@ -208,22 +210,26 @@ fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
                 continue;
             }
         };
-        match std::fs::metadata(path) {
-            Ok(md) if md.is_dir() => {
-                set.dirs.insert(id);
+        let id = match file_id(path) {
+            Ok(id) => id,
+            Err(e) => {
+                errors.add(format!("exclude identity {}: {e}", path.display()));
+                continue;
             }
-            Ok(_) => {
-                set.files.insert(id);
-                let parent = match path.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                    _ => PathBuf::from("."),
-                };
-                if let Ok(parent_id) = file_id(&parent) {
+        };
+        if md.is_dir() {
+            set.dirs.insert(id);
+        } else {
+            set.files.insert(id);
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            match file_id(&parent) {
+                Ok(parent_id) => {
                     set.files_by_parent.entry(parent_id).or_default().insert(id);
                 }
-            }
-            Err(e) => {
-                errors.add(format!("exclude {}: {e}", path.display()));
+                Err(e) => errors.add(format!("exclude parent identity {}: {e}", parent.display())),
             }
         }
     }
@@ -372,10 +378,12 @@ impl<'x> Walker<'x> {
                 }
             } else if let Some(parent_id) = dir_identity
                 && let Some(files) = self.excludes.files_by_parent.get(&parent_id)
-                && let Ok(id) = file_id(&path)
-                && files.contains(&id)
             {
-                continue;
+                match file_id(&path) {
+                    Ok(id) if files.contains(&id) => continue,
+                    Ok(_) => {}
+                    Err(e) => self.errors.add(format!("{}: {e}", path.display())),
+                }
             }
             let id = self.builder.add(dir_id, &name, ent_flags);
             if is_dir {

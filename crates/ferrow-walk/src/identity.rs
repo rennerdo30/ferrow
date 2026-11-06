@@ -71,45 +71,21 @@ pub fn file_id(path: &Path) -> std::io::Result<FileId> {
 /// to their target.
 #[cfg(windows)]
 pub fn file_id(path: &Path) -> std::io::Result<FileId> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
-    // encode_wide preserves lone surrogates, so WTF-8 names open fine.
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: `wide` is NUL-terminated and outlives the call. Minimal
-    // access (attributes only), full sharing, no security attributes
-    // or template file. FILE_FLAG_BACKUP_SEMANTICS allows opening
-    // directories.
-    let handle: HANDLE = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `handle` was just opened successfully and is closed
-    // exactly once below.
-    let result = unsafe { file_id_from_handle(handle) };
-    // SAFETY: closing the handle opened above, exactly once.
-    unsafe {
-        CloseHandle(handle);
-    }
-    result
+    // Rust performs long-path conversion and preserves lone surrogates.
+    // The owned File closes the handle on every query success/error path.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    // SAFETY: `file` owns a live handle and outlives the entire query.
+    unsafe { file_id_from_handle(file.as_raw_handle()) }
 }
 
 #[cfg(windows)]
