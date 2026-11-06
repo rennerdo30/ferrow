@@ -186,14 +186,14 @@ fn json_and_nul_escape_tricky_names_exactly() {
         "--null",
     ]);
     assert!(out.status.success());
-    let mut parts: Vec<String> = out
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8(p.to_vec()).unwrap())
-        .collect();
-    parts.sort();
-    assert_eq!(parts, expected);
+    // Byte-for-byte: exactly the JSON output's paths (same search, same
+    // order), each followed by one NUL. Extra or missing delimiters fail.
+    let mut expected_nul: Vec<u8> = Vec::new();
+    for path in &parsed {
+        expected_nul.extend_from_slice(path.as_bytes());
+        expected_nul.push(0);
+    }
+    assert_eq!(out.stdout, expected_nul);
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -212,6 +212,7 @@ fn index_then_search_all_modes() {
     let out = ferrow(&["search", "report", "--index", index]);
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().collect();
+    let plain_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     assert_eq!(lines.len(), 3, "{text}");
     assert!(lines.iter().all(|l| l.starts_with(root)), "{text}");
     assert!(text.contains("Report 2024.txt"));
@@ -232,28 +233,17 @@ fn index_then_search_all_modes() {
         vec![tree.root.join("Budget.xlsx").to_string_lossy().into_owned()]
     );
 
-    // NUL-separated output: exact paths, NUL-terminated.
+    // NUL-separated output, byte-for-byte: exactly the plain output's
+    // paths (same search, same order), each followed by one NUL. Extra
+    // or missing delimiters fail.
     let out = ferrow(&["search", "report", "--index", index, "--null"]);
     assert!(out.status.success());
-    assert_eq!(out.stdout.last(), Some(&0), "missing trailing NUL");
-    let parts: Vec<String> = out
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8(p.to_vec()).unwrap())
-        .collect();
-    let mut expected_nul: Vec<String> = [
-        tree.root.join("Report 2024.txt"),
-        tree.root.join("report draft.txt"),
-        tree.root.join("sub").join("deep report.log"),
-    ]
-    .iter()
-    .map(|p| p.to_string_lossy().into_owned())
-    .collect();
-    let mut sorted_parts = parts.clone();
-    sorted_parts.sort();
-    expected_nul.sort();
-    assert_eq!(sorted_parts, expected_nul);
+    let mut expected_nul: Vec<u8> = Vec::new();
+    for line in &plain_lines {
+        expected_nul.extend_from_slice(line.as_bytes());
+        expected_nul.push(0);
+    }
+    assert_eq!(out.stdout, expected_nul);
 
     // Count only.
     let out = ferrow(&["search", "report", "--index", index, "--count"]);
