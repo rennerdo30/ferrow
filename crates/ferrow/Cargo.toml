@@ -10,3 +10,7 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+directories = "6.0.0"
+ferrow-index = { path = "../ferrow-index" }
+ferrow-query = { path = "../ferrow-query" }
+ferrow-walk = { path = "../ferrow-walk" }
