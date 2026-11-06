@@ -129,8 +129,10 @@ name = "ferrow"
 version = "0.0.0"
 dependencies = [
  "ferrow-index",
+ "ferrow-ipc",
  "ferrow-query",
  "ferrow-walk",
+ "ferrowd",
  "serde_json",
 ]
 
