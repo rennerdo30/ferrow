@@ -118,10 +118,11 @@ fn dotdot_detour_is_not_an_excluded_ancestor() {
     std::fs::create_dir(&private).unwrap();
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("keep.txt"), b"x").unwrap();
-    let detour = private.join("..").join("root");
-    let index = run(&detour, vec![private], false);
-    assert!(contains(&index, b"keep.txt"));
-    assert_eq!(index.path(0), detour);
+    for detour in [private.join("..").join("root"), private.join("..")] {
+        let index = run(&detour, vec![private.clone()], false);
+        assert!(contains(&index, b"keep.txt"));
+        assert_eq!(index.path(0), detour);
+    }
 }
 
 #[cfg(windows)]
@@ -268,4 +269,49 @@ fn file_exclude_resolves_link_target_parent() {
     let alias = f.path.join("alias");
     f.file_link(&file, &alias);
     assert_eq!(run(&target, vec![alias], false).len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn excluded_containing_location_applies_to_trailing_alias_root() {
+    let mut f = Fixture::new("alias-own-location");
+    let private = f.path.join("private");
+    let outside = f.path.join("outside");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("outside.txt"), b"x").unwrap();
+    let alias = private.join("alias");
+    f.link(&outside, &alias);
+    // On Unix a trailing slash makes symlink_metadata inspect the target.
+    // The link's own containing location must still enforce the exclusion.
+    let trailing = alias.join("").into_os_string();
+    for root in [alias, trailing.into()] {
+        for follow in [false, true] {
+            assert!(run(&root, vec![private.clone()], follow).is_empty());
+        }
+    }
+}
+
+#[test]
+fn file_alias_checks_resolved_parent_even_after_hardlink_root() {
+    use ferrow_walk::{WalkOptions, scan};
+    let mut f = Fixture::new("hardlink-location-cache");
+    let private = f.path.join("private");
+    std::fs::create_dir(&private).unwrap();
+    let secret = private.join("secret.txt");
+    let keep = f.path.join("keep.txt");
+    std::fs::write(&secret, b"x").unwrap();
+    std::fs::hard_link(&secret, &keep).unwrap();
+    let alias = f.path.join("alias");
+    f.file_link(&secret, &alias);
+    // File hard links have no unique containing directory. Admitting a root
+    // hard link outside private must not cache its parent as the alias's.
+    let (index, report) = scan(&WalkOptions {
+        roots: vec![keep.clone(), alias],
+        excludes: vec![private],
+        follow_symlinks: false,
+    });
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.path(0), keep);
 }

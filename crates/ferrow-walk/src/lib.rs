@@ -105,7 +105,7 @@ fn is_hidden(name: &[u8], entry: &std::fs::DirEntry) -> bool {
 /// them — any spelling (normal, verbatim, differently cased) or
 /// alias (symlink, junction) of the same directory is skipped with
 /// everything below it. File excludes match by identity inside the
-/// directory that contains the spelled-out path, so identity lookups
+/// directory that contains the resolved exclude path, so identity lookups
 /// stay at one per directory (plus files in such a directory).
 #[derive(Default)]
 struct ExcludeSet {
@@ -152,12 +152,7 @@ impl ExcludeSet {
 
     /// Shared location check for roots and aliases, including aliases kept
     /// as leaves. Canonical strings locate ancestors; only identities match.
-    fn excluded_location(
-        &self,
-        path: &Path,
-        id: Option<FileId>,
-        is_link: bool,
-    ) -> std::io::Result<bool> {
+    fn excluded_location(&self, path: &Path, id: Option<FileId>) -> std::io::Result<bool> {
         if self.is_empty() {
             return Ok(false);
         }
@@ -169,11 +164,14 @@ impl ExcludeSet {
         if self.dirs.is_empty() {
             return Ok(false);
         }
-        // A link's own containing location matters even if its target is
-        // outside that directory. Resolve the parent, not lexical ancestors
-        // of a spelling that could contain a `..` detour.
-        if is_link
-            && let Some(parent) = path.parent()
+        // Check the containing location even if a trailing slash makes
+        // metadata classify an alias root as its target. Resolve the parent
+        // only for a named entry, never for a final `..`: that would make a
+        // directory we are leaving look like an ancestor of the location.
+        if matches!(
+            path.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        ) && let Some(parent) = path.parent()
             && self.excluded_ancestors(&std::fs::canonicalize(parent)?)?
         {
             return Ok(true);
@@ -187,7 +185,16 @@ impl ExcludeSet {
         {
             return Ok(*cached);
         }
-        self.excluded_ancestors(&std::fs::canonicalize(path)?)
+        let resolved = std::fs::canonicalize(path)?;
+        // Only directories have a unique ancestor chain. A file identity
+        // may have hard-linked names in different containing directories;
+        // never cache a location result under that file's identity.
+        let location = if std::fs::metadata(&resolved)?.is_dir() {
+            resolved.as_path()
+        } else {
+            resolved.parent().unwrap_or(&resolved)
+        };
+        self.excluded_ancestors(location)
     }
 }
 
@@ -365,7 +372,7 @@ impl<'x> Walker<'x> {
                         Ok(id) => {
                             child_identity = Some(id);
                             if is_symlink {
-                                match self.excludes.excluded_location(&path, Some(id), true) {
+                                match self.excludes.excluded_location(&path, Some(id)) {
                                     Ok(true) => continue,
                                     Ok(false) => {}
                                     Err(e) => {
@@ -497,7 +504,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
                 continue;
             }
         };
-        match excludes.excluded_location(&abs, root_identity, is_symlink) {
+        match excludes.excluded_location(&abs, root_identity) {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
