@@ -4,7 +4,6 @@
 //! feeds a [`ferrow_index::IndexBuilder`]. Permission and IO errors are
 //! counted and sampled into the report, never fatal.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,10 +92,42 @@ fn is_hidden(name: &[u8], entry: &std::fs::DirEntry) -> bool {
     }
 }
 
+/// Normalised comparison key for exclude matching: the lossless bytes
+/// of each path component. On Windows components are case-folded, so
+/// excludes compare case-insensitively (documented in ADR 0001); on
+/// Unix they compare exactly.
+fn path_key(path: &Path) -> Vec<Vec<u8>> {
+    path.components()
+        .map(|component| {
+            let mut bytes = Vec::new();
+            name_to_bytes(component.as_os_str(), &mut bytes);
+            #[cfg(windows)]
+            {
+                let mut folded = Vec::new();
+                ferrow_index::fold_name(&bytes, &mut folded);
+                folded
+            }
+            #[cfg(not(windows))]
+            {
+                bytes
+            }
+        })
+        .collect()
+}
+
+/// True when `key` equals an excluded path or lies under one
+/// (component-wise prefix), so an excluded ancestor cannot be
+/// bypassed by naming a deeper root explicitly.
+fn key_is_excluded(key: &[Vec<u8>], excludes: &[Vec<Vec<u8>>]) -> bool {
+    excludes
+        .iter()
+        .any(|excluded| key.len() >= excluded.len() && key[..excluded.len()] == excluded[..])
+}
+
 #[derive(Clone, Copy)]
 struct Walker<'a> {
     builder: &'a IndexBuilder,
-    excludes: &'a HashSet<PathBuf>,
+    excludes: &'a [Vec<Vec<u8>>],
     follow_symlinks: bool,
     errors: &'a Errors,
 }
@@ -198,7 +229,7 @@ impl<'x> Walker<'x> {
             return false;
         }
         match std::path::absolute(path) {
-            Ok(abs) => self.excludes.contains(&abs),
+            Ok(abs) => key_is_excluded(&path_key(&abs), self.excludes),
             Err(_) => false,
         }
     }
@@ -228,10 +259,11 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     let started = Instant::now();
     let builder = IndexBuilder::new();
     let errors = Errors::new();
-    let excludes: HashSet<PathBuf> = options
+    let excludes: Vec<Vec<Vec<u8>>> = options
         .excludes
         .iter()
         .filter_map(|p| std::path::absolute(p).ok())
+        .map(|p| path_key(&p))
         .collect();
     let walker = Walker {
         builder: &builder,
@@ -253,6 +285,11 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
                 continue;
             }
         };
+        // Excludes apply to roots too, including excluded ancestors:
+        // naming a directory explicitly never re-includes it.
+        if key_is_excluded(&path_key(&abs), &excludes) {
+            continue;
+        }
         let name = root_name_bytes(&abs);
         // symlink_metadata first: a root symlink is only followed when
         // the switch is on (fs::metadata would traverse it silently).
@@ -492,6 +529,58 @@ mod tests {
         // root, f.txt, a, g.txt, loop — the loop is a leaf, never descended.
         assert_eq!(idx.len(), 5, "cycle was not bounded");
         assert!(report.errors >= 1, "cycle must be counted: {report:?}");
+    }
+
+    #[test]
+    fn excluded_root_is_not_indexed() {
+        let dir = TestDir::new("excluded-root");
+        dir.file("private.txt");
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![dir.0.clone()],
+            excludes: vec![dir.0.clone()],
+            follow_symlinks: false,
+        });
+        assert!(
+            idx.is_empty(),
+            "excluded root exposed {} entries",
+            idx.len()
+        );
+    }
+
+    #[test]
+    fn excluded_ancestor_is_not_bypassed_by_explicit_root() {
+        let dir = TestDir::new("excluded-ancestor");
+        dir.file("sub/private.txt");
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![dir.0.join("sub")],
+            excludes: vec![dir.0.clone()],
+            follow_symlinks: false,
+        });
+        assert!(
+            idx.is_empty(),
+            "excluded subtree exposed {} entries",
+            idx.len()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn excludes_compare_case_insensitively_on_windows() {
+        let dir = TestDir::new("exclude-case");
+        dir.file("KeepDir/keep.txt");
+        dir.file("keep.txt");
+        // Same directory, different case spelling.
+        let (idx, _) = scan(&WalkOptions {
+            roots: vec![dir.0.clone()],
+            excludes: vec![dir.0.join("KEEPDIR")],
+            follow_symlinks: false,
+        });
+        let names = by_name(&idx);
+        assert!(names.contains_key("keep.txt"));
+        assert!(
+            !names.contains_key("KeepDir"),
+            "case-insensitive exclude missed"
+        );
     }
 
     #[test]

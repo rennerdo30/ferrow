@@ -97,6 +97,16 @@ no dependency, and easily outruns the disk on load. If load ever becomes
 CPU-bound at larger sizes, switching the checksum is a format-version
 bump.
 
+### Exclude matching (`ferrow-walk`)
+
+Excludes are compared against absolute paths component by component: a
+path is excluded when it equals an excluded path or lies under one.
+The check applies to scan roots exactly as to children, so an excluded
+directory cannot be re-included by naming it (or a directory under it)
+as an explicit root. On **Windows the comparison is case-insensitive**
+(components are case-folded with the same `fold_name` used for search),
+matching the platform's usual path semantics; on Unix it is byte-exact.
+
 ## Alternatives considered
 
 - **Storing full paths**: simpler result rendering, but multiplies memory
