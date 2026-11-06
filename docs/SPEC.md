@@ -97,7 +97,7 @@ launchers ────┘     (daemon)       └─ backend-macos   (FSEvents)
                   ferrow-query  (parser → plan → parallel matcher)
 ```
 
-- `ferrowd` is the only process that needs privileges (Windows service, Linux systemd unit, macOS LaunchAgent). The UI and CLI stay unprivileged.
+- `ferrowd` is the only process that needs privileges, and it is **required for v1 on all three platforms** (owner, 2026-11-06). It runs as a Windows service under LocalSystem, a Linux systemd system service with minimal capabilities, and a macOS LaunchDaemon with Full Disk Access. The UI and CLI stay unprivileged. Plan: [`milestones/M2-service.md`](milestones/M2-service.md).
 - **Single-user fallback:** with no daemon installed, the CLI and GUI can index in-process using the unprivileged backends.
 - **Privacy:** the daemon must only return entries that the requesting user may list. This applies on multi-user machines, where a privileged index would otherwise leak names. This is a security requirement, not an option.
 - Crates: `ferrow-index`, `ferrow-query`, `ferrow-backend-*`, `ferrow-ipc`, `ferrowd`, `ferrow` (CLI), `ferrow-gui`.
@@ -115,7 +115,14 @@ launchers ────┘     (daemon)       └─ backend-macos   (FSEvents)
 - The committed `Cargo.toml` holds the portable build profiles. `.cargo/config.toml` is **machine-local and gitignored**; `.cargo/config.example.toml` shows an optional local setup (sccache wrapper, cache dir, target dir outside the repository).
 - License: MIT (same as the owner's other public Rust project, kwil).
 
-## 9. Open decisions for the owner
+## 9. Owner decisions so far
+
+- 2026-11-06: excludes **fail closed**. If the scanner cannot determine whether an entry is excluded (for example, its identity query fails), it leaves the entry out and reports the error.
+- 2026-11-06: **Windows Start menu integration** is parked for now. Microsoft documents no supported way to add local file results (the web-provider API is EEA-only and returns web links, and cloud-files search needs a Copilot+ PC). An unofficial injection add-on is a watched option, to be revisited after M2.
+- 2026-11-06: a background index service on every platform (see §6).
+- 2026-11-06: a Pair Desk project `ferrow` tracks issues and the handoff.
+
+## 10. Open decisions for the owner
 
 1. **GUI toolkit:**
    - **Recommendation:** decide after a short spike that measures the 5 M-row virtual list and the start time.
