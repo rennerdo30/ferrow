@@ -499,3 +499,29 @@ pub fn highlight_ranges(query: &Query, name: &[u8]) -> Vec<Range<usize>> {
     }
     merged
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrow_index::IndexBuilder;
+
+    #[test]
+    fn name_prefilters_precede_path_work_and_paths_are_cancellable() {
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        let leaf = b.add(root, b"leaf", 0);
+        let index = b.freeze();
+        let matcher = Matcher::new(&Query::parse("path:root absent").unwrap());
+        let mut scratch = Scratch::default();
+        assert!(!matcher.matches(&index, leaf, &mut scratch, &CancelToken::new()));
+        assert!(
+            scratch.chain.is_empty(),
+            "name rejection must avoid path rebuild"
+        );
+        assert!(!scratch.path(&index, leaf, &CancelToken::cancelled()));
+        assert!(
+            scratch.chain.is_empty(),
+            "cancellation must stop parent traversal"
+        );
+    }
+}

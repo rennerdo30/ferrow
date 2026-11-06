@@ -177,7 +177,7 @@ jobs:
           timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee bench-output.txt
       - name: Measure main service through the same IPC harness and fixture
         if: github.event_name == 'pull_request'
-        run: timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a base-output.txt
+        run: timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" --legacy-queries 2>&1 | tee -a base-output.txt
       - name: Measure head service IPC
         run: timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a bench-output.txt
       - name: Write additive head summary

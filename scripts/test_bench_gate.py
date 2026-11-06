@@ -12,10 +12,10 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 
-def fixture():
+def fixture(language=True):
     lines = ["FERROW-MEASURE entries=16 seed=2026 heap_bytes=800 bytes_per_entry=50",
              "FERROW-MEASURE load_ms_median=100"]
-    for query in sorted(gate.QUERIES):
+    for query in sorted(gate.QUERIES | (gate.NEW_QUERIES if language else set())):
         for prefix in ("FERROW-QUERY", "FERROW-SERVICE"):
             lines.append(f'{prefix} query="{query}" first_page_ms=0.2 page_hits=2 full_count_ms=10 total_hits=2')
     return "\n".join(lines)
@@ -32,6 +32,45 @@ class GateTests(unittest.TestCase):
 
     def rows(self):
         return gate.compare(self.base, self.head, 16)
+
+    def test_metric_inventory_includes_twenty_required_language_observations(self):
+        self.assertEqual(gate.EXPECTED_METRICS, 46)
+        self.assertEqual(len(self.rows()), 46)
+
+    def test_legacy_baseline_accepts_only_explicit_legacy_queries(self):
+        base = gate.parse(fixture(language=False), require_new=False)
+        self.assertEqual(len(gate.compare(base, self.head, 16)), 46)
+        with self.assertRaises(ValueError):
+            gate.parse(fixture(), require_new=False)
+
+    def test_missing_or_partial_language_readings_fail_closed(self):
+        with self.assertRaises(ValueError):
+            gate.parse(fixture(language=False))
+        for query in gate.NEW_QUERIES:
+            for prefix in ("FERROW-QUERY", "FERROW-SERVICE"):
+                with self.subTest(query=query, prefix=prefix), self.assertRaises(ValueError):
+                    gate.parse(fixture().replace(f'{prefix} query="{query}"', f'IGNORE query="{query}"'))
+
+    def test_common_wildcard_absolute_first_page_limit(self):
+        for query in gate.COMMON_WILDCARDS:
+            head = copy.deepcopy(self.head)
+            for readings in head[1:]:
+                readings[query].update(page_hits=100, total_hits=200, first_page_ms=16)
+            self.assertFalse(any(row[-1] for row in gate.compare(self.base, head, 16)))
+            for arm in (1, 2):
+                bad = copy.deepcopy(head)
+                bad[arm][query]["first_page_ms"] = 16.001
+                self.assertTrue(any(row[-1] for row in gate.compare(self.base, bad, 16)))
+
+    def test_language_counts_and_complete_first_pages_must_agree(self):
+        self.head[2]["*.log"]["total_hits"] = 3
+        with self.assertRaises(ValueError):
+            self.rows()
+        self.head = copy.deepcopy(self.base)
+        for readings in self.head[1:]:
+            readings["*.log"].update(page_hits=0, total_hits=200)
+        with self.assertRaises(ValueError):
+            self.rows()
 
     def test_relative_boundary_and_regression(self):
         self.head[0]["load_ms_median"] = 110
@@ -106,7 +145,7 @@ class GateTests(unittest.TestCase):
     def test_cli_exit_codes_and_summary_on_trivial_inputs(self):
         with tempfile.TemporaryDirectory() as folder:
             base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
-            base.write_text(fixture(), encoding="utf-8")
+            base.write_text(fixture(language=False), encoding="utf-8")
             for text, expected in ((fixture(), 0), (fixture().replace("load_ms_median=100", "load_ms_median=200"), 1), ("", 2)):
                 head.write_text(text, encoding="utf-8")
                 result = subprocess.run([sys.executable, str(Path(__file__).with_name("bench-gate.py")),

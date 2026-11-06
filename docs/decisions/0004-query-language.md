@@ -83,6 +83,10 @@ appears first in the input. Rebuild paths only for surviving candidates,
 with per-worker reused path, folded path and ancestor buffers; no index or
 SearchOptions changes. Check cancellation while traversing parent chains.
 Keep existing ordered first-page admission and cancellation contracts.
+An anchored wildcard's required name prefix also narrows the existing sorted
+name order by two binary searches. AND may use any required prefix; OR only
+uses a shared required prefix, and NOT never narrows. Non-ASCII sensitive
+prefixes do not assume Unicode folding on invalid-byte names.
 
 Input is limited to 4096 bytes, 256 leaves and 32 nested groups/NOT nodes;
 overflow returns a precise byte span. These bounds prevent recursive parser,
