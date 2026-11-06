@@ -140,16 +140,60 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
     let sum = crc32(&buf[HEADER_LEN..]);
     buf[checksum_at..checksum_at + 4].copy_from_slice(&sum.to_le_bytes());
 
-    // Write via a temp file in the same directory, then rename, so a crash
-    // never leaves a half-written index at the target path.
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp).map_err(SaveError::Io)?;
-        f.write_all(&buf).map_err(SaveError::Io)?;
-        f.sync_all().map_err(SaveError::Io)?;
+    write_atomically(path, &buf).map_err(SaveError::Io)
+}
+
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `bytes` to `path` atomically: a unique temp file is created
+/// exclusively beside the destination, written and synced, then renamed
+/// over the destination. The temp file is removed on any error. On Unix
+/// the temp file is mode 0600, so the replaced index stays private.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "index".to_string());
+    let pid = std::process::id();
+    for _ in 0..100 {
+        let seq = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = parent.join(format!(".{base}.ferrow-tmp-{pid}-{seq}-{nonce:x}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = (|| -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
     }
-    std::fs::rename(&tmp, path).map_err(SaveError::Io)?;
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique temporary file for the index",
+    ))
 }
 
 fn take<'a>(data: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8], LoadError> {
@@ -373,6 +417,142 @@ mod tests {
         let sum = crc32(&bytes[HEADER_LEN..]);
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
         assert!(matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))));
+    }
+
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+        let dir = std::env::temp_dir().join(format!(
+            "ferrow-persist-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn tiny_index(name: &[u8]) -> Index {
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        b.add(root, name, 0);
+        b.freeze()
+    }
+
+    #[test]
+    fn save_preserves_unrelated_sibling_tmp() {
+        let dir = test_dir("sibling-tmp");
+        let path = dir.join("index.bin");
+        let sibling = path.with_extension("tmp");
+        std::fs::write(&sibling, b"unrelated owner data").unwrap();
+        tiny_index(b"a.txt").save(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&sibling).ok(),
+            Some(b"unrelated owner data".to_vec()),
+            "save destroyed an unrelated sibling index.tmp"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_to_tmp_named_destination_is_atomic() {
+        let dir = test_dir("tmp-dest");
+        let path = dir.join("index.tmp");
+        std::fs::write(&path, b"existing target").unwrap();
+        tiny_index(b"a.txt").save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.name(1), b"a.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_collide_or_corrupt() {
+        let dir = test_dir("concurrent");
+        let path = dir.join("index.bin");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let name = format!("file-{i}.txt");
+                    tiny_index(name.as_bytes()).save(&path)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let names: Vec<String> = (0..8).map(|i| format!("file-{i}.txt")).collect();
+        let final_name = String::from_utf8(loaded.name(1).to_vec()).unwrap();
+        assert!(names.contains(&final_name), "unexpected name {final_name}");
+        // No leftover temp files beside the destination.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != path)
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_leaves_destination_intact_and_no_temp() {
+        let dir = test_dir("fault");
+        // Destination is a non-empty directory: rename over it must fail on
+        // every platform, which exercises the error/cleanup path.
+        let dest = dir.join("index.bin");
+        std::fs::create_dir_all(dest.join("child")).unwrap();
+        std::fs::write(dest.join("child").join("keep.txt"), b"keep").unwrap();
+        let result = tiny_index(b"a.txt").save(&dest);
+        assert!(result.is_err(), "expected save to fail, got {result:?}");
+        assert_eq!(
+            std::fs::read(dest.join("child").join("keep.txt")).unwrap(),
+            b"keep"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != dest)
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_index_is_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: umask is process-wide; tests in this binary that create
+        // files do not depend on permission bits except this one.
+        let old = unsafe { libc_umask(0) };
+        let dir = test_dir("private");
+        let path = dir.join("index.bin");
+        let result = tiny_index(b"a.txt").save(&path);
+        // SAFETY: restoring the previous umask value obtained above.
+        unsafe { libc_umask(old) };
+        result.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "index mode was {mode:o}");
+        // Replacement keeps the private mode.
+        // SAFETY: as above.
+        let old = unsafe { libc_umask(0) };
+        let result = tiny_index(b"b.txt").save(&path);
+        // SAFETY: restoring the previous umask value obtained above.
+        unsafe { libc_umask(old) };
+        result.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "replaced index mode was {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    unsafe fn libc_umask(mask: u32) -> u32 {
+        // Minimal umask(2) declaration to avoid a libc dependency.
+        unsafe extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        // SAFETY: umask always succeeds and takes the mask by value.
+        unsafe { umask(mask) }
     }
 
     #[test]
