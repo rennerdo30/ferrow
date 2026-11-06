@@ -277,7 +277,7 @@ fn default_and_user_endpoints_are_named_as_documented() {
     } else if cfg!(target_os = "linux") {
         assert_eq!(service, "/run/ferrow/ferrowd.sock");
     } else if cfg!(target_os = "macos") {
-        assert_eq!(service, "/var/run/ferrow/ferrowd.sock");
+        assert_eq!(service, "/private/var/run/ferrow/ferrowd.sock");
     }
     assert!(Endpoint::user_service().display().contains("ferrowd-user-"));
 }

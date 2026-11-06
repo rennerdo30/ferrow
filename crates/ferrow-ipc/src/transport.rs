@@ -22,6 +22,10 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(unix)]
+#[path = "unix_security.rs"]
+mod unix_security;
+
 /// Where a service listens and clients connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -51,7 +55,7 @@ impl Endpoint {
         #[cfg(target_os = "macos")]
         {
             Endpoint {
-                path: PathBuf::from("/var/run/ferrow/ferrowd.sock"),
+                path: PathBuf::from("/private/var/run/ferrow/ferrowd.sock"),
             }
         }
         #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -91,8 +95,14 @@ impl Endpoint {
         }
         #[cfg(unix)]
         {
+            // SAFETY: geteuid has no preconditions. Use the real uid, never USER.
+            let uid = unsafe { libc::geteuid() };
             Endpoint {
-                path: std::env::temp_dir().join(format!("{name}.sock")),
+                path: PathBuf::from("/tmp")
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    .join(format!("ferrow-{uid}"))
+                    .join(format!("{name}.sock")),
             }
         }
     }
@@ -165,6 +175,8 @@ mod platform {
         wake_read: UnixStream,
         wake_write: std::sync::Mutex<UnixStream>,
         cancelled: std::sync::atomic::AtomicBool,
+        socket_id: (u64, u64),
+        _lease: std::fs::File,
     }
 
     pub struct Stream {
@@ -177,15 +189,10 @@ mod platform {
         pub fn bind(endpoint: &Endpoint) -> std::io::Result<Listener> {
             use std::os::unix::fs::PermissionsExt;
             if let Some(parent) = endpoint.path.parent() {
-                std::fs::create_dir_all(parent)?;
+                super::unix_security::directory(parent, *endpoint == Endpoint::default_service())?;
             }
-            // The endpoint is owned by this service instance: a
-            // leftover socket file from a previous run is removed.
-            match std::fs::remove_file(&endpoint.path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
+            let lease = super::unix_security::lease(&endpoint.path)?;
+            super::unix_security::reclaim(&endpoint.path)?;
             let inner = UnixListener::bind(&endpoint.path)?;
             std::fs::set_permissions(&endpoint.path, std::fs::Permissions::from_mode(0o666))?;
             let (wake_read, wake_write) = UnixStream::pair()?;
@@ -195,6 +202,8 @@ mod platform {
                 wake_read,
                 wake_write: std::sync::Mutex::new(wake_write),
                 cancelled: std::sync::atomic::AtomicBool::new(false),
+                socket_id: super::unix_security::identity(&endpoint.path)?,
+                _lease: lease,
             })
         }
 
@@ -251,7 +260,9 @@ mod platform {
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            if super::unix_security::identity(&self.path).ok() == Some(self.socket_id) {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 
