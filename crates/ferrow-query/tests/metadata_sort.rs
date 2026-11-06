@@ -2,6 +2,60 @@ use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder, ROOT_PARENT};
 use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, search};
 
 #[test]
+fn retired_index_cancels_preparation_but_a_live_owner_keeps_it_valid() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    for keep_owner in [false, true] {
+        let b = IndexBuilder::with_columns(ColumnSet::MODIFIED);
+        for i in 0..4 {
+            b.add_with_metadata(
+                ROOT_PARENT,
+                format!("file-{i}").as_bytes(),
+                0,
+                EntryMetadata {
+                    modified: Some(i * 10_000_000),
+                    ..Default::default()
+                },
+            );
+        }
+        let index = Arc::new(b.freeze());
+        let weak = Arc::downgrade(&index);
+        let live = keep_owner.then(|| index.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let receiver = Mutex::new(release_rx);
+        index.request_sort_with_hook(
+            SortKey::Modified,
+            Arc::new(move || {
+                started_tx.send(()).unwrap();
+                receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }),
+        );
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let ticket = index.sort_ticket(SortKey::Modified).unwrap();
+        drop(index);
+        assert_eq!(weak.upgrade().is_some(), keep_owner);
+        release_tx.send(()).unwrap();
+        let status = ticket.wait_timeout(Duration::from_secs(2));
+        assert_eq!(
+            status,
+            if keep_owner {
+                ferrow_query::SortStatus::Ready
+            } else {
+                ferrow_query::SortStatus::Unprepared
+            }
+        );
+        if let Some(index) = live {
+            assert!(index.metadata_order(SortKey::Modified, false).is_some());
+        }
+    }
+}
+
+#[test]
 fn pending_sort_returns_names_and_cancellation_while_worker_is_paused() {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;

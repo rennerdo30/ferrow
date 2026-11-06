@@ -3,7 +3,7 @@ use crate::{LoadError, RawEntry};
 use std::cmp::Ordering;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
-    atomic::{AtomicU8, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
 
@@ -71,9 +71,14 @@ pub enum SortStatus {
 #[derive(Debug, Default)]
 struct Signal {
     state: AtomicU8,
+    retired: AtomicBool,
     wait: Mutex<()>,
     ready: Condvar,
 }
+// Unwind the standard stable sort without invoking the panic hook. Its
+// comparator cannot return an error; unwinding releases its scratch and ids.
+struct PreparationCancelled;
+const PREPARE_INTERVAL: usize = 1024;
 impl Signal {
     fn status(&self) -> SortStatus {
         match self.state.load(AtomicOrdering::Acquire) {
@@ -244,6 +249,11 @@ fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], LoadEr
     Ok(result)
 }
 impl<T: Value> Column<T> {
+    fn check_live(&self) {
+        if self.signal.retired.load(AtomicOrdering::Relaxed) {
+            std::panic::resume_unwind(Box::new(PreparationCancelled));
+        }
+    }
     fn build(raw: &[RawEntry], get: impl Fn(&EntryMetadata) -> Option<T>) -> Arc<Self> {
         let mut c = Self {
             packed: Vec::with_capacity(raw.len() * T::WIDTH),
@@ -315,16 +325,45 @@ impl<T: Value> Column<T> {
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         before();
-                        let mut ids = (*names).clone();
+                        column.check_live();
+                        let mut ids = Vec::with_capacity(names.len());
+                        for chunk in names.chunks(PREPARE_INTERVAL) {
+                            column.check_live();
+                            ids.extend_from_slice(chunk);
+                        }
+                        column.check_live();
                         // Stable input name order preserves ties. This dedicated
                         // thread never occupies or waits for the query Rayon pool.
-                        ids.sort_by(|&a, &b| column.cmp(a, b));
+                        let mut comparisons = 0usize;
+                        ids.sort_by(|&a, &b| {
+                            if comparisons.is_multiple_of(PREPARE_INTERVAL) {
+                                column.check_live();
+                            }
+                            comparisons = comparisons.wrapping_add(1);
+                            column.cmp(a, b)
+                        });
+                        column.check_live();
                         let known = ids.partition_point(|&id| column.get(id).is_some());
-                        let _ = column.order.set(PackedIds::from_ids(&ids, known, |i| {
+                        let order = PackedIds::from_ids(&ids, known, |i| {
+                            if i.is_multiple_of(PREPARE_INTERVAL) {
+                                column.check_live();
+                            }
                             i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal
-                        }));
+                        });
+                        column.check_live();
+                        let _ = column.order.set(order);
                     }));
-                    column.signal.finish(if result.is_ok() { 2 } else { 3 });
+                    let state = match result {
+                        Ok(()) => 2,
+                        Err(e) if e.is::<PreparationCancelled>() => 0,
+                        Err(_) => 3,
+                    };
+                    let signal = column.signal.clone();
+                    // A completion ticket retains only the small signal, never
+                    // retired columns or the name permutation.
+                    drop(column);
+                    drop(names);
+                    signal.finish(state);
                 });
             if launched.is_err() {
                 self.signal.finish(3);
@@ -415,6 +454,20 @@ pub(crate) struct MetadataColumns {
     created: Option<Arc<Column<i64>>>,
     accessed: Option<Arc<Column<i64>>>,
     attributes: Option<Arc<Column<u32>>>,
+}
+impl Drop for MetadataColumns {
+    fn drop(&mut self) {
+        fn retire<T>(column: &Option<Arc<Column<T>>>) {
+            if let Some(c) = column {
+                c.signal.retired.store(true, AtomicOrdering::Relaxed);
+            }
+        }
+        retire(&self.size);
+        retire(&self.modified);
+        retire(&self.created);
+        retire(&self.accessed);
+        retire(&self.attributes);
+    }
 }
 impl MetadataColumns {
     #[cfg(feature = "test-hooks")]
@@ -710,6 +763,43 @@ pub fn metadata_timestamp(time: std::time::SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retired_worker_releases_columns_and_names_before_signalling() {
+        use std::sync::mpsc;
+        let builder = crate::IndexBuilder::with_columns(ColumnSet::MODIFIED);
+        for i in 0..4 {
+            builder.add_with_metadata(
+                crate::ROOT_PARENT,
+                b"file",
+                0,
+                EntryMetadata {
+                    modified: Some(i),
+                    ..Default::default()
+                },
+            );
+        }
+        let index = builder.freeze();
+        let column = index.metadata.modified.as_ref().unwrap();
+        let weak_column = Arc::downgrade(column);
+        let weak_names = Arc::downgrade(&index.sorted);
+        let ticket = SortTicket(column.signal.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        column.request_using(index.sorted.clone(), move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(index);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            ticket.wait_timeout(Duration::from_secs(2)),
+            SortStatus::Unprepared
+        );
+        assert!(weak_column.upgrade().is_none());
+        assert!(weak_names.upgrade().is_none());
+    }
+
     #[test]
     fn packed_boundaries_seconds_and_exact_overflows() {
         for value in [
