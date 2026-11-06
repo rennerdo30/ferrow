@@ -77,8 +77,7 @@ struct Signal {
     wait: Mutex<()>,
     ready: Condvar,
 }
-// Unwind the standard stable sort without invoking the panic hook. Its
-// comparator cannot return an error; unwinding releases its scratch and ids.
+#[derive(Debug)]
 struct PreparationCancelled;
 const PREPARE_INTERVAL: usize = 1024;
 impl Signal {
@@ -141,19 +140,28 @@ impl PackedIds {
             5
         }
     }
-    fn from_ids(ids: &[u32], known: usize, boundary: impl Fn(usize) -> bool) -> Self {
+    fn from_ids(
+        ids: &[u32],
+        known: usize,
+        boundary: impl Fn(usize) -> bool,
+        check: impl Fn() -> Result<(), PreparationCancelled>,
+    ) -> Result<Self, PreparationCancelled> {
+        check()?;
         let width = Self::width(ids.len());
         let flag = 1u64 << (width * 8 - 1);
         let mut bytes = Vec::with_capacity(ids.len() * width);
         for (i, &id) in ids.iter().enumerate() {
+            if i.is_multiple_of(PREPARE_INTERVAL) {
+                check()?;
+            }
             let code = u64::from(id) | if boundary(i) { flag } else { 0 };
             bytes.extend_from_slice(&code.to_le_bytes()[..width]);
         }
-        Self {
+        Ok(Self {
             bytes,
             width,
             known,
-        }
+        })
     }
     fn len(&self) -> usize {
         self.bytes.len() / self.width
@@ -251,7 +259,7 @@ fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], LoadEr
     Ok(result)
 }
 impl<T: Value> Column<T> {
-    fn check_live(&self) {
+    fn check_live(&self) -> Result<(), PreparationCancelled> {
         if self.signal.retired.load(AtomicOrdering::Relaxed)
             || (!self.signal.pinned.load(AtomicOrdering::Relaxed)
                 && !self
@@ -262,8 +270,51 @@ impl<T: Value> Column<T> {
                     .iter()
                     .any(|cancel| !cancel.load(AtomicOrdering::Relaxed)))
         {
-            std::panic::resume_unwind(Box::new(PreparationCancelled));
+            return Err(PreparationCancelled);
         }
+        Ok(())
+    }
+    // Stable name ties, one reusable half-size scratch buffer, and bounded
+    // cancellation even in panic=abort builds. Only the small leaf sorts use
+    // the standard library; merges check every PREPARE_INTERVAL output ids.
+    fn sort_ids(
+        &self,
+        ids: &mut [u32],
+        scratch: &mut Vec<u32>,
+        check: &mut impl FnMut() -> Result<(), PreparationCancelled>,
+    ) -> Result<(), PreparationCancelled> {
+        check()?;
+        if ids.len() <= PREPARE_INTERVAL {
+            ids.sort_by(|&a, &b| self.cmp(a, b));
+            return check();
+        }
+        let mid = ids.len() / 2;
+        let (left, right) = ids.split_at_mut(mid);
+        self.sort_ids(left, scratch, check)?;
+        self.sort_ids(right, scratch, check)?;
+        if self.cmp(ids[mid - 1], ids[mid]) != Ordering::Greater {
+            return check();
+        }
+        scratch.clear();
+        for chunk in ids[..mid].chunks(PREPARE_INTERVAL) {
+            check()?;
+            scratch.extend_from_slice(chunk);
+        }
+        let (mut left, mut right, mut out) = (0, mid, 0usize);
+        while left < mid {
+            if out.is_multiple_of(PREPARE_INTERVAL) {
+                check()?;
+            }
+            if right == ids.len() || self.cmp(scratch[left], ids[right]) != Ordering::Greater {
+                ids[out] = scratch[left];
+                left += 1;
+            } else {
+                ids[out] = ids[right];
+                right += 1;
+            }
+            out += 1;
+        }
+        check()
     }
     fn build(raw: &[RawEntry], get: impl Fn(&EntryMetadata) -> Option<T>) -> Arc<Self> {
         let mut c = Self {
@@ -378,37 +429,37 @@ impl<T: Value> Column<T> {
                             if let Some(before) = before.take() {
                                 before();
                             }
-                            column.check_live();
+                            column.check_live()?;
                             let mut ids = Vec::with_capacity(names.len());
                             for chunk in names.chunks(PREPARE_INTERVAL) {
-                                column.check_live();
+                                column.check_live()?;
                                 ids.extend_from_slice(chunk);
                             }
-                            column.check_live();
+                            column.check_live()?;
                             // Stable input name order preserves ties. This dedicated
                             // thread never occupies or waits for the query Rayon pool.
-                            let mut comparisons = 0usize;
-                            ids.sort_by(|&a, &b| {
-                                if comparisons.is_multiple_of(PREPARE_INTERVAL) {
-                                    column.check_live();
-                                }
-                                comparisons = comparisons.wrapping_add(1);
-                                column.cmp(a, b)
+                            let mut scratch = Vec::with_capacity(if ids.len() > PREPARE_INTERVAL {
+                                ids.len() / 2
+                            } else {
+                                0
                             });
-                            column.check_live();
+                            column.sort_ids(&mut ids, &mut scratch, &mut || column.check_live())?;
+                            drop(scratch);
+                            column.check_live()?;
                             let known = ids.partition_point(|&id| column.get(id).is_some());
-                            let order = PackedIds::from_ids(&ids, known, |i| {
-                                if i.is_multiple_of(PREPARE_INTERVAL) {
-                                    column.check_live();
-                                }
-                                i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal
-                            });
-                            column.check_live();
+                            let order = PackedIds::from_ids(
+                                &ids,
+                                known,
+                                |i| i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal,
+                                || column.check_live(),
+                            )?;
+                            column.check_live()?;
                             let _ = column.order.set(order);
+                            Ok::<_, PreparationCancelled>(())
                         }));
                         let state = match result {
-                            Ok(()) => 2,
-                            Err(e) if e.is::<PreparationCancelled>() => 0,
+                            Ok(Ok(())) => 2,
+                            Ok(Err(_)) => 0,
                             Err(_) => 3,
                         };
                         let mut requests =
@@ -419,7 +470,7 @@ impl<T: Value> Column<T> {
                                 || requests.iter().any(|c| !c.load(AtomicOrdering::Relaxed)))
                         {
                             // New demand arrived after the cancellation checkpoint.
-                            // Old scratch has already unwound; reuse this worker.
+                            // Old scratch has already dropped; reuse this worker.
                             continue;
                         }
                         *requests = Vec::new();
@@ -843,6 +894,64 @@ pub fn metadata_timestamp(time: std::time::SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellable_merge_matches_stable_oracle_and_returns_errors_normally() {
+        let builder = crate::IndexBuilder::with_columns(ColumnSet::MODIFIED);
+        for i in 0..4097 {
+            builder.add_with_metadata(
+                crate::ROOT_PARENT,
+                format!("file-{i:04}").as_bytes(),
+                0,
+                EntryMetadata {
+                    modified: (i % 7 != 0).then_some((i * 7919 % 101) * 10_000_000),
+                    ..Default::default()
+                },
+            );
+        }
+        let index = builder.freeze();
+        let column = index.metadata.modified.as_ref().unwrap();
+        for len in [0, 4, 1024, 1025, 2049, 4097] {
+            let mut ids = index.sorted[..len].to_vec();
+            let mut expected = ids.clone();
+            expected.sort_by(|&a, &b| column.cmp(a, b));
+            let mut scratch = Vec::with_capacity(len / 2);
+            column
+                .sort_ids(&mut ids, &mut scratch, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(ids, expected, "len={len}");
+            assert_eq!(scratch.capacity(), len / 2);
+        }
+        let mut ids = (*index.sorted).clone();
+        let mut calls = 0;
+        let result = column.sort_ids(&mut ids, &mut Vec::new(), &mut || {
+            calls += 1;
+            if calls == 20 {
+                Err(PreparationCancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 20);
+        // Cancellation at the second packing block, without a timing race.
+        let calls = std::cell::Cell::new(0usize);
+        let result = PackedIds::from_ids(
+            &index.sorted,
+            0,
+            |_| false,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    Err(PreparationCancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 3);
+    }
+
     #[test]
     fn cancelled_requests_stop_shared_preparation_and_allow_retry() {
         use std::sync::mpsc;
