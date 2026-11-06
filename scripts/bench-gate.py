@@ -10,8 +10,11 @@ import subprocess
 import statistics
 
 QUERIES = {"a", "re", "report 2024", "!tmp log", "zzzz-no-hit-zzzz", "文書"}
+NEW_QUERIES = {"*.log", "report*2024*", "path:docs report", "ext:txt;md", "<a|re> !tmp"}
+COMMON_WILDCARDS = {"*.log", "report*2024*"}
 # load + memory, then first page and full count per query, in-process and IPC.
-EXPECTED_METRICS = 2 + 2 * 2 * len(QUERIES)
+PAIRED_METRICS = 2 + 2 * 2 * len(QUERIES)
+EXPECTED_METRICS = PAIRED_METRICS + 2 * 2 * len(NEW_QUERIES)
 
 
 def number(value):
@@ -21,7 +24,7 @@ def number(value):
     return value
 
 
-def parse(text):
+def parse(text, require_new=True):
     measures, queries, service = {}, {}, {}
     for line in text.splitlines():
         prefix, _, body = line.partition(" ")
@@ -44,11 +47,12 @@ def parse(text):
             raise ValueError(f"missing measurement: {key}")
     if measures["entries"] <= 0 or measures["heap_bytes"] <= 0:
         raise ValueError("empty fixture")
-    if set(queries) != QUERIES:
+    expected = QUERIES | NEW_QUERIES if require_new else QUERIES
+    if set(queries) != expected:
         raise ValueError("missing or unexpected in-process query set")
     # Every arm must carry the full IPC set: an absent service arm is
     # missing evidence, never a reason to compare fewer metrics.
-    if set(service) != QUERIES:
+    if set(service) != expected:
         raise ValueError("missing or unexpected service (IPC) query set")
     return measures, queries, service
 
@@ -56,6 +60,9 @@ def parse(text):
 def compare(base, head, expected_entries=5_000_000):
     bm, bq, bs = base
     hm, hq, hs = head
+    if (set(bq) != QUERIES or set(bs) != QUERIES
+            or set(hq) != QUERIES | NEW_QUERIES or set(hs) != QUERIES | NEW_QUERIES):
+        raise ValueError("incomplete metric inventory")
     if bm["entries"] != expected_entries or hm["entries"] != expected_entries:
         raise ValueError("wrong fixture size")
     if bm["seed"] != 2026 or hm["seed"] != 2026:
@@ -64,55 +71,85 @@ def compare(base, head, expected_entries=5_000_000):
                ("bytes/entry", bm["heap_bytes"] / expected_entries,
                 hm["heap_bytes"] / expected_entries, False)]
     for label, before, after in (("in-process", bq, hq), ("IPC", bs, hs)):
-        for query in sorted(before):
+        for query in sorted(QUERIES):
             for key in ("page_hits", "total_hits"):
                 if before[query][key] != after[query][key]:
                     raise ValueError(f"changed {key}: {label} {query!r}")
             for key in ("first_page_ms", "full_count_ms"):
                 metrics.append((f"{label} {query!r} {key}", before[query][key], after[query][key], True))
-    if len(metrics) != EXPECTED_METRICS:
-        raise ValueError(f"expected {EXPECTED_METRICS} metrics, got {len(metrics)}")
+    if len(metrics) != PAIRED_METRICS:
+        raise ValueError(f"expected {PAIRED_METRICS} paired metrics, got {len(metrics)}")
     # 0.1 ms absolute tolerance dominates the relative allowance below 1 ms.
     # Memory has no timing tolerance. Strictly greater fails; the boundary passes.
-    return [(name, b, h, b + max(b * 0.10, 0.1 if timed else 0),
+    rows = [(name, b, h, b + max(b * 0.10, 0.1 if timed else 0),
              h > b + max(b * 0.10, 0.1 if timed else 0))
             for name, b, h, timed in metrics]
+    # New syntax has no meaningful baseline on main. Require every reading,
+    # verify IPC agrees, and enforce the approved common-wildcard page limit.
+    for query in sorted(NEW_QUERIES):
+        if any(hq[query][key] != hs[query][key] for key in ("page_hits", "total_hits")):
+            raise ValueError(f"inconsistent new-language counts: {query!r}")
+        if hq[query]["page_hits"] != min(100, hq[query]["total_hits"]):
+            raise ValueError(f"incomplete new-language first page: {query!r}")
+        for label, readings in (("in-process", hq), ("IPC", hs)):
+            for key in ("first_page_ms", "full_count_ms"):
+                limit = 16.0 if key == "first_page_ms" and query in COMMON_WILDCARDS else None
+                value = readings[query][key]
+                rows.append((f"new-language {label} {query!r} {key}", None, value, limit,
+                             limit is not None and value > limit))
+    if len(rows) != EXPECTED_METRICS:
+        raise ValueError(f"expected {EXPECTED_METRICS} metrics, got {len(rows)}")
+    return rows
 
 
 def render(rows):
     lines = ["## Paired benchmark regression gate", "",
              "Same runner/job; median of 3 loads and 5 queries per arm. "
              "Limit: base + max(10%, 0.1 ms); memory: base + 10%. "
+             "All 20 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms. "
              "Section 3 absolute targets remain reported goals.", "",
              "| Metric | Base | Head | Limit | Result |", "|---|---:|---:|---:|---|"]
-    lines += [f"| {name} | {b:.6f} | {h:.6f} | {limit:.6f} | {'FAIL' if bad else 'pass'} |"
+    def cell(value):
+        return "observation" if value is None else f"{value:.6f}"
+    lines += [f"| {name.replace('|', chr(92) + '|')} | {cell(b)} | {h:.6f} | {cell(limit)} | {'FAIL' if bad else 'pass'} |"
               for name, b, h, limit, bad in rows]
     return "\n".join(lines) + "\n"
 
 
-def interleaved(measure, kind, query, operation, expected=None, trace=None):
-    """Warm both arms, then take 3 load or 5 query samples in ABBA order."""
+def interleaved(measure, kind, query, operation, expected=None, trace=None, observation=None):
+    """Warm both arms, then sample ABBA, optionally interleaving head-only C.
+
+    C runs the new-syntax descriptor on head and never participates in the
+    paired content comparison. Its own warm-up and five samples must agree.
+    """
     samples = {"base": [], "head": []}
+    if observation is not None:
+        samples["observation"] = []
     signatures, order = {}, []
     trace_index = len(trace) if trace is not None else None
     if trace is not None:
         trace.append("")
     count = 3 if kind == "load" else 5
-    for warmup, arms in [(True, ("base", "head"))] + [
-            (False, ("base", "head") if i % 2 == 0 else ("head", "base")) for i in range(count)]:
+    forward = tuple(samples)
+    for warmup, arms in [(True, forward)] + [
+            (False, forward if i % 2 == 0 else forward[::-1]) for i in range(count)]:
         for arm in arms:
-            order.append(("warm " if warmup else "") + ("A" if arm == "base" else "B"))
+            order.append(("warm " if warmup else "") + {"base": "A", "head": "B", "observation": "C"}[arm])
             if trace is not None:
-                trace[trace_index] = f"| {kind} {query!r} {operation} | {' '.join(order)} |"
-            sample = measure(arm, kind, query, operation)
+                label = f"{kind} {query!r} {operation}"
+                if observation is not None:
+                    label += f"; C = head-only {observation[1]!r} {observation[2]}"
+                trace[trace_index] = f"| {label.replace('|', chr(92) + '|')} | {' '.join(order)} |"
+            sample = measure("head", *observation) if arm == "observation" else measure(arm, kind, query, operation)
             value, hits, digest, heap, entries = sample
             number(value)
-            if expected is not None and hits != expected:
+            if arm != "observation" and expected is not None and hits != expected:
                 raise ValueError(f"remeasure changed hits: {arm} {kind} {query!r}")
             signature = hits, digest, entries
-            if signatures and signature != next(iter(signatures.values())):
+            group = "observation" if arm == "observation" else "paired"
+            if group in signatures and signature != signatures[group]:
                 raise ValueError("paired sample content/count/fixture mismatch")
-            signatures[arm] = signature
+            signatures[group] = signature
             if samples[arm] and heap != samples[arm][0][3]:
                 raise ValueError("heap changed within one arm")
             if not warmup:
@@ -136,7 +173,7 @@ def retry_failures(rows, base, head, measure, trace=None):
     result = []
     for row in rows:
         name, _, _, _, bad = row
-        if not bad:
+        if not bad or row[1] is None:
             result.append(row)
             continue
         kind, query, operation, expected = descriptors[name]
@@ -148,8 +185,12 @@ def retry_failures(rows, base, head, measure, trace=None):
 
 
 def probe(args, arm, kind, query, operation):
+    if arm == "base" and kind != "load" and query not in QUERIES:
+        raise ValueError("base probe accepts only legacy queries")
     command = [str(getattr(args, arm + "_probe")), str(getattr(args, arm + "_binary")),
                str(getattr(args, arm + "_index")), kind, query, operation]
+    if arm == "base":
+        command.append("--legacy-queries")
     try:
         run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True)
     except subprocess.CalledProcessError as error:
@@ -176,19 +217,25 @@ def measure_pair(args, measure, trace):
     for arm, (elapsed, _, _, heap, entries) in load.items():
         output[arm].append(f"FERROW-MEASURE entries={entries} seed=2026 heap_bytes={heap} bytes_per_entry={heap/entries:.9f} load_ms_median={elapsed:.9f}")
     for kind, prefix in (("in-process", "FERROW-QUERY"), ("IPC", "FERROW-SERVICE")):
-        for query in sorted(QUERIES):
-            page = interleaved(measure, kind, query, "first_page_ms", trace=trace)
-            full = interleaved(measure, kind, query, "full_count_ms", trace=trace)
-            for arm in output:
+        new_queries = sorted(NEW_QUERIES)
+        for i, query in enumerate(sorted(QUERIES)):
+            new_query = new_queries[i] if i < len(new_queries) else None
+            page = interleaved(measure, kind, query, "first_page_ms", trace=trace,
+                               observation=(kind, new_query, "first_page_ms") if new_query else None)
+            full = interleaved(measure, kind, query, "full_count_ms", trace=trace,
+                               observation=(kind, new_query, "full_count_ms") if new_query else None)
+            for arm in page:
                 if page[arm][1] != min(100, full[arm][1]):
                     raise ValueError("page/count evidence disagrees")
-                output[arm].append(f'{prefix} query="{query}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]}')
+                target = "head" if arm == "observation" else arm
+                text = new_query if arm == "observation" else query
+                output[target].append(f'{prefix} query="{text}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]}')
     for arm, lines in output.items():
         getattr(args, arm).write_text("\n".join(lines)+"\n", encoding="utf-8")
 
 
 def sample_order(trace):
-    return ("\n### Sample order (A = base, B = head; warm samples excluded)\n\n| Metric | Producer order |\n|---|---|\n" + "\n".join(trace) + "\n") if trace else ""
+    return ("\n### Sample order (A = base, B = head legacy, C = head-only new syntax; warm samples excluded)\n\n| Metric | Producer order |\n|---|---|\n" + "\n".join(trace) + "\n") if trace else ""
 
 
 def publish(report):
@@ -218,18 +265,20 @@ def main():
         if args.measure:
             trace.append("| Initial phase | Warm both arms, then interleave samples |")
             measure_pair(args, lambda *metric: probe(args, *metric), trace)
-        rows = compare(parse(args.base.read_text(encoding="utf-8")),
-                       parse(args.head.read_text(encoding="utf-8")), args.entries)
+        base = parse(args.base.read_text(encoding="utf-8"), require_new=False)
+        head = parse(args.head.read_text(encoding="utf-8"))
+        rows = compare(base, head, args.entries)
         report = render(rows)
         if any(retry_paths):
             if not all(retry_paths):
                 raise ValueError("all paired retry paths are required")
-            if any(row[-1] for row in rows):
+            retryable = any(row[-1] and row[1] is not None and row[0] != "bytes/entry" for row in rows)
+            memory_failed = any(row[-1] and row[0] == "bytes/entry" for row in rows)
+            if retryable and not memory_failed:
                 trace.append("| Single retry phase | Only failing latency metrics |")
-            retried = retry_failures(rows, parse(args.base.read_text(encoding="utf-8")),
-                                     parse(args.head.read_text(encoding="utf-8")),
+            retried = retry_failures(rows, base, head,
                                      lambda *metric: probe(args, *metric), trace)
-            if any(row[-1] for row in rows) and not any(row[-1] and row[0] == "bytes/entry" for row in rows):
+            if retryable and not memory_failed:
                 report += "\n### One paired latency remeasurement (final decision)\n\n" + render(retried)
             rows = retried
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:

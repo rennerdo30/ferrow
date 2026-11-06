@@ -29,8 +29,9 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 {
-        return Err("usage: service_bench <ferrow> <index>".into());
+    let legacy = args.len() == 3 && args[2] == "--legacy-queries";
+    if args.len() != 2 && !legacy {
+        return Err("usage: service_bench <ferrow> <index> [--legacy-queries]".into());
     }
     let index = Index::load(std::path::Path::new(&args[1]))?;
     let name = format!(
@@ -77,14 +78,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         index.len(),
         started.elapsed().as_secs_f64() * 1000.0
     );
-    for text in [
+    let queries = [
         "a",
         "re",
         "report 2024",
         "!tmp log",
         "zzzz-no-hit-zzzz",
         "文書",
-    ] {
+        "*.log",
+        "report*2024*",
+        "path:docs report",
+        "ext:txt;md",
+        "<a|re> !tmp",
+    ];
+    let queries = if legacy { &queries[..6] } else { &queries[..] };
+    for &text in queries {
         let query = Query::parse(text)?;
         let expected = search(
             &index,

@@ -146,7 +146,7 @@ jobs:
           use ferrow_query::{CancelToken, Query, SearchOptions, count, search};
           use std::process::{Child, Command, Stdio};
           use std::time::{Duration, Instant};
-          
+
           struct Service(Child);
           impl Drop for Service {
               fn drop(&mut self) {
@@ -154,7 +154,7 @@ jobs:
                   let _ = self.0.wait();
               }
           }
-          
+
           fn digest(paths: &[Vec<u8>]) -> u64 {
               let mut digest = 0xcbf29ce484222325u64;
               for path in paths {
@@ -164,11 +164,29 @@ jobs:
               }
               digest
           }
-          
+
           fn main() -> Result<(), Box<dyn std::error::Error>> {
-              let args: Vec<_> = std::env::args().skip(1).collect();
+              let mut args: Vec<_> = std::env::args().skip(1).collect();
+              let legacy = args.last().is_some_and(|arg| arg == "--legacy-queries");
+              if legacy {
+                  args.pop();
+              }
               if args.len() != 5 {
-                  return Err("expected binary, index, kind, query, operation".into());
+                  return Err("expected binary, index, kind, query, operation [--legacy-queries]".into());
+              }
+              if legacy
+                  && args[2] != "load"
+                  && ![
+                      "a",
+                      "re",
+                      "report 2024",
+                      "!tmp log",
+                      "zzzz-no-hit-zzzz",
+                      "文書",
+                  ]
+                  .contains(&args[3].as_str())
+              {
+                  return Err("base probe accepts only legacy queries".into());
               }
               let path = std::path::Path::new(&args[1]);
               eprintln!(
@@ -326,6 +344,7 @@ jobs:
       - name: Smoke interleaved collection on the shared 16-entry fixture
         if: github.event_name == 'pull_request'
         run: |
+          timeout -k 5s 120s target/release/examples/service_bench "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin" --legacy-queries
           echo '## 16-entry chain smoke (latency outcomes informational)' >> "$GITHUB_STEP_SUMMARY"
           result=0
           timeout -k 5s 300s python3 scripts/bench-gate.py base-smoke.txt head-smoke.txt --measure --entries 16 \
@@ -349,6 +368,8 @@ jobs:
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
         run: |
+          # 26 legacy pairs use ABBA; 20 head-only observations run between
+          # head legacy samples (C), with excluded warm-ups and no base comparison.
           python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure \
             --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
             --head-probe "$PWD/target/release/examples/latency_probe" \

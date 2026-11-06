@@ -27,6 +27,11 @@ const QUERIES: &[&str] = &[
     "!tmp log",
     "zzzz-no-hit-zzzz",
     "文書",
+    "*.log",
+    "report*2024*",
+    "path:docs report",
+    "ext:txt;md",
+    "<a|re> !tmp",
 ];
 
 fn entries() -> usize {
