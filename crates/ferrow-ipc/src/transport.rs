@@ -26,6 +26,10 @@ use std::path::PathBuf;
 #[path = "unix_security.rs"]
 mod unix_security;
 
+#[cfg(unix)]
+#[path = "unix_connect.rs"]
+mod unix_connect;
+
 /// Where a service listens and clients connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -275,13 +279,15 @@ mod platform {
             })
         }
 
-        pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
-            let inner = UnixStream::connect(&endpoint.path)?;
-            inner.set_nonblocking(true)?;
+        pub fn connect(
+            endpoint: &Endpoint,
+            deadline: std::time::Instant,
+        ) -> std::io::Result<Stream> {
+            let inner = super::unix_connect::connect(&endpoint.path, deadline)?;
             Ok(Stream {
                 inner,
                 caller: None,
-                deadline: super::io_deadline(),
+                deadline,
             })
         }
 
@@ -316,7 +322,7 @@ mod platform {
         }
     }
 
-    fn wait_io(
+    pub(super) fn wait_io(
         stream: &UnixStream,
         events: i16,
         deadline: std::time::Instant,
@@ -823,9 +829,13 @@ mod platform {
             })
         }
 
-        pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
+        pub fn connect(
+            endpoint: &Endpoint,
+            deadline: std::time::Instant,
+        ) -> std::io::Result<Stream> {
             let name = wide(&endpoint.pipe_name);
-            for _attempt in 0..50 {
+            loop {
+                super::remaining(deadline)?;
                 // SAFETY: name outlives the call; the returned
                 // handle is owned by PipeHandle on success.
                 let handle = unsafe {
@@ -848,7 +858,7 @@ mod platform {
                         handle: Some(owned),
                         caller: None,
                         cancelled: event()?,
-                        deadline: super::io_deadline(),
+                        deadline,
                     });
                 }
                 let err = last_error();
@@ -856,12 +866,13 @@ mod platform {
                     return Err(err);
                 }
                 // SAFETY: name outlives the bounded wait.
-                unsafe { WaitNamedPipeW(name.as_ptr(), 2_000) };
+                unsafe {
+                    WaitNamedPipeW(
+                        name.as_ptr(),
+                        super::remaining(deadline)?.as_millis().clamp(1, 2_000) as u32,
+                    )
+                };
             }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "named pipe stays busy",
-            ))
         }
 
         pub fn set_deadline(&mut self, deadline: std::time::Instant) -> std::io::Result<()> {
@@ -1198,7 +1209,15 @@ impl Stream {
     }
 
     pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
-        Ok(Stream(platform::Stream::connect(endpoint)?))
+        Self::connect_with_deadline(endpoint, io_deadline())
+    }
+
+    /// Bound the connection itself, before entering the OS connect operation.
+    pub fn connect_with_deadline(
+        endpoint: &Endpoint,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Stream> {
+        Ok(Stream(platform::Stream::connect(endpoint, deadline)?))
     }
 
     /// Absolute budget shared by every read/write until explicitly renewed.

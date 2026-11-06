@@ -109,7 +109,7 @@ pub(super) fn reclaim(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    match std::os::unix::net::UnixStream::connect(path) {
+    match super::unix_connect::connect(path, super::io_deadline()) {
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
         _ => {
             return Err(io::Error::new(

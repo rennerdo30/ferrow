@@ -15,6 +15,16 @@ fn accepted_stream_can_move_to_a_worker() {
 }
 
 #[test]
+fn expired_connection_budget_refuses_before_connecting() {
+    let error =
+        match Stream::connect_with_deadline(&test_endpoint("absent"), std::time::Instant::now()) {
+            Err(error) => error,
+            Ok(_) => panic!("connected after deadline"),
+        };
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[test]
 fn healthy_session_survives_idle_then_active() {
     for cancellable in [false, true] {
         let endpoint = test_endpoint("idle");
