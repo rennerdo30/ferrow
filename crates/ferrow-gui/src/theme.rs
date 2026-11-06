@@ -240,6 +240,9 @@ impl Palette {
         v.selection.bg_fill = self.highlight;
         v.selection.stroke = Stroke::new(1.0, self.text);
         v.text_cursor.stroke = Stroke::new(1.5, self.text);
+        // No blinking caret: it would repaint twice a second while idle,
+        // costing CPU and remote-desktop bandwidth.
+        v.text_cursor.blink = false;
         v.extreme_bg_color = Color32::TRANSPARENT;
         v.hyperlink_color = self.accent_text;
         for w in [

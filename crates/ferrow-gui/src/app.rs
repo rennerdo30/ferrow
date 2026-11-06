@@ -13,6 +13,7 @@ use eframe::egui::{
 use ferrow_index::{Index, flags};
 
 use crate::engine::{Engine, Event, Hits, home_dir};
+use crate::logo::TitleLogo;
 use crate::platform;
 use crate::theme::{self, Palette};
 
@@ -59,6 +60,7 @@ pub struct FerrowApp {
     dark: bool,
     accent: Option<[u8; 3]>,
     focus_search: bool,
+    title_logo: TitleLogo,
 }
 
 impl FerrowApp {
@@ -96,6 +98,7 @@ impl FerrowApp {
             dark,
             accent,
             focus_search: true,
+            title_logo: TitleLogo::new(),
         })
     }
 
@@ -907,7 +910,15 @@ impl eframe::App for FerrowApp {
         let search_rect = if platform::CUSTOM_TITLE_ROW {
             let painter = ui.painter();
             let mid = full.top() + title_h / 2.0;
-            app_mark(painter, pos2(full.left() + 22.0, mid));
+            if let Some(tex) = self.title_logo.texture(&ctx, 18.0) {
+                let r = Rect::from_center_size(pos2(full.left() + 22.0, mid), vec2(18.0, 18.0));
+                painter.image(
+                    tex.id(),
+                    r,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
             painter.text(
                 pos2(full.left() + 40.0, mid),
                 Align2::LEFT_CENTER,
@@ -1029,21 +1040,6 @@ fn ellipsized(
     job.wrap.overflow_character = Some('…');
     job.wrap.break_anywhere = true;
     ui.fonts_mut(|f| f.layout_job(job))
-}
-
-/// Small Ferrow mark for the title row: rust ring, dark lens, handle.
-fn app_mark(painter: &egui::Painter, c: Pos2) {
-    let lens = c + vec2(-1.5, -1.5);
-    painter.line_segment(
-        [lens + vec2(4.5, 4.5), lens + vec2(8.0, 8.0)],
-        Stroke::new(2.2, Color32::from_rgb(0x6A, 0x6E, 0x74)),
-    );
-    painter.circle_filled(lens, 6.0, Color32::from_rgb(0x2A, 0x26, 0x23));
-    painter.circle_stroke(
-        lens,
-        5.5,
-        Stroke::new(2.0, Color32::from_rgb(0xE0, 0x7A, 0x35)),
-    );
 }
 
 fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {

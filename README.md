@@ -109,11 +109,12 @@ The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup
 
 Helper scripts build and start Ferrow in one step. Arguments after the optional release flag go to `ferrow`.
 
-| | Windows (PowerShell) | Linux / macOS |
-|---|---|---|
-| Run (debug build) | `./scripts/run.ps1` | `./scripts/run.sh` |
-| Run (optimised build) | `./scripts/run.ps1 -Release "*.rs"` | `./scripts/run.sh --release '*.rs'` |
-| Run all CI checks | `./scripts/check.ps1` | `./scripts/check.sh` |
+| | Windows (cmd, or double-click) | Windows (PowerShell) | Linux / macOS |
+|---|---|---|---|
+| Desktop app | `scripts\gui.bat` | | `cargo run -p ferrow-gui` |
+| CLI (debug build) | `scriptsun.bat search report` | `./scripts/run.ps1` | `./scripts/run.sh` |
+| CLI (optimised build) | `scriptsun.bat --release search report` | `./scripts/run.ps1 -Release "*.rs"` | `./scripts/run.sh --release '*.rs'` |
+| Run all CI checks | `scripts\check.bat` | `./scripts/check.ps1` | `./scripts/check.sh` |
 
 The check scripts run the same steps as CI on every push (format, clippy with warnings as errors, tests).
 
