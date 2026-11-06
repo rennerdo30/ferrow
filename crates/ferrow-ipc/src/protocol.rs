@@ -116,8 +116,7 @@ pub enum Message {
     Response(Response),
 }
 
-/// A decoded frame: the wire version byte (not yet validated
-/// against [`PROTOCOL_VERSION`]; the handshake does that), the
+/// A decoded frame: the validated wire version byte, the
 /// request id the message belongs to, and the message itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
@@ -129,6 +128,10 @@ pub struct Envelope {
 /// A protocol-level decode or encode failure. Never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
+    VersionMismatch {
+        version: u8,
+        id: u32,
+    },
     /// A length field exceeds a hard limit.
     TooLarge,
     /// Input ended before a complete value could be read.
@@ -143,6 +146,9 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProtocolError::VersionMismatch { version, .. } => {
+                write!(f, "unsupported frame version {version}")
+            }
             ProtocolError::TooLarge => f.write_str("message exceeds a size limit"),
             ProtocolError::Truncated => f.write_str("message is truncated"),
             ProtocolError::TrailingBytes => f.write_str("trailing bytes after message"),
@@ -359,6 +365,9 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
     let version = r.u8()?;
     let kind = r.u8()?;
     let id = r.u32()?;
+    if u16::from(version) != PROTOCOL_VERSION {
+        return Err(ProtocolError::VersionMismatch { version, id });
+    }
     let message = match kind {
         KIND_HELLO => Message::Request(Request::Hello { version: r.u16()? }),
         KIND_QUERY => {

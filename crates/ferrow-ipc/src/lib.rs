@@ -35,12 +35,27 @@ fn version_mismatch(peer: u16) -> Message {
     })
 }
 
+fn server_read<S: Read + Write>(stream: &mut S) -> std::io::Result<Option<Envelope>> {
+    match read_message(stream) {
+        Err(error) => {
+            if let Some(ProtocolError::VersionMismatch { version, id }) = error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<ProtocolError>())
+            {
+                write_message(stream, *id, &version_mismatch(u16::from(*version)))?;
+            }
+            Err(error)
+        }
+        result => result,
+    }
+}
+
 /// Server side of the `Hello` handshake: the first message must be
 /// `Hello` with a supported version. On a version mismatch an
 /// `Error{VersionMismatch}` reply is written before failing, so
 /// the client can say why it was refused.
 pub fn server_handshake<S: Read + Write>(stream: &mut S) -> std::io::Result<()> {
-    let Some(envelope) = read_message(stream)? else {
+    let Some(envelope) = server_read(stream)? else {
         return Err(io_invalid("connection closed before Hello".into()));
     };
     match envelope.message {
@@ -74,7 +89,7 @@ where
     F: FnMut(Request) -> Vec<Response>,
 {
     server_handshake(&mut stream)?;
-    while let Some(envelope) = read_message(&mut stream)? {
+    while let Some(envelope) = server_read(&mut stream)? {
         let Message::Request(request) = envelope.message else {
             write_message(
                 &mut stream,
