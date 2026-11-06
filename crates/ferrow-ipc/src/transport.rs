@@ -224,6 +224,7 @@ mod platform {
             }
             let (inner, _) = self.inner.accept()?;
             let caller = peer_identity(&inner)?;
+            inner.set_nonblocking(true)?;
             Ok((
                 Stream {
                     inner,
@@ -256,8 +257,10 @@ mod platform {
 
     impl Stream {
         pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
+            let inner = UnixStream::connect(&endpoint.path)?;
+            inner.set_nonblocking(true)?;
             Ok(Stream {
-                inner: UnixStream::connect(&endpoint.path)?,
+                inner,
                 caller: None,
                 deadline: super::io_deadline(),
             })
@@ -279,20 +282,44 @@ mod platform {
 
     impl Read for Stream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.inner
-                .set_read_timeout(Some(super::remaining(self.deadline)?))?;
+            wait_io(&self.inner, libc::POLLIN, self.deadline)?;
             self.inner.read(buf)
         }
     }
 
     impl Write for Stream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.inner
-                .set_write_timeout(Some(super::remaining(self.deadline)?))?;
+            wait_io(&self.inner, libc::POLLOUT, self.deadline)?;
             self.inner.write(buf)
         }
         fn flush(&mut self) -> std::io::Result<()> {
             self.inner.flush()
+        }
+    }
+
+    fn wait_io(
+        stream: &UnixStream,
+        events: i16,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let timeout = super::remaining(deadline)?
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        let mut wait = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: one live socket descriptor and one initialized pollfd.
+        match unsafe { libc::poll(&raw mut wait, 1, timeout) } {
+            -1 => Err(std::io::Error::last_os_error()),
+            0 => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "IPC deadline expired",
+            )),
+            _ => Ok(()),
         }
     }
 
