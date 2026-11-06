@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 
 use ferrow_index::{Index, IndexBuilder};
 use ferrow_ipc::{
-    CallerIdentity, Endpoint, ErrorCode, Listener, Request, Response, Stream, serve_cancellable,
+    CallerIdentity, Endpoint, ErrorCode, Listener, Request, Response, serve_cancellable,
 };
 use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
@@ -275,12 +275,12 @@ pub fn handle_authorized(
     handle(store, request)
 }
 
-/// Cooperative shutdown for the accept loop. `request` also
-/// wakes the parked `accept` with a throwaway connection, so
-/// stopping never needs a polling timer.
+/// Cooperative shutdown with persistent listener cancellation. Registration
+/// observes earlier requests, and callbacks signal without connecting or waiting.
 #[derive(Clone, Default)]
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
+    listener: Arc<std::sync::Mutex<Option<std::sync::Weak<Listener>>>>,
 }
 
 impl Shutdown {
@@ -292,9 +292,29 @@ impl Shutdown {
         self.flag.load(Ordering::SeqCst)
     }
 
-    pub fn request(&self, endpoint: &Endpoint) {
+    pub fn request(&self, _endpoint: &Endpoint) {
         self.flag.store(true, Ordering::SeqCst);
-        let _ = Stream::connect(endpoint);
+        if let Some(listener) = self
+            .listener
+            .lock()
+            .expect("shutdown poisoned")
+            .as_ref()
+            .and_then(|l| l.upgrade())
+        {
+            let _ = listener.cancel();
+        }
+    }
+
+    fn register(&self, listener: &Arc<Listener>) -> std::io::Result<()> {
+        let mut slot = self
+            .listener
+            .lock()
+            .map_err(|_| std::io::Error::other("shutdown poisoned"))?;
+        *slot = Some(Arc::downgrade(listener));
+        if self.is_requested() {
+            listener.cancel()?;
+        }
+        Ok(())
     }
 }
 
@@ -305,12 +325,17 @@ pub fn serve(
     store: SnapshotStore,
     shutdown: Shutdown,
 ) -> std::io::Result<()> {
-    let listener = Listener::bind(&config.endpoint)?;
+    let listener = Arc::new(Listener::bind(&config.endpoint)?);
+    shutdown.register(&listener)?;
     let owner = CallerIdentity::current()?;
     let system = config.endpoint == Endpoint::default_service();
     eprintln!("ferrowd: listening on {}", config.endpoint);
     while !shutdown.is_requested() {
-        let (stream, _caller) = listener.accept()?;
+        let (stream, _caller) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(_) if shutdown.is_requested() => break,
+            Err(e) => return Err(e),
+        };
         if shutdown.is_requested() {
             drop(stream);
             break;
@@ -324,4 +349,27 @@ pub fn serve(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn stop_before_listener_registration_cannot_be_lost() {
+        let endpoint = Endpoint::named(&format!("fr-stop-{}", std::process::id()));
+        let shutdown = Shutdown::new();
+        shutdown.request(&endpoint);
+        let listener = Arc::new(Listener::bind(&endpoint).unwrap());
+        shutdown.register(&listener).unwrap();
+        let accept = listener.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(accept.accept().is_err()).unwrap();
+        });
+        let stopped = rx.recv_timeout(std::time::Duration::from_millis(200));
+        listener.cancel().unwrap(); // bound cleanup even with the handshake broken
+        thread.join().unwrap();
+        assert!(stopped.unwrap());
+    }
 }
