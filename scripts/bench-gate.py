@@ -11,6 +11,10 @@ import subprocess
 QUERIES = {"a", "re", "report 2024", "!tmp log", "zzzz-no-hit-zzzz", "文書"}
 # load + memory, then first page and full count per query, in-process and IPC.
 EXPECTED_METRICS = 2 + 2 * 2 * len(QUERIES)
+# New sorts have no comparable main arm yet. Require all observations, while
+# preserving the complete strict paired inventory above (and other extensions).
+EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES)
+EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
 
 
 def number(value):
@@ -89,6 +93,57 @@ def render(rows):
     return "\n".join(lines) + "\n"
 
 
+def metadata_observations(text, head, expected_entries=5_000_000):
+    scalars, engine, ipc, scan = {}, {}, {}, {}
+    for line in text.splitlines():
+        prefix, _, body = line.partition(" ")
+        if prefix not in {"FERROW-METADATA", "FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE", "FERROW-SCAN"}:
+            continue
+        fields = dict(word.split("=", 1) for word in shlex.split(body))
+        if prefix in {"FERROW-METADATA", "FERROW-SCAN"}:
+            target = scalars if prefix == "FERROW-METADATA" else scan
+            if target.keys() & fields.keys():
+                raise ValueError("duplicate metadata/scan scalar")
+            target.update({key: number(value) for key, value in fields.items()})
+        else:
+            query = fields.pop("query")
+            target = engine if prefix == "FERROW-MODIFIED-QUERY" else ipc
+            if query in target:
+                raise ValueError("duplicate modified-sort query")
+            target[query] = {key: number(fields[key]) for key in ("first_page_ms", "full_count_ms", "page_hits", "total_hits")}
+    required = {"entries", "seed", "core_heap_bytes", "default_heap_bytes", "default_bytes_per_entry",
+                "metadata_bytes_per_entry", "load_ms_median", "precomputed_build_ms", "lazy_build_ms_median", "lazy_saved_bytes", "freeze_ms"}
+    if not required <= scalars.keys() or set(engine) != QUERIES or set(ipc) != QUERIES:
+        raise ValueError("missing metadata observations")
+    if not {"entries", "errors", "none_ms_median", "default_ms_median"} <= scan.keys() or scan["entries"] != 2101 or scan["errors"] != 0:
+        raise ValueError("invalid scan-cost observations")
+    if scalars["entries"] != expected_entries or scalars["seed"] != 2026:
+        raise ValueError("wrong metadata fixture")
+    if scalars["core_heap_bytes"] != head[0]["heap_bytes"]:
+        raise ValueError("metadata core heap changed")
+    total = scalars["default_heap_bytes"] / expected_entries
+    extra = (scalars["default_heap_bytes"] - scalars["core_heap_bytes"]) / expected_entries
+    expected_extra = 32 + 2 * ((expected_entries + 7) // 8) / expected_entries
+    if abs(total-scalars["default_bytes_per_entry"]) > 0.000001 or abs(extra-expected_extra) > 0.000001 or abs(extra-scalars["metadata_bytes_per_entry"]) > 0.000001:
+        raise ValueError("inconsistent default-column heap evidence")
+    if scalars["lazy_saved_bytes"] != 16*expected_entries:
+        raise ValueError("inconsistent lazy-cache saving")
+    rows = [("default columns bytes/entry", total), ("default columns load ms", scalars["load_ms_median"])]
+    for label, observations, core in (("in-process", engine, head[1]), ("IPC", ipc, head[2])):
+        for query in sorted(QUERIES):
+            for key in ("page_hits", "total_hits"):
+                if observations[query][key] != core[query][key]:
+                    raise ValueError(f"modified sort changed {key}: {label} {query!r}")
+            rows.extend((f"modified descending {label} {query!r} {key}", observations[query][key]) for key in ("first_page_ms", "full_count_ms"))
+    if len(rows) != EXPECTED_METADATA_METRICS:
+        raise ValueError("incomplete metadata metric inventory")
+    report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
+    report += "".join(f"| {name} | {value:.6f} |\n" for name, value in rows)
+    report += f"\nPrecompute: {scalars['precomputed_build_ms']:.6f} ms; deferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
+    report += f"\nSame-tree scan, none/default columns: {scan['none_ms_median']:.6f}/{scan['default_ms_median']:.6f} ms (five alternating samples per arm, 2101 entries).\n"
+    return rows, report
+
+
 def retry_failures(rows, base, head, measure):
     """Validate first, then retry each failing latency exactly once per arm.
 
@@ -138,6 +193,7 @@ def main():
     parser.add_argument("base", type=Path)
     parser.add_argument("head", type=Path)
     parser.add_argument("--entries", type=int, default=5_000_000)
+    parser.add_argument("--require-metadata", action="store_true")
     for arm in ("base", "head"):
         for field in ("probe", "binary", "index"):
             parser.add_argument(f"--{arm}-{field}", type=Path)
@@ -146,6 +202,10 @@ def main():
         rows = compare(parse(args.base.read_text(encoding="utf-8")),
                        parse(args.head.read_text(encoding="utf-8")), args.entries)
         report = render(rows)
+        if args.require_metadata:
+            _, metadata_report = metadata_observations(args.head.read_text(encoding="utf-8"),
+                                                       parse(args.head.read_text(encoding="utf-8")), args.entries)
+            report += metadata_report
         retry_paths = [getattr(args, arm + "_" + field) for arm in ("base", "head")
                        for field in ("probe", "binary", "index")]
         if any(retry_paths):

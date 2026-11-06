@@ -2,7 +2,7 @@
 //! Usage: service_bench <ferrow binary> <saved fixture index>.
 use ferrow_index::Index;
 use ferrow_ipc::{Client, Endpoint};
-use ferrow_query::{CancelToken, Query, SearchOptions, count, search};
+use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, count, search};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,12 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 {
-        return Err("usage: service_bench <ferrow> <index>".into());
+    if args.len() != 2 && args.len() != 3 {
+        return Err("usage: service_bench <ferrow> <index> [modified]".into());
+    }
+    let modified = args.get(2).is_some_and(|s| s == "modified");
+    if args.len() == 3 && !modified {
+        return Err("unknown service sort".into());
     }
     let index = Index::load(std::path::Path::new(&args[1]))?;
     let name = format!(
@@ -90,10 +94,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &index,
             &query,
             &SearchOptions {
+                sort: if modified {
+                    SortKey::Modified
+                } else {
+                    SortKey::Name
+                },
+                descending: modified,
                 limit: Some(100),
                 ..SearchOptions::default()
             },
         );
+        if expected.sort_unavailable.is_some() {
+            return Err("missing sort column".into());
+        }
         let expected_paths: Vec<Vec<u8>> = expected
             .hits
             .iter()
@@ -111,7 +124,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut full = Vec::new();
         for _ in 0..5 {
             let t = Instant::now();
-            let paths = client.query(text, 100)?;
+            let paths = if modified {
+                let (rows, columns) =
+                    client.query_rows(text, 100, ferrow_ipc::Sort::Modified, true)?;
+                if columns != index.columns_present().bits() {
+                    return Err("IPC columns mismatch".into());
+                }
+                for (row, &id) in rows.iter().zip(&expected.hits) {
+                    let m = index.metadata(id);
+                    if row.size != m.size
+                        || row.modified != m.modified
+                        || row.created != m.created
+                        || row.accessed != m.accessed
+                        || row.attributes != m.attributes
+                    {
+                        return Err("IPC metadata mismatch".into());
+                    }
+                }
+                rows.into_iter().map(|row| row.path).collect()
+            } else {
+                client.query(text, 100)?
+            };
             page.push(t.elapsed());
             if paths != expected_paths {
                 return Err(format!("IPC order/content for {text:?}").into());
@@ -124,7 +157,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!(
-            "FERROW-SERVICE query={text:?} first_page_ms={:.6} page_hits={} full_count_ms={:.6} total_hits={total}",
+            "{} query={text:?} first_page_ms={:.6} page_hits={} full_count_ms={:.6} total_hits={total}",
+            if modified {
+                "FERROW-MODIFIED-SERVICE"
+            } else {
+                "FERROW-SERVICE"
+            },
             median(page),
             expected_paths.len(),
             median(full)

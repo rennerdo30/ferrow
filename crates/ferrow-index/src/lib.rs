@@ -100,6 +100,12 @@ impl Index {
     pub fn metadata_heap_bytes(&self) -> usize {
         self.metadata.heap_bytes()
     }
+
+    /// Worker-side preparation for an unpublished snapshot. Never needed by search.
+    /// Also permits measuring the work deferred by a hypothetical lazy cache.
+    pub fn rebuild_metadata_orders(&mut self) {
+        self.metadata.sort(&self.sorted);
+    }
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.parent.len()
@@ -257,6 +263,14 @@ struct RawEntry {
 
 const SHARDS: usize = 16;
 
+/// Freeze costs; metadata collection and sort are disjoint parts of total.
+#[derive(Debug, Clone, Copy)]
+pub struct FreezeTimings {
+    pub total: std::time::Duration,
+    pub metadata_collect: std::time::Duration,
+    pub metadata_sort: std::time::Duration,
+}
+
 /// Thread-safe builder. Entries may be added from many threads in any
 /// order; sharding keeps lock contention low. Ids are handed out densely,
 /// so parent ids returned by [`IndexBuilder::add`] stay valid after
@@ -341,6 +355,11 @@ impl IndexBuilder {
     /// Freeze into an immutable [`Index`]: builds the arenas (folding in
     /// parallel) and the name-sort permutation (parallel sort).
     pub fn freeze(self) -> Index {
+        self.freeze_with_timings().0
+    }
+
+    pub fn freeze_with_timings(self) -> (Index, FreezeTimings) {
+        let started = std::time::Instant::now();
         let n = self.len();
         let mut raw: Vec<RawEntry> = Vec::with_capacity(n);
         for shard in self.shards {
@@ -368,7 +387,9 @@ impl IndexBuilder {
         }
 
         // Release builder entries before folding/sorting the frozen columns.
+        let t = std::time::Instant::now();
         let mut metadata = MetadataColumns::build(&raw, self.columns);
+        let metadata_collect = t.elapsed();
         drop(raw);
         // Allocate the final arena once and split it only at entry boundaries.
         // Each worker reuses scratch; no per-name Vec or slice table survives.
@@ -416,8 +437,10 @@ impl IndexBuilder {
                 .then_with(|| a.cmp(&b))
         });
 
+        let t = std::time::Instant::now();
         metadata.sort(&sorted);
-        Index {
+        let metadata_sort = t.elapsed();
+        let index = Index {
             metadata,
             parent,
             name_off,
@@ -426,7 +449,15 @@ impl IndexBuilder {
             arena,
             folded_arena,
             sorted,
-        }
+        };
+        (
+            index,
+            FreezeTimings {
+                total: started.elapsed(),
+                metadata_collect,
+                metadata_sort,
+            },
+        )
     }
 }
 

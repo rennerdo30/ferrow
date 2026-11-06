@@ -25,6 +25,15 @@ def without_service(text):
     return "\n".join(line for line in text.splitlines() if not line.startswith("FERROW-SERVICE"))
 
 
+def metadata_fixture():
+    lines = ["FERROW-METADATA entries=16 seed=2026 core_heap_bytes=800 default_heap_bytes=1316 default_bytes_per_entry=82.25 metadata_bytes_per_entry=32.25 load_ms_median=200 precomputed_build_ms=20 lazy_build_ms_median=20 lazy_saved_bytes=256 freeze_ms=50",
+             "FERROW-SCAN entries=2101 errors=0 none_ms_median=10 default_ms_median=20"]
+    for query in sorted(gate.QUERIES):
+        for prefix in ("FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE"):
+            lines.append(f'{prefix} query="{query}" first_page_ms=1 page_hits=2 full_count_ms=10 total_hits=2')
+    return "\n".join(lines)
+
+
 class GateTests(unittest.TestCase):
     def setUp(self):
         self.base = gate.parse(fixture())
@@ -79,6 +88,35 @@ class GateTests(unittest.TestCase):
         self.head[2]["a"]["full_count_ms"] = 12
         self.assertTrue(any(row[-1] for row in self.rows()))
         self.assertEqual(len(self.rows()), gate.EXPECTED_METRICS)
+
+    def test_metadata_observation_inventory_keeps_paired_gate(self):
+        rows, report = gate.metadata_observations(metadata_fixture(), self.head, 16)
+        self.assertEqual(len(rows), 26)
+        self.assertEqual(len(self.rows()) + len(rows), gate.EXPECTED_TOTAL_METRICS)
+        self.assertIn("head-only", report)
+        self.head[1]["a"]["full_count_ms"] = 20
+        self.assertTrue(any(row[-1] for row in self.rows()))
+
+    def test_metadata_observations_refuse_missing_malformed_and_changed_counts(self):
+        text = metadata_fixture()
+        for invalid in ("", text.replace('FERROW-MODIFIED-SERVICE query="a"', 'IGNORE query="a"'),
+                        text.replace("entries=16", "entries=17"), text.replace("seed=2026", "seed=2027"),
+                        text.replace("default_heap_bytes=1316", "default_heap_bytes=1300"),
+                        text.replace("load_ms_median=200", "load_ms_median=nan"),
+                        text.replace("page_hits=2", "page_hits=3"), text.replace("total_hits=2", "total_hits=3"),
+                        text.replace("errors=0", "errors=1"), text + "\n" + text):
+            with self.subTest(invalid=invalid), self.assertRaises((ValueError, KeyError)):
+                gate.metadata_observations(invalid, self.head, 16)
+
+    def test_cli_requires_metadata_when_ci_requests_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
+            base.write_text(fixture(), encoding="utf-8")
+            for observations, expected in (("", 2), (metadata_fixture(), 0)):
+                head.write_text(fixture()+"\n"+observations, encoding="utf-8")
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name("bench-gate.py")), str(base), str(head),
+                                         "--entries", "16", "--require-metadata"], capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_retry_only_failed_latency_once_paired(self):
         self.head[2]["report 2024"]["first_page_ms"] = 4

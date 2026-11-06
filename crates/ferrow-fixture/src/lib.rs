@@ -287,7 +287,12 @@ pub fn generate(entries: usize, seed: u64) -> Index {
 pub fn generate_into(builder: &IndexBuilder, entries: usize, seed: u64) {
     assert!(entries >= 1, "fixture needs at least the root entry");
     let mut rng = Rng::new(seed);
-    let root = builder.add_root(b"fixture-root", flags::DIR);
+    let root = builder.add_with_metadata(
+        ferrow_index::ROOT_PARENT,
+        b"fixture-root",
+        flags::DIR,
+        fixture_metadata(0),
+    );
     if entries == 1 {
         return;
     }
@@ -295,17 +300,38 @@ pub fn generate_into(builder: &IndexBuilder, entries: usize, seed: u64) {
     // more often (exponential-ish bias via min of two draws), which gives
     // a realistic mix of wide shallow dirs and deeper chains.
     let mut dirs: Vec<(u32, u32)> = vec![(root, 0)];
-    for _ in 1..entries {
+    for ordinal in 1..entries {
         let a = rng.below(dirs.len());
         let b = rng.below(dirs.len());
         let (parent, depth) = dirs[a.max(b)];
         let make_dir = depth < MAX_DEPTH && rng.chance(12, 100);
         if make_dir {
-            let id = builder.add(parent, dir_name(&mut rng).as_bytes(), flags::DIR);
+            let id = builder.add_with_metadata(
+                parent,
+                dir_name(&mut rng).as_bytes(),
+                flags::DIR,
+                fixture_metadata(ordinal),
+            );
             dirs.push((id, depth + 1));
         } else {
-            builder.add(parent, file_name(&mut rng).as_bytes(), 0);
+            builder.add_with_metadata(
+                parent,
+                file_name(&mut rng).as_bytes(),
+                0,
+                fixture_metadata(ordinal),
+            );
         }
+    }
+}
+
+fn fixture_metadata(ordinal: usize) -> ferrow_index::EntryMetadata {
+    let mixed = (ordinal as u64).wrapping_mul(6364136223846793005);
+    ferrow_index::EntryMetadata {
+        size: Some(mixed % (1 << 36)),
+        modified: Some(17_000_000_000_000_000 + ((mixed >> 16) % 31_536_000) as i64 * 10_000_000),
+        created: None,
+        accessed: None,
+        attributes: None,
     }
 }
 

@@ -143,6 +143,8 @@ jobs:
           cargo build --release --locked -p ferrow
           cargo build --release --locked -p ferrow-query --example service_bench
           cargo build --release --locked -p ferrow-query --example latency_probe
+          cargo build --release --locked -p ferrow-query --example metadata_bench
+          cargo build --release --locked -p ferrow-walk --example scan_cost
           cargo bench --no-run -p ferrow-query --bench m1_bench --locked
       - name: Build main in a separate target directory
         if: github.event_name == 'pull_request'
@@ -164,6 +166,8 @@ jobs:
         run: |
           cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
           timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin"
+          timeout -k 5s 120s target/release/examples/metadata_bench "$RUNNER_TEMP/ferrow-small-metadata.bin"
+          timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small-metadata.bin" modified
       - name: Measure main in-process
         if: github.event_name == 'pull_request'
         working-directory: .bench-base
@@ -186,13 +190,19 @@ jobs:
         run: timeout -k 5s 120s "$RUNNER_TEMP/ferrow-base-target/release/examples/service_bench" "$RUNNER_TEMP/ferrow-base-target/release/ferrow" "$RUNNER_TEMP/ferrow-base.bin" 2>&1 | tee -a base-output.txt
       - name: Measure head service IPC
         run: timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a bench-output.txt
+      - name: Observe default columns and modified newest-first queries
+        run: |
+          git rev-parse HEAD
+          timeout -k 5s 600s target/release/examples/metadata_bench "$RUNNER_TEMP/ferrow-metadata.bin" 2>&1 | tee -a bench-output.txt
+          timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-metadata.bin" modified 2>&1 | tee -a bench-output.txt
+          timeout -k 5s 120s target/release/examples/scan_cost "$RUNNER_TEMP/ferrow-scan-fixture" 2>&1 | tee -a bench-output.txt
       - name: Write additive head summary
         if: always()
         run: ./scripts/bench-summary.sh bench-output.txt
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
         run: |
-          python3 scripts/bench-gate.py base-output.txt bench-output.txt \
+          python3 scripts/bench-gate.py base-output.txt bench-output.txt --require-metadata \
             --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
             --head-probe "$PWD/target/release/examples/latency_probe" \
             --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
