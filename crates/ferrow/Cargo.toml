@@ -11,8 +11,11 @@ publish = false
 
 [dependencies]
 ferrow-index = { path = "../ferrow-index" }
+ferrow-ipc = { path = "../ferrow-ipc" }
 ferrow-query = { path = "../ferrow-query" }
 ferrow-walk = { path = "../ferrow-walk" }
+ferrowd = { path = "../ferrowd" }
 
 [dev-dependencies]
+ferrow-ipc = { path = "../ferrow-ipc" }
 serde_json = "1.0.154"

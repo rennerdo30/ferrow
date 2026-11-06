@@ -4,7 +4,14 @@
 //! ferrow index <root>... [--exclude <path>]... [--follow-symlinks] [--out <file>]
 //! ferrow search <query> [--index <file>] [--limit N] [--json | --null] [--count]
 //! ferrow stats [--index <file>]
+//! ferrow status
+//! ferrow service install | uninstall | status | run
 //! ```
+//!
+//! `search` talks to the `ferrowd` service when one is reachable
+//! (unless `--index` pins an index file) and otherwise falls back
+//! to the in-process index (M2b). `status` says which mode is
+//! active and why.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,6 +19,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ferrow_index::Index;
+use ferrow_ipc::{Client, Endpoint, Stream};
 use ferrow_query::{Query, SearchOptions, search};
 use ferrow_walk::{WalkOptions, scan};
 
@@ -22,7 +30,15 @@ Usage:
   ferrow index <root>... [--exclude <path>]... [--follow-symlinks] [--out <file>]
   ferrow search <query> [--index <file>] [--limit N] [--json | --null] [--count]
   ferrow stats [--index <file>]
+  ferrow status
+  ferrow service install | uninstall | status
+  ferrow service run [<root>...] [--index <file>] [--exclude <path>]... [--follow-symlinks]
   ferrow --help | --version
+
+Search uses the ferrowd service when it is reachable and falls
+back to the saved index otherwise; `ferrow status` says which.
+`service run` starts the daemon unprivileged in the foreground
+(per-user endpoint) for development.
 
 Build an index first, then search it:
   ferrow index ~/Documents /data
@@ -280,6 +296,59 @@ fn json_escape(s: &str, out: &mut String) {
     }
 }
 
+/// Service endpoints to try, in order. `FERROW_ENDPOINT_NAME`
+/// (a short pipe/socket name) pins one endpoint, for tests and
+/// development daemons; otherwise the system service first,
+/// then a per-user `ferrow service run` daemon.
+fn service_candidates() -> Vec<Endpoint> {
+    if let Ok(name) = std::env::var("FERROW_ENDPOINT_NAME")
+        && !name.is_empty()
+    {
+        return vec![Endpoint::named(&name)];
+    }
+    vec![Endpoint::default_service(), Endpoint::user_service()]
+}
+
+/// Connect to the first reachable service, if any.
+fn service_client() -> Option<(Client<Stream>, Endpoint)> {
+    for endpoint in service_candidates() {
+        if let Ok(client) = Client::connect(&endpoint) {
+            return Some((client, endpoint));
+        }
+    }
+    None
+}
+
+/// Write result paths in the selected output mode. Shared by the
+/// service and in-process search paths so both are byte-identical.
+fn emit_paths<W: Write>(
+    out: &mut W,
+    paths: &[Vec<u8>],
+    json: bool,
+    null: bool,
+) -> Result<(), String> {
+    if json {
+        let mut text = String::from("[");
+        for (i, path) in paths.iter().enumerate() {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push('"');
+            json_escape(&String::from_utf8_lossy(path), &mut text);
+            text.push('"');
+        }
+        text.push_str("]\n");
+        out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    } else {
+        let sep: &[u8] = if null { &[0] } else { b"\n" };
+        for path in paths {
+            out.write_all(path).map_err(|e| e.to_string())?;
+            out.write_all(sep).map_err(|e| e.to_string())?;
+        }
+    }
+    out.flush().map_err(|e| e.to_string())
+}
+
 fn cmd_search(args: Args) -> Result<(), String> {
     if args.positional.len() != 1 {
         return Err("search needs exactly one query argument".to_string());
@@ -288,10 +357,31 @@ fn cmd_search(args: Args) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "query is not valid UTF-8".to_string())?;
     let query = Query::parse(query_text).map_err(|e| e.to_string())?;
-    let (index, _) = load(&args)?;
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+
+    // Service first (M2b), unless --index pins an index file.
+    // Only a connection failure falls back; an answer (or a
+    // typed service error) from a reachable service is final.
+    if args.index.is_none()
+        && let Some((mut client, _endpoint)) = service_client()
+    {
+        if args.count {
+            let n = client.count(query_text).map_err(|e| e.to_string())?;
+            let n = match args.limit {
+                Some(limit) => n.min(limit as u64),
+                None => n,
+            };
+            writeln!(out, "{n}").map_err(|e| e.to_string())?;
+            return out.flush().map_err(|e| e.to_string());
+        }
+        let limit = u32::try_from(args.limit.unwrap_or(0)).unwrap_or(u32::MAX);
+        let paths = client.query(query_text, limit).map_err(|e| e.to_string())?;
+        return emit_paths(&mut out, &paths, args.json, args.null);
+    }
+
+    let (index, _) = load(&args)?;
 
     if args.count {
         let (n, cancelled) = ferrow_query::count(&index, &query, &ferrow_query::CancelToken::new());
@@ -318,34 +408,13 @@ fn cmd_search(args: Args) -> Result<(), String> {
         return Err("search cancelled".to_string());
     }
 
+    let mut paths: Vec<Vec<u8>> = Vec::with_capacity(result.hits.len());
     let mut buf: Vec<u8> = Vec::new();
-    if args.json {
-        let mut text = String::from("[");
-        for (i, &id) in result.hits.iter().enumerate() {
-            index.path_bytes(id, &mut buf);
-            if i > 0 {
-                text.push(',');
-            }
-            text.push('"');
-            json_escape(&String::from_utf8_lossy(&buf), &mut text);
-            text.push('"');
-        }
-        text.push_str("]\n");
-        out.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-    } else if args.null {
-        for &id in &result.hits {
-            index.path_bytes(id, &mut buf);
-            out.write_all(&buf).map_err(|e| e.to_string())?;
-            out.write_all(&[0]).map_err(|e| e.to_string())?;
-        }
-    } else {
-        for &id in &result.hits {
-            index.path_bytes(id, &mut buf);
-            out.write_all(&buf).map_err(|e| e.to_string())?;
-            out.write_all(b"\n").map_err(|e| e.to_string())?;
-        }
+    for &id in &result.hits {
+        index.path_bytes(id, &mut buf);
+        paths.push(buf.clone());
     }
-    out.flush().map_err(|e| e.to_string())
+    emit_paths(&mut out, &paths, args.json, args.null)
 }
 
 fn cmd_stats(args: Args) -> Result<(), String> {
@@ -360,6 +429,70 @@ fn cmd_stats(args: Args) -> Result<(), String> {
     println!("heap bytes: {heap} ({per_entry:.1} bytes/entry)");
     println!("load time: {load_ms:.1} ms");
     Ok(())
+}
+
+/// `ferrow status` / `ferrow service status`: which mode is
+/// active and why (SPEC section 5).
+fn cmd_status() -> Result<(), String> {
+    match service_client() {
+        Some((mut client, endpoint)) => {
+            let (entries, mode, report) = client.status().map_err(|e| e.to_string())?;
+            println!("mode: service ({endpoint})");
+            println!("entries: {entries}");
+            println!("backend: {mode} - {report}");
+        }
+        None => {
+            let tried: Vec<String> = service_candidates().iter().map(|e| e.display()).collect();
+            println!(
+                "mode: in-process (no service reachable at {})",
+                tried.join(", ")
+            );
+            match default_index_path() {
+                Some(path) if path.exists() => println!("index: {}", path.display()),
+                Some(path) => println!(
+                    "index: {} (not built yet; run `ferrow index`)",
+                    path.display()
+                ),
+                None => println!("index: no platform data directory; pass --index/--out"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
+    let Some(sub) = rest.first() else {
+        return Err("service needs a subcommand: install | uninstall | status | run".into());
+    };
+    match sub.to_str().unwrap_or("") {
+        "status" => cmd_status(),
+        "run" => {
+            let args = parse_args(&rest[1..])?;
+            let endpoint = match std::env::var("FERROW_ENDPOINT_NAME") {
+                Ok(name) if !name.is_empty() => Endpoint::named(&name),
+                _ => Endpoint::user_service(),
+            };
+            let config = ferrowd::DaemonConfig {
+                endpoint,
+                index_path: args.index,
+                roots: args
+                    .positional
+                    .iter()
+                    .map(|p| PathBuf::from(p.clone()))
+                    .collect(),
+                excludes: args.excludes,
+                follow_symlinks: args.follow_symlinks,
+            };
+            let store = ferrowd::SnapshotStore::new(ferrowd::initial_snapshot(&config));
+            eprintln!("ferrowd: {}", store.get().report);
+            ferrowd::serve(&config, store, ferrowd::Shutdown::new()).map_err(|e| e.to_string())
+        }
+        "install" => ferrowd::install::install().map(|msg| println!("{msg}")),
+        "uninstall" => ferrowd::install::uninstall().map(|msg| println!("{msg}")),
+        other => Err(format!(
+            "unknown service subcommand: {other} (install | uninstall | status | run)"
+        )),
+    }
 }
 
 fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
@@ -379,6 +512,8 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
         "index" => cmd_index(parse_args(&argv[1..])?),
         "search" => cmd_search(parse_args(&argv[1..])?),
         "stats" => cmd_stats(parse_args(&argv[1..])?),
+        "status" => cmd_status(),
+        "service" => cmd_service(&argv[1..]),
         other => Err(format!("unknown subcommand: {other}\n\n{USAGE}")),
     }
 }

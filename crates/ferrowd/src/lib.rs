@@ -20,6 +20,8 @@ use ferrow_ipc::{Endpoint, ErrorCode, Listener, Request, Response, Stream, serve
 use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
+pub mod install;
+
 /// One immutable index plus how it was produced.
 pub struct Snapshot {
     pub index: Arc<Index>,
