@@ -55,6 +55,80 @@ fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
+#[cfg(windows)]
+#[test]
+fn cli_accepts_non_unicode_root_argument() {
+    use std::os::windows::ffi::OsStringExt;
+    static NEXT: AtomicUsize = AtomicUsize::new(100);
+    let base = std::env::temp_dir().join(format!(
+        "ferrow-cli-nonunicode-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let root = base.join(std::ffi::OsString::from_wide(&[b'r' as u16, 0xd800]));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("needle.txt"), b"x").unwrap();
+    let index = base.join("index.bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferrow"))
+        .arg("index")
+        .arg(&root)
+        .arg("--out")
+        .arg(&index)
+        .output()
+        .expect("run ferrow");
+    assert!(
+        out.status.success(),
+        "exit={:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_ferrow"))
+        .args(["search", "needle", "--index"])
+        .arg(&index)
+        .arg("--count")
+        .output()
+        .expect("run ferrow");
+    assert_eq!(stdout(&out).trim(), "1");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_accepts_non_unicode_root_argument() {
+    use std::os::unix::ffi::OsStringExt;
+    static NEXT: AtomicUsize = AtomicUsize::new(100);
+    let base = std::env::temp_dir().join(format!(
+        "ferrow-cli-nonunicode-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let root = base.join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'x']));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("needle.txt"), b"x").unwrap();
+    let index = base.join("index.bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_ferrow"))
+        .arg("index")
+        .arg(&root)
+        .arg("--out")
+        .arg(&index)
+        .output()
+        .expect("run ferrow");
+    assert!(
+        out.status.success(),
+        "exit={:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_ferrow"))
+        .args(["search", "needle", "--index"])
+        .arg(&index)
+        .arg("--count")
+        .output()
+        .expect("run ferrow");
+    assert_eq!(stdout(&out).trim(), "1");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn index_then_search_all_modes() {
     let tree = TestTree::new();

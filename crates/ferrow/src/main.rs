@@ -65,7 +65,7 @@ fn default_index_path() -> Option<PathBuf> {
 }
 
 struct Args {
-    positional: Vec<String>,
+    positional: Vec<std::ffi::OsString>,
     out: Option<PathBuf>,
     index: Option<PathBuf>,
     excludes: Vec<PathBuf>,
@@ -76,7 +76,13 @@ struct Args {
     follow_symlinks: bool,
 }
 
-fn parse_args(rest: &[String]) -> Result<Args, String> {
+/// Parse arguments keeping paths as `OsString`s, so non-Unicode paths
+/// (lone surrogates on Windows, invalid UTF-8 on Unix) work everywhere.
+/// Only flag names, `--limit` and the query are treated as text. Flag
+/// detection runs on the lossless name bytes (`--flag=value` splitting
+/// included); path values round-trip through `osname` unchanged.
+fn parse_args(rest: &[std::ffi::OsString]) -> Result<Args, String> {
+    use ferrow_index::osname::{bytes_to_os, name_to_bytes};
     let mut args = Args {
         positional: Vec::new(),
         out: None,
@@ -88,45 +94,56 @@ fn parse_args(rest: &[String]) -> Result<Args, String> {
         count: false,
         follow_symlinks: false,
     };
+    // Lossless bytes per token, computed once.
+    let tokens: Vec<Vec<u8>> = rest
+        .iter()
+        .map(|t| {
+            let mut b = Vec::new();
+            name_to_bytes(t, &mut b);
+            b
+        })
+        .collect();
     let mut i = 0;
-    let need = |i: &usize, flag: &str, rest: &[String]| -> Result<String, String> {
-        rest.get(i + 1)
-            .cloned()
-            .ok_or_else(|| format!("flag {flag} needs a value"))
-    };
     while i < rest.len() {
+        let token = &tokens[i];
         // `--flag=value` or `--flag value`
-        let (flag, inline): (&str, Option<String>) = match rest[i].split_once('=') {
-            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
-            _ => (rest[i].as_str(), None),
+        let (flag, inline): (&[u8], Option<Vec<u8>>) = match token.iter().position(|&b| b == b'=') {
+            Some(eq) if token.starts_with(b"--") => (&token[..eq], Some(token[eq + 1..].to_vec())),
+            _ => (token.as_slice(), None),
         };
-        let value = |i: &mut usize| -> Result<String, String> {
+        let flag_text = String::from_utf8_lossy(flag).into_owned();
+        let take_value = |i: &mut usize| -> Result<std::ffi::OsString, String> {
             match &inline {
-                Some(v) => Ok(v.clone()),
+                Some(v) => Ok(bytes_to_os(v)),
                 None => {
-                    let v = need(i, flag, rest)?;
+                    let v = rest
+                        .get(*i + 1)
+                        .ok_or_else(|| format!("flag {flag_text} needs a value"))?;
                     *i += 1;
-                    Ok(v)
+                    Ok(v.clone())
                 }
             }
         };
         match flag {
-            "--out" => args.out = Some(PathBuf::from(value(&mut i)?)),
-            "--index" => args.index = Some(PathBuf::from(value(&mut i)?)),
-            "--exclude" => args.excludes.push(PathBuf::from(value(&mut i)?)),
-            "--limit" => {
-                let v = value(&mut i)?;
+            b"--out" => args.out = Some(PathBuf::from(take_value(&mut i)?)),
+            b"--index" => args.index = Some(PathBuf::from(take_value(&mut i)?)),
+            b"--exclude" => args.excludes.push(PathBuf::from(take_value(&mut i)?)),
+            b"--limit" => {
+                let v = take_value(&mut i)?;
+                let v = v
+                    .to_str()
+                    .ok_or_else(|| "invalid --limit value: not UTF-8".to_string())?;
                 args.limit = Some(
                     v.parse::<usize>()
                         .map_err(|_| format!("invalid --limit value: {v}"))?,
                 );
             }
-            "--json" => args.json = true,
-            "--null" | "-0" => args.null = true,
-            "--count" => args.count = true,
-            "--follow-symlinks" => args.follow_symlinks = true,
-            other if other.starts_with("--") => {
-                return Err(format!("unknown flag: {other}"));
+            b"--json" => args.json = true,
+            b"--null" | b"-0" => args.null = true,
+            b"--count" => args.count = true,
+            b"--follow-symlinks" => args.follow_symlinks = true,
+            other if other.starts_with(b"--") => {
+                return Err(format!("unknown flag: {}", String::from_utf8_lossy(other)));
             }
             _ => args.positional.push(rest[i].clone()),
         }
@@ -152,7 +169,11 @@ fn cmd_index(args: Args) -> Result<(), String> {
     }
     let out = index_path(&args.out)?;
     let (index, report) = scan(&WalkOptions {
-        roots: args.positional.iter().map(PathBuf::from).collect(),
+        roots: args
+            .positional
+            .iter()
+            .map(|p| PathBuf::from(p.clone()))
+            .collect(),
         excludes: args.excludes,
         follow_symlinks: args.follow_symlinks,
     });
@@ -196,7 +217,10 @@ fn cmd_search(args: Args) -> Result<(), String> {
     if args.positional.len() != 1 {
         return Err("search needs exactly one query argument".to_string());
     }
-    let query = Query::parse(&args.positional[0]).map_err(|e| e.to_string())?;
+    let query_text = args.positional[0]
+        .to_str()
+        .ok_or_else(|| "query is not valid UTF-8".to_string())?;
+    let query = Query::parse(query_text).map_err(|e| e.to_string())?;
     let (index, _) = load(&args)?;
 
     let stdout = std::io::stdout();
@@ -271,11 +295,12 @@ fn cmd_stats(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-fn run(argv: Vec<String>) -> Result<(), String> {
+fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
     let Some(cmd) = argv.first() else {
         return Err("missing subcommand\n\n".to_string() + USAGE);
     };
-    match cmd.as_str() {
+    let cmd = cmd.to_str().unwrap_or("");
+    match cmd {
         "--help" | "-h" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -292,7 +317,8 @@ fn run(argv: Vec<String>) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // args_os: paths may be non-Unicode; std::env::args() would panic.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     match run(argv) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {

@@ -168,6 +168,25 @@ impl<'x> Walker<'x> {
     }
 }
 
+/// Lossless stored name for a root path: the raw `OsStr` bytes via
+/// [`name_to_bytes`] (never `to_string_lossy`), with trailing
+/// separators removed so path joins stay clean. A bare root (`/`,
+/// `E:\`, a UNC share root) keeps its separator. Only real separator
+/// bytes are stripped (on Unix only `/`, so a name ending in `\` is
+/// preserved); separator bytes are ASCII and cannot be part of a
+/// multi-byte WTF-8/UTF-8 sequence, so byte trimming is exact.
+fn root_name_bytes(path: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    name_to_bytes(path.as_os_str(), &mut bytes);
+    if path.parent().is_some() {
+        let is_sep = |b: u8| b == std::path::MAIN_SEPARATOR as u8 || (cfg!(windows) && b == b'/');
+        while bytes.len() > 1 && is_sep(*bytes.last().unwrap()) {
+            bytes.pop();
+        }
+    }
+    bytes
+}
+
 /// Scan all roots and freeze the index.
 pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     let started = Instant::now();
@@ -188,17 +207,9 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     // Roots are added sequentially (cheap), their subtrees in parallel.
     let mut root_dirs: Vec<(PathBuf, u32)> = Vec::new();
     for root in &options.roots {
-        // Store the root without a trailing separator (except a bare "/"
-        // or drive root) so path joins stay clean.
-        let display = root.to_string_lossy();
-        let trimmed = display.trim_end_matches(['/', '\\']);
-        let root_str: &str = if trimmed.is_empty() {
-            &display
-        } else {
-            trimmed
-        };
+        let name = root_name_bytes(root);
         let (name_bytes, is_dir) = match std::fs::metadata(root) {
-            Ok(md) => (root_str.as_bytes().to_vec(), md.is_dir()),
+            Ok(md) => (name, md.is_dir()),
             Err(e) => {
                 errors.add(format!("{}: {e}", root.display()));
                 continue;
@@ -331,6 +342,59 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert_eq!(report.errors, 1);
         assert_eq!(report.error_samples.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_with_lone_surrogate_is_lossless() {
+        use std::os::windows::ffi::OsStringExt;
+        let dir = TestDir::new("surrogate");
+        let root = dir
+            .0
+            .join(std::ffi::OsString::from_wide(&[b'r' as u16, 0xd800]));
+        std::fs::create_dir_all(&root).unwrap();
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![root.clone()],
+            ..WalkOptions::default()
+        });
+        assert_eq!(report.errors, 0, "{:?}", report.error_samples);
+        assert_eq!(idx.path(0), root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_root_with_invalid_utf8_name_is_lossless() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = TestDir::new("nonutf8");
+        let root = dir
+            .0
+            .join(std::ffi::OsString::from_vec(vec![b'r', 0xff, b'x']));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"x").unwrap();
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![root.clone()],
+            ..WalkOptions::default()
+        });
+        assert_eq!(report.errors, 0, "{:?}", report.error_samples);
+        assert_eq!(idx.path(0), root);
+        assert_eq!(idx.path(1), root.join("file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_root_name_ending_in_backslash_is_kept() {
+        let dir = TestDir::new("backslash");
+        // A trailing backslash is a valid part of a Unix file name.
+        let root = dir.0.join("dir\\");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"x").unwrap();
+        let (idx, report) = scan(&WalkOptions {
+            roots: vec![root.clone()],
+            ..WalkOptions::default()
+        });
+        assert_eq!(report.errors, 0, "{:?}", report.error_samples);
+        assert_eq!(idx.path(0), root);
+        assert_eq!(idx.path(1), root.join("file.txt"));
     }
 
     #[cfg(unix)]
