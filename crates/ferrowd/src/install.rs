@@ -51,7 +51,7 @@ pub fn install() -> Result<String, String> {
     };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    let exe = ferrowd_exe()?;
+    let exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     let index = crate::default_service_index_path();
     if let Some(parent) = index.parent() {
         std::fs::create_dir_all(parent).map_err(|e| admin_hint("install", &e))?;
@@ -65,7 +65,9 @@ pub fn install() -> Result<String, String> {
         .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
         .is_ok()
     {
-        return Ok(format!("service {SERVICE_NAME} is already installed"));
+        return Err(format!(
+            "service {SERVICE_NAME} is already installed; uninstall it before installing the protected executable"
+        ));
     }
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
@@ -116,8 +118,8 @@ pub fn uninstall() -> Result<String, String> {
 const SYSTEMD_TEMPLATE: &str = "[Unit]\nDescription=Ferrow file-name index service\nAfter=local-fs.target\nWants=local-fs.target\n\n[Service]\nType=simple\nExecStart=@FERROWD@ --service-endpoint --index /var/lib/ferrow/index.bin\nRestart=on-failure\nRestartSec=2s\n# Only the capabilities the indexer needs: read every directory\n# (live backends in later milestones use CAP_SYS_ADMIN).\nCapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN\nAmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN\nRuntimeDirectory=ferrow\nStateDirectory=ferrow\nStateDirectoryMode=0700\n# Hardening. ProtectHome stays off: indexing home directories is\n# the point. Writes are confined to the state directory.\nProtectSystem=strict\nReadWritePaths=/var/lib/ferrow\nPrivateTmp=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectControlGroups=true\nLockPersonality=true\nRestrictSUIDSGID=true\nRestrictRealtime=true\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(target_os = "linux")]
-fn systemd_unit(exe: &std::path::Path) -> String {
-    SYSTEMD_TEMPLATE.replace("@FERROWD@", &exe.display().to_string())
+fn systemd_unit() -> String {
+    SYSTEMD_TEMPLATE.replace("@FERROWD@", "\"/usr/local/libexec/ferrow/ferrowd\"")
 }
 
 #[cfg(target_os = "linux")]
@@ -150,8 +152,8 @@ fn root_hint(action: &str, e: &std::io::Error) -> String {
 
 #[cfg(target_os = "linux")]
 pub fn install() -> Result<String, String> {
-    let exe = ferrowd_exe()?;
-    std::fs::write(UNIT_PATH, systemd_unit(&exe)).map_err(|e| root_hint("install", &e))?;
+    let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
+    std::fs::write(UNIT_PATH, systemd_unit()).map_err(|e| root_hint("install", &e))?;
     std::fs::create_dir_all("/var/lib/ferrow").map_err(|e| root_hint("install", &e))?;
     run_cmd("systemctl", &["daemon-reload"])?;
     run_cmd("systemctl", &["enable", SERVICE_NAME])?;
@@ -175,10 +177,10 @@ pub fn uninstall() -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_plist(exe: &std::path::Path) -> String {
+fn launchd_plist() -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCHD_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--service-endpoint</string>\n\t\t<string>--index</string>\n\t\t<string>/var/lib/ferrow/index.bin</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>WorkingDirectory</key>\n\t<string>/var/lib/ferrow</string>\n\t<key>StandardOutPath</key>\n\t<string>/var/log/ferrowd.log</string>\n\t<key>StandardErrorPath</key>\n\t<string>/var/log/ferrowd.log</string>\n</dict>\n</plist>\n",
-        exe.display()
+        "/usr/local/libexec/ferrow/ferrowd"
     )
 }
 
@@ -189,9 +191,9 @@ fn plist_path() -> String {
 
 #[cfg(target_os = "macos")]
 pub fn install() -> Result<String, String> {
-    let exe = ferrowd_exe()?;
+    let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     let path = plist_path();
-    std::fs::write(&path, launchd_plist(&exe)).map_err(|e| root_hint("install", &e))?;
+    std::fs::write(&path, launchd_plist()).map_err(|e| root_hint("install", &e))?;
     std::fs::create_dir_all("/var/lib/ferrow").map_err(|e| root_hint("install", &e))?;
     Ok(format!(
         "launchd daemon {LAUNCHD_LABEL} installed ({path}). Load it with: sudo launchctl bootstrap system {path}\n\
@@ -226,7 +228,7 @@ pub fn uninstall() -> Result<String, String> {
 mod tests {
     #[test]
     fn generated_unit_matches_packaging_file() {
-        let generated = super::systemd_unit(std::path::Path::new("/usr/local/bin/ferrowd"));
+        let generated = super::systemd_unit();
         assert_eq!(
             generated,
             include_str!("../../../packaging/systemd/ferrowd.service")
@@ -238,7 +240,7 @@ mod tests {
 mod tests {
     #[test]
     fn generated_plist_matches_packaging_file() {
-        let generated = super::launchd_plist(std::path::Path::new("/usr/local/bin/ferrowd"));
+        let generated = super::launchd_plist();
         assert_eq!(
             generated,
             include_str!("../../../packaging/launchd/com.github.rennerdo30.ferrowd.plist")

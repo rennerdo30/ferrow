@@ -22,6 +22,7 @@ use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
 pub mod install;
+pub mod protection;
 
 /// One immutable index plus how it was produced.
 pub struct Snapshot {

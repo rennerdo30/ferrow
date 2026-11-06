@@ -198,6 +198,7 @@ dependencies = [
  "ferrow-ipc",
  "ferrow-query",
  "ferrow-walk",
+ "libc",
  "windows-service",
  "windows-sys",
 ]

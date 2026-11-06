@@ -33,6 +33,21 @@ only the OS user who started it. Per-user result filtering remains M2c.
 
 ## Install (needs admin/root once)
 
+Installation copies `ferrowd` into `%ProgramFiles%\Ferrow\` on Windows
+or `/usr/local/libexec/ferrow/` on Unix and registers only that fixed path.
+Unix directories and binaries must be root-owned 0755, with no group/other
+write access or symbolic-link component. Existing unsafe paths are refused.
+
+Windows components must be owned by SYSTEM, Administrators or TrustedInstaller
+and contain no reparse points. Non-admin ACEs must grant no WRITE_DAC,
+WRITE_OWNER or DELETE on ancestors, and no FILE_DELETE_CHILD on their parents.
+Create-subdirectory permission on a protected ancestor such as `C:\` is allowed.
+The final directory additionally refuses non-admin add-file, add-subdirectory,
+delete-child and other write rights, including inherited grants to new files.
+The binary refuses non-admin write, append, delete, WRITE_DAC and WRITE_OWNER.
+Constructed security descriptors test these rules, including create-only roots.
+No user-supplied executable path is substituted into systemd or launchd files.
+
 Ferrow never elevates itself: run the command from an elevated
 terminal / with sudo, as it tells you.
 

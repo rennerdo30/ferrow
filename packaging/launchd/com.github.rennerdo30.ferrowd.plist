@@ -6,7 +6,7 @@
 	<string>com.github.rennerdo30.ferrowd</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/ferrowd</string>
+		<string>/usr/local/libexec/ferrow/ferrowd</string>
 		<string>--service-endpoint</string>
 		<string>--index</string>
 		<string>/var/lib/ferrow/index.bin</string>

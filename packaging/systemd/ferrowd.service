@@ -5,7 +5,7 @@ Wants=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ferrowd --service-endpoint --index /var/lib/ferrow/index.bin
+ExecStart="/usr/local/libexec/ferrow/ferrowd" --service-endpoint --index /var/lib/ferrow/index.bin
 Restart=on-failure
 RestartSec=2s
 # Only the capabilities the indexer needs: read every directory
