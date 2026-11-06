@@ -123,6 +123,7 @@ launchers ────┘     (daemon)       └─ backend-macos   (FSEvents)
 - 2026-11-06: a Pair Desk project `ferrow` tracks issues and the handoff.
 - 2026-11-07: **high performance is the most important property of the app.** Every milestone measures its effect on the §3 numbers in CI. The speed work (M2e) comes next after M2a/M2b land, before per-user visibility (M2c) and the MFT/USN backend (M2d). The query path through the service is benchmarked like the in-process path.
 - 2026-11-07: **never freeze.** Freezes in existing tools are why Ferrow exists. No code path may block the UI, a search or the service on indexing, disk I/O, a slow or unreachable volume, a lock or a large result set. Work is bounded and cancellable, and freeze resistance is tested (for example with mocked slow stages).
+- 2026-11-07: **perfect performance in remote desktop sessions** (RDP, VNC, TeamViewer and similar). The UI repaints only what changed and only when something changed: no animations, no blinking caret, no idle redraws. The renderer must work without a GPU, for example over RDP.
 
 ## 10. Open decisions for the owner
 
