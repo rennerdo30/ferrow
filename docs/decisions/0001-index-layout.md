@@ -77,14 +77,21 @@ Loading first reads and validates the bounded header (magic, version,
 counts), checks the exact expected total length against the file size
 (with a 16 GiB ceiling), and only then reads the payload in one
 sequential read. Trailing bytes are rejected; they are not covered by
-trusting the checksum alone. After the checksum, every parent/name/sort
-id is range-checked and parent cycles are rejected. The derived data
-is **validated, not rebuilt**: the sort column must be a permutation
-(no duplicate ids) in exact sort order, and every folded name must
-equal `fold_name` of the raw name. Validation was chosen over
-rebuilding on load because it is O(n) plus one pass over the arena,
-while rebuilding would pay a full parallel sort on every cold start,
-against the load-time target. A crafted file with a valid checksum
+trusting the checksum alone. After the checksum, the loader first
+requires the canonical packed name layout the writer produces (names
+contiguous in entry-id order, each `name_off` equal to the running sum
+of previous lengths, the total exactly the arena length), checked with
+checked arithmetic before any content validation; then every
+parent/name/sort id is range-checked and parent cycles are rejected.
+The derived data is **validated, not rebuilt**: the sort column must
+be a permutation (no duplicate ids) in exact sort order, and every
+folded name must equal `fold_name` of the raw name. Validation was
+chosen over rebuilding on load because, under the packed layout, the
+sum of all name lengths equals the arena length, so folding plus
+adjacent sort-key comparisons cost O(n + arena bytes) in total — not
+O(sum of referenced name lengths), which overlapping ranges would
+allow — while rebuilding would pay a full parallel sort on every cold
+start, against the load-time target. A crafted file with a valid checksum
 but inconsistent derived data is rejected as corrupt. Any problem is a typed error, never a panic
 (`ferrow-index/src/persist.rs`). Saving creates a unique temp file
 beside the destination with exclusive creation (mode 0600 on Unix),

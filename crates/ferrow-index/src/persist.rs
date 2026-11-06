@@ -329,6 +329,26 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
     let folded_arena = take(data, &mut at, arena_len)?.to_vec();
     let sorted = read_u32s(data, &mut at, n)?;
 
+    // Require the canonical packed name layout the writer produces
+    // (freeze appends names in entry-id order): names contiguous,
+    // each offset equal to the running sum of previous lengths, total
+    // exactly the arena length. Checked with u64 arithmetic before any
+    // content validation, so shared/overlapping ranges cannot make
+    // folding and sort-key work grow with the sum of referenced name
+    // lengths instead of the stored arena size.
+    let mut running: u64 = 0;
+    for i in 0..n {
+        if name_off[i] as u64 != running {
+            return Err(LoadError::Corrupt("name layout is not packed"));
+        }
+        running = running
+            .checked_add(name_len[i] as u64)
+            .ok_or(LoadError::Corrupt("size overflow"))?;
+    }
+    if running != arena_len as u64 {
+        return Err(LoadError::Corrupt("name layout is not packed"));
+    }
+
     // Validate so later lookups can never panic on a crafted file.
     for i in 0..n {
         if parent[i] != ROOT_PARENT && parent[i] as usize >= n {
@@ -374,9 +394,9 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
     }
 
     // Validate the derived data instead of trusting it (ADR 0001:
-    // validation chosen over rebuild — uniqueness/order checks are O(n)
-    // and the folded check is one pass over the arena with a single
-    // reused buffer, while rebuilding would pay a full parallel sort).
+    // validation chosen over rebuild — under the packed layout above,
+    // folding plus adjacent sort-key comparisons cost O(n + arena
+    // bytes), while rebuilding would pay a full parallel sort).
     fn name_at<'a>(arena: &'a [u8], name_off: &[u32], name_len: &[u16], i: usize) -> &'a [u8] {
         let off = name_off[i] as usize;
         &arena[off..off + name_len[i] as usize]
@@ -576,6 +596,43 @@ mod tests {
         assert!(
             matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
             "inconsistent folded arena must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_name_ranges_with_valid_checksum() {
+        // Three entries all referencing the same 255-byte name range.
+        // The writer only ever produces the canonical packed layout
+        // (names contiguous in entry-id order), so this must be
+        // rejected before any folding work happens.
+        let n = 3u32;
+        let a = 255u32;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"FERROWID");
+        for v in [1, n, a, 0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for _ in 0..n {
+            b.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        for _ in 0..n {
+            b.extend_from_slice(&0u32.to_le_bytes());
+        }
+        for _ in 0..n {
+            b.extend_from_slice(&(a as u16).to_le_bytes());
+        }
+        for _ in 0..n {
+            b.extend_from_slice(&0u16.to_le_bytes());
+        }
+        b.extend(std::iter::repeat_n(b'a', a as usize * 2));
+        for id in 0..n {
+            b.extend_from_slice(&id.to_le_bytes());
+        }
+        fix_checksum(&mut b);
+        assert!(
+            matches!(from_bytes(&b), Err(LoadError::Corrupt(_))),
+            "overlapping name ranges must be rejected, got {:?}",
+            from_bytes(&b).map(|i| i.len())
         );
     }
 
