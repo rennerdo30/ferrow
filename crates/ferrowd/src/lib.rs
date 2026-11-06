@@ -72,6 +72,7 @@ impl Snapshot {
 #[derive(Clone)]
 pub struct SnapshotStore {
     inner: Arc<arc_swap::ArcSwap<Snapshot>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
     changes: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
 }
 
@@ -79,6 +80,7 @@ impl SnapshotStore {
     pub fn new(snapshot: Snapshot) -> SnapshotStore {
         SnapshotStore {
             inner: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             changes: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -97,6 +99,10 @@ impl SnapshotStore {
         // swap returns the old Arc: reclamation happens after publication,
         // without holding a reader/writer or application publication lock.
         let old = self.inner.swap(Arc::new(snapshot));
+        // Increment after publishing the pointer, before notifying persistence.
+        // A saver reads the generation before acquiring its snapshot, so it
+        // may conservatively save again but cannot certify an older snapshot.
+        self.generation.fetch_add(1, Ordering::AcqRel);
         if let Some(sender) = self
             .changes
             .lock()

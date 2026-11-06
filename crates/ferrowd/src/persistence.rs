@@ -1,4 +1,4 @@
-use crate::{DaemonConfig, Shutdown, SnapshotStore, prepare_state};
+use crate::{DaemonConfig, Shutdown, Snapshot, SnapshotStore, prepare_state};
 use std::io;
 use std::sync::{
     Arc,
@@ -20,7 +20,7 @@ pub struct Persistence {
     thread: Option<std::thread::JoinHandle<io::Result<()>>>,
 }
 
-fn save(config: &DaemonConfig, store: &SnapshotStore) -> io::Result<()> {
+fn save(config: &DaemonConfig, snapshot: Arc<Snapshot>) -> io::Result<()> {
     let Some(path) = &config.index_path else {
         return Ok(());
     };
@@ -28,7 +28,7 @@ fn save(config: &DaemonConfig, store: &SnapshotStore) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    store.get().index.save(path).map_err(io::Error::other)?;
+    snapshot.index.save(path).map_err(io::Error::other)?;
     prepare_state(config)
 }
 
@@ -37,6 +37,15 @@ impl Persistence {
         config: &DaemonConfig,
         store: &SnapshotStore,
         shutdown: &Shutdown,
+    ) -> io::Result<Option<Self>> {
+        Self::start_with_saver(config, store, shutdown, save)
+    }
+
+    fn start_with_saver(
+        config: &DaemonConfig,
+        store: &SnapshotStore,
+        shutdown: &Shutdown,
+        mut saver: impl FnMut(&DaemonConfig, Arc<Snapshot>) -> io::Result<()> + Send + 'static,
     ) -> io::Result<Option<Self>> {
         if config.index_path.is_none() {
             return Ok(None);
@@ -77,8 +86,17 @@ impl Persistence {
                                 }
                             }
                         }
-                        save(&config, &current)?;
+                        let mut saved_generation = current.generation.load(Ordering::Acquire);
+                        saver(&config, current.get())?;
                         if s.load(Ordering::Acquire) {
+                            loop {
+                                let latest = current.generation.load(Ordering::Acquire);
+                                if latest == saved_generation {
+                                    break;
+                                }
+                                saved_generation = latest;
+                                saver(&config, current.get())?;
+                            }
                             return Ok(());
                         }
                     }
@@ -105,8 +123,13 @@ impl Persistence {
         }))
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn finish(self) -> io::Result<()> {
+        self.finish_with(|| {})
+    }
+
+    fn finish_with(mut self, stopped: impl FnOnce()) -> io::Result<()> {
         self.stop.store(true, Ordering::Release);
+        stopped();
         let _ = self.wake.try_send(()); // a queued change also observes stop
         self.store
             .changes
@@ -134,6 +157,52 @@ impl Drop for Persistence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_during_save_persists_a_newer_publication() {
+        let store = SnapshotStore::new(Snapshot::empty());
+        let config = DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-save-race-unused"),
+            index_path: Some("unused-mocked-save".into()),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let shutdown = Shutdown::new();
+        let saved = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = saved.clone();
+        let (paused_tx, paused) = mpsc::channel();
+        let (release, resumed) = mpsc::channel();
+        let worker =
+            Persistence::start_with_saver(&config, &store, &shutdown, move |_, snapshot| {
+                if snapshot.report == "A" {
+                    paused_tx.send(()).unwrap();
+                    resumed.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                observed.lock().unwrap().push(snapshot.report.clone());
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let mut a = Snapshot::empty();
+        a.report = "A".into();
+        store.swap(a);
+        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut b = Snapshot::empty();
+        b.report = "B".into();
+        store.swap(b);
+        let (stopped_tx, stopped) = mpsc::channel();
+        let finisher =
+            std::thread::spawn(move || worker.finish_with(|| stopped_tx.send(()).unwrap()));
+        stopped.recv_timeout(Duration::from_secs(2)).unwrap();
+        release.send(()).unwrap();
+        finisher.join().unwrap().unwrap();
+        assert_eq!(
+            *saved.lock().unwrap(),
+            ["A", "B"],
+            "controlled shutdown lost a pre-shutdown publication"
+        );
+    }
     #[test]
     fn clean_idle_host_arms_no_periodic_task() {
         assert_eq!(scheduled_delay(false), None);

@@ -111,7 +111,11 @@ one and swap it in without blocking queries.
 
 Snapshot publication wakes a coalesced persistence worker. A dirty index arms
 one 250 ms deadline; a clean index waits indefinitely for an event. Controlled
-shutdown saves the latest snapshot and reports persistence failures. Unix
+shutdown saves the latest snapshot and reports persistence failures. Publications
+advance a generation after swapping the snapshot. If shutdown arrives during a
+save, the worker compares its captured generation with the current generation
+and saves again until it covers the newest publication. Hosts stop publishing
+before finishing persistence. Unix
 foreground hosts handle SIGTERM/SIGINT cooperatively; SCM STOP/SHUTDOWN uses
 the same final-save path. A failed load or state-policy check refuses startup.
 
