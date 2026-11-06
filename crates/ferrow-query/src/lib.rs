@@ -381,7 +381,9 @@ fn count_impl<const TIMED: bool>(
         timings.prepare = t.elapsed();
     }
     let mut total = 0usize;
-    for block in index.sorted().chunks(BLOCK_SIZE) {
+    // Counts do not expose order: walk adjacent arena names instead of
+    // chasing the name-sort permutation through memory.
+    for start in (0..index.len()).step_by(BLOCK_SIZE) {
         if cancel.is_cancelled() {
             if let Some(t) = started {
                 timings.total = t.elapsed();
@@ -389,9 +391,9 @@ fn count_impl<const TIMED: bool>(
             return ((total, true), timings);
         }
         let scan_started = TIMED.then(std::time::Instant::now);
-        total += block
-            .par_iter()
-            .filter(|&&id| matcher.matches(index, id))
+        total += (start..(start + BLOCK_SIZE).min(index.len()))
+            .into_par_iter()
+            .filter(|&id| matcher.matches(index, id as u32))
             .count();
         if let Some(t) = scan_started {
             timings.scan += t.elapsed();
