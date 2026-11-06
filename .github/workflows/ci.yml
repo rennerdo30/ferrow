@@ -142,6 +142,7 @@ jobs:
           test "$(id -u)" -ne 0
           cargo build --release --locked -p ferrow
           cargo build --release --locked -p ferrow-query --example service_bench
+          cargo build --release --locked -p ferrow-query --example latency_probe
           cargo bench --no-run -p ferrow-query --bench m1_bench --locked
       - name: Build main in a separate target directory
         if: github.event_name == 'pull_request'
@@ -149,7 +150,10 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
         run: |
+          # The small retry driver is identical; each copy links its own arm's libraries.
+          cp ../crates/ferrow-query/examples/latency_probe.rs crates/ferrow-query/examples/latency_probe.rs
           cargo build --release --locked -p ferrow
+          cargo build --release --locked -p ferrow-query --example latency_probe
           cargo bench --no-run -p ferrow-query --bench m1_bench --locked
       - name: Smoke benchmark chain with 16 entries
         env:
@@ -165,6 +169,7 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/ferrow-base-target
           FERROW_MEASURES_ONLY: "1"
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-base.bin
         run: |
           git rev-parse HEAD
           timeout -k 5s 600s cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee "$GITHUB_WORKSPACE/base-output.txt"
@@ -185,4 +190,10 @@ jobs:
         run: ./scripts/bench-summary.sh bench-output.txt
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
-        run: python3 scripts/bench-gate.py base-output.txt bench-output.txt
+        run: |
+          python3 scripts/bench-gate.py base-output.txt bench-output.txt \
+            --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
+            --head-probe "$PWD/target/release/examples/latency_probe" \
+            --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
+            --head-binary "$PWD/target/release/ferrow" \
+            --base-index "$RUNNER_TEMP/ferrow-base.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin"

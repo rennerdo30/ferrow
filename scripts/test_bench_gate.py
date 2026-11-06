@@ -80,6 +80,34 @@ class GateTests(unittest.TestCase):
         self.assertTrue(any(row[-1] for row in self.rows()))
         self.assertEqual(len(self.rows()), gate.EXPECTED_METRICS)
 
+    def test_retry_only_failed_latency_once_paired(self):
+        self.head[2]["report 2024"]["first_page_ms"] = 4
+        calls = []
+        def measure(*args):
+            calls.append(args)
+            return (1 if args[0] == "base" else 1.05), 2
+        rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
+        self.assertFalse(any(row[-1] for row in rows))
+        self.assertEqual(calls, [(arm, "IPC", "report 2024", "first_page_ms") for arm in ("base", "head")])
+        calls.clear()
+        self.head[0]["heap_bytes"] = 1000
+        self.assertTrue(any(row[-1] for row in gate.retry_failures(self.rows(), self.base, self.head, measure)))
+        self.assertEqual(calls, [])
+
+    def test_retry_repeat_breach_fails_and_bad_evidence_refuses(self):
+        self.head[0]["load_ms_median"] = 200
+        rows = gate.retry_failures(self.rows(), self.base, self.head,
+                                   lambda arm, *_: (100 if arm == "base" else 111, 16))
+        self.assertTrue(any(row[-1] for row in rows))
+        for bad in ((float("nan"), 16), (100, 17), (-1, 16)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: bad)
+
+    def test_retry_pass_does_not_run_producers(self):
+        def unexpected(*_):
+            self.fail("passing metrics must not be remeasured")
+        self.assertEqual(gate.retry_failures(self.rows(), self.base, self.head, unexpected), self.rows())
+
     def test_service_set_is_required_in_every_arm(self):
         # Missing in one arm, in both arms, or only partly present: refused.
         with self.assertRaises(ValueError):
