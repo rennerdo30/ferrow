@@ -14,6 +14,44 @@ fn accepted_stream_can_move_to_a_worker() {
     assert_send::<Stream>();
 }
 
+#[test]
+fn refusal_cleanup_does_not_wait_for_a_reader() {
+    let endpoint = test_endpoint("nonreader");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        assert!(serve_stream(stream, handler).is_err());
+        done_tx.send(()).unwrap();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut stream = loop {
+        match Stream::connect(&endpoint) {
+            Ok(s) => break s,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("connect: {e}"),
+        }
+    };
+    write_message(
+        &mut stream,
+        0,
+        &Message::Request(Request::Hello { version: 99 }),
+    )
+    .unwrap();
+    let finished = done_rx.recv_timeout(std::time::Duration::from_millis(250));
+    drop(stream); // release the peer even when testing the broken implementation
+    server.join().unwrap();
+    assert!(
+        finished.is_ok(),
+        "server destruction waited for the non-reading peer"
+    );
+}
+
 fn test_endpoint(tag: &str) -> Endpoint {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     Endpoint::named(&format!(

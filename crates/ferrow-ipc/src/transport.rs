@@ -283,12 +283,12 @@ mod platform {
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
-        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
     };
 
     /// SDDL_REVISION_1.
@@ -316,15 +316,11 @@ mod platform {
 
     impl Drop for PipeHandle {
         fn drop(&mut self) {
-            // FlushFileBuffers on a pipe waits until the peer has
-            // read everything written, so a final reply (for
-            // example a handshake refusal) is not discarded by
-            // the disconnect below. It fails harmlessly when the
-            // peer is already gone.
-            // SAFETY: the handle is owned here and closed once.
+            // Closing releases ownership without waiting for peer reads.
+            // Do not FlushFileBuffers or DisconnectNamedPipe here: the former
+            // waits indefinitely, and the latter discards queued refusals.
+            // SAFETY: the handle is owned here and closed exactly once.
             unsafe {
-                FlushFileBuffers(self.0);
-                DisconnectNamedPipe(self.0);
                 CloseHandle(self.0);
             }
         }
