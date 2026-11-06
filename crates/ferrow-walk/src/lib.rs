@@ -221,7 +221,14 @@ fn resolve_excludes(paths: &[PathBuf], errors: &Errors) -> ExcludeSet {
             set.dirs.insert(id);
         } else {
             set.files.insert(id);
-            let parent = match path.parent() {
+            let resolved = match std::fs::canonicalize(path) {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    errors.add(format!("exclude location {}: {e}", path.display()));
+                    continue;
+                }
+            };
+            let parent = match resolved.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
                 _ => PathBuf::from("."),
             };
@@ -352,13 +359,10 @@ impl<'x> Walker<'x> {
             // exclude.
             let need_identity = self.follow_symlinks || !self.excludes.is_empty();
             let mut child_identity: Option<FileId> = None;
-            if is_dir {
+            if is_dir || is_symlink {
                 if need_identity {
                     match file_id(&path) {
                         Ok(id) => {
-                            if self.excludes.dirs.contains(&id) {
-                                continue;
-                            }
                             child_identity = Some(id);
                             if is_symlink {
                                 match self.excludes.excluded_location(&path, Some(id), true) {
@@ -369,6 +373,10 @@ impl<'x> Walker<'x> {
                                         continue;
                                     }
                                 }
+                            } else if self.excludes.dirs.contains(&id) {
+                                // A real parent-to-child edge inherits the
+                                // already-checked parent chain: one lookup.
+                                continue;
                             }
                         }
                         Err(e) => {

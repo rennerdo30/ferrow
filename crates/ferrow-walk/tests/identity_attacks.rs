@@ -25,9 +25,11 @@ fn alias_child_cannot_reinclude_excluded_ancestor() {
     std::fs::create_dir(&root).unwrap();
     std::fs::write(sub.join("private.txt"), b"x").unwrap();
     f.link(&sub, &root.join("alias"));
-    let index = run(&root, vec![private], true);
-    assert!(!contains(&index, b"private.txt"));
-    assert!(!contains(&index, b"alias"));
+    for follow in [true, false] {
+        let index = run(&root, vec![private.clone()], follow);
+        assert!(!contains(&index, b"private.txt"));
+        assert!(!contains(&index, b"alias"));
+    }
 }
 
 #[test]
@@ -102,7 +104,9 @@ fn junction_descendant_cannot_reinclude_excluded_ancestor() {
     for follow in [true, false] {
         assert!(run(&alias, vec![private.clone()], follow).is_empty());
     }
-    assert_eq!(run(&root, vec![private], true).len(), 1);
+    for follow in [true, false] {
+        assert_eq!(run(&root, vec![private.clone()], follow).len(), 1);
+    }
 }
 
 #[cfg(unix)]
@@ -173,4 +177,95 @@ fn excludes_support_long_paths_that_std_can_scan() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn explicitly_excluded_directory_symlink_is_absent_with_following_off() {
+    use ferrow_walk::{WalkOptions, scan};
+    let mut f = Fixture::new("excluded-link-leaf");
+    let root = f.path.join("root");
+    let target = f.path.join("target");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("private.txt"), b"x").unwrap();
+    let alias = root.join("alias");
+    f.link(&target, &alias);
+    let spellings = vec![alias, target.clone()];
+    #[cfg(windows)]
+    let spellings = {
+        let mut spellings = spellings;
+        let junction = root.join("junction");
+        f.junction(&target, &junction);
+        spellings.push(junction);
+        spellings
+    };
+    let mut failures = Vec::new();
+    for exclude in spellings {
+        for follow in [false, true] {
+            let (index, report) = scan(&WalkOptions {
+                roots: vec![root.clone()],
+                excludes: vec![exclude.clone()],
+                follow_symlinks: follow,
+            });
+            if index.len() != 1 || report.errors != 0 {
+                failures.push(format!(
+                    "exclude={exclude:?}, follow={follow}: {} entries, {report:?}",
+                    index.len()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn ordinary_non_excluded_symlink_leaves_remain_present() {
+    use ferrow_index::flags;
+    let mut f = Fixture::new("kept-link-leaf");
+    let root = f.path.join("root");
+    let target = f.path.join("target");
+    let unrelated = f.path.join("unrelated");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::write(target.join("target.txt"), b"x").unwrap();
+    f.link(&target, &root.join("alias"));
+    #[cfg(windows)]
+    f.junction(&target, &root.join("junction"));
+    let index = run(&root, vec![unrelated], false);
+    assert!(contains(&index, b"alias"));
+    #[cfg(windows)]
+    assert!(contains(&index, b"junction"));
+    assert!(!contains(&index, b"target.txt"));
+    for id in 1..index.len() as u32 {
+        assert_ne!(index.flags(id) & flags::SYMLINK, 0);
+        assert_eq!(index.flags(id) & flags::DIR, 0);
+    }
+}
+
+#[test]
+fn file_alias_cannot_reinclude_excluded_ancestor() {
+    let mut f = Fixture::new("file-alias");
+    let private = f.path.join("private");
+    let root = f.path.join("root");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let file = private.join("secret.txt");
+    std::fs::write(&file, b"x").unwrap();
+    f.file_link(&file, &root.join("alias"));
+    for follow in [true, false] {
+        assert_eq!(run(&root, vec![private.clone()], follow).len(), 1);
+    }
+}
+
+#[test]
+fn file_exclude_resolves_link_target_parent() {
+    let mut f = Fixture::new("file-exclude-link");
+    let target = f.path.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let file = target.join("secret.txt");
+    std::fs::write(&file, b"x").unwrap();
+    let alias = f.path.join("alias");
+    f.file_link(&file, &alias);
+    assert_eq!(run(&target, vec![alias], false).len(), 1);
 }

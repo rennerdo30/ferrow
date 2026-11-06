@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Fixture {
     pub path: PathBuf,
-    links: Vec<PathBuf>,
+    links: Vec<(PathBuf, bool)>,
 }
 
 impl Fixture {
@@ -26,7 +26,15 @@ impl Fixture {
         std::os::windows::fs::symlink_dir(target, link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, link).unwrap();
-        self.links.push(link.to_path_buf());
+        self.links.push((link.to_path_buf(), true));
+    }
+
+    pub fn file_link(&mut self, target: &Path, link: &Path) {
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        self.links.push((link.to_path_buf(), false));
     }
 
     #[cfg(windows)]
@@ -56,16 +64,20 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(status.success(), "junction fixture PID {pid}: {status}");
-        self.links.push(link.to_path_buf());
+        self.links.push((link.to_path_buf(), true));
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         // Unlink our recorded aliases before recursive cleanup, especially junctions.
-        for link in self.links.iter().rev() {
+        for (link, _is_dir) in self.links.iter().rev() {
             #[cfg(windows)]
-            let result = std::fs::remove_dir(link);
+            let result = if *_is_dir {
+                std::fs::remove_dir(link)
+            } else {
+                std::fs::remove_file(link)
+            };
             #[cfg(unix)]
             let result = std::fs::remove_file(link);
             if let Err(error) = result {
