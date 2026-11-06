@@ -179,7 +179,13 @@ impl FerrowApp {
                 egui::pos2(rect.right() - 84.0, rect.center().y - 14.0),
                 vec2(80.0, 28.0),
             );
-            let resp = ui.put(btn, egui::Button::new("Remove").min_size(btn.size()));
+            let resp = ui.put(
+                btn,
+                egui::Button::new("Remove")
+                    .fill(p.control)
+                    .stroke(Stroke::new(1.0, p.control_stroke))
+                    .min_size(btn.size()),
+            );
             if resp.clicked() {
                 remove = Some(i);
             }
@@ -195,6 +201,8 @@ impl FerrowApp {
                 PickTarget::Root => "Add folder…",
                 PickTarget::Exclude => "Add excluded folder…",
             })
+            .fill(p.control)
+            .stroke(Stroke::new(1.0, p.control_stroke))
             .min_size(vec2(160.0, 32.0)),
         );
         if add.clicked() {
@@ -236,6 +244,7 @@ impl FerrowApp {
                         });
                         let b = egui::Button::new(text)
                             .fill(if selected { p.accent } else { p.control })
+                            .stroke(Stroke::new(1.0, p.control_stroke))
                             .min_size(vec2(76.0, 30.0));
                         if ui.add(b).clicked() {
                             choice = value;
@@ -275,7 +284,12 @@ impl FerrowApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new("Open").min_size(vec2(80.0, 30.0)))
+                            .add(
+                                egui::Button::new("Open")
+                                    .fill(p.control)
+                                    .stroke(Stroke::new(1.0, p.control_stroke))
+                                    .min_size(vec2(80.0, 30.0)),
+                            )
                             .clicked()
                             && let Some(dir) = path.parent()
                         {
