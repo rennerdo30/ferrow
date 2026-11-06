@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ferrow_ipc::Endpoint;
-use ferrowd::{DaemonConfig, Shutdown, SnapshotStore, initial_snapshot, serve};
+use ferrowd::DaemonConfig;
 
 #[cfg(windows)]
 mod service_windows;
@@ -95,9 +95,7 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
         excludes,
         follow_symlinks,
     };
-    let store = SnapshotStore::new(initial_snapshot(&config).map_err(|e| e.to_string())?);
-    eprintln!("ferrowd: {}", store.get().report);
-    serve(&config, store, Shutdown::new()).map_err(|e| e.to_string())
+    ferrowd::serve_foreground(&config).map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]

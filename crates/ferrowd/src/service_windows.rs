@@ -47,12 +47,12 @@ fn run_service() -> Result<(), windows_service::Error> {
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
-    let set_state = |state: ServiceState, accept: ServiceControlAccept| {
+    let set_state = |state: ServiceState, accept: ServiceControlAccept, code: u32| {
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code: ServiceExitCode::Win32(code),
             checkpoint: 0,
             wait_hint: Duration::default(),
             process_id: None,
@@ -61,11 +61,15 @@ fn run_service() -> Result<(), windows_service::Error> {
     set_state(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        0,
     )?;
-    let store =
-        SnapshotStore::new(initial_snapshot(&config).map_err(windows_service::Error::Winapi)?);
-    let result = serve(&config, store, shutdown);
-    set_state(ServiceState::Stopped, ServiceControlAccept::empty())?;
+    let result = initial_snapshot(&config)
+        .and_then(|snapshot| serve(&config, SnapshotStore::new(snapshot), shutdown));
+    set_state(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        if result.is_err() { 1 } else { 0 },
+    )?;
     result.map_err(|e| {
         eprintln!("ferrowd service: {e}");
         windows_service::Error::Winapi(e)

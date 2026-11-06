@@ -124,3 +124,41 @@ fn unknown_callers_cannot_read_any_snapshot_data() {
         }
     }
 }
+
+#[test]
+fn controlled_shutdown_saves_the_latest_replaced_snapshot() {
+    let dir = TestDir::new("persist");
+    dir.file("new-after-start.txt");
+    let store = SnapshotStore::new(Snapshot::empty());
+    let endpoint = Endpoint::named(&format!("fr-persist-{}", std::process::id()));
+    let path = dir.0.join("saved.bin");
+    let config = DaemonConfig {
+        endpoint: endpoint.clone(),
+        index_path: Some(path.clone()),
+        roots: vec![],
+        excludes: vec![],
+        follow_symlinks: false,
+    };
+    let shutdown = Shutdown::new();
+    let stop = shutdown.clone();
+    let server_store = store.clone();
+    let server = std::thread::spawn(move || serve(&config, server_store, stop));
+    drop(connect(&endpoint));
+    store.rescan(&WalkOptions {
+        roots: vec![dir.0.clone()],
+        ..Default::default()
+    });
+    shutdown.request(&endpoint);
+    server.join().unwrap().unwrap();
+    let saved = Snapshot::from_file(&path).unwrap();
+    let response = ferrowd::handle(
+        &SnapshotStore::new(saved),
+        ferrow_ipc::Request::Count {
+            text: "new-after-start".into(),
+        },
+    );
+    assert!(matches!(
+        &response[..],
+        [ferrow_ipc::Response::Count { n: 1 }]
+    ));
+}

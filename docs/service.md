@@ -98,3 +98,9 @@ endpoint name for tests and multiple side-by-side daemons.
 An idle daemon uses 0 % CPU: it parks on `accept` and has no
 timers. The index is an immutable snapshot; rescans build a new
 one and swap it in without blocking queries.
+
+Snapshot publication wakes a coalesced persistence worker. A dirty index arms
+one 250 ms deadline; a clean index waits indefinitely for an event. Controlled
+shutdown saves the latest snapshot and reports persistence failures. Unix
+foreground hosts handle SIGTERM/SIGINT cooperatively; SCM STOP/SHUTDOWN uses
+the same final-save path. A failed load or state-policy check refuses startup.

@@ -22,6 +22,7 @@ use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
 pub mod install;
+pub mod persistence;
 pub mod protection;
 
 /// One immutable index plus how it was produced.
@@ -69,12 +70,14 @@ impl Snapshot {
 #[derive(Clone)]
 pub struct SnapshotStore {
     inner: Arc<arc_swap::ArcSwap<Snapshot>>,
+    changes: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
 }
 
 impl SnapshotStore {
     pub fn new(snapshot: Snapshot) -> SnapshotStore {
         SnapshotStore {
             inner: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
+            changes: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -92,6 +95,14 @@ impl SnapshotStore {
         // swap returns the old Arc: reclamation happens after publication,
         // without holding a reader/writer or application publication lock.
         let old = self.inner.swap(Arc::new(snapshot));
+        if let Some(sender) = self
+            .changes
+            .lock()
+            .expect("change subscriber poisoned")
+            .as_ref()
+        {
+            let _ = sender.try_send(());
+        }
         retire(old);
     }
 
@@ -360,26 +371,70 @@ pub fn serve(
     shutdown.register(&listener)?;
     let owner = CallerIdentity::current()?;
     let system = config.endpoint == Endpoint::default_service();
+    let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
     eprintln!("ferrowd: listening on {}", config.endpoint);
-    while !shutdown.is_requested() {
-        let (stream, _caller) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(_) if shutdown.is_requested() => break,
-            Err(e) => return Err(e),
-        };
-        if shutdown.is_requested() {
-            drop(stream);
-            break;
-        }
-        let store = store.clone();
-        let owner = owner.clone();
-        std::thread::spawn(move || {
-            let _ = serve_cancellable(stream, move |context, request| {
-                handle_authorized(&store, request, &context.caller, &owner, system)
+    let result = (|| {
+        while !shutdown.is_requested() {
+            let (stream, _caller) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(_) if shutdown.is_requested() => break,
+                Err(e) => return Err(e),
+            };
+            if shutdown.is_requested() {
+                drop(stream);
+                break;
+            }
+            let store = store.clone();
+            let owner = owner.clone();
+            std::thread::spawn(move || {
+                let _ = serve_cancellable(stream, move |context, request| {
+                    handle_authorized(&store, request, &context.caller, &owner, system)
+                });
             });
-        });
+        }
+        Ok(())
+    })();
+    if let Some(worker) = persistence {
+        worker.finish()?;
     }
-    Ok(())
+    result
+}
+
+/// Foreground hosts register Unix signals before scanning or starting workers.
+pub fn serve_foreground(config: &DaemonConfig) -> std::io::Result<()> {
+    let shutdown = Shutdown::new();
+    #[cfg(unix)]
+    let (signal_handle, signal_worker) = {
+        use signal_hook::{
+            consts::{SIGINT, SIGTERM},
+            iterator::Signals,
+        };
+        let mut signals = Signals::new([SIGTERM, SIGINT])?;
+        let handle = signals.handle();
+        let stop = shutdown.clone();
+        let endpoint = config.endpoint.clone();
+        let thread = std::thread::Builder::new()
+            .name("stop-signals".into())
+            .spawn(move || {
+                if signals.forever().next().is_some() {
+                    stop.request(&endpoint);
+                }
+            })?;
+        (handle, thread)
+    };
+    let result = (|| {
+        let store = SnapshotStore::new(initial_snapshot(config)?);
+        eprintln!("ferrowd: {}", store.get().report);
+        serve(config, store, shutdown)
+    })();
+    #[cfg(unix)]
+    {
+        signal_handle.close();
+        signal_worker
+            .join()
+            .map_err(|_| std::io::Error::other("signal worker panicked"))?;
+    }
+    result
 }
 
 #[cfg(test)]
