@@ -1,96 +1,101 @@
-# ADR 0003: optional file metadata and ready-to-use sort orders
+# ADR 0003: optional file metadata and asynchronous sort preparation
 
-Status: implementation decision for FR-14 (2026-11-07). Performance
-acceptance remains conditional on hosted measurements.
+Status: revised implementation decision for FR-14 (2026-11-07). The parent
+preserved `b6d4c23` as the functional v2 checkpoint and authorized the measured
+optimization below after Part 0. Performance acceptance requires hosted evidence.
 
-## Representation and public contract
+## Columns and precision
 
-Each enabled column owns one dense value array and a packed validity bitmap
-(one bit per entry). A disabled column owns no arrays, including no sort array.
-Missing or unsupported values are unknown, never zero or the current time.
-`EntryMetadata` transports optional values; `Index::metadata(id)` and
-`Index::columns_present()` expose them to consumers. Builder callers choose
-columns explicitly; the portable walker defaults to size and modified time.
+Each enabled column owns one packed value array, a validity bitmap, and sparse
+exact overflow arrays. Disabled columns own no arrays and perform no optional
+scan work. Defaults are size and modified; created, accessed and attributes are
+opt-in. Unknown values are never fabricated.
 
-| Column | Representation | Range and precision | Value bytes/entry |
-|---|---|---|---:|
-| Size | `u64` | Full 0 through 2^64-1 bytes | 8 |
-| Modified | `i64` | Signed Unix-epoch 100 ns ticks, about +/-29,227 years | 8 |
-| Created | `i64` | Same; unsupported birth time is unknown | 8 |
-| Accessed | `i64` | Same | 8 |
-| Attributes | `u32` | Windows attribute bits; Unix complete mode including file type | 4 |
+| Column | Packed representation | Exact overflow policy |
+|---|---|---|
+| Size | unsigned 40-bit bytes, 0 through 2^40-1 | Larger sizes use sorted entry ids plus exact u64 values |
+| Modified/created/accessed | unsigned 32-bit Unix seconds, 1970 through 2106-02-07 06:28:15 UTC | Outside that interval, sorted entry ids plus exact i64 Unix 100ns ticks |
+| Attributes | unsigned 32-bit Windows flags or Unix complete mode/type | No overflow needed |
 
-Times retain 100 ns precision. Sub-100 ns fractions are truncated toward the
-earlier instant, including before 1970. Out-of-range times remain unknown.
-This preserves seconds for display and orders representable timestamps to
-100 ns. Attributes describe the indexed entry, including a symlink itself;
-following a link controls traversal only. Metadata collection errors are
-reported while the entry remains searchable with unknown metadata.
+The public `EntryMetadata` time unit remains signed Unix-epoch **100ns ticks**.
+Representable packed dates are rounded down to whole seconds; outside the
+packed interval the overflow table preserves the original value. Every
+representable second sorts exactly; same-second packed values use the name tie
+order. Unsupported or out-of-range OS timestamps remain unknown. A packed
+maximum value with no overflow record is the legitimate maximum. Unknown slots
+are canonical zero and all validity tail bits must be zero.
 
-## Sorting and cost
+Size uses 40 rather than 32 bits because the existing metadata fixture spans
+0..64GiB: a 32-bit representation would overflow almost every row. This decision
+preserves that fixture distribution. The exact-overflow policy still supports
+files through u64::MAX, negative dates, and dates after 2106.
 
-Name order remains precomputed. Each enabled sortable metadata column stores
-two `u32` permutations (8 bytes/entry), with the primary value ascending or
-descending and ties always in ascending folded-name/raw-name/id order.
-Unknown values sort last in either direction. Attributes are display-only.
-An unavailable sort is a typed query outcome, never a silent name fallback.
-Name descending can traverse the existing name permutation backward.
+## Sorting and memory target
 
-Including validity, each sortable column costs **16.125 bytes/entry**;
-attributes cost **4.125**. Default size + modified cost **32.25 bytes/entry**
-(161,250,000 bytes at 5 M, plus bounded vector/object overhead). The existing
-name/path budget is accounted separately. The last reviewed fixture retained
-49.582959 bytes/entry without metadata; this layout predicts about
-**81.832959 bytes/entry total**, subject to actual capacity measurements.
+Name order remains precomputed. A non-name sort is prepared on a dedicated
+background thread on first use. It never uses the query Rayon pool. Queries
+return name order with an explicit pending status until preparation completes;
+no index-sized allocation, clone, sort or wait happens on the query thread.
+Missing columns remain explicit unavailable-sort errors.
 
-Precomputing both directions avoids building a permutation, reversing equal
-groups, or taking a cache lock during a search. All sorting happens during
-worker-side freeze; loaded permutations are validated rather than rebuilt.
-Changing sort selects a ready immutable slice and retains the existing bounded,
-cancellable first-page scheduler. Common and medium-rare modified-descending
-pages must meet 16 ms at 5 M; rare/no-hit behavior remains tracked by FR-8.
+Each key caches **one** ascending permutation. Stable sorting starts from name
+order, so ties retain folded-name/raw-name/id order. Descending iteration visits
+value groups in reverse while retaining ascending names within a group; unknown
+values remain last. Group boundaries are found without linear scans of a large
+equal group. Query cancellation and bounded first-page admission remain intact.
 
-A lazy first-use alternative saves 8 bytes/entry per unused order pair but
-requires a pending-sort state and background cache publication. CI compares
-freeze time with isolated permutation-build time and reports the memory saved
-by the lazy alternative. Those measurements can disprove precomputation if
-load/memory cost is unacceptable. No unmeasured latency claim is acceptance.
-The upper bound is zero permutation-building work on the search path; the
-cheapest disproof is the hosted modified-sort page measurement on the existing
-fixture. No local performance workload is permitted.
+Cached ids use 24 bits through 2^24 entries and 32 bits above that range. At 5M:
 
-## Persistence
+| Column | Values + validity | One ready order | Total bytes/entry |
+|---|---:|---:|---:|
+| Size | 5.125 | 3 | 8.125 |
+| Each date | 4.125 | 3 | 7.125 |
+| Attributes | 4.125 | 0 | 4.125 |
+| Defaults, both orders ready | 9.25 | 6 | 15.25 |
 
-Format v2 appends a column-presence bitmask and enabled arrays/permutations to
-the v1 payload. The mask is checksum-covered. The bounded header still carries
-counts; exact total length is checked before payload allocation using the mask.
-Unknown mask bits, noncanonical validity bits/unknown slots, invalid ids,
-duplicate ids and misordered permutations are corrupt-file errors.
-All existing name, folded-arena, parent-cycle and checksum checks remain.
-v1 files are rejected with a clear unsupported-version/rebuild message. No
-metadata is fabricated. A rebuild explicitly creates the enabled columns.
+Add 12 bytes per overflow and small fixed objects/capacity tails. Before either
+sort is requested, defaults cost 9.25 bytes/entry. Above 2^24 entries, each
+prepared order adds one further byte/entry. Background scratch and old snapshots
+are reported separately from retained current-snapshot heap.
 
-## Platform scan cost
+The parent targets are about **16 extra bytes/entry**, about **66 total**, and
+at most about **15% default-column load overhead** over the same core index.
+Common modified-descending pages must stay within 16ms. `report 2024` and no-hit
+are accepted as FR-8 rare-hit cases for now, with their numbers still reported.
+Targets are never weakened to obtain a green gate.
 
-On Windows `DirEntry::metadata()` returns the size, times and attribute bits
-already present in directory enumeration data, without an additional syscall:
-[Rust standard-library contract](https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata).
-The walker reuses that metadata for hidden/reparse classification. Root
-metadata and existing exclude/identity operations are separate from this claim.
+## Persistence and preparation
 
-On Unix directory enumeration does not supply these fields. An enabled column
-set requires one `DirEntry::metadata()` (`lstat`/`statx`) per retained candidate;
-all enabled fields come from that one record. The empty column set makes no
-metadata request for optional columns. Existing traversal/exclude checks stay
-unchanged. CI measures the same fixture tree with none and default columns,
-reporting entry/error equality and scan-time delta, never timing assertions in
-unit tests. M2d's future MFT backend can supply these fields during enumeration.
+Format v3 stores the column mask, exact metadata payload length, packed arrays,
+validity and sorted overflow ids/values, all checksum-covered. Exact file length
+is validated before payload allocation. Packed widths, overflow counts, ranges,
+strict id ordering, canonical values and bitmap tails are validated. Existing
+parent-cycle, packed-name, folded-arena and name-permutation checks remain.
 
-## Performance gates
+Metadata permutations are **not stored or constructed during load**. The v1
+core format can load with metadata absent, supporting the exact shared fixture
+used by the interleaved gate. The functional-checkpoint v2 format receives a
+clear rebuild message. Fresh snapshots own fresh preparation state, so a cache
+cannot outlive its source data or be applied to another snapshot.
 
-Existing paired metrics and their inventory remain required. New
-modified-descending engine/IPC observations are mandatory head-only evidence
-until main can supply that sort. Invalid or incomplete evidence fails closed.
-Report core heap and default-column heap separately; preserve the paired core
-memory gate. A default-column load regression against the section 3 target
-requires parent review with the hosted numbers before acceptance.
+Preparation exposes pending/ready/failure status and a completion ticket that a
+worker may wait on to post a GUI event. No GUI polling timer is needed. The
+checkpoint's persisted two-direction arrays remain the measured alternative:
+32.25 extra B/entry and 1315ms load versus 684ms core, so they fail the new targets.
+Lazy preparation is measured separately and queries remain usable while pending.
+
+## Platform cost and cheapest disproof
+
+On Windows directory enumeration already carries all five fields;
+[`DirEntry::metadata`](https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata)
+requires no extra per-entry syscall. Roots and existing identity/exclude checks
+are separate costs. Unix requests one lstat/statx-equivalent record per retained
+candidate when any optional column is enabled. None requests no optional record.
+M2d can provide these fields during MFT enumeration later.
+
+The cheapest disproof is the unchanged hosted fixture: report cold and warmed
+heap, compare warmed core/default loads with alternating samples, measure sort
+preparation, and measure the six modified-descending queries in-process and over
+IPC. Compare the same Unix tree with no columns/default columns. Stop with
+numbers and trade-offs if the memory or load target cannot be reached. No local
+benchmark, large fixture or full-suite run is allowed.
