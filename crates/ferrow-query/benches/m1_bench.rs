@@ -72,7 +72,13 @@ fn measures() {
     );
 
     // Persisted size and load time.
-    let path = std::env::temp_dir().join(format!("ferrow-bench-{}.bin", std::process::id()));
+    let retained = std::env::var_os("FERROW_BENCH_INDEX_PATH");
+    let path = retained
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("ferrow-bench-{}.bin", std::process::id()))
+        });
     index.save(&path).expect("save bench index");
     let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     // Load breakdown from the median-total run, so the named parts
@@ -84,7 +90,9 @@ fn measures() {
         load_runs.push(timings);
         drop(loaded);
     }
-    let _ = std::fs::remove_file(&path);
+    if retained.is_none() {
+        let _ = std::fs::remove_file(&path);
+    }
     load_runs.sort_by_key(|t| t.total);
     let load = load_runs[load_runs.len() / 2];
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
@@ -176,5 +184,7 @@ fn main() {
         "FERROW-ACTIVE query=arena-count-window crc=crc32fast derived=direct-ascii-carried-keys freeze=worker-scratch"
     );
     measures();
-    divan::main();
+    if std::env::var_os("FERROW_MEASURES_ONLY").is_none() {
+        divan::main();
+    }
 }

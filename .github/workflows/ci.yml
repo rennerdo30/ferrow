@@ -113,8 +113,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Build unprivileged service and IPC benchmark harness
+        run: |
+          test "$(id -u)" -ne 0
+          cargo build --release --locked -p ferrow
+          cargo build --release --locked -p ferrow-query --example service_bench
+      - name: Smoke benchmark chain with 16 entries
+        env:
+          FERROW_BENCH_ENTRIES: "16"
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-small.bin
+          FERROW_MEASURES_ONLY: "1"
+        run: |
+          cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 1 --min-time 0.01
+          timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-small.bin"
       - name: Run the 5M-entry benchmark
+        env:
+          FERROW_BENCH_INDEX_PATH: ${{ runner.temp }}/ferrow-bench.bin
+          FERROW_MEASURES_ONLY: "1"
         run: cargo bench -p ferrow-query --bench m1_bench --locked -- --sample-count 10 --min-time 0.2 2>&1 | tee bench-output.txt
+      - name: Measure the real service IPC path
+        run: timeout -k 5s 120s target/release/examples/service_bench "$PWD/target/release/ferrow" "$RUNNER_TEMP/ferrow-bench.bin" 2>&1 | tee -a bench-output.txt
       - name: Write the job summary table
         if: always()
         run: ./scripts/bench-summary.sh bench-output.txt
