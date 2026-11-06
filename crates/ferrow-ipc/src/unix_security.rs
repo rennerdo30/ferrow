@@ -10,6 +10,38 @@ fn refused(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
+pub(super) fn client_directory(socket: &Path, expected: u32) -> io::Result<()> {
+    let path = socket
+        .parent()
+        .ok_or_else(|| refused("socket has no directory"))?;
+    if !path.is_absolute() {
+        return Err(refused("socket directory must be absolute"));
+    }
+    let mut current = std::path::PathBuf::new();
+    for part in path.components() {
+        if !matches!(part, Component::RootDir | Component::Normal(_)) {
+            return Err(refused("socket ancestors must be canonical"));
+        }
+        current.push(part);
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&current)?;
+        let meta = dir.metadata()?;
+        if current == path {
+            super::server_policy::directory(expected, meta.uid(), meta.mode(), meta.is_dir())?;
+        } else {
+            let sticky_temp = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
+            if !(meta.uid() == 0 || meta.uid() == expected)
+                || meta.mode() & 0o022 != 0 && !sticky_temp
+            {
+                return Err(refused("untrusted IPC socket directory ancestor"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn directory(path: &Path, system: bool) -> io::Result<()> {
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
@@ -109,7 +141,7 @@ pub(super) fn reclaim(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    match std::os::unix::net::UnixStream::connect(path) {
+    match super::unix_connect::connect(path, super::io_deadline()) {
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
         _ => {
             return Err(io::Error::new(

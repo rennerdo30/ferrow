@@ -331,7 +331,7 @@ fn service_client() -> Discovery {
         let result = (|| {
             let mut client = Client::connect_deadline(&endpoint, deadline)?;
             client.status()?; // includes the interim visibility authorization check
-            client.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5))?;
+            client.clear_deadline();
             Ok::<_, std::io::Error>(client)
         })();
         match result {

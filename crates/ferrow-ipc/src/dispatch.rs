@@ -37,12 +37,22 @@ struct Work {
     thread: std::thread::JoinHandle<io::Result<()>>,
 }
 
+impl Work {
+    fn cancel(&self) {
+        // Only the first cancellation owns a wake. Shutdown uses the same
+        // transition, so a retained receiver can hold at most one notification.
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            let _ = self.wake.send(());
+        }
+    }
+}
+
 fn reply(writer: &Mutex<Stream>, id: u32, responses: Vec<Response>) -> io::Result<()> {
     let mut writer = writer
         .lock()
         .map_err(|_| io::Error::other("writer poisoned"))?;
-    writer.set_deadline(Instant::now() + Duration::from_secs(5))?;
     for response in responses {
+        writer.set_deadline(Instant::now() + Duration::from_secs(5))?;
         write_message(&mut *writer, id, &Message::Response(response))?;
     }
     Ok(())
@@ -65,8 +75,7 @@ where
     let mut active: Option<Work> = None;
     let result = (|| {
         loop {
-            stream.set_deadline(Instant::now() + Duration::from_secs(5))?;
-            let Some(envelope) = crate::server_read(&mut stream)? else {
+            let Some(envelope) = crate::server_read_frame(&mut stream, true)? else {
                 return Ok(());
             };
             let Message::Request(request) = envelope.message else {
@@ -81,8 +90,7 @@ where
                 if let Some(work) = &active
                     && work.id == target_id
                 {
-                    work.cancelled.store(true, Ordering::Release);
-                    let _ = work.wake.send(());
+                    work.cancel();
                 }
                 continue; // no reply under Cancel's own id
             }
@@ -147,11 +155,62 @@ where
         }
     })();
     if let Some(work) = active {
-        work.cancelled.store(true, Ordering::Release);
-        let _ = work.wake.send(());
+        work.cancel();
         work.thread
             .join()
             .map_err(|_| io::Error::other("request panicked"))??;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Client, Endpoint, Listener, read_message};
+
+    #[test]
+    fn redundant_cancel_retains_one_wake_and_shutdown_completes() {
+        let endpoint = Endpoint::named(&format!("ferrow-cancel-wake-{}", std::process::id()));
+        let listener = Listener::bind(&endpoint).unwrap();
+        let (started_tx, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let (observed_tx, observed) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_cancellable(stream, move |context, _| {
+                started_tx.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                observed_tx
+                    .send((context.is_cancelled(), context.wake.try_iter().count()))
+                    .unwrap();
+                vec![Response::Count { n: 0 }]
+            })
+        });
+        let mut client = Client::connect(&endpoint).unwrap();
+        let id = client.start_query("held", 1).unwrap();
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..3 {
+            client.cancel(id).unwrap();
+        }
+        let mut stream = client.into_inner();
+        // The BadRequest is a barrier: all three Cancels were processed while
+        // the original handler still owns its undrained wake receiver.
+        write_message(&mut stream, 999, &Message::Request(Request::Status)).unwrap();
+        assert_eq!(read_message(&mut stream).unwrap().unwrap().id, 999);
+        release.send(()).unwrap();
+        let notification = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(read_message(&mut stream).unwrap().unwrap().id, id);
+        drop(stream);
+        server.join().unwrap().unwrap();
+        assert_eq!(
+            notification,
+            (true, 1),
+            "redundant cancels queued extra wakes"
+        );
+    }
 }

@@ -14,6 +14,40 @@ fn accepted_stream_can_move_to_a_worker() {
     assert_send::<Stream>();
 }
 
+#[test]
+fn expired_connection_budget_refuses_before_connecting() {
+    let error =
+        match Stream::connect_with_deadline(&test_endpoint("absent"), std::time::Instant::now()) {
+            Err(error) => error,
+            Ok(_) => panic!("connected after deadline"),
+        };
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn healthy_session_survives_idle_then_active() {
+    for cancellable in [false, true] {
+        let endpoint = test_endpoint("idle");
+        let listener = Listener::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            if cancellable {
+                ferrow_ipc::serve_cancellable(stream, |_, request| handler(request))
+            } else {
+                serve_stream(stream, handler)
+            }
+        });
+        let mut client = Client::connect(&endpoint).unwrap();
+        assert_eq!(client.count("before").unwrap(), 6);
+        std::thread::sleep(std::time::Duration::from_millis(5150));
+        let result = client.count("after");
+        drop(client);
+        let served = server.join().unwrap();
+        assert_eq!(result.unwrap(), 5, "idle session lost its next operation");
+        served.unwrap();
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn bind_reserves_pipe_name_until_listener_drop() {

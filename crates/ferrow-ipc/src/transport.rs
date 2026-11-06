@@ -26,6 +26,14 @@ use std::path::PathBuf;
 #[path = "unix_security.rs"]
 mod unix_security;
 
+#[cfg(unix)]
+#[path = "unix_connect.rs"]
+mod unix_connect;
+
+#[cfg(any(unix, test))]
+#[path = "server_policy.rs"]
+mod server_policy;
+
 /// Where a service listens and clients connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -281,71 +289,22 @@ mod platform {
             })
         }
 
-        pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
-            Self::connect_deadline(endpoint, super::io_deadline())
-        }
-
-        pub fn connect_deadline(
+        pub fn connect(
             endpoint: &Endpoint,
             deadline: std::time::Instant,
         ) -> std::io::Result<Stream> {
-            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-            use std::os::unix::ffi::OsStrExt;
-            let path = endpoint.path.as_os_str().as_bytes();
-            // SAFETY: all-zero sockaddr_un is valid before filling family/path.
-            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-            if path.len() >= address.sun_path.len() || path.contains(&0) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "invalid Unix endpoint path",
-                ));
-            }
-            address.sun_family = libc::AF_UNIX as _;
-            for (out, byte) in address.sun_path.iter_mut().zip(path) {
-                *out = *byte as _;
-            }
-            #[cfg(target_os = "macos")]
-            {
-                address.sun_len = size_of::<libc::sockaddr_un>() as u8;
-            }
-            // SAFETY: valid socket domain/type, ownership captured immediately.
-            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: newly returned fd is uniquely owned.
-            let inner = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
-            inner.set_nonblocking(true)?;
-            // SAFETY: initialized sockaddr_un and its exact size remain live.
-            if unsafe {
-                libc::connect(
-                    inner.as_raw_fd(),
-                    (&raw const address).cast(),
-                    size_of::<libc::sockaddr_un>() as _,
-                )
-            } != 0
-            {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINPROGRESS) {
-                    return Err(error);
-                }
-                wait_io(&inner, libc::POLLOUT, deadline)?;
-                if let Some(error) = inner.take_error()? {
-                    return Err(error);
-                }
-            }
-            let server = peer_identity(&inner)?;
+            // Authenticate before Hello or query bytes. System servers belong
+            // to root; development servers belong to the current effective uid.
             let expected = if *endpoint == Endpoint::default_service() {
-                Some(0)
+                0
             } else {
-                current_identity()?.uid
+                // SAFETY: geteuid has no preconditions.
+                unsafe { libc::geteuid() }
             };
-            if server.uid != expected {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "untrusted Unix server uid",
-                ));
-            }
+            super::unix_security::client_directory(&endpoint.path, expected)?;
+            let inner = super::unix_connect::connect(&endpoint.path, deadline)?;
+            super::server_policy::server_uid(expected, peer_identity(&inner)?.uid)?;
+            super::unix_security::client_directory(&endpoint.path, expected)?;
             Ok(Stream {
                 inner,
                 caller: None,
@@ -384,7 +343,7 @@ mod platform {
         }
     }
 
-    fn wait_io(
+    pub(super) fn wait_io(
         stream: &UnixStream,
         events: i16,
         deadline: std::time::Instant,
@@ -899,17 +858,13 @@ mod platform {
             })
         }
 
-        pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
-            Self::connect_deadline(endpoint, super::io_deadline())
-        }
-
-        pub fn connect_deadline(
+        pub fn connect(
             endpoint: &Endpoint,
             deadline: std::time::Instant,
         ) -> std::io::Result<Stream> {
             let name = wide(&endpoint.pipe_name);
             loop {
-                let budget = super::remaining(deadline)?;
+                super::remaining(deadline)?;
                 // SAFETY: name outlives the call; the returned
                 // handle is owned by PipeHandle on success.
                 let handle = unsafe {
@@ -943,7 +898,7 @@ mod platform {
                 unsafe {
                     WaitNamedPipeW(
                         name.as_ptr(),
-                        budget.as_millis().max(1).min(u32::MAX as u128 - 1) as u32,
+                        super::remaining(deadline)?.as_millis().clamp(1, 2_000) as u32,
                     )
                 };
             }
@@ -1283,16 +1238,23 @@ impl Stream {
     }
 
     pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
-        Ok(Stream(platform::Stream::connect(endpoint)?))
+        Self::connect_with_deadline(endpoint, io_deadline())
+    }
+
+    /// Bound the connection itself, before entering the OS connect operation.
+    pub fn connect_with_deadline(
+        endpoint: &Endpoint,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<Stream> {
+        remaining(deadline)?;
+        Ok(Stream(platform::Stream::connect(endpoint, deadline)?))
     }
 
     pub fn connect_deadline(
         endpoint: &Endpoint,
         deadline: std::time::Instant,
     ) -> std::io::Result<Stream> {
-        Ok(Stream(platform::Stream::connect_deadline(
-            endpoint, deadline,
-        )?))
+        Self::connect_with_deadline(endpoint, deadline)
     }
 
     /// Absolute budget shared by every read/write until explicitly renewed.
