@@ -2,6 +2,50 @@ use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder, ROOT_PARENT};
 use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, search};
 
 #[test]
+fn already_cancelled_query_does_not_start_preparation() {
+    let b = IndexBuilder::with_columns(ColumnSet::MODIFIED);
+    for i in 0..4 {
+        b.add_with_metadata(
+            ROOT_PARENT,
+            format!("file-{i}").as_bytes(),
+            0,
+            EntryMetadata {
+                modified: Some(i * 10_000_000),
+                ..Default::default()
+            },
+        );
+    }
+    let index = b.freeze();
+    let ticket = index.sort_ticket(SortKey::Modified).unwrap();
+    assert_eq!(ticket.status(), ferrow_query::SortStatus::Unprepared);
+    let result = search(
+        &index,
+        &Query::default(),
+        &SearchOptions {
+            sort: SortKey::Modified,
+            cancel: CancelToken::cancelled(),
+            ..Default::default()
+        },
+    );
+    assert!(result.cancelled);
+    assert_eq!(result.visited, 0);
+    assert!(result.hits.is_empty());
+    assert_eq!(
+        ticket.wait_timeout(std::time::Duration::from_secs(2)),
+        ferrow_query::SortStatus::Unprepared
+    );
+    let options = SearchOptions {
+        sort: SortKey::Modified,
+        ..Default::default()
+    };
+    search(&index, &Query::default(), &options);
+    assert_eq!(
+        ticket.wait_timeout(std::time::Duration::from_secs(2)),
+        ferrow_query::SortStatus::Ready
+    );
+}
+
+#[test]
 fn retired_index_cancels_preparation_but_a_live_owner_keeps_it_valid() {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;

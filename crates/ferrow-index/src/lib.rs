@@ -103,7 +103,18 @@ impl Index {
     /// Start preparation once, without waiting, allocating by entry count, or
     /// borrowing the query pool. Pending searches can keep using name order.
     pub fn request_sort(&self, key: SortKey) -> SortStatus {
-        self.metadata.request(key, self.sorted.clone())
+        self.metadata.request(key, self.sorted.clone(), None)
+    }
+    /// Share preparation until every requesting token is cancelled. An
+    /// uncancelled request continues warming the cache after search returns.
+    /// Explicit `request_sort` calls keep it alive until ready or retirement.
+    pub fn request_sort_cancellable(
+        &self,
+        key: SortKey,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> SortStatus {
+        self.metadata
+            .request(key, self.sorted.clone(), Some(cancel))
     }
     #[cfg(feature = "test-hooks")]
     pub fn request_sort_with_hook(

@@ -72,6 +72,8 @@ pub enum SortStatus {
 struct Signal {
     state: AtomicU8,
     retired: AtomicBool,
+    pinned: AtomicBool,
+    requests: Mutex<Vec<Arc<AtomicBool>>>,
     wait: Mutex<()>,
     ready: Condvar,
 }
@@ -250,7 +252,16 @@ fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], LoadEr
 }
 impl<T: Value> Column<T> {
     fn check_live(&self) {
-        if self.signal.retired.load(AtomicOrdering::Relaxed) {
+        if self.signal.retired.load(AtomicOrdering::Relaxed)
+            || (!self.signal.pinned.load(AtomicOrdering::Relaxed)
+                && !self
+                    .signal
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|cancel| !cancel.load(AtomicOrdering::Relaxed)))
+        {
             std::panic::resume_unwind(Box::new(PreparationCancelled));
         }
     }
@@ -305,14 +316,51 @@ impl<T: Value> Column<T> {
             _ => Ordering::Equal,
         }
     }
+    #[cfg(test)]
     fn request(self: &Arc<Self>, names: Arc<Vec<u32>>) -> SortStatus {
         self.request_using(names, || {})
     }
+    #[cfg(any(test, feature = "test-hooks"))]
     fn request_using(
         self: &Arc<Self>,
         names: Arc<Vec<u32>>,
         before: impl FnOnce() + Send + 'static,
     ) -> SortStatus {
+        self.request_for(names, None, before)
+    }
+    fn request_for(
+        self: &Arc<Self>,
+        names: Arc<Vec<u32>>,
+        cancel: Option<Arc<AtomicBool>>,
+        before: impl FnOnce() + Send + 'static,
+    ) -> SortStatus {
+        let status = self.signal.status();
+        if matches!(status, SortStatus::Ready | SortStatus::Failed) {
+            return status;
+        }
+        // Admission and completion share this lock: a live request arriving
+        // while cancellation unwinds must either keep this worker or start one.
+        let mut requests = self
+            .signal
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let status = self.signal.status();
+        if !matches!(status, SortStatus::Unprepared | SortStatus::Pending)
+            || cancel
+                .as_ref()
+                .is_some_and(|c| c.load(AtomicOrdering::Relaxed))
+        {
+            return status;
+        }
+        if let Some(cancel) = cancel {
+            requests.retain(|c| !c.load(AtomicOrdering::Relaxed));
+            if !requests.iter().any(|c| Arc::ptr_eq(c, &cancel)) {
+                requests.push(cancel);
+            }
+        } else {
+            self.signal.pinned.store(true, AtomicOrdering::Relaxed);
+        }
         if self
             .signal
             .state
@@ -323,49 +371,73 @@ impl<T: Value> Column<T> {
             let launched = std::thread::Builder::new()
                 .name("ferrow-sort".into())
                 .spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        before();
-                        column.check_live();
-                        let mut ids = Vec::with_capacity(names.len());
-                        for chunk in names.chunks(PREPARE_INTERVAL) {
-                            column.check_live();
-                            ids.extend_from_slice(chunk);
-                        }
-                        column.check_live();
-                        // Stable input name order preserves ties. This dedicated
-                        // thread never occupies or waits for the query Rayon pool.
-                        let mut comparisons = 0usize;
-                        ids.sort_by(|&a, &b| {
-                            if comparisons.is_multiple_of(PREPARE_INTERVAL) {
-                                column.check_live();
-                            }
-                            comparisons = comparisons.wrapping_add(1);
-                            column.cmp(a, b)
-                        });
-                        column.check_live();
-                        let known = ids.partition_point(|&id| column.get(id).is_some());
-                        let order = PackedIds::from_ids(&ids, known, |i| {
-                            if i.is_multiple_of(PREPARE_INTERVAL) {
-                                column.check_live();
-                            }
-                            i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal
-                        });
-                        column.check_live();
-                        let _ = column.order.set(order);
-                    }));
-                    let state = match result {
-                        Ok(()) => 2,
-                        Err(e) if e.is::<PreparationCancelled>() => 0,
-                        Err(_) => 3,
-                    };
                     let signal = column.signal.clone();
-                    // A completion ticket retains only the small signal, never
-                    // retired columns or the name permutation.
-                    drop(column);
-                    drop(names);
-                    signal.finish(state);
+                    let mut before = Some(before);
+                    loop {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Some(before) = before.take() {
+                                before();
+                            }
+                            column.check_live();
+                            let mut ids = Vec::with_capacity(names.len());
+                            for chunk in names.chunks(PREPARE_INTERVAL) {
+                                column.check_live();
+                                ids.extend_from_slice(chunk);
+                            }
+                            column.check_live();
+                            // Stable input name order preserves ties. This dedicated
+                            // thread never occupies or waits for the query Rayon pool.
+                            let mut comparisons = 0usize;
+                            ids.sort_by(|&a, &b| {
+                                if comparisons.is_multiple_of(PREPARE_INTERVAL) {
+                                    column.check_live();
+                                }
+                                comparisons = comparisons.wrapping_add(1);
+                                column.cmp(a, b)
+                            });
+                            column.check_live();
+                            let known = ids.partition_point(|&id| column.get(id).is_some());
+                            let order = PackedIds::from_ids(&ids, known, |i| {
+                                if i.is_multiple_of(PREPARE_INTERVAL) {
+                                    column.check_live();
+                                }
+                                i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal
+                            });
+                            column.check_live();
+                            let _ = column.order.set(order);
+                        }));
+                        let state = match result {
+                            Ok(()) => 2,
+                            Err(e) if e.is::<PreparationCancelled>() => 0,
+                            Err(_) => 3,
+                        };
+                        let mut requests =
+                            signal.requests.lock().unwrap_or_else(|e| e.into_inner());
+                        if state == 0
+                            && !column.signal.retired.load(AtomicOrdering::Relaxed)
+                            && (column.signal.pinned.load(AtomicOrdering::Relaxed)
+                                || requests.iter().any(|c| !c.load(AtomicOrdering::Relaxed)))
+                        {
+                            // New demand arrived after the cancellation checkpoint.
+                            // Old scratch has already unwound; reuse this worker.
+                            continue;
+                        }
+                        *requests = Vec::new();
+                        column.signal.pinned.store(false, AtomicOrdering::Relaxed);
+                        // A completion ticket retains only the small signal, never
+                        // retired columns or the name permutation.
+                        drop(column);
+                        drop(names);
+                        // Finish under the admission lock so no request observes a
+                        // pending worker that has already decided to stop.
+                        signal.finish(state);
+                        drop(requests);
+                        break;
+                    }
                 });
             if launched.is_err() {
+                *requests = Vec::new();
+                self.signal.pinned.store(false, AtomicOrdering::Relaxed);
                 self.signal.finish(3);
             }
         }
@@ -379,6 +451,13 @@ impl<T: Value> Column<T> {
             + self.order.get().map_or(0, |o| o.bytes.capacity())
             + std::mem::size_of::<Self>()
             + std::mem::size_of::<Signal>()
+            + self
+                .signal
+                .requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .capacity()
+                * std::mem::size_of::<Arc<AtomicBool>>()
             + 4 * std::mem::size_of::<usize>()
     }
     fn serialized_len(&self) -> usize {
@@ -530,25 +609,26 @@ impl MetadataColumns {
             attributes: self.attributes.as_ref().and_then(|c| c.get(id)),
         }
     }
-    pub(crate) fn request(&self, key: SortKey, names: Arc<Vec<u32>>) -> SortStatus {
+    pub(crate) fn request(
+        &self,
+        key: SortKey,
+        names: Arc<Vec<u32>>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> SortStatus {
         match key {
             SortKey::Name => SortStatus::Ready,
-            SortKey::Size => self
-                .size
-                .as_ref()
-                .map_or(SortStatus::Unavailable, |c| c.request(names)),
-            SortKey::Modified => self
-                .modified
-                .as_ref()
-                .map_or(SortStatus::Unavailable, |c| c.request(names)),
-            SortKey::Created => self
-                .created
-                .as_ref()
-                .map_or(SortStatus::Unavailable, |c| c.request(names)),
-            SortKey::Accessed => self
-                .accessed
-                .as_ref()
-                .map_or(SortStatus::Unavailable, |c| c.request(names)),
+            SortKey::Size => self.size.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, cancel, || {})
+            }),
+            SortKey::Modified => self.modified.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, cancel, || {})
+            }),
+            SortKey::Created => self.created.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, cancel, || {})
+            }),
+            SortKey::Accessed => self.accessed.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, cancel, || {})
+            }),
         }
     }
     pub(crate) fn ticket(&self, key: SortKey) -> Option<SortTicket> {
@@ -763,6 +843,68 @@ pub fn metadata_timestamp(time: std::time::SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_requests_stop_shared_preparation_and_allow_retry() {
+        use std::sync::mpsc;
+        for keep_second in [false, true] {
+            let builder = crate::IndexBuilder::with_columns(ColumnSet::MODIFIED);
+            for i in 0..4 {
+                builder.add_with_metadata(
+                    crate::ROOT_PARENT,
+                    b"file",
+                    0,
+                    EntryMetadata {
+                        modified: Some(i),
+                        ..Default::default()
+                    },
+                );
+            }
+            let index = builder.freeze();
+            let column = index.metadata.modified.as_ref().unwrap();
+            let ticket = SortTicket(column.signal.clone());
+            let first = Arc::new(AtomicBool::new(false));
+            let second = Arc::new(AtomicBool::new(false));
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            column.request_for(index.sorted.clone(), Some(first.clone()), move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                column.request_for(index.sorted.clone(), Some(second.clone()), || {
+                    panic!("a second request must share the existing worker")
+                }),
+                SortStatus::Pending
+            );
+            first.store(true, AtomicOrdering::Relaxed);
+            second.store(!keep_second, AtomicOrdering::Relaxed);
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                ticket.wait_timeout(Duration::from_secs(2)),
+                if keep_second {
+                    SortStatus::Ready
+                } else {
+                    SortStatus::Unprepared
+                }
+            );
+            assert_eq!(column.order.get().is_some(), keep_second);
+            assert_eq!(Arc::strong_count(&first), 1);
+            assert_eq!(Arc::strong_count(&second), 1);
+            if !keep_second {
+                column.request_for(
+                    index.sorted.clone(),
+                    Some(Arc::new(AtomicBool::new(false))),
+                    || {},
+                );
+                assert_eq!(
+                    ticket.wait_timeout(Duration::from_secs(2)),
+                    SortStatus::Ready
+                );
+            }
+        }
+    }
+
     #[test]
     fn retired_worker_releases_columns_and_names_before_signalling() {
         use std::sync::mpsc;

@@ -191,7 +191,31 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
     started: Option<std::time::Instant>,
 ) -> (SearchResult, QueryTimings) {
     let mut timings = QueryTimings::default();
-    let sort_status = index.request_sort(options.sort);
+    if options.cancel.is_cancelled() {
+        let sort_status = index.sort_ticket(options.sort).map_or(
+            if options.sort == SortKey::Name {
+                SortStatus::Ready
+            } else {
+                SortStatus::Unavailable
+            },
+            |ticket| ticket.status(),
+        );
+        return (
+            SearchResult {
+                hits: Vec::new(),
+                cancelled: true,
+                visited: 0,
+                sort_unavailable: (sort_status == SortStatus::Unavailable).then_some(options.sort),
+                sort_status,
+            },
+            timings,
+        );
+    }
+    let sort_status = if options.sort == SortKey::Name {
+        SortStatus::Ready
+    } else {
+        index.request_sort_cancellable(options.sort, options.cancel.flag.clone())
+    };
     if sort_status == SortStatus::Unavailable {
         if let Some(t) = started {
             timings.total = t.elapsed();
