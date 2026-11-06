@@ -117,6 +117,10 @@ impl Index {
     pub fn sort_ticket(&self, key: SortKey) -> Option<SortTicket> {
         self.metadata.ticket(key)
     }
+    #[cfg(feature = "bench-internals")]
+    pub fn sort_value_for_benchmark(&self, key: SortKey, id: u32) -> Option<i128> {
+        self.metadata.value(key, id)
+    }
     pub fn metadata_heap_bytes(&self) -> usize {
         self.metadata.heap_bytes()
     }

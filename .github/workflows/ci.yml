@@ -137,6 +137,8 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Test regression comparison and CLI on trivial inputs
         run: python3 -m unittest discover -s scripts -p 'test_bench_gate.py'
+      - name: Test compact persisted-cache prototype on four entries
+        run: cargo test -p ferrow-query --example metadata_bench --locked -j 8
       - name: Prepare the identical selective retry driver for both arms
         run: |
           cat > crates/ferrow-query/examples/latency_probe.rs <<'RUST'

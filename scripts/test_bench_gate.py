@@ -28,7 +28,7 @@ def without_service(text):
 
 
 def metadata_fixture():
-    lines = ["FERROW-METADATA entries=16 seed=2026 core_heap_bytes=800 default_heap_bytes=1044 cold_default_heap_bytes=948 default_bytes_per_entry=65.25 metadata_bytes_per_entry=15.25 load_ms_median=200 core_load_ms_median=200 sort_during_load=0 lazy_build_ms_median=20 lazy_saved_bytes=96 freeze_ms=50",
+    lines = ["FERROW-METADATA entries=16 seed=2026 core_heap_bytes=800 default_heap_bytes=1044 cold_default_heap_bytes=948 default_bytes_per_entry=65.25 metadata_bytes_per_entry=15.25 load_ms_median=200 core_load_ms_median=200 sort_during_load=0 lazy_build_ms_median=20 persisted_load_ms_median=240 lazy_saved_bytes=96 freeze_ms=50",
              "FERROW-SCAN entries=2101 errors=0 none_ms_median=10 default_ms_median=20"]
     for query in sorted(gate.QUERIES):
         for prefix in ("FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE"):

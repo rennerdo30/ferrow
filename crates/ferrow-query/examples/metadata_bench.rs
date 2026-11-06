@@ -2,6 +2,8 @@
 use ferrow_index::{ColumnSet, Index, IndexBuilder};
 use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, count, search};
 use std::time::Instant;
+#[path = "support/sort_prototype.rs"]
+mod sort_prototype;
 
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
@@ -82,17 +84,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lazy.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     prepare(&index);
+    let cache_path = path.with_extension("sort-prototype.bin");
+    std::fs::write(&cache_path, sort_prototype::encode(&index))?;
+    let mut persisted = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        let loaded = Index::load(path)?;
+        sort_prototype::validate(&loaded, &cache_path)?;
+        persisted.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert!(loaded.metadata_order(SortKey::Modified, false).is_none());
+    }
     let heap = index.heap_bytes();
     let metadata = index.metadata_heap_bytes();
     assert_eq!(heap - metadata, core.heap_bytes());
     println!(
-        "FERROW-METADATA entries={n} seed=2026 core_heap_bytes={} default_heap_bytes={heap} cold_default_heap_bytes={cold} default_bytes_per_entry={:.9} metadata_bytes_per_entry={:.9} load_ms_median={:.6} core_load_ms_median={:.6} sort_during_load=0 lazy_build_ms_median={:.6} lazy_saved_bytes={} freeze_ms={:.6}",
+        "FERROW-METADATA entries={n} seed=2026 core_heap_bytes={} default_heap_bytes={heap} cold_default_heap_bytes={cold} default_bytes_per_entry={:.9} metadata_bytes_per_entry={:.9} load_ms_median={:.6} core_load_ms_median={:.6} sort_during_load=0 lazy_build_ms_median={:.6} persisted_load_ms_median={:.6} lazy_saved_bytes={} freeze_ms={:.6}",
         heap - metadata,
         heap as f64 / n as f64,
         metadata as f64 / n as f64,
         median(loads),
         median(core_load),
         median(lazy),
+        median(persisted),
         heap - cold,
         freeze.total.as_secs_f64() * 1000.0
     );
