@@ -33,35 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core = core.freeze();
     core.save(&core_path)?;
     let cold = index.heap_bytes();
-    for file in [&core_path, path] {
-        let loaded = Index::load(file)?;
-        assert!(
-            loaded
-                .sort_ticket(SortKey::Modified)
-                .is_none_or(|t| t.status() == ferrow_index::SortStatus::Unprepared)
-        );
-    }
-    let mut core_load = Vec::new();
-    let mut loads = Vec::new();
-    for run in 0..3 {
-        for metadata in if run % 2 == 0 {
-            [false, true]
-        } else {
-            [true, false]
-        } {
-            let (loaded, t) = Index::load_with_timings(if metadata { path } else { &core_path })?;
-            assert_eq!(loaded.len(), n);
-            if metadata {
-                assert_eq!(
-                    loaded.sort_ticket(SortKey::Modified).unwrap().status(),
-                    ferrow_index::SortStatus::Unprepared
-                );
-                loads.push(t.total.as_secs_f64() * 1000.0);
-            } else {
-                core_load.push(t.total.as_secs_f64() * 1000.0);
-            }
-        }
-    }
     fn prepare(index: &Index) {
         for key in [SortKey::Size, SortKey::Modified] {
             index.request_sort(key);
@@ -86,14 +57,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     prepare(&index);
     let cache_path = path.with_extension("sort-prototype.bin");
     std::fs::write(&cache_path, sort_prototype::encode(&index))?;
-    let mut persisted = Vec::new();
-    for _ in 0..3 {
+    let mut samples: [Vec<f64>; 3] = Default::default();
+    println!("FERROW-LOAD-ORDER modes=core,lazy,persisted warm=ABC samples=ABC,BCA,CAB");
+    for (warm, mode) in sort_prototype::load_order() {
         let started = Instant::now();
-        let loaded = Index::load(path)?;
-        sort_prototype::validate(&loaded, &cache_path)?;
-        persisted.push(started.elapsed().as_secs_f64() * 1000.0);
+        let loaded = Index::load(if mode == 0 { &core_path } else { path })?;
+        if mode == 2 {
+            sort_prototype::validate(&loaded, &cache_path)?;
+        }
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(loaded.len(), n);
+        assert!(
+            loaded
+                .sort_ticket(SortKey::Modified)
+                .is_none_or(|t| t.status() == ferrow_index::SortStatus::Unprepared)
+        );
         assert!(loaded.metadata_order(SortKey::Modified, false).is_none());
+        if !warm {
+            samples[mode].push(elapsed);
+        }
     }
+    let [core_load, loads, persisted] = samples;
     let heap = index.heap_bytes();
     let metadata = index.metadata_heap_bytes();
     assert_eq!(heap - metadata, core.heap_bytes());

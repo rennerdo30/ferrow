@@ -2,6 +2,12 @@
 use ferrow_index::{Index, SortKey};
 use std::path::Path;
 
+pub fn load_order() -> impl Iterator<Item = (bool, usize)> {
+    (0..3)
+        .map(|mode| (true, mode))
+        .chain((0..3).flat_map(|run| (0..3).map(move |slot| (false, (run + slot) % 3))))
+}
+
 fn width(n: usize) -> usize {
     if n <= 1 << 23 {
         3
@@ -94,6 +100,28 @@ fn validate_bytes(index: &Index, bytes: &[u8]) -> Result<(), Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn strategy_samples_balance_each_arm_in_each_position_after_warmup() {
+        let order: Vec<_> = load_order().collect();
+        assert_eq!(&order[..3], &[(true, 0), (true, 1), (true, 2)]);
+        let samples = &order[3..];
+        assert!(samples.iter().all(|s| !s.0));
+        for row in samples.chunks_exact(3) {
+            let mut modes: Vec<_> = row.iter().map(|s| s.1).collect();
+            modes.sort();
+            assert_eq!(modes, vec![0, 1, 2]);
+        }
+        for column in 0..3 {
+            let mut modes: Vec<_> = samples
+                .iter()
+                .skip(column)
+                .step_by(3)
+                .map(|s| s.1)
+                .collect();
+            modes.sort();
+            assert_eq!(modes, vec![0, 1, 2]);
+        }
+    }
     #[test]
     fn prototype_validates_values_ties_permutation_and_group_flags() {
         let b = ferrow_index::IndexBuilder::with_columns(ferrow_index::ColumnSet::DEFAULT);

@@ -150,7 +150,7 @@ def metadata_observations(text, head, expected_entries=5_000_000):
     report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
     report += "".join(f"| {name} | {value:.6f} |\n" for name, value in rows)
     report += f"\nDeferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
-    report += f"\nPersisted compact-cache prototype load (full validation, no sorting): {scalars['persisted_load_ms_median']:.6f} ms.\n"
+    report += f"\nCore/lazy/persisted load samples warm each arm, then cycle ABC/BCA/CAB. Persisted compact-cache prototype load (full validation, no sorting): {scalars['persisted_load_ms_median']:.6f} ms.\n"
     report += f"\nCore/default load: {scalars['core_load_ms_median']:.6f}/{scalars['load_ms_median']:.6f} ms; limit core + 15%. Cold/warm default heap: {scalars['cold_default_heap_bytes']/expected_entries:.6f}/{total:.6f} B/entry; limit 66 B/entry with both sorts ready.\n"
     report += f"\nSame-tree scan, none/default columns: {scan['none_ms_median']:.6f}/{scan['default_ms_median']:.6f} ms (five alternating samples per arm, 2101 entries).\n"
     return rows, report
