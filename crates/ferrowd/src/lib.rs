@@ -3,9 +3,8 @@
 //! The daemon holds the index as an immutable [`Snapshot`]
 //! behind an `Arc` swap: building a new index never blocks
 //! readers, and swapping is one pointer store. Connections are
-//! served one thread each over `ferrow-ipc`; the accept loop is
-//! the only parked thread, so an idle daemon burns 0 % CPU
-//! (no polling timers anywhere).
+//! served with bounded workers over `ferrow-ipc`. Accept, signal and clean
+//! persistence waits park on events; only dirty state arms a one-shot deadline.
 //!
 //! Until M2c, system replies require an OS-authenticated privileged caller;
 //! development replies require the starting user. Refusals contain no index data.
@@ -128,9 +127,8 @@ pub struct DaemonConfig {
 }
 
 /// The system service's index file: readable only by the
-/// service (enforced by the directory ACL / mode at install
-/// time; the file itself is written 0600 on Unix by
-/// `Index::save`'s exclusive temp creation? see `ferrow-index`).
+/// service and administrators. The directory and file policy is validated
+/// before system loads and saves, including atomic index replacements.
 pub fn default_service_index_path() -> std::io::Result<PathBuf> {
     #[cfg(windows)]
     {
@@ -300,10 +298,9 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
             mode: snapshot.mode.clone(),
             report: snapshot.report.clone(),
         }],
-        Request::Cancel { .. } => vec![Response::Error {
-            code: ErrorCode::Cancelled,
-            msg: "cancellation is not wired to in-flight work in protocol v1".into(),
-        }],
+        // The envelope-aware dispatcher owns in-flight cancellation; it is
+        // one-way and never receives a separate reply under Cancel's own id.
+        Request::Cancel { .. } => vec![],
         Request::Hello { .. } => vec![bad_request("unexpected Hello".into())],
     }
 }

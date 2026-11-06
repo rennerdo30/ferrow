@@ -6,8 +6,8 @@
 //!   connect/read/write — and `PIPE_REJECT_REMOTE_CLIENTS`, so
 //!   only local callers can connect at all.
 //! - Linux: a Unix domain socket at `/run/ferrow/ferrowd.sock`;
-//!   macOS: `/var/run/ferrow/ferrowd.sock`. The socket file is
-//!   mode 0666 so every local user may connect; *what a caller
+//!   macOS: `/private/var/run/ferrow/ferrowd.sock`. System sockets are
+//!   mode 0666; development sockets have a uid-owned 0700 parent. What a caller
 //!   may see* is enforced per request from the OS identity
 //!   (M2c), never from anything the client claims.
 //!
@@ -38,7 +38,7 @@ pub struct Endpoint {
 impl Endpoint {
     /// The system service endpoint: `\\.\pipe\ferrowd` on Windows,
     /// `/run/ferrow/ferrowd.sock` on Linux,
-    /// `/var/run/ferrow/ferrowd.sock` on macOS.
+    /// `/private/var/run/ferrow/ferrowd.sock` on macOS.
     pub fn default_service() -> Endpoint {
         #[cfg(windows)]
         {
@@ -81,7 +81,7 @@ impl Endpoint {
     }
 
     /// An endpoint from a short name: `\\.\pipe\<name>` on
-    /// Windows, `<temp dir>/<name>.sock` on Unix. Tests use a
+    /// Windows, `<canonical /tmp>/ferrow-<uid>/<name>.sock` on Unix. Tests use a
     /// unique name per test so nothing privileged is touched.
     pub fn named(name: &str) -> Endpoint {
         #[cfg(windows)]
