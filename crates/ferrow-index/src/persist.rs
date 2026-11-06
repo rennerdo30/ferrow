@@ -29,6 +29,49 @@ use crate::{Index, OwnedColumns, ROOT_PARENT};
 pub const MAGIC: [u8; 8] = *b"FERROWID";
 pub const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 4 + 4 + 4;
+/// Sane ceiling for one index file (16 GiB). A header claiming more is
+/// rejected before any payload is read or allocated.
+const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+struct Header {
+    entry_count: u32,
+    arena_len: u32,
+    checksum: u32,
+}
+
+/// Exact total file length for the given counts, in `u64` so the math is
+/// overflow-free on 32-bit targets too.
+fn expected_len(entry_count: u32, arena_len: u32) -> u64 {
+    HEADER_LEN as u64 + entry_count as u64 * 16 + arena_len as u64 * 2
+}
+
+fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
+    if data.len() < HEADER_LEN {
+        // Too short for a header: bad magic if the prefix disagrees, else truncated.
+        if data.len() >= MAGIC.len() && data[..MAGIC.len()] != MAGIC {
+            return Err(LoadError::WrongMagic);
+        }
+        return Err(LoadError::Truncated);
+    }
+    if data[..8] != MAGIC {
+        return Err(LoadError::WrongMagic);
+    }
+    let u32at =
+        |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    let version = u32at(8);
+    if version != VERSION {
+        return Err(LoadError::UnsupportedVersion(version));
+    }
+    let header = Header {
+        entry_count: u32at(12),
+        arena_len: u32at(16),
+        checksum: u32at(20),
+    };
+    if expected_len(header.entry_count, header.arena_len) > MAX_INDEX_BYTES {
+        return Err(LoadError::Corrupt("index size exceeds limit"));
+    }
+    Ok(header)
+}
 
 #[derive(Debug)]
 pub enum SaveError {
@@ -229,40 +272,52 @@ fn read_u16s(data: &[u8], at: &mut usize, n: usize) -> Result<Vec<u16>, LoadErro
 }
 
 pub(crate) fn load(path: &Path) -> Result<Index, LoadError> {
-    let data = std::fs::read(path).map_err(LoadError::Io)?;
+    let mut file = std::fs::File::open(path).map_err(LoadError::Io)?;
+    let file_len = file.metadata().map_err(LoadError::Io)?.len();
+    load_from(&mut file, file_len)
+}
+
+/// Read an index from `reader`, where `file_len` is the total source
+/// length. Only the bounded header is read before the expected total
+/// length is validated against `file_len`, so a hostile header never
+/// triggers a payload read or a large allocation.
+fn load_from<R: std::io::Read>(reader: &mut R, file_len: u64) -> Result<Index, LoadError> {
+    // Read up to the header first; a shorter source is handled by
+    // parse_header (wrong magic vs truncated).
+    let head_len = usize::try_from(file_len.min(HEADER_LEN as u64)).unwrap_or(HEADER_LEN);
+    let mut data = vec![0u8; head_len];
+    reader.read_exact(&mut data).map_err(LoadError::Io)?;
+    let header = parse_header(&data)?;
+    let expected = expected_len(header.entry_count, header.arena_len);
+    if file_len < expected {
+        return Err(LoadError::Truncated);
+    }
+    if file_len > expected {
+        return Err(LoadError::Corrupt("unexpected trailing bytes"));
+    }
+    let total = usize::try_from(expected).map_err(|_| LoadError::Corrupt("size overflow"))?;
+    data.try_reserve_exact(total - data.len())
+        .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
+    data.resize(total, 0);
+    reader
+        .read_exact(&mut data[head_len..])
+        .map_err(LoadError::Io)?;
     from_bytes(&data)
 }
 
 /// Parse an index from bytes (also used by tests and fuzz-style checks).
 pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
-    if data.len() < HEADER_LEN {
-        // Too short for a header: bad magic if the prefix disagrees, else truncated.
-        if data.len() >= MAGIC.len() && data[..MAGIC.len()] != MAGIC {
-            return Err(LoadError::WrongMagic);
-        }
+    let header = parse_header(data)?;
+    let n = header.entry_count as usize;
+    let arena_len = header.arena_len as usize;
+    let expected = expected_len(header.entry_count, header.arena_len);
+    if (data.len() as u64) < expected {
         return Err(LoadError::Truncated);
     }
-    if data[..8] != MAGIC {
-        return Err(LoadError::WrongMagic);
+    if (data.len() as u64) > expected {
+        return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
-    let u32at =
-        |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
-    let version = u32at(8);
-    if version != VERSION {
-        return Err(LoadError::UnsupportedVersion(version));
-    }
-    let n = u32at(12) as usize;
-    let arena_len = u32at(16) as usize;
-    let stored_sum = u32at(20);
-
-    let expected = HEADER_LEN
-        .checked_add(n.saturating_mul(16))
-        .and_then(|v| v.checked_add(arena_len.saturating_mul(2)))
-        .ok_or(LoadError::Corrupt("size overflow"))?;
-    if data.len() < expected {
-        return Err(LoadError::Truncated);
-    }
-    if crc32(&data[HEADER_LEN..expected]) != stored_sum {
+    if crc32(&data[HEADER_LEN..]) != header.checksum {
         return Err(LoadError::ChecksumMismatch);
     }
 
@@ -280,8 +335,9 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
         if parent[i] != ROOT_PARENT && parent[i] as usize >= n {
             return Err(LoadError::Corrupt("parent id out of range"));
         }
-        let end = name_off[i] as usize + name_len[i] as usize;
-        if end > arena_len {
+        // u64 math: overflow-free even on 32-bit targets.
+        let end = name_off[i] as u64 + name_len[i] as u64;
+        if end > arena_len as u64 {
             return Err(LoadError::Corrupt("name offset out of range"));
         }
         if sorted[i] as usize >= n {
@@ -361,6 +417,69 @@ mod tests {
         let mut buf = Vec::new();
         idx.path_bytes(2, &mut buf);
         assert!(buf.ends_with("Ärger.log".as_bytes()));
+    }
+
+    #[test]
+    fn rejects_unexpected_trailing_payload() {
+        let mut bytes = sample_bytes();
+        bytes.extend_from_slice(&[0u8; 4096]);
+        assert!(
+            matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
+            "trailing bytes must be rejected, got {:?}",
+            from_bytes(&bytes).map(|i| i.len())
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_counts_before_allocating() {
+        // Header claims the maximum counts; parsing must refuse on size
+        // grounds without trying to size buffers from them.
+        let mut bytes = sample_bytes();
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
+            "oversized counts must be rejected as corrupt, got {:?}",
+            from_bytes(&bytes).map(|i| i.len())
+        );
+    }
+
+    #[test]
+    fn load_rejects_oversized_metadata_before_payload_read() {
+        // Injected counting reader: the header claims huge counts and the
+        // declared source length is small. Loading must stop after the
+        // header without reading (let alone allocating) the payload.
+        struct Counting<'a> {
+            inner: &'a [u8],
+            read: usize,
+        }
+        impl std::io::Read for Counting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.read += n;
+                Ok(n)
+            }
+        }
+        let mut bytes = sample_bytes();
+        bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut reader = Counting {
+            inner: &bytes,
+            read: 0,
+        };
+        let result = load_from(&mut reader, bytes.len() as u64);
+        assert!(matches!(result, Err(LoadError::Corrupt(_))), "{result:?}");
+        assert_eq!(reader.read, HEADER_LEN, "payload was read before rejection");
+
+        // Same for a length mismatch against a plausible header.
+        let bytes = sample_bytes();
+        let mut reader = Counting {
+            inner: &bytes,
+            read: 0,
+        };
+        let result = load_from(&mut reader, bytes.len() as u64 + 4096);
+        assert!(matches!(result, Err(LoadError::Corrupt(_))), "{result:?}");
+        assert_eq!(reader.read, HEADER_LEN, "payload was read before rejection");
     }
 
     #[test]
