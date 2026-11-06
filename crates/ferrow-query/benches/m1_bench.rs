@@ -60,18 +60,30 @@ fn measures() {
     let path = std::env::temp_dir().join(format!("ferrow-bench-{}.bin", std::process::id()));
     index.save(&path).expect("save bench index");
     let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    // Load breakdown from the median-total run, so the named parts
+    // plus the unattributed remainder add up to that run's total.
     let mut load_runs = Vec::new();
     for _ in 0..3 {
-        let t = Instant::now();
-        let loaded = Index::load(&path).expect("load bench index");
-        load_runs.push(t.elapsed().as_secs_f64() * 1000.0);
+        let (loaded, timings) = Index::load_with_timings(&path).expect("load bench index");
         assert_eq!(loaded.len(), index.len());
+        load_runs.push(timings);
         drop(loaded);
     }
     let _ = std::fs::remove_file(&path);
+    load_runs.sort_by_key(|t| t.total);
+    let load = load_runs[load_runs.len() / 2];
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     println!(
-        "FERROW-MEASURE file_bytes={file_bytes} load_ms_median={:.1}",
-        median_ms(load_runs)
+        "FERROW-MEASURE file_bytes={file_bytes} load_ms_median={:.1} \
+         load_read_ms={:.1} load_checksum_ms={:.1} load_decode_ms={:.1} \
+         load_structure_ms={:.1} load_derived_ms={:.1} load_unattributed_ms={:.1}",
+        ms(load.total),
+        ms(load.read),
+        ms(load.checksum),
+        ms(load.decode),
+        ms(load.structure),
+        ms(load.derived),
+        ms(load.unattributed()),
     );
 
     // Query latency: first page (limit 100) and full count, median of 5.

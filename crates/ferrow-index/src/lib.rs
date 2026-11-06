@@ -15,7 +15,7 @@ use rayon::prelude::*;
 pub mod osname;
 pub mod persist;
 
-pub use persist::{LoadError, SaveError};
+pub use persist::{LoadError, LoadTimings, SaveError};
 
 /// Entry flag bits stored in the `flags` column.
 pub mod flags {
@@ -48,6 +48,11 @@ pub const ROOT_PARENT: u32 = u32::MAX;
 pub fn fold_name(name: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(name.len());
+    if name.is_ascii() {
+        // Simple case folding over ASCII is exactly A-Z -> a-z.
+        out.extend(name.iter().map(u8::to_ascii_lowercase));
+        return;
+    }
     if let Ok(s) = std::str::from_utf8(name) {
         let mut buf = [0u8; 4];
         for ch in s.chars() {
@@ -168,6 +173,13 @@ impl Index {
     /// Load from the versioned binary format. See [`persist`].
     pub fn load(path: &std::path::Path) -> Result<Index, LoadError> {
         persist::load(path)
+    }
+
+    /// Load with an additive timing breakdown (read, checksum,
+    /// decode, structure validation, derived-data validation). See
+    /// [`LoadTimings`].
+    pub fn load_with_timings(path: &std::path::Path) -> Result<(Index, LoadTimings), LoadError> {
+        persist::load_with_timings(path)
     }
 
     /// Column access for [`persist`] and tests.

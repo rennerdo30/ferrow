@@ -18,6 +18,12 @@ freeze_ms=$(get freeze_ms FERROW-MEASURE)
 bytes_per_entry=$(get bytes_per_entry FERROW-MEASURE)
 file_bytes=$(get file_bytes FERROW-MEASURE)
 load_ms=$(get load_ms_median FERROW-MEASURE)
+load_read_ms=$(get load_read_ms FERROW-MEASURE)
+load_checksum_ms=$(get load_checksum_ms FERROW-MEASURE)
+load_decode_ms=$(get load_decode_ms FERROW-MEASURE)
+load_structure_ms=$(get load_structure_ms FERROW-MEASURE)
+load_derived_ms=$(get load_derived_ms FERROW-MEASURE)
+load_unattributed_ms=$(get load_unattributed_ms FERROW-MEASURE)
 
 emit() {
     echo "## Ferrow M1 benchmark"
@@ -31,6 +37,12 @@ emit() {
     echo "| Memory | ${bytes_per_entry} bytes/entry |"
     echo "| Index file size | ${file_bytes} bytes |"
     echo "| Load saved index (median of 3) | ${load_ms} ms |"
+    echo "| Load: read | ${load_read_ms} ms |"
+    echo "| Load: checksum | ${load_checksum_ms} ms |"
+    echo "| Load: decode | ${load_decode_ms} ms |"
+    echo "| Load: structure validation | ${load_structure_ms} ms |"
+    echo "| Load: derived-data validation | ${load_derived_ms} ms |"
+    echo "| Load: unattributed | ${load_unattributed_ms} ms |"
     echo
     echo "Query latency, median of 5 (one-shot measures; divan detail below):"
     echo

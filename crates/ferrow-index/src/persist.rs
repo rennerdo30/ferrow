@@ -23,6 +23,9 @@
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+use rayon::prelude::*;
 
 use crate::{Index, OwnedColumns, ROOT_PARENT, fold_name};
 
@@ -270,7 +273,40 @@ fn read_u16s(data: &[u8], at: &mut usize, n: usize) -> Result<Vec<u16>, LoadErro
         .collect())
 }
 
+/// Additive breakdown of one index load: disjoint measured spans of
+/// [`LoadTimings::total`]. [`LoadTimings::unattributed`] is whatever
+/// time the named parts do not cover, so the parts always add up.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadTimings {
+    /// Whole load, wall clock.
+    pub total: Duration,
+    /// Reading the header and payload from the source.
+    pub read: Duration,
+    /// CRC-32 over the payload.
+    pub checksum: Duration,
+    /// Decoding columns and arenas out of the payload bytes.
+    pub decode: Duration,
+    /// Structural validation: packed name layout, id ranges, parent
+    /// cycles, sort-order uniqueness.
+    pub structure: Duration,
+    /// Derived-data validation: folded-arena consistency and
+    /// adjacent sort-order checks (parallel, in chunks).
+    pub derived: Duration,
+}
+
+impl LoadTimings {
+    /// Total time not covered by the named parts.
+    pub fn unattributed(&self) -> Duration {
+        self.total
+            .saturating_sub(self.read + self.checksum + self.decode + self.structure + self.derived)
+    }
+}
+
 pub(crate) fn load(path: &Path) -> Result<Index, LoadError> {
+    Ok(load_with_timings(path)?.0)
+}
+
+pub(crate) fn load_with_timings(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
     let mut file = std::fs::File::open(path).map_err(LoadError::Io)?;
     let file_len = file.metadata().map_err(LoadError::Io)?.len();
     load_from(&mut file, file_len)
@@ -280,12 +316,19 @@ pub(crate) fn load(path: &Path) -> Result<Index, LoadError> {
 /// length. Only the bounded header is read before the expected total
 /// length is validated against `file_len`, so a hostile header never
 /// triggers a payload read or a large allocation.
-fn load_from<R: std::io::Read>(reader: &mut R, file_len: u64) -> Result<Index, LoadError> {
+fn load_from<R: std::io::Read>(
+    reader: &mut R,
+    file_len: u64,
+) -> Result<(Index, LoadTimings), LoadError> {
+    let started = Instant::now();
+    let mut timings = LoadTimings::default();
     // Read up to the header first; a shorter source is handled by
     // parse_header (wrong magic vs truncated).
     let head_len = usize::try_from(file_len.min(HEADER_LEN as u64)).unwrap_or(HEADER_LEN);
     let mut data = vec![0u8; head_len];
+    let t = Instant::now();
     reader.read_exact(&mut data).map_err(LoadError::Io)?;
+    timings.read += t.elapsed();
     let header = parse_header(&data)?;
     let expected = expected_len(header.entry_count, header.arena_len);
     if file_len < expected {
@@ -298,14 +341,22 @@ fn load_from<R: std::io::Read>(reader: &mut R, file_len: u64) -> Result<Index, L
     data.try_reserve_exact(total - data.len())
         .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
     data.resize(total, 0);
+    let t = Instant::now();
     reader
         .read_exact(&mut data[head_len..])
         .map_err(LoadError::Io)?;
-    from_bytes(&data)
+    timings.read += t.elapsed();
+    let index = from_bytes_inner(&data, &mut timings)?;
+    timings.total = started.elapsed();
+    Ok((index, timings))
 }
 
 /// Parse an index from bytes (also used by tests and fuzz-style checks).
 pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
+    from_bytes_inner(data, &mut LoadTimings::default())
+}
+
+fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, LoadError> {
     let header = parse_header(data)?;
     let n = header.entry_count as usize;
     let arena_len = header.arena_len as usize;
@@ -316,10 +367,14 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
     if (data.len() as u64) > expected {
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
-    if crc32(&data[HEADER_LEN..]) != header.checksum {
+    let t = Instant::now();
+    let sum_ok = crc32(&data[HEADER_LEN..]) == header.checksum;
+    timings.checksum += t.elapsed();
+    if !sum_ok {
         return Err(LoadError::ChecksumMismatch);
     }
 
+    let t = Instant::now();
     let mut at = HEADER_LEN;
     let parent = read_u32s(data, &mut at, n)?;
     let name_off = read_u32s(data, &mut at, n)?;
@@ -328,6 +383,8 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
     let arena = take(data, &mut at, arena_len)?.to_vec();
     let folded_arena = take(data, &mut at, arena_len)?.to_vec();
     let sorted = read_u32s(data, &mut at, n)?;
+    timings.decode += t.elapsed();
+    let structure_started = Instant::now();
 
     // Require the canonical packed name layout the writer produces
     // (freeze appends names in entry-id order): names contiguous,
@@ -393,21 +450,9 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
         }
     }
 
-    // Validate the derived data instead of trusting it (ADR 0001:
-    // validation chosen over rebuild — under the packed layout above,
-    // folding plus adjacent sort-key comparisons cost O(n + arena
-    // bytes), while rebuilding would pay a full parallel sort).
-    fn name_at<'a>(arena: &'a [u8], name_off: &[u32], name_len: &[u16], i: usize) -> &'a [u8] {
-        let off = name_off[i] as usize;
-        &arena[off..off + name_len[i] as usize]
-    }
-    let mut folded_buf: Vec<u8> = Vec::new();
-    for i in 0..n {
-        fold_name(name_at(&arena, &name_off, &name_len, i), &mut folded_buf);
-        if folded_buf != name_at(&folded_arena, &name_off, &name_len, i) {
-            return Err(LoadError::Corrupt("folded arena inconsistent with names"));
-        }
-    }
+    // Sort-order uniqueness is structural and stays serial (a single
+    // pass over a bool per entry); the packed/range/cycle checks above
+    // plus this one make up the structure span.
     let mut seen = vec![false; n];
     for &id in &sorted {
         if seen[id as usize] {
@@ -415,6 +460,43 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
         }
         seen[id as usize] = true;
     }
+    timings.structure += structure_started.elapsed();
+
+    // Validate the derived data instead of trusting it (ADR 0001:
+    // validation chosen over rebuild — under the packed layout above,
+    // folding plus adjacent sort-key comparisons cost O(n + arena
+    // bytes), while rebuilding would pay a full parallel sort). Both
+    // checks run in parallel over entry-id-aligned chunks, which also
+    // keeps each chunk's arena access sequential for the fold check.
+    let derived_started = Instant::now();
+    fn name_at<'a>(arena: &'a [u8], name_off: &[u32], name_len: &[u16], i: usize) -> &'a [u8] {
+        let off = name_off[i] as usize;
+        &arena[off..off + name_len[i] as usize]
+    }
+    // Chunked ranges over `0..count`, sized for a few chunks per
+    // thread with a floor so small inputs stay in one chunk.
+    fn chunk_ranges(count: usize) -> Vec<(usize, usize)> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = count.div_ceil(threads * 4).max(1024);
+        (0..count.div_ceil(chunk))
+            .map(|c| (c * chunk, ((c + 1) * chunk).min(count)))
+            .collect()
+    }
+    chunk_ranges(n)
+        .into_par_iter()
+        .try_for_each(|(start, end)| -> Result<(), LoadError> {
+            let mut folded_buf: Vec<u8> = Vec::new();
+            for i in start..end {
+                fold_name(name_at(&arena, &name_off, &name_len, i), &mut folded_buf);
+                if folded_buf != name_at(&folded_arena, &name_off, &name_len, i) {
+                    return Err(LoadError::Corrupt("folded arena inconsistent with names"));
+                }
+            }
+            Ok(())
+        })?;
     let key_cmp = |a: u32, b: u32| {
         name_at(&folded_arena, &name_off, &name_len, a as usize)
             .cmp(name_at(&folded_arena, &name_off, &name_len, b as usize))
@@ -424,11 +506,17 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
             })
             .then_with(|| a.cmp(&b))
     };
-    for w in sorted.windows(2) {
-        if key_cmp(w[0], w[1]) != std::cmp::Ordering::Less {
-            return Err(LoadError::Corrupt("sort order is not sorted"));
-        }
-    }
+    chunk_ranges(n.saturating_sub(1))
+        .into_par_iter()
+        .try_for_each(|(start, end)| -> Result<(), LoadError> {
+            for i in start..end {
+                if key_cmp(sorted[i], sorted[i + 1]) != std::cmp::Ordering::Less {
+                    return Err(LoadError::Corrupt("sort order is not sorted"));
+                }
+            }
+            Ok(())
+        })?;
+    timings.derived += derived_started.elapsed();
 
     Ok(Index::from_columns(OwnedColumns {
         parent,
@@ -857,6 +945,50 @@ mod tests {
             assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn load_with_timings_reports_additive_parts() {
+        let dir = test_dir("timings");
+        let path = dir.join("index.bin");
+        tiny_index(b"a.txt").save(&path).unwrap();
+        let (loaded, t) = Index::load_with_timings(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        // The parts are disjoint measured spans of the total, so they
+        // must add up to at most the total (the rest is unattributed).
+        let parts = t.read + t.checksum + t.decode + t.structure + t.derived;
+        assert!(
+            parts <= t.total,
+            "parts {parts:?} exceed total {:?}",
+            t.total
+        );
+        assert_eq!(t.unattributed(), t.total - parts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_corrupt_folded_name_past_first_chunk() {
+        // Derived-data validation runs in parallel chunks; a mismatch
+        // in a late chunk must still be rejected.
+        let dir = test_dir("late-chunk");
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        for i in 0..3000 {
+            b.add(root, format!("file-{i:04}.txt").as_bytes(), 0);
+        }
+        b.freeze().save(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let n = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let folded_last = HEADER_LEN + n * 12 + arena_len * 2 - 1;
+        bytes[folded_last] ^= 1;
+        fix_checksum(&mut bytes);
+        assert!(
+            matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))),
+            "corrupt folded name in a late chunk must be rejected"
+        );
     }
 
     #[test]

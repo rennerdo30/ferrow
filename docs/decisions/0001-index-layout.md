@@ -91,7 +91,13 @@ sum of all name lengths equals the arena length, so folding plus
 adjacent sort-key comparisons cost O(n + arena bytes) in total — not
 O(sum of referenced name lengths), which overlapping ranges would
 allow — while rebuilding would pay a full parallel sort on every cold
-start, against the load-time target. A crafted file with a valid checksum
+start, against the load-time target. The derived-data validation
+(folded-arena consistency and adjacent sort-order checks) runs in
+parallel over entry-id-aligned chunks, which keeps each chunk's
+arena access sequential for the fold check. `Index::load_with_timings`
+reports the load as additive parts — read, checksum, decode,
+structure validation, derived-data validation, plus an unattributed
+remainder — and the CI bench summary publishes that breakdown. A crafted file with a valid checksum
 but inconsistent derived data is rejected as corrupt. Any problem is a typed error, never a panic
 (`ferrow-index/src/persist.rs`). Saving creates a unique temp file
 beside the destination with exclusive creation (mode 0600 on Unix),
