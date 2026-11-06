@@ -36,30 +36,61 @@ test on the file name by default.
 The default index file lives in the platform data directory.
 ";
 
+/// A usable platform base directory from an environment variable:
+/// present, non-empty and absolute. Anything else yields `None`, which
+/// surfaces as the explicit "pass --index/--out" error instead of a
+/// path relative to the working directory.
+fn valid_base(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return None;
+    }
+    Some(path)
+}
+
+/// `%LOCALAPPDATA%\ferrow`
+fn windows_data_dir(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    Some(valid_base(env("LOCALAPPDATA"))?.join("ferrow"))
+}
+
+/// `~/Library/Application Support/ferrow`
+fn macos_data_dir(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    Some(
+        valid_base(env("HOME"))?
+            .join("Library")
+            .join("Application Support")
+            .join("ferrow"),
+    )
+}
+
+/// `$XDG_DATA_HOME/ferrow`, falling back to `~/.local/share/ferrow`.
+/// Per the XDG base directory spec, a relative `XDG_DATA_HOME` is
+/// invalid and ignored.
+fn xdg_data_dir(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(xdg) = valid_base(env("XDG_DATA_HOME")) {
+        return Some(xdg.join("ferrow"));
+    }
+    Some(
+        valid_base(env("HOME"))?
+            .join(".local")
+            .join("share")
+            .join("ferrow"),
+    )
+}
+
 /// Default index file in the platform per-user data directory.
 ///
 /// Hand-rolled from environment variables instead of a `directories`
 /// dependency: that crate's tree pulls in an MPL-2.0 crate, and Ferrow
 /// only allows permissive licences (see `deny.toml`).
 fn default_index_path() -> Option<PathBuf> {
-    let data_dir: PathBuf = if cfg!(windows) {
-        // %LOCALAPPDATA%\ferrow
-        PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("ferrow")
+    let env = |name: &str| std::env::var_os(name);
+    let data_dir = if cfg!(windows) {
+        windows_data_dir(&env)?
     } else if cfg!(target_os = "macos") {
-        // ~/Library/Application Support/ferrow
-        PathBuf::from(std::env::var_os("HOME")?)
-            .join("Library")
-            .join("Application Support")
-            .join("ferrow")
+        macos_data_dir(&env)?
     } else {
-        // $XDG_DATA_HOME/ferrow or ~/.local/share/ferrow
-        match std::env::var_os("XDG_DATA_HOME") {
-            Some(x) if !x.is_empty() => PathBuf::from(x).join("ferrow"),
-            _ => PathBuf::from(std::env::var_os("HOME")?)
-                .join(".local")
-                .join("share")
-                .join("ferrow"),
-        }
+        xdg_data_dir(&env)?
     };
     Some(data_dir.join("index.bin"))
 }
@@ -313,6 +344,78 @@ fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
         "search" => cmd_search(parse_args(&argv[1..])?),
         "stats" => cmd_stats(parse_args(&argv[1..])?),
         other => Err(format!("unknown subcommand: {other}\n\n{USAGE}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+        let map: std::collections::HashMap<String, std::ffi::OsString> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), std::ffi::OsString::from(v)))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    fn abs(parts: &[&str]) -> PathBuf {
+        // Platform-absolute base for tests.
+        let mut p = if cfg!(windows) {
+            PathBuf::from("E:\\base")
+        } else {
+            PathBuf::from("/base")
+        };
+        for part in parts {
+            p.push(part);
+        }
+        p
+    }
+
+    fn abs_str(parts: &[&str]) -> String {
+        abs(parts).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn relative_xdg_data_home_uses_home_fallback() {
+        let env = env_of(&[
+            ("XDG_DATA_HOME", "relative/data"),
+            ("HOME", &abs_str(&["home"])),
+        ]);
+        assert_eq!(
+            xdg_data_dir(&env),
+            Some(abs(&["home", ".local", "share", "ferrow"]))
+        );
+        // An absolute XDG_DATA_HOME wins.
+        let env = env_of(&[
+            ("XDG_DATA_HOME", &abs_str(&["xdg"])),
+            ("HOME", &abs_str(&["home"])),
+        ]);
+        assert_eq!(xdg_data_dir(&env), Some(abs(&["xdg", "ferrow"])));
+    }
+
+    #[test]
+    fn empty_platform_base_does_not_write_relative_to_cwd() {
+        // Empty or relative bases never produce a (relative) path.
+        assert_eq!(windows_data_dir(&env_of(&[("LOCALAPPDATA", "")])), None);
+        assert_eq!(
+            windows_data_dir(&env_of(&[("LOCALAPPDATA", "relative\\AppData")])),
+            None
+        );
+        assert_eq!(windows_data_dir(&env_of(&[])), None);
+        assert_eq!(macos_data_dir(&env_of(&[("HOME", "")])), None);
+        assert_eq!(macos_data_dir(&env_of(&[("HOME", "relative/home")])), None);
+        assert_eq!(
+            xdg_data_dir(&env_of(&[("XDG_DATA_HOME", ""), ("HOME", "")])),
+            None
+        );
+        assert_eq!(xdg_data_dir(&env_of(&[("HOME", "relative/home")])), None);
+        // Valid absolute bases work.
+        assert_eq!(
+            windows_data_dir(&env_of(&[("LOCALAPPDATA", &abs_str(&["Local"]))])),
+            Some(abs(&["Local", "ferrow"]))
+        );
+        assert!(default_index_path().is_none_or(|p| p.is_absolute()));
     }
 }
 
