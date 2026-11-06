@@ -57,6 +57,32 @@ fn two_clients_complete_requests_before_either_closes() {
 }
 
 #[test]
+fn incomplete_frames_expire_at_a_total_deadline() {
+    use std::io::Write;
+    for bytes in [vec![], vec![128], vec![128, 0, 0, 0, 1]] {
+        let endpoint = test_endpoint("deadline");
+        let listener = Listener::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_deadline(std::time::Instant::now() + std::time::Duration::from_millis(60))
+                .unwrap();
+            let error = read_message(&mut stream).unwrap_err();
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ),
+                "{error}"
+            );
+        });
+        let mut stream = Stream::connect(&endpoint).unwrap();
+        stream.write_all(&bytes).unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn refusal_cleanup_does_not_wait_for_a_reader() {
     let endpoint = test_endpoint("nonreader");
     let listener = Listener::bind(&endpoint).unwrap();
