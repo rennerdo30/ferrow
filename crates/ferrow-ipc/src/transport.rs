@@ -267,6 +267,14 @@ mod platform {
     }
 
     impl Stream {
+        pub fn try_clone(&self) -> std::io::Result<Stream> {
+            Ok(Stream {
+                inner: self.inner.try_clone()?,
+                caller: self.caller.clone(),
+                deadline: self.deadline,
+            })
+        }
+
         pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
             let inner = UnixStream::connect(&endpoint.path)?;
             inner.set_nonblocking(true)?;
@@ -803,6 +811,18 @@ mod platform {
     }
 
     impl Stream {
+        pub fn try_clone(&self) -> std::io::Result<Stream> {
+            use std::os::windows::io::{BorrowedHandle, IntoRawHandle};
+            // SAFETY: borrow is bounded by self; duplicate becomes independently owned.
+            let handle = unsafe { BorrowedHandle::borrow_raw(self.raw()) }.try_clone_to_owned()?;
+            Ok(Stream {
+                handle: Some(PipeHandle(handle.into_raw_handle())),
+                caller: self.caller.clone(),
+                cancelled: self.cancelled.clone(),
+                deadline: self.deadline,
+            })
+        }
+
         pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
             let name = wide(&endpoint.pipe_name);
             for _attempt in 0..50 {
@@ -1171,6 +1191,12 @@ impl Listener {
 }
 
 impl Stream {
+    /// Independent handle for one reader and one writer. Reads must not run
+    /// concurrently: last-message identity belongs to the sole reader.
+    pub fn try_clone(&self) -> std::io::Result<Stream> {
+        Ok(Stream(self.0.try_clone()?))
+    }
+
     pub fn connect(endpoint: &Endpoint) -> std::io::Result<Stream> {
         Ok(Stream(platform::Stream::connect(endpoint)?))
     }

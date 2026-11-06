@@ -82,6 +82,43 @@ fn incomplete_frames_expire_at_a_total_deadline() {
     }
 }
 
+#[test]
+fn running_request_observes_cancel_with_its_envelope_id() {
+    let endpoint = test_endpoint("cancel");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        ferrow_ipc::serve_cancellable(stream, move |context, request| {
+            if matches!(request, Request::Query { .. }) {
+                started_tx.send(context.id).unwrap();
+                assert!(context.wait_cancelled(std::time::Duration::from_secs(1)));
+            }
+            handler(request)
+        })
+        .unwrap();
+    });
+    let mut client = Client::connect(&endpoint).unwrap();
+    let id = client.start_query("pending", 1).unwrap();
+    assert_eq!(
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap(),
+        id
+    );
+    client.cancel(id).unwrap();
+    assert!(
+        client
+            .finish_query(id)
+            .unwrap_err()
+            .to_string()
+            .contains("Cancelled")
+    );
+    assert_eq!(client.count("next").unwrap(), 4);
+    drop(client);
+    server.join().unwrap();
+}
+
 #[cfg(windows)]
 #[test]
 fn identity_is_captured_only_after_reading_client_data() {
@@ -222,6 +259,8 @@ fn client_server_round_trip_and_caller_identity() {
         "both Results pages, in order"
     );
     assert_eq!(client.count("abcd").unwrap(), 4);
+    client.cancel(7).unwrap();
+    assert_eq!(client.count("after cancel").unwrap(), 12);
     assert_eq!(
         client.status().unwrap(),
         (42, "test".to_string(), "test backend".to_string())

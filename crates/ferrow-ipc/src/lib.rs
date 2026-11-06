@@ -13,8 +13,10 @@
 //! - [`Client`] and [`serve_stream`]: the handshake and
 //!   request/response plumbing over any stream.
 
+mod dispatch;
 pub mod protocol;
 pub mod transport;
+pub use dispatch::{RequestContext, serve_cancellable};
 
 use std::io::{Read, Write};
 
@@ -112,7 +114,12 @@ where
             )?;
             continue;
         }
+        // Cancel is one-way. Its target request owns any cancellation reply.
+        let cancel = matches!(request, Request::Cancel { .. });
         let mut responses = handler(request);
+        if cancel {
+            continue;
+        }
         if responses.is_empty() {
             responses.push(Response::Error {
                 code: ErrorCode::Internal,
@@ -204,12 +211,22 @@ impl<S: Read + Write> Client<S> {
     /// Run a query, collecting every `Results` page. `limit = 0`
     /// means no limit.
     pub fn query(&mut self, text: &str, limit: u32) -> std::io::Result<Vec<Vec<u8>>> {
-        let id = self.send(Request::Query {
+        let id = self.start_query(text, limit)?;
+        self.finish_query(id)
+    }
+
+    /// Start a query without borrowing the client until completion; its id can
+    /// be passed to `cancel` before `finish_query` receives its final response.
+    pub fn start_query(&mut self, text: &str, limit: u32) -> std::io::Result<u32> {
+        self.send(Request::Query {
             text: text.to_owned(),
             limit,
             sort: Sort::Name,
             flags: 0,
-        })?;
+        })
+    }
+
+    pub fn finish_query(&mut self, id: u32) -> std::io::Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         loop {
             match Self::check(self.expect(id)?)? {
