@@ -354,8 +354,8 @@ mod tests {
             };
             let mut clicked = (false, false);
             let mut output = ctx.run_ui(input, |ui| {
-                let all = ui.interact(header, egui::Id::new("all"), Sense::click());
-                let c = ui.interact(cell, egui::Id::new("cell"), Sense::click());
+                let all = ui.interact(header, egui::Id::unique("all"), Sense::click());
+                let c = ui.interact(cell, egui::Id::unique("cell"), Sense::click());
                 clicked = (c.clicked(), all.clicked());
             });
             output.textures_delta.clear();
