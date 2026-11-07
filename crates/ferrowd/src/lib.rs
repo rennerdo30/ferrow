@@ -144,7 +144,8 @@ pub fn default_service_index_path() -> std::io::Result<PathBuf> {
             protection::windows::known_folder(
                 &windows_sys::Win32::UI::Shell::FOLDERID_ProgramData,
             )?
-            .join("Ferrow/index.bin"),
+            .join("Ferrow")
+            .join("index.bin"),
         )
     }
     #[cfg(target_os = "macos")]

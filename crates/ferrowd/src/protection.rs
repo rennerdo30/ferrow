@@ -14,7 +14,9 @@ pub fn binary_path() -> io::Result<PathBuf> {
                 // Its own administrator-only folder: the install folder
                 // above it also holds the desktop app, which every user
                 // must be able to run (M4 setup).
-                .join("Ferrow/service/ferrowd.exe"),
+                .join("Ferrow")
+                .join("service")
+                .join("ferrowd.exe"),
         )
     }
     #[cfg(unix)]
