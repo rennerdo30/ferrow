@@ -397,8 +397,11 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
 
 /// Indexes smaller than this always use the plain ordered scan.
 const PREFILTER_MIN_ENTRIES: usize = 1 << 16;
-/// Selectivity sample: this many runs of `BLOCK_SIZE` consecutive ids.
+/// Selectivity sample: this many runs of `PREFILTER_SAMPLE_RUN` consecutive
+/// ids. 8 x 4096 cost about 0.4 ms on a broad 5M query on CI; 8 x 1024
+/// still separates "fills the page early" from "visits most of the index".
 const PREFILTER_SAMPLE_RUNS: usize = 8;
+const PREFILTER_SAMPLE_RUN: usize = 1_024;
 
 /// For a query with metadata-only conjuncts that few entries pass, mark the
 /// passing ids in one id-order pass first.
@@ -420,13 +423,12 @@ fn prefilter_bits<M: EntryMatcher>(
     if !matcher.has_prefilter() || candidates < PREFILTER_MIN_ENTRIES {
         return None;
     }
-    // Evenly spaced runs of consecutive ids: sequential reads, a few
-    // hundred microseconds at most.
+    // Evenly spaced runs of consecutive ids: sequential reads.
     let stride = n / PREFILTER_SAMPLE_RUNS;
     let (mut sampled, mut passed) = (0usize, 0usize);
     for run in 0..PREFILTER_SAMPLE_RUNS {
         let start = run * stride;
-        for id in start..(start + BLOCK_SIZE).min(n) {
+        for id in start..(start + PREFILTER_SAMPLE_RUN).min(n) {
             sampled += 1;
             passed += usize::from(matcher.prefilter(index, id as u32));
         }
