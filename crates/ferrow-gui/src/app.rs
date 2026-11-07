@@ -1155,6 +1155,7 @@ impl eframe::App for FerrowApp {
         }
 
         let full = ui.max_rect();
+        #[cfg(windows)]
         let ppp = ctx.pixels_per_point();
         let title_h = if platform::CUSTOM_TITLE_ROW {
             TITLE_HEIGHT

@@ -59,7 +59,12 @@ pub fn paste_text() -> Option<String> {
     #[cfg(target_os = "macos")]
     return read_from(Command::new("pbpaste"));
     #[cfg(all(unix, not(target_os = "macos")))]
-    return read_from(Command::new("wl-paste").arg("-n")).or_else(|| {
+    return read_from({
+        let mut c = Command::new("wl-paste");
+        c.arg("-n");
+        c
+    })
+    .or_else(|| {
         let mut c = Command::new("xclip");
         c.args(["-selection", "clipboard", "-o"]);
         read_from(c)
