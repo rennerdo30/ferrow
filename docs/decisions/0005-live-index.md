@@ -1,6 +1,6 @@
 # ADR 0005: live index updates on Windows (M2d)
 
-Status: proposed (2026-11-07). Prerequisite for per-user visibility
+Status: **rejected in review 1** (`0005-live-index-review-1.md`), revision needed (2026-11-07). Prerequisite for per-user visibility
 (ADR 0002, review 1 item 1: permissions must stay fresh). Needs an
 independent review before code merges.
 
