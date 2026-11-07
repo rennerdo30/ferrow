@@ -1,7 +1,11 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed (2026-11-07). Needs a separate security review before any
-code merges (M2 acceptance item 3).
+Status: proposed, **revision required** (2026-11-07). The first security review
+(`0002-visibility-review-1.md`) accepted the direction with 13 required
+changes; the ordinary-caller gate stays closed until a revised ADR passes a new
+review. The biggest one: permissions captured at scan time go stale, so
+filtering needs live security-change tracking (M2d) or fresh checks at query
+time.
 
 ## Problem
 
