@@ -443,8 +443,22 @@ mod win {
                 // SAFETY: root is a NUL-terminated UTF-16 string.
                 unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED }
             })
+            // A `subst` drive is a folder on another drive: scanning it too
+            // walks the same files twice and lists every one twice.
+            .filter(|&l| !is_subst_drive(l))
             .map(|l| std::path::PathBuf::from(format!("{}:\\", l as char)))
             .collect()
+    }
+
+    /// Whether a drive letter is a `subst` alias. Its DOS device target is
+    /// a `\??\` path (`\??\E:\folder`); a real volume maps to `\Device\...`.
+    pub fn is_subst_drive(letter: u8) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+        let name = [letter as u16, b':' as u16, 0];
+        let mut target = [0u16; 1024];
+        // SAFETY: name is NUL-terminated; the buffer and its length match.
+        let n = unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+        n >= 4 && target[..4] == [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16]
     }
 
     pub fn list_drives() -> Vec<super::DriveInfo> {
@@ -537,5 +551,24 @@ mod win {
         };
         // AccentColor is stored as 0xAABBGGRR.
         (status == 0).then_some([data as u8, (data >> 8) as u8, (data >> 16) as u8])
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn real_volumes_are_not_subst_and_subst_aliases_are_skipped() {
+        // The system drive is always a real volume.
+        assert!(!super::win::is_subst_drive(b'C'));
+        // An unassigned letter is not an alias either.
+        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        if let Some(free) = (b'D'..=b'Z').find(|l| mask & (1 << (l - b'A')) == 0) {
+            assert!(!super::win::is_subst_drive(free));
+        }
+        // Whatever `fixed_drive_roots` returns is never an alias.
+        for root in super::win::fixed_drive_roots() {
+            let letter = root.to_string_lossy().as_bytes()[0];
+            assert!(!super::win::is_subst_drive(letter), "{root:?}");
+        }
     }
 }
