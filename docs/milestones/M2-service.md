@@ -68,13 +68,18 @@ Goal: move toward the SPEC §3 targets: load ≤ 300 ms and full count ≤ 50 ms
 - **G1, name and metadata inference through the system service**
   (accepted by the owner 2026-11-07; details and fix options in
   [ADR 0002](../decisions/0002-visibility.md#known-gap-g1-name-and-metadata-inference-accepted-2026-11-07-open-todo)).
-  Another local account that may query the service can, with many guessed
-  queries, reconstruct names and folder paths of files it cannot list and
-  estimate their indexed size and dates; it can never open or read them.
-  Affects only machines with several accounts that do not trust each other.
+  Any caller the service admits whose token cannot list some indexed folder
+  (another local account, or a restricted, low-integrity or AppContainer
+  process of the same account) can, with many guessed queries, reconstruct
+  names and folder paths of files it cannot list and estimate every indexed
+  property (size, dates, attributes, type); it can never open or read them.
   **TODO:** per-user candidate structures (or constant-work queries) built on
   live updates (M2d), with a new design and security review. Until then the
   service docs, the install guide and the setup page state the gap.
+- **G2, 50 ms revocation window** ([ADR 0002](../decisions/0002-visibility.md#known-gap-g2-50-ms-revocation-window-open-todo)):
+  a permission removed less than 50 ms before a row is admitted may still let
+  that row through in the same request. **TODO:** shrink or remove the window
+  if directory-open cost allows.
 
 ## Not in M2
 The Linux fanotify and macOS FSEvents live backends (M3), the GUI (its toolkit spike runs separately), installers, and release builds. Installers and releases need the owner's yes.

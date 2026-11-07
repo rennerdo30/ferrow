@@ -1,6 +1,7 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 4** (2026-11-07). Revisions 1–3 and their
+Status: proposed, **revision 5** (2026-11-07). Review 4 required 4 changes
+(`0002-visibility-review-4.md`), applied here. Revisions 1–3 and their
 reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
 `-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
 **accepted known gap G1 below** (name, path and old-metadata inference
@@ -40,15 +41,27 @@ and **acting as the caller on the OS thread doing the work**:
    without reparse traversal. If it does not exist now: hidden. This closes
    historical names (review 2 item 1): a file moved out of a folder can no
    longer be returned from it, whoever is later granted the folder.
-3. **Attached now.** After the child open, the child handle's current full
-   path (`GetFileInformationByHandleEx(FileNameInfo)` plus the volume) must
-   equal the row's path built from the checked components, compared with the
-   volume's case rules. A folder moved during the request makes them differ:
-   hidden (review 3 item 2). The returned path and name are that current
-   spelling, so a case-only rename shows the new case. This is the request's
-   linearisation point for the row: a revocation or move completed before it
-   is honoured; one after it applies from the next request.
-4. **Fresh metadata.** Size, dates, attributes and the file/folder type
+3. **Attached now.** After the child open, the child handle's complete
+   volume-relative name (`GetFileInformationByHandleEx(FileNameInfo)`, which
+   must start with `\`; an incomplete or malformed result is rejected, never
+   repaired) on the verified volume must equal the row's path built from the
+   checked components **exactly, UTF-16 unit for unit**. Windows allows
+   case sensitivity per directory, so no case-insensitive comparison is
+   used: a case-only rename, or a move between `A` and `a` in a
+   case-sensitive folder, makes the row hidden for that request (a
+   conservative miss; the next scan picks up the new spelling). For a hard
+   link the reported name is that handle's link; if it differs from the
+   checked path the row is hidden, and the other link's path is never
+   substituted (review 4 items 1 and 2).
+4. **Fresh grants.** A directory grant (an open of rule 1) may be reused for
+   other rows of the same request only within **50 ms** of being obtained;
+   after that the chain from that directory down is opened again. So a row is
+   admitted only if every directory on its path granted list+traverse to the
+   caller within the 50 ms before the row's attachment check. Windows checks
+   access when a handle is opened and does not revoke granted handles, so
+   this bounded window is the guarantee: **a revocation is honoured for every
+   row admitted more than 50 ms after it completed** (known gap G2, below).
+5. **Fresh metadata.** Size, dates, attributes and the file/folder type
    returned for the row are read from that child handle now, never from the
    index. The **whole query expression** is evaluated again on the fresh
    values (OR, NOT, `file:`, `folder:`, `size:`, `dm:` …); a row that no
@@ -58,7 +71,8 @@ and **acting as the caller on the OS thread doing the work**:
 
 Namespace scope: names are the long names the scan enumerated; 8.3 short
 names, alternate data streams and case-variant aliases are never rows and
-never substitute for a checked name. A volume-root row is shown when the
+never substitute for a checked name. Two names that differ only in case in
+a case-sensitive directory are two separate rows, each checked on its own. A volume-root row is shown when the
 volume root opened for the caller; a configured file root is a row like any
 file.
 
@@ -153,7 +167,7 @@ that is not currently listable.
 
 The query engine (Rayon, as SYSTEM, in memory only) produces candidate rows
 in the requested order, in batches; the request thread hands each batch to the
-authorization pool and keeps only authorized rows (rules 1–3), memoising
+authorization pool and keeps only authorized rows (rules 1–5), memoising
 per request: `directory → authorized handle or denied` (at most 4 096 open
 handles per request, least recently used closed first; batches of 256 rows).
 Rows are emitted only
@@ -167,9 +181,12 @@ suggestion; review 1 item 9).
 by the fresh values before it is returned. Across pages, a row's position can
 still reflect its indexed (older) size or date: known gap G1.
 
-**Count.** A filtered count authorizes every candidate (rules 1–3). It is
-exact if it finishes within the request budget, else returned as a lower
-bound (`at_least`).
+**Count.** A filtered count applies **all five rules**, including the fresh
+whole-expression evaluation (rule 5), before counting a row: a row that
+search would drop is never counted (review 4 item 3). "Exact" means every
+candidate was validated within the budget; because candidates come from the
+shared index (gap G1), it is not a claim about every matching file on disk.
+Otherwise the count is a lower bound (`at_least`).
 
 ## Budgets, stalls, resources and fairness (review 2 items 7, 8; review 3 item 5)
 
@@ -233,16 +250,21 @@ service and is willing to send many queries can:
 2. by extending a prefix one character at a time, and narrowing with
    `path:` / `parent:`, **reconstruct full names and folder paths of files
    it cannot list**;
-3. by sweeping `size:` / `dm:` predicates and comparing sort positions with
-   files of its own, **estimate the indexed (possibly old) size and dates**
-   of such files, including a previous file that had the same name.
+3. by sweeping `size:`, `dm:`/`dc:`/`da:`, `attrib:`, `file:`/`folder:`,
+   `ext:` and every other searchable predicate, and by comparing sort
+   positions with files of its own, **estimate every indexed property** of
+   such files (size, dates, attributes, file or folder type), possibly from
+   an earlier file that had the same name.
 
 It cannot open, read or modify those files, and it cannot see them as
 results.
 
-**Who is affected.** Only machines with more than one local account that do
-not fully trust each other. On a single-user PC there is no other account to
-learn from. Elevated administrators can see everything anyway.
+**Who is affected.** Any caller the service admits whose effective token
+cannot list some indexed folder: another local account, but also a
+**restricted, low-integrity or AppContainer process of the same account**
+(for example a sandboxed browser or app). On a single-account PC with no
+sandboxed or restricted processes asking the service, nobody learns more
+than they could list. Elevated administrators can see everything anyway.
 
 **Mitigations now.** Budgets limit how fast the signal can be read, elapsed
 times are not sent to filtered callers, and per-SID limits slow bulk
@@ -261,6 +283,17 @@ design and security review. Until G1 is done, the docs (`docs/service.md`,
 `docs/INSTALL.md`) and the setup page state that on machines with several
 accounts other users may be able to infer file names (not contents) through
 the service.
+
+## Known gap G2: 50 ms revocation window (open TODO)
+
+Windows checks permissions when a handle is opened and never revokes a
+granted handle. Rule 4 reuses a directory grant within a request for at most
+50 ms, so a permission removed less than 50 ms before a row's attachment
+check may still let that row through in that request. Any later request
+honours it. Lowering the window costs directory opens (each path's chain is
+opened again); 0 ms means opening every chain per row. Tracked with G1 in
+`docs/milestones/M2-service.md`; acceptance by the owner is required before
+the gate opens.
 
 ## Unix
 
@@ -289,6 +322,14 @@ Two local users A and B, the installed service, a prepared tree:
   `SetThreadToken`/`RevertToSelf` (fault injection) terminates the service;
   no token outlives the last outstanding job of its request, and none is
   closed while a job runs (handle counts).
+- **Review 4 probes:** after a directory grant, revoke B's access and move a
+  previously indexed secret into that folder (deterministic, mocked
+  scheduler and real CI): rows admitted more than 50 ms after the revocation
+  never show it; a move of `d` from `A` to `a` in a case-sensitive folder
+  where B may list `A` but not `a`: hidden; a hard link whose handle reports
+  the other link: hidden; Query and Count agree for a replaced file with
+  different metadata, with OR/NOT; a restricted and an AppContainer process
+  of the same account are filtered.
 - **Squatting:** a pipe server running as A, created first and **able to
   impersonate**, never receives a write from B's client and never holds B's
   token.
