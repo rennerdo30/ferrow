@@ -155,6 +155,9 @@ volume are coordinated by one per-volume hold gate in the service:
   device or driver stall can extend a hold, and then that volume is already
   stalled for every program. Only searches by filtered callers open
   windows; with no such search running the gate is idle.
+  **Accepted by the owner on 2026-11-07** (10 ms windows, 20 ms gaps,
+  device or driver stalls as the only extension; review 6 item 1 asked for
+  this decision).
 - **Throughput.** At most a third of the time is window time, so filtered
   authorization runs at up to about a third of its unthrottled rate per
   volume; first pages (100 rows) fit in one or two windows. Unfiltered
