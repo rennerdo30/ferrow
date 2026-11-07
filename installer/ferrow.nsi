@@ -527,9 +527,11 @@ Function un.ValidateManifest
     ${If} $2 == 0
       !insertmacro FAIL "The installed file list has an absolute path." "un."
     ${EndIf}
-    System::Call 'shlwapi::StrPBrkW(w r0, w "*?:$\"<>|") p.r2'
+    ; A quote cannot occur in a Windows file name; the prefix check below
+    ; catches everything that escapes $INSTDIR.
+    System::Call 'shlwapi::StrPBrkW(w r0, w "*?:<>|") p.r2'
     ${If} $2 != 0
-      !insertmacro FAIL "The installed file list contains invalid path characters." "un."
+      !insertmacro FAIL "The installed file list contains invalid path characters ($0)." "un."
     ${EndIf}
     GetFullPathName $1 "$INSTDIR\$0"
     StrCpy $2 "$INSTDIR\"
