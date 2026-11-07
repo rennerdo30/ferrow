@@ -12,10 +12,13 @@ import statistics
 QUERIES = {"a", "re", "report 2024", "!tmp log", "zzzz-no-hit-zzzz", "文書"}
 NEW_QUERIES = {"*.log", "report*2024*", "path:docs report", "ext:txt;md", "<a|re> !tmp"}
 COMMON_WILDCARDS = {"*.log", "report*2024*"}
+# size:/dm: filters over the metadata fixture (examples/metadata_bench.rs).
+FILTER_QUERIES = {"size:>1gb", "size:<1mb", "dm:2024-03-01..2024-03-31",
+                  "*.log dm:>=2024-06-01", "report size:<1gb"}
 # load + memory, then first page and full count per query, in-process and IPC.
 PAIRED_METRICS = 2 + 2 * 2 * len(QUERIES)
 EXPECTED_METRICS = PAIRED_METRICS + 2 * 2 * len(NEW_QUERIES)
-EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES)
+EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES) + 2 * len(FILTER_QUERIES)
 EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
 
 
@@ -119,10 +122,10 @@ def render(rows):
 
 
 def metadata_observations(text, head, expected_entries=5_000_000):
-    scalars, engine, ipc, scan = {}, {}, {}, {}
+    scalars, engine, ipc, scan, filters = {}, {}, {}, {}, {}
     for line in text.splitlines():
         prefix, _, body = line.partition(" ")
-        if prefix not in {"FERROW-METADATA", "FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE", "FERROW-SCAN"}:
+        if prefix not in {"FERROW-METADATA", "FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE", "FERROW-SCAN", "FERROW-FILTER-QUERY"}:
             continue
         fields = dict(word.split("=", 1) for word in shlex.split(body))
         if prefix in {"FERROW-METADATA", "FERROW-SCAN"}:
@@ -132,14 +135,16 @@ def metadata_observations(text, head, expected_entries=5_000_000):
             target.update({key: number(value) for key, value in fields.items()})
         else:
             query = fields.pop("query")
-            target = engine if prefix == "FERROW-MODIFIED-QUERY" else ipc
+            target = {"FERROW-MODIFIED-QUERY": engine, "FERROW-MODIFIED-SERVICE": ipc}.get(prefix, filters)
             if query in target:
-                raise ValueError("duplicate modified-sort query")
+                raise ValueError("duplicate modified-sort or filter query")
             target[query] = {key: number(fields[key]) for key in ("first_page_ms", "full_count_ms", "page_hits", "total_hits")}
     required = {"entries", "seed", "core_heap_bytes", "default_heap_bytes", "default_bytes_per_entry",
                 "metadata_bytes_per_entry", "load_ms_median", "core_load_ms_median", "cold_default_heap_bytes", "sort_during_load", "lazy_build_ms_median", "persisted_load_ms_median", "lazy_saved_bytes", "freeze_ms"}
     if not required <= scalars.keys() or set(engine) != QUERIES or set(ipc) != QUERIES:
         raise ValueError("missing metadata observations")
+    if set(filters) != FILTER_QUERIES:
+        raise ValueError("missing or unexpected filter query set")
     if not {"entries", "errors", "none_ms_median", "default_ms_median"} <= scan.keys() or scan["entries"] != 2101 or scan["errors"] != 0:
         raise ValueError("invalid scan-cost observations")
     if scalars["entries"] != expected_entries or scalars["seed"] != 2026:
@@ -171,6 +176,10 @@ def metadata_observations(text, head, expected_entries=5_000_000):
             if query in {"a", "re", "!tmp log", "文書"} and observations[query]["first_page_ms"] > 16:
                 raise ValueError(f"modified-sort first-page target exceeded: {label} {query!r}")
             rows.extend((f"modified descending {label} {query!r} {key}", observations[query][key]) for key in ("first_page_ms", "full_count_ms"))
+    for query in sorted(FILTER_QUERIES):
+        if filters[query]["page_hits"] != min(100, filters[query]["total_hits"]):
+            raise ValueError(f"incomplete filter first page: {query!r}")
+        rows.extend((f"filter {query!r} {key}", filters[query][key]) for key in ("first_page_ms", "full_count_ms"))
     if len(rows) != EXPECTED_METADATA_METRICS:
         raise ValueError("incomplete metadata metric inventory")
     report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
