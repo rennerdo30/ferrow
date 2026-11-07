@@ -1,6 +1,6 @@
 # ADR 0004: bounded query language
 
-Status: accepted for M2g (FR-15); metadata predicates are Part 2.
+Status: accepted for M2g (FR-15); metadata predicates (Part 2) implemented 2026-11-07.
 
 ## Grammar and meaning
 
@@ -71,10 +71,24 @@ attrib: attribute (";" attribute)*
 comparison := ">" | ">=" | "<" | "<=" | "="
 ```
 
-The reserved prefixes produce an explicit unsupported-filter error today.
-Part 2 introduces typed size bounds, date field/range/relative-day values and
-attribute sets alongside the current `Filter` enum after M2f defines columns.
-Do not silently reinterpret a reserved filter as a filename substring.
+Implemented (2026-11-07) as `MetadataFilter::{Size, Date, Attributes}`:
+
+- **Units are binary** (1 kb = 1024 bytes), not decimal as first drafted, so a
+  filter agrees with the Size column, Explorer and Everything. `k`/`m`/`g`/`t`
+  are accepted too, and decimals (`1.5mb`). Size filters match files only.
+- **Dates** resolve against the local clock when the query is parsed, into a
+  half-open tick range. Words: `today`, `yesterday`, `thisweek` (from Monday),
+  `thismonth`, `thisyear`, and rolling windows `last<N><minutes|hours|days|weeks>`
+  that end now (`lasthour` means one). A `YYYY-MM-DD` date is that local day;
+  `>`, `>=`, `<`, `<=` and `a..b` (either end open) combine them.
+- **`attrib:`** takes Windows attribute letters, all required:
+  R H S D A T P L C O I E, with optional `;` separators.
+- Values may start with `<`, `>` or `=` right after the prefix; elsewhere those
+  characters still group terms.
+- An entry without the column's value never matches. `Query::required_columns`
+  tells callers which columns a query reads, so the app can say what to index.
+- Evaluation reads one packed column value per candidate (`Index::metadata_value`,
+  `Index::attributes`); the AND ordering treats it as a cheap term, like a name match.
 
 ## Performance and bounded work
 

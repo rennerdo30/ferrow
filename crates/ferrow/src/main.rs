@@ -53,7 +53,9 @@ Query syntax: space = AND, | = OR, ! = NOT, <...> groups terms.
 \"quoted phrase\" is literal. Plain terms are case-insensitive substrings.
 Wildcards match the whole name: * = any run, ? = one Unicode scalar.
 Modifiers stack: case:, path:, wholeword:, file:, folder:, regex:.
-Filters: ext:txt;md, parent:\"/folder\", depth:2 (root depth is zero).
+Filters: ext:txt;md, parent:\"/folder\", depth:2 (root depth is zero),
+size:>10mb, size:1mb..5mb, dm:today, dm:last10minutes,
+dm:2026-01-01..2026-01-31 (dc: created, da: accessed), attrib:H.
 Size, date and attribute filters are reserved for a later milestone.
 Quote the query for your shell, for example:
   ferrow search \"*.log\"

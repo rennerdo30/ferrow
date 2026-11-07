@@ -692,6 +692,9 @@ impl MetadataColumns {
         };
         signal.map(SortTicket)
     }
+    pub(crate) fn attributes(&self, id: u32) -> Option<u32> {
+        self.attributes.as_ref().and_then(|c| c.get(id))
+    }
     pub(crate) fn value(&self, key: SortKey, id: u32) -> Option<i128> {
         match key {
             SortKey::Size => self.size.as_ref().and_then(|c| c.get(id)).map(i128::from),

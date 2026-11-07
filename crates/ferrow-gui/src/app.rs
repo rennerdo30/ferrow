@@ -1097,6 +1097,8 @@ impl FerrowApp {
                         "   ·   Preparing sort by {}…",
                         self.settings.sort.label()
                     ));
+                } else if let Some(hint) = filter_column_hint(&self.query, index) {
+                    line.push_str(&hint);
                 } else if self.columns_need_rebuild {
                     line.push_str("   ·   Rebuild the index to fill the new columns");
                 }
@@ -1382,7 +1384,39 @@ const SYNTAX_HELP: &[(&str, &str)] = &[
     ("regex:^\\d+\\.txt$", "Regular expression"),
     ("parent:C:\\logs", "Direct children of a folder"),
     ("depth:2", "Folder depth"),
+    ("size:>10mb", "Size: >, >=, <, <=, or a range 1mb..5mb"),
+    ("dm:today", "Modified today (dc: created, da: accessed)"),
+    (
+        "dm:last10minutes",
+        "Modified in the last 10 minutes (hours, days, weeks)",
+    ),
+    ("dm:2026-01-01..2026-01-31", "Modified in a date range"),
+    ("attrib:H", "Attributes: R H S A C E and more"),
 ];
+
+/// A filter that reads a column this index does not have matches nothing;
+/// say which column to show and rebuild.
+fn filter_column_hint(query: &str, index: &Index) -> Option<String> {
+    use ferrow_index::ColumnSet;
+    let needed = ferrow_query::Query::parse(query).ok()?.required_columns();
+    let present = index.columns_present();
+    if present.contains(needed) {
+        return None;
+    }
+    let missing = [
+        (ColumnSet::SIZE, "Size"),
+        (ColumnSet::MODIFIED, "Date modified"),
+        (ColumnSet::CREATED, "Date created"),
+        (ColumnSet::ACCESSED, "Date accessed"),
+        (ColumnSet::ATTRIBUTES, "Attributes"),
+    ]
+    .into_iter()
+    .find(|(c, _)| needed.contains(*c) && !present.contains(*c))?
+    .1;
+    Some(format!(
+        "   ·   This filter needs the {missing} column: show it (right-click the header) and rebuild the index"
+    ))
+}
 
 fn type_label(name: &str, is_dir: bool) -> String {
     if is_dir {

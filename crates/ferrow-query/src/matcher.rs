@@ -1,5 +1,5 @@
-use crate::{CancelToken, Expr, Filter, Pattern, Query, Term};
-use ferrow_index::{Index, ROOT_PARENT, flags, fold_name};
+use crate::{CancelToken, DateField, Expr, Filter, MetadataFilter, Pattern, Query, Term};
+use ferrow_index::{Index, ROOT_PARENT, SortKey, flags, fold_name};
 use memchr::memmem;
 use std::ops::Range;
 
@@ -409,7 +409,29 @@ impl GeneralMatcher {
     ) -> bool {
         match &p.term.pattern {
             Pattern::EntryType => true,
-            Pattern::Filter(Filter::Metadata(_)) => false,
+            Pattern::Filter(Filter::Metadata(filter)) => match filter {
+                MetadataFilter::Size { min, max } => {
+                    index.flags(id) & flags::DIR == 0
+                        && index.metadata_value(SortKey::Size, id).is_some_and(|v| {
+                            min.is_none_or(|m| v >= i128::from(m))
+                                && max.is_none_or(|m| v <= i128::from(m))
+                        })
+                }
+                MetadataFilter::Date { field, start, end } => {
+                    let key = match field {
+                        DateField::Modified => SortKey::Modified,
+                        DateField::Created => SortKey::Created,
+                        DateField::Accessed => SortKey::Accessed,
+                    };
+                    index.metadata_value(key, id).is_some_and(|v| {
+                        start.is_none_or(|s| v >= i128::from(s))
+                            && end.is_none_or(|e| v < i128::from(e))
+                    })
+                }
+                MetadataFilter::Attributes(all) => {
+                    index.attributes(id).is_some_and(|a| a & all == *all)
+                }
+            },
             Pattern::Filter(Filter::Extension(_)) => {
                 let name = if p.term.case_sensitive {
                     index.name(id)
