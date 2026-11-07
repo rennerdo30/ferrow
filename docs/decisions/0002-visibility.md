@@ -1,11 +1,12 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 5** (2026-11-07). Review 4 required 4 changes
-(`0002-visibility-review-4.md`), applied here. Revisions 1–3 and their
+Status: proposed, **revision 6** (2026-11-07). Review 5 required 1 change
+(`0002-visibility-review-5.md`, ancestor swap), applied here as rule 4;
+review 4 required 4 (`0002-visibility-review-4.md`). Revisions 1–3 and their
 reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
 `-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
 **accepted known gap G1 below** (name, path and old-metadata inference
-by repeated guessing) and known gap G2 (50 ms revocation window). Needs review 5 before code; the ordinary-caller gate
+by repeated guessing) and known gap G2 (revocation window, now at most one row's 5 ms hold, rule 4). Needs review 6 before code; the ordinary-caller gate
 stays closed until a review accepts it. Live updates (ADR 0005) are separate.
 
 ## Goal and threat model
@@ -53,14 +54,33 @@ and **acting as the caller on the OS thread doing the work**:
    link the reported name is that handle's link; if it differs from the
    checked path the row is hidden, and the other link's path is never
    substituted (review 4 items 1 and 2).
-4. **Fresh grants.** A directory grant (an open of rule 1) may be reused for
-   other rows of the same request only within **50 ms** of being obtained;
-   after that the chain from that directory down is opened again. So a row is
-   admitted only if every directory on its path granted list+traverse to the
-   caller within the 50 ms before the row's attachment check. Windows checks
-   access when a handle is opened and does not revoke granted handles, so
-   this bounded window is the guarantee: **a revocation is honoured for every
-   row admitted more than 50 ms after it completed** (known gap G2, below).
+4. **Held chain (review 5 item 1).** The folder chain of rule 1 is opened
+   fresh for the row (grants are never reused from an earlier row's chain
+   that was released), every directory in it **without `FILE_SHARE_DELETE`**,
+   and all of its handles stay open until rules 2, 3 and 5 are done for the
+   row. While a directory is held this way nobody can rename, move or delete
+   it (that needs `DELETE` access, which the missing share flag refuses), so
+   every ancestor that rule 1 identified and authorized is still the
+   ancestor at rule 3's attachment check: an ancestor cannot be swapped for
+   another directory. If any open fails with a sharing violation (someone
+   holds the directory with `DELETE` access, or without sharing), or the
+   per-job handle limit is reached: hidden for this request.
+   **Hold limit.** One held chain may serve several rows below it (rows of a
+   batch with the same parent are checked together), but a hold lasts at most
+   **5 ms** from the chain's first open to the last row's attachment check,
+   measured on the monotonic clock; a row whose check ends later is hidden,
+   and the chain is released and reopened for the remaining rows. Windows
+   checks access when a handle is opened and never revokes it, so the
+   guarantee is: **a revocation is honoured for every row whose hold began
+   after the revocation completed**; one completed during a hold may still
+   admit rows of that hold, at most 5 ms later (known gap G2, below).
+   Only **denials** may be remembered across holds (`directory id → denied`,
+   at most 50 ms, within the request); a stale denial can only hide a row.
+   **Side effect on other programs:** while held (at most 5 ms per hold),
+   renaming, moving or deleting that directory fails with a sharing
+   violation, as it does while antivirus or the Windows Search indexer has it
+   open. Programs that retry succeed; the docs state it. Only filtered
+   callers' searches hold directories.
 5. **Fresh metadata.** Size, dates, attributes and the file/folder type
    returned for the row are read from that child handle now, never from the
    index. The **whole query expression** is evaluated again on the fresh
@@ -80,7 +100,10 @@ Opens use `NtCreateFile` with `RootDirectory` set to the parent handle,
 `FILE_DIRECTORY_FILE` for directories, `FILE_OPEN_REPARSE_POINT`,
 **without** `FILE_OPEN_FOR_BACKUP_INTENT` (so no
 backup-privilege bypass for anyone, including Backup Operators; review 2
-item 6), share mode read|write|delete, synchronous I/O. The kernel evaluates
+item 6), synchronous I/O. Share mode: **read|write for every directory of
+the chain** (no delete sharing, rule 4) and read|write|delete for the row's
+own child handle (a rename of the child after the attachment check only
+affects later requests). The kernel evaluates
 everything else: deny and inherited ACEs, owner rights, mandatory labels,
 conditional ACEs and central access policies, restricted and AppContainer
 tokens, traverse with the caller's own privileges.
@@ -167,9 +190,11 @@ that is not currently listable.
 
 The query engine (Rayon, as SYSTEM, in memory only) produces candidate rows
 in the requested order, in batches; the request thread hands each batch to the
-authorization pool and keeps only authorized rows (rules 1–5), memoising
-per request: `directory → authorized handle or denied` (at most 4 096 open
-handles per request, least recently used closed first; batches of 256 rows).
+authorization pool and keeps only authorized rows (rules 1–5). Grants are
+never memoised beyond one hold (rule 4); only denials are (`directory id →
+denied`, at most 50 ms, at most 65 536 entries per request). A job holds at
+most 64 handles at once (one chain plus its child); batches of 256 rows,
+grouped by parent so one hold serves siblings.
 Rows are emitted only
 after authorization; limits, pagination, `more` (meaning *more authorized
 rows may exist*), byte budgets and highlights apply to authorized rows only.
@@ -207,7 +232,8 @@ Otherwise the count is a lower bound (`at_least`).
   that SID's or volume's rows wait within the budget, then the request
   returns `partial` or `Busy`. A stalled SID cannot occupy the threads other
   SIDs need for healthy volumes.
-- **Retained state.** A request holds one snapshot, at most 4 096 handles and
+- **Retained state.** A request holds one snapshot, at most 64 handles per
+  running job (so at most 256 for the pool), the denial memo and
   at most 1 MB of batch and result state; at most 8 filtered requests hold
   snapshots at once, so old snapshots are released promptly.
 - **Connections.** Before the handshake no SID is known: at most 8
@@ -280,20 +306,52 @@ probing. These reduce the rate, not the kind of information.
 
 Either needs live updates first, more memory per active user, and a new
 design and security review. Until G1 is done, the docs (`docs/service.md`,
-`docs/INSTALL.md`) and the setup page state that on machines with several
-accounts other users may be able to infer file names (not contents) through
-the service.
+`docs/INSTALL.md`) and the setup page state that **any program or account
+that may query the service but cannot open some folder** (another account,
+or a sandboxed or restricted program of the same account) may be able to
+work out the names, folder paths, sizes, dates and other searchable
+properties of files in it, never their contents, through the service.
 
-## Known gap G2: 50 ms revocation window (accepted 2026-11-07, open TODO)
+## Known gap G2: revocation during a row's hold (accepted 2026-11-07, open TODO)
 
 Windows checks permissions when a handle is opened and never revokes a
-granted handle. Rule 4 reuses a directory grant within a request for at most
-50 ms, so a permission removed less than 50 ms before a row's attachment
-check may still let that row through in that request. Any later request
-honours it. Lowering the window costs directory opens (each path's chain is
-opened again); 0 ms means opening every chain per row. Tracked with G1 in
-`docs/milestones/M2-service.md` and Pair Desk. **Accepted by the owner on
-2026-11-07**; TODO: measure the open cost and shrink the window.
+granted handle. Rule 4 holds a row's folder chain for at most 5 ms, so a
+permission removed while that chain is held may still let rows of that hold
+through, at most 5 ms after the removal. Any later hold and any later
+request honours it. The owner accepted a 50 ms window on 2026-11-07;
+revision 6 (rule 4, review 5) shrinks it to the 5 ms hold. TODO: measure
+typical hold times and lower the limit if the open cost allows. Tracked with
+G1 in `docs/milestones/M2-service.md` and Pair Desk.
+
+## Planned optimisation: indexing-time pre-filter (after the first version)
+
+Owner question, 2026-11-07: why not check permissions while indexing?
+Permissions recorded at scan time go stale (review 1 item 1): a revocation,
+a moved file or a changed ACL is not seen until a rescan, and even live
+updates (ADR 0005) report some changes late. So the scan can never be the
+authority. It can be a **pre-filter**: while scanning, the service records
+per directory whether a filtered principal could list it (for example by
+`AccessCheck` against the directory's security descriptor for the groups
+of each known local account), and a filtered search skips candidates under
+directories recorded as denied for the caller **before** rules 1–5 run.
+Rules 1–5 stay unchanged for everything that passes.
+
+- **Safe direction only:** a stale record can only hide a row (a folder
+  granted after the scan stays hidden until the next scan or journal
+  update); it can never admit one, because every admitted row still passes
+  rules 1–5.
+- **Gains:** far fewer chain opens per search (faster first pages), and
+  names under folders that were already denied at scan time no longer
+  affect search work or timing, which narrows G1 (it does not close it:
+  folders whose access was broader at scan time still leak).
+- **Costs to settle in its own review:** the memory per directory and
+  principal, how principals are enumerated (local accounts and their
+  groups; restricted and AppContainer tokens never match a recorded
+  principal and always take the full path), and a test that a grant after
+  the scan is honoured once the record refreshes.
+
+It is not part of the first implementation; it needs a short design and
+review of its own once rules 1–5 work and are measured.
 
 ## Unix
 
@@ -324,12 +382,22 @@ Two local users A and B, the installed service, a prepared tree:
   closed while a job runs (handle counts).
 - **Review 4 probes:** after a directory grant, revoke B's access and move a
   previously indexed secret into that folder (deterministic, mocked
-  scheduler and real CI): rows admitted more than 50 ms after the revocation
-  never show it; a move of `d` from `A` to `a` in a case-sensitive folder
+  scheduler and real CI): no row whose hold began after the revocation shows
+  it, and no hold exceeds 5 ms; a move of `d` from `A` to `a` in a case-sensitive folder
   where B may list `A` but not `a`: hidden; a hard link whose handle reports
   the other link: hidden; Query and Count agree for a replaced file with
   different metadata, with OR/NOT; a restricted and an AppContainer process
   of the same account are filtered.
+- **Review 5 probe (ancestor swap):** snapshot has `\A\D\secret.txt`, the
+  file was moved to private storage; B may list A₁ and D. Between B's chain
+  open and the child open (mocked scheduler, then real CI): move D to
+  staging, rename A₁ away, put B-denied A₂ at `\A`, move D under A₂, move
+  `secret.txt` into D. Each rename of a held directory fails with a sharing
+  violation; if the sequence instead completes before the chain is opened,
+  rule 1 fails at A₂. The secret is never returned. Also: a directory held
+  with `DELETE` access by another process → hidden, not blocked; a hold
+  exceeding 5 ms (mocked slow open) → the row is hidden; Explorer-style
+  rename with retry succeeds while a broad filtered search runs.
 - **Squatting:** a pipe server running as A, created first and **able to
   impersonate**, never receives a write from B's client and never holds B's
   token.
@@ -355,7 +423,9 @@ Two local users A and B, the installed service, a prepared tree:
 Unfiltered callers: unchanged; the paired gate stays strict. Filtered callers:
 a CI arm on the installed service over a real tree reports first page and
 count with cold per-request memos, split into scan, authorization and
-serialisation; the open cost is measured, not assumed.
+serialisation; the open cost (one chain per hold, depth-dependent) and the
+hold times are measured, not assumed. The indexing-time pre-filter (above)
+is the planned answer if chain opens dominate.
 
 ## Not decided here
 

@@ -76,10 +76,10 @@ Goal: move toward the SPEC §3 targets: load ≤ 300 ms and full count ≤ 50 ms
   **TODO:** per-user candidate structures (or constant-work queries) built on
   live updates (M2d), with a new design and security review. Until then the
   service docs, the install guide and the setup page state the gap.
-- **G2, 50 ms revocation window** (accepted by the owner 2026-11-07; [ADR 0002](../decisions/0002-visibility.md#known-gap-g2-50-ms-revocation-window-accepted-2026-11-07-open-todo)):
-  a permission removed less than 50 ms before a row is admitted may still let
-  that row through in the same request. **TODO:** shrink or remove the window
-  if directory-open cost allows.
+- **G2, revocation during a row's hold** (owner accepted 50 ms on 2026-11-07; revision 6 shrinks it to 5 ms; [ADR 0002](../decisions/0002-visibility.md#known-gap-g2-revocation-during-a-rows-hold-accepted-2026-11-07-open-todo)):
+  a permission removed while a search holds that folder chain (at most 5 ms)
+  may still let rows of that hold through. **TODO:** measure hold times and
+  lower the limit if the open cost allows.
 
 ## Not in M2
 The Linux fanotify and macOS FSEvents live backends (M3), the GUI (its toolkit spike runs separately), installers, and release builds. Installers and releases need the owner's yes.
