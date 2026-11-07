@@ -63,6 +63,19 @@ These are measured with additive timings (shared rule S10) on the CI bench:
 
 Goal: move toward the SPEC §3 targets: load ≤ 300 ms and full count ≤ 50 ms at 5 M entries.
 
+## Open security gaps (accepted, to fix)
+
+- **G1, name and metadata inference through the system service**
+  (accepted by the owner 2026-11-07; details and fix options in
+  [ADR 0002](../decisions/0002-visibility.md#known-gap-g1-name-and-metadata-inference-accepted-2026-11-07-open-todo)).
+  Another local account that may query the service can, with many guessed
+  queries, reconstruct names and folder paths of files it cannot list and
+  estimate their indexed size and dates; it can never open or read them.
+  Affects only machines with several accounts that do not trust each other.
+  **TODO:** per-user candidate structures (or constant-work queries) built on
+  live updates (M2d), with a new design and security review. Until then the
+  service docs, the install guide and the setup page state the gap.
+
 ## Not in M2
 The Linux fanotify and macOS FSEvents live backends (M3), the GUI (its toolkit spike runs separately), installers, and release builds. Installers and releases need the owner's yes.
 

@@ -1,11 +1,11 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 3, review 3 requires 5 changes** (`0002-visibility-review-3.md`, 2026-11-07). Revision 1 (scan-time
-descriptors): review 1 required 13 changes. Revision 2 (per-search checks):
-review 2 required 10 more (`0002-visibility-review-2.md`). The owner chose
-strict filtering over simpler options. Needs review 3 before code; the
-ordinary-caller gate stays closed until a review accepts it. Live updates
-(ADR 0005) are separate.
+Status: proposed, **revision 4** (2026-11-07). Revisions 1–3 and their
+reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
+`-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
+**accepted known gap G1 below** (name, path and old-metadata inference
+by repeated guessing). Needs review 4 before code; the ordinary-caller gate
+stays closed until a review accepts it. Live updates (ADR 0005) are separate.
 
 ## Goal and threat model
 
@@ -30,7 +30,9 @@ and **acting as the caller on the OS thread doing the work**:
 
 1. **Folder chain.** Starting from the volume root, each directory on the
    row's path is opened *relative to the previous handle* for
-   `FILE_LIST_DIRECTORY`, without reparse traversal, and its
+   `FILE_LIST_DIRECTORY | FILE_TRAVERSE` (both rights on every directory used
+   for descent, whatever the caller's bypass-traverse privilege; review 3
+   item 3), without reparse traversal, and its
    `(volume serial, 128-bit file id)` equals the one recorded for that
    directory in the snapshot. Any mismatch, error or reparse point: hidden.
 2. **Current child.** The row's own name is opened relative to its parent
@@ -38,13 +40,31 @@ and **acting as the caller on the OS thread doing the work**:
    without reparse traversal. If it does not exist now: hidden. This closes
    historical names (review 2 item 1): a file moved out of a folder can no
    longer be returned from it, whoever is later granted the folder.
-3. **Fresh metadata.** Size, dates and attributes returned for the row are
-   read from that child handle now, never from the index. A metadata filter
-   (`size:`, `dm:` …) is re-evaluated on the fresh values; a row that no longer
-   matches is dropped.
+3. **Attached now.** After the child open, the child handle's current full
+   path (`GetFileInformationByHandleEx(FileNameInfo)` plus the volume) must
+   equal the row's path built from the checked components, compared with the
+   volume's case rules. A folder moved during the request makes them differ:
+   hidden (review 3 item 2). The returned path and name are that current
+   spelling, so a case-only rename shows the new case. This is the request's
+   linearisation point for the row: a revocation or move completed before it
+   is honoured; one after it applies from the next request.
+4. **Fresh metadata.** Size, dates, attributes and the file/folder type
+   returned for the row are read from that child handle now, never from the
+   index. The **whole query expression** is evaluated again on the fresh
+   values (OR, NOT, `file:`, `folder:`, `size:`, `dm:` …); a row that no
+   longer matches is dropped. Candidate selection still uses indexed values,
+   so which rows are *considered* can reflect old metadata; that is part of
+   known gap G1 (review 3 item 1).
+
+Namespace scope: names are the long names the scan enumerated; 8.3 short
+names, alternate data streams and case-variant aliases are never rows and
+never substitute for a checked name. A volume-root row is shown when the
+volume root opened for the caller; a configured file root is a row like any
+file.
 
 Opens use `NtCreateFile` with `RootDirectory` set to the parent handle,
-`FILE_OPEN_REPARSE_POINT`, **without** `FILE_OPEN_FOR_BACKUP_INTENT` (so no
+`FILE_DIRECTORY_FILE` for directories, `FILE_OPEN_REPARSE_POINT`,
+**without** `FILE_OPEN_FOR_BACKUP_INTENT` (so no
 backup-privilege bypass for anyone, including Backup Operators; review 2
 item 6), share mode read|write|delete, synchronous I/O. The kernel evaluates
 everything else: deny and inherited ACEs, owner rights, mandatory labels,
@@ -100,12 +120,14 @@ that is not currently listable.
   1. the existing connected-pipe owner check (`authenticate_server`, owner
      LocalSystem) stays;
   2. `GetNamedPipeServerProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`;
-     the handle is held for the whole check, so the process cannot exit and
-     its id be reused meanwhile;
+     the handle is held for the whole check, so the process id cannot be
+     reused meanwhile (the process can still exit; step 4 catches that);
   3. that process's token user is LocalSystem, and its image
      (`QueryFullProcessImageNameW`) opened by path has the same volume and
      file id as `%ProgramFiles%\Ferrow\service\ferrowd.exe` (the known folder
-     is the trusted source);
+     is the trusted source). This identifies the file now at that path, not the
+     loaded image; under the threat model (install folder writable only by
+     SYSTEM and Administrators) that is sufficient;
   4. the pipe is checked again to still be connected to that process
      (`GetNamedPipeServerProcessId` unchanged).
   Any failure: disconnect without writing. A squatter can impersonate only
@@ -113,10 +135,14 @@ that is not currently listable.
   and custom endpoints never raise the level.
 - **Server.** The token is captured per request frame (as today), duplicated
   at impersonation level and owned by that request. Stream clones used for
-  writing carry no token. The request's token is released when its last
-  authorization job finishes.
+  writing carry no token. The response may finish before a stalled job does;
+  the token is released when the request's **last outstanding job returns**,
+  never earlier (closing it under a running job is not allowed) and never
+  later.
 - **Authorization pool.** Directory and child opens run only on a dedicated
-  pool of 4 OS threads, never on Rayon or async executors. A job is: install
+  pool of 4 OS threads, never on Rayon or async executors. The SYSTEM and
+  elevated-admin exemptions apply only after the restricted, AppContainer and
+  integrity exclusions pass; a failed token query denies the exemption. A job is: install
   the request's token with `SetThreadToken` (checked), do the opens, then
   `RevertToSelf` (checked). No other code runs inside the guard, guards
   never nest, and a failed revert terminates the service process (the
@@ -128,7 +154,9 @@ that is not currently listable.
 The query engine (Rayon, as SYSTEM, in memory only) produces candidate rows
 in the requested order, in batches; the request thread hands each batch to the
 authorization pool and keeps only authorized rows (rules 1–3), memoising
-per request: `directory → authorized handle or denied`. Rows are emitted only
+per request: `directory → authorized handle or denied` (at most 4 096 open
+handles per request, least recently used closed first; batches of 256 rows).
+Rows are emitted only
 after authorization; limits, pagination, `more` (meaning *more authorized
 rows may exist*), byte budgets and highlights apply to authorized rows only.
 Filtered and unfiltered requests are different internal request types, so a
@@ -137,28 +165,47 @@ suggestion; review 1 item 9).
 
 **Ordering.** Candidates are ordered by indexed values; the page is re-sorted
 by the fresh values before it is returned. Across pages, a row's position can
-still reflect its indexed (older) size or date — see residual risks.
+still reflect its indexed (older) size or date: known gap G1.
 
 **Count.** A filtered count authorizes every candidate (rules 1–3). It is
 exact if it finishes within the request budget, else returned as a lower
 bound (`at_least`).
 
-## Budgets, stalls and fairness (review 2 items 7 and 8)
+## Budgets, stalls, resources and fairness (review 2 items 7, 8; review 3 item 5)
 
-- Each filtered request has a total budget (default 1 s for searches, 3 s for
-  counts) covering parsing, scanning, authorization and serialisation.
-- An authorization job that exceeds 200 ms marks its **volume** as stalled for
-  filtered callers: rows from it are treated as hidden until the job
-  completes. The response never waits for a stalled job; the stalled thread
-  keeps its token until the OS returns, then reverts and releases it.
-  At most 4 jobs can be outstanding (the pool size); when all threads are
-  stalled, filtered requests get `Busy`. Unfiltered requests never use the
-  pool.
-- Connections: at most 4 per user SID; the handshake must complete within 2 s;
-  an idle filtered connection closes after 30 s; 4 of the 32 connection slots
-  are reserved for SYSTEM and elevated administrators. At most 2 filtered
-  requests per SID run at once, scheduled round-robin across SIDs; the queue
-  holds at most 16 requests, then `Busy`.
+- **Budget.** Each filtered request has a total budget (default 1 s for
+  searches, 3 s for counts) covering parsing, scanning, authorization and
+  serialisation. When it ends the response is sent (`partial` / `at_least`);
+  queued jobs of that request are dropped, running jobs finish but their
+  results are discarded (a per-request generation flag), so nothing is
+  written late.
+- **Stalls.** A job running longer than 200 ms marks its **volume** stalled
+  for filtered callers until it returns: rows from that volume are hidden,
+  other volumes keep working. The response, request teardown and dispatcher
+  never join or wait on a stalled syscall; the dispatcher's existing joins
+  are changed so a request's writer can finish while its jobs are still out.
+- **Outstanding work.** Jobs count against their SID and volume until the
+  syscall returns, not until the response ends: at most 2 outstanding jobs
+  per SID and 2 per volume; at most 4 overall (the pool size). Beyond that,
+  that SID's or volume's rows wait within the budget, then the request
+  returns `partial` or `Busy`. A stalled SID cannot occupy the threads other
+  SIDs need for healthy volumes.
+- **Retained state.** A request holds one snapshot, at most 4 096 handles and
+  at most 1 MB of batch and result state; at most 8 filtered requests hold
+  snapshots at once, so old snapshots are released promptly.
+- **Connections.** Before the handshake no SID is known: at most 8
+  connections may be in the handshake at once, each must finish within 2 s.
+  After it: at most 4 per user SID, idle filtered connections close after
+  30 s, and 4 of the 32 slots are reserved for SYSTEM and elevated
+  administrators. At most 2 filtered requests per SID run at once,
+  round-robin across SIDs; the queue holds at most 16, then `Busy`.
+- **Scan isolation.** The service's scan (and later the journal reader) runs
+  on its own thread pool, never on the Rayon pool that answers queries, so
+  blocked scan I/O cannot stall searches. (Today's walker uses the global
+  pool; this changes for the service.)
+- **Cost.** Exact broad counts are not achievable for filtered callers (5 M
+  rows in 3 s on 4 workers leaves 2.4 µs per row), so they are lower bounds;
+  responsiveness comes from prompt `partial` / `at_least` / `Busy` replies.
 
 ## Status and errors
 
@@ -167,21 +214,53 @@ allowlist (protocol version, `visibility: filtered`, ready/scanning), no
 totals, report strings, paths or samples; errors to filtered callers carry no
 paths.
 
-## Residual risks the owner must accept (review 2 item 9)
+## Known gap G1: name and metadata inference (accepted 2026-11-07, open TODO)
 
-These cannot be removed without per-user indexes, and are stated so they can
-be accepted or rejected explicitly:
+**This is a real disclosure gap, accepted by the owner for now and tracked
+as future work** (`docs/milestones/M2-service.md`, "Open security gaps",
+G1). It does not let anyone open or read a file.
 
-1. **Existence inference by chosen queries.** A caller can type a guessed name
-   or prefix and learn from response time, budget exhaustion, `partial` or
-   `at_least` whether hidden names matching it exist (not what they are, and
-   not where).
-2. **Cross-page ordering by older metadata.** When sorting by size or date,
-   the page a currently listable file appears on is chosen from its indexed
-   value, which may be older than the fresh value shown.
+**What leaks.** The service answers every caller from one shared index and
+only filters the rows it returns. The work a search does — and therefore its
+response time, whether the budget runs out, and the `partial` / `at_least`
+flags — depends on all matching names, including hidden ones. Candidate
+selection and cross-page order also use indexed (possibly older) metadata.
 
-Mitigations: budgets cap the signal's resolution; elapsed times are not sent
-to filtered callers.
+**What an attacker can recover.** Another local account that may query the
+service and is willing to send many queries can:
+
+1. learn whether a hidden name matching a chosen pattern exists;
+2. by extending a prefix one character at a time, and narrowing with
+   `path:` / `parent:`, **reconstruct full names and folder paths of files
+   it cannot list**;
+3. by sweeping `size:` / `dm:` predicates and comparing sort positions with
+   files of its own, **estimate the indexed (possibly old) size and dates**
+   of such files, including a previous file that had the same name.
+
+It cannot open, read or modify those files, and it cannot see them as
+results.
+
+**Who is affected.** Only machines with more than one local account that do
+not fully trust each other. On a single-user PC there is no other account to
+learn from. Elevated administrators can see everything anyway.
+
+**Mitigations now.** Budgets limit how fast the signal can be read, elapsed
+times are not sent to filtered callers, and per-SID limits slow bulk
+probing. These reduce the rate, not the kind of information.
+
+**Future fix (TODO G1).** Remove the hidden-dependent signals, for example:
+
+- per-user candidate structures: the service keeps, per active user, the set
+  of directories that user can list (built acting as the user, kept fresh
+  by live updates, ADR 0005), and searches only those, so no work, timing or
+  ordering depends on hidden names;
+- or constant-work queries over a caller-specific view.
+
+Either needs live updates first, more memory per active user, and a new
+design and security review. Until G1 is done, the docs (`docs/service.md`,
+`docs/INSTALL.md`) and the setup page state that on machines with several
+accounts other users may be able to infer file names (not contents) through
+the service.
 
 ## Unix
 
@@ -208,7 +287,8 @@ Two local users A and B, the installed service, a prepared tree:
 - **Tokens:** restricted token and low-integrity process for A; a
   non-elevated admin is filtered; an elevated admin is not; a failed
   `SetThreadToken`/`RevertToSelf` (fault injection) terminates the service;
-  no token outlives its request (handle counts).
+  no token outlives the last outstanding job of its request, and none is
+  closed while a job runs (handle counts).
 - **Squatting:** a pipe server running as A, created first and **able to
   impersonate**, never receives a write from B's client and never holds B's
   token.
@@ -217,6 +297,17 @@ Two local users A and B, the installed service, a prepared tree:
   B or an administrator.
 - **Every query kind:** small/broad, prefix, OR/NOT, each sort, count exact and
   lower-bound, partial page, highlights, filtered Status.
+- **Review 3 probes:** replace a privately indexed file with a differently
+  sized one of the same name, grant B, sweep `size:`/`dm:` with OR/NOT;
+  only fresh values may decide which rows are *returned* (which are
+  *considered* is gap G1); a move between each component open and the child
+  open (mocked) and a case-only rename (the row is hidden, or shown with its
+  current path); traverse denied at each depth with bypass-traverse absent,
+  on NTFS and ReFS; repeated expiry and disconnect of A with mocked blocked
+  opens: fixed resource bounds, prompt teardown, no late output, B keeps
+  working on a healthy volume; blocked scan workers while queries still run;
+  restricted or low-integrity SYSTEM tokens and enabled-admin-but-not-full
+  tokens are filtered.
 
 ## Performance
 
@@ -228,4 +319,5 @@ serialisation; the open cost is measured, not assumed.
 ## Not decided here
 
 Unix filtering, live updates (ADR 0005), any cross-request authorization
-cache (only with a freshness mechanism a future review accepts).
+cache (only with a freshness mechanism a future review accepts), and the
+fix for gap G1.
