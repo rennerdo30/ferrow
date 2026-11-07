@@ -1,193 +1,231 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 2, review 2 requires changes** (`0002-visibility-review-2.md`, 2026-11-07). Revision 1 (scan-time
-descriptors) was accepted only with 13 required changes
-(`0002-visibility-review-1.md`); the owner chose per-search checks by
-Windows itself. Needs a new security review before the ordinary-caller gate
-opens. Live index updates (ADR 0005) are a separate project and not a
-prerequisite.
+Status: proposed, **revision 3** (2026-11-07). Revision 1 (scan-time
+descriptors): review 1 required 13 changes. Revision 2 (per-search checks):
+review 2 required 10 more (`0002-visibility-review-2.md`). The owner chose
+strict filtering over simpler options. Needs review 3 before code; the
+ordinary-caller gate stays closed until a review accepts it. Live updates
+(ADR 0005) are separate.
 
-## Problem
+## Goal and threat model
 
-The system service runs as SYSTEM and indexes every name on the machine.
-Today it answers only SYSTEM and elevated Administrators, so the desktop app
-(non-elevated) keeps its own index: lost when the app closes mid-scan, never
-updated in the background, duplicating the service's work. The app should
-search the always-running service, and each caller must see only what they
-could find through the file system themselves, **as of the moment of the
-search**.
+The system service runs as SYSTEM and indexes every name on fixed local
+NTFS and ReFS volumes. A non-elevated caller (including a filtered admin
+token) may learn from it **only names and metadata that the caller could
+obtain from the file system at the moment of the search by listing folders
+from the volume root down**. Elevated administrators and SYSTEM are
+unfiltered.
+
+Trusted: the installed service binary and its directory (writable only by
+SYSTEM and Administrators), the kernel. Untrusted: every other local user,
+their processes, and any file system content they control. A compromised
+installed service is trusted-code compromise: it could keep a caller's token
+and impersonate them; nothing below defends against that, and the install
+ACLs (`protection.rs`) are part of the security boundary.
 
 ## Rule
 
-A result row is shown to a filtered caller only if, during the request that
-returns it, **Windows opened every directory on the row's path — from the
-volume root down to the row's containing directory — for listing, acting as
-the caller**. The row itself is not opened (seeing a name needs only its
-folder listable). Nothing else grants visibility.
+For a filtered caller, the service returns a row only if, within the request
+and **acting as the caller on the OS thread doing the work**:
 
-- Stricter than the OS for bypass-traverse users: a folder reachable only by
-  already knowing its path is hidden (accepted as policy in review 1).
-- The decision is Windows' own: open under the caller's impersonation token
-  with `CreateFileW(path, FILE_LIST_DIRECTORY | SYNCHRONIZE,
-  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING,
-  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)`. The kernel
-  evaluates the DACL with deny and inherited ACEs, owner rights, mandatory
-  integrity labels, conditional ACEs, central access policies, restricted and
-  AppContainer tokens, and traverse checks with the caller's own privileges.
-  The service re-implements none of it (review 1 items 3 and 4).
-- `FILE_FLAG_BACKUP_SEMANTICS` grants nothing by itself: backup privilege
-  applies only if the *caller's* token has it enabled, and such callers are
-  elevated administrators, who are unfiltered anyway.
-- The opened handle is verified to be the indexed object: its file id
-  (`GetFileInformationByHandleEx(FileIdInfo)`) must equal the id recorded at
-  scan time (the service's walk records each directory's 64-bit NTFS or
-  128-bit ReFS file id: directories only, about 1–2 bytes per entry), and it
-  must be a directory without a reparse point (junctions,
-  symlinks and mount points in a path fail the check). Otherwise: hidden
-  (review 1 item 8).
-- Any error — open failure, id mismatch, impersonation failure, a missing or
-  identification-only token, a timeout — means hidden. Fail closed.
+1. **Folder chain.** Starting from the volume root, each directory on the
+   row's path is opened *relative to the previous handle* for
+   `FILE_LIST_DIRECTORY`, without reparse traversal, and its
+   `(volume serial, 128-bit file id)` equals the one recorded for that
+   directory in the snapshot. Any mismatch, error or reparse point: hidden.
+2. **Current child.** The row's own name is opened relative to its parent
+   handle for `FILE_READ_ATTRIBUTES` (granted when the parent allows listing),
+   without reparse traversal. If it does not exist now: hidden. This closes
+   historical names (review 2 item 1): a file moved out of a folder can no
+   longer be returned from it, whoever is later granted the folder.
+3. **Fresh metadata.** Size, dates and attributes returned for the row are
+   read from that child handle now, never from the index. A metadata filter
+   (`size:`, `dm:` …) is re-evaluated on the fresh values; a row that no longer
+   matches is dropped.
 
-Unfiltered callers: SYSTEM and administrators whose token is elevated
-(`TokenElevationType` full, Administrators group enabled). Everyone else is
-filtered, including filtered admin tokens, restricted, low-integrity and
-AppContainer tokens (no SID shortcut, review 1 item 3). Anonymous or
-unidentified callers are refused.
+Opens use `NtCreateFile` with `RootDirectory` set to the parent handle,
+`FILE_OPEN_REPARSE_POINT`, **without** `FILE_OPEN_FOR_BACKUP_INTENT` (so no
+backup-privilege bypass for anyone, including Backup Operators; review 2
+item 6), share mode read|write|delete, synchronous I/O. The kernel evaluates
+everything else: deny and inherited ACEs, owner rights, mandatory labels,
+conditional ACEs and central access policies, restricted and AppContainer
+tokens, traverse with the caller's own privileges.
 
-## Freshness
+"Stricter than the OS" (a folder reachable only by knowing its path is
+hidden) was accepted as policy in review 1.
 
-Decisions are cached **only inside one request**. A permission change made
-before a request starts is always honoured by it. A change during a request
-may or may not be seen by that request (the linearisation point is each
-directory's open); the next request sees it. There is no cross-request cache,
-so a revocation never lingers (review 1 item 1).
+## Who is filtered
 
-## Impersonation level and server verification
+Unfiltered: the token user is SYSTEM, or the token is elevated
+(`TokenElevationTypeFull`) with an enabled Administrators group **and** is
+not restricted, not AppContainer and at least high integrity. The exclusions
+are checked first (no SID shortcut). Everyone else authenticated is filtered.
+Anonymous, identification-only or missing tokens are refused.
 
-Checking by opening needs a token at `SecurityImpersonation` level; today the
-client connects with `SECURITY_IDENTIFICATION` (`transport.rs`). Change for
-the **system endpoint only**:
+## Snapshot contents (review 2 items 2 and 3)
 
-1. The client opens the pipe with `SECURITY_SQOS_PRESENT |
-   SECURITY_IMPERSONATION` (static tracking, no effective-only change).
-2. Before writing a single byte it verifies the server: the pipe's server
-   process (`GetNamedPipeServerProcessId`) must run as LocalSystem
-   (`S-1-5-18`) from the installed service image
-   (`%ProgramFiles%\Ferrow\service\ferrowd.exe`, compared by file id).
-   Otherwise it disconnects without writing. A pipe squatter can impersonate
-   only after reading from the client, so it never gets the token.
-3. The service duplicates the captured token at impersonation level, uses it
-   only on the request's worker thread between `SetThreadToken` and
-   `RevertToSelf` (guarded so every exit path reverts), and closes it at the
-   end of the request. Development endpoints keep identification level.
+Only volumes whose identity Windows guarantees are served to filtered
+callers: local fixed NTFS and ReFS. FAT, exFAT, network, removable and
+`subst`-only paths are indexed for unfiltered callers only (deduplicating
+`subst` is not a security measure).
 
-## Where the filter applies
+The service's scan of such a volume:
 
-Visibility is mandatory authorization, not an optimisation (review 1 item 9):
+- Opens the volume root (`\\?\Volume{GUID}\`), then every directory **relative
+  to its parent's handle** (no path strings, no reparse traversal; reparse
+  points are recorded as leaves).
+- From **the same handle** it reads the directory's `FILE_ID_INFO` (volume
+  serial + full 128-bit id) and enumerates it
+  (`FileIdExtdDirectoryInfo`, with buffer and continuation validation).
+- Records, per directory, the 128-bit id (16 bytes per directory, about 1.6
+  bytes per entry); per volume, the volume GUID and serial; per configured
+  root below a volume root, the ids of its ancestors up to the volume root.
 
-- The service wraps every `Query` and `Count` for a filtered caller in a
-  visibility context; the query engine evaluates `visible(row) && query(row)`
-  on every path — ordered search, count, every sort, OR/NOT, prefix
-  candidates — and applies it before limits, pagination, `more`, byte budgets
-  and highlights. There is no code path that serves a filtered caller without
-  the context; a missing context is an error, never unfiltered.
-- Per request, a directory decision is memoised (`dir id → visible`), with
-  ancestors resolved first, so a path's directories are opened once.
-- Root entries: a bare volume root (`C:\`) is opened like any directory. A
-  configured root below a volume root (for example `E:\Data`) has its
-  ancestors (`E:\`) opened too, by path, before anything under it is shown
-  (review 1 item 7). A file root is visible if its containing directory chain
-  is.
-- Hard links: each returned name is checked through its own parent chain.
-- Alternate data streams are not indexed; 8.3 and case variants are not
-  separate rows, and the check uses the stored canonical path.
+The index, these records and the volume table are one immutable snapshot
+published through the existing `SnapshotStore` swap; a request holds one
+snapshot from start to serialisation. A snapshot without these records (an
+older index file, an unsupported volume) serves filtered callers nothing.
+Volume attach/detach, reformat or a changed volume serial invalidates that
+volume for filtered callers until it is rescanned. File ids can be reused
+after deletion; rule 2 (current child) and the per-component id check make a
+reused id harmless: a stale snapshot can only hide rows, never show a row
+that is not currently listable.
 
-## Bounded work, counts and partial pages
+## Impersonation (review 2 items 4 and 6)
 
-Opening a directory costs tens of microseconds. Per request:
+- **Client.** For the system endpoint only, the client connects with
+  `SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION | SECURITY_EFFECTIVE_ONLY`
+  (static tracking). Before writing anything — Hello included — on every
+  connection and reconnect, it authenticates the server:
+  1. the existing connected-pipe owner check (`authenticate_server`, owner
+     LocalSystem) stays;
+  2. `GetNamedPipeServerProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`;
+     the handle is held for the whole check, so the process cannot exit and
+     its id be reused meanwhile;
+  3. that process's token user is LocalSystem, and its image
+     (`QueryFullProcessImageNameW`) opened by path has the same volume and
+     file id as `%ProgramFiles%\Ferrow\service\ferrowd.exe` (the known folder
+     is the trusted source);
+  4. the pipe is checked again to still be connected to that process
+     (`GetNamedPipeServerProcessId` unchanged).
+  Any failure: disconnect without writing. A squatter can impersonate only
+  after reading a client write, so it never obtains the token. Development
+  and custom endpoints never raise the level.
+- **Server.** The token is captured per request frame (as today), duplicated
+  at impersonation level and owned by that request. Stream clones used for
+  writing carry no token. The request's token is released when its last
+  authorization job finishes.
+- **Authorization pool.** Directory and child opens run only on a dedicated
+  pool of 4 OS threads, never on Rayon or async executors. A job is: install
+  the request's token with `SetThreadToken` (checked), do the opens, then
+  `RevertToSelf` (checked). No other code runs inside the guard, guards
+  never nest, and a failed revert terminates the service process (the
+  service restarts through its failure actions) rather than returning a
+  thread that might act as someone else.
 
-- **First page:** the scan continues until the page holds `limit` visible
-  rows. A budget (default 250 ms and 20 000 directory opens) bounds it; when
-  it runs out, the page returns what it has, flagged `partial`.
-- **Count:** for a filtered caller the count is exact when it finishes within
-  the budget (default 500 ms); otherwise the reply is a lower bound flagged
-  `at_least` (the protocol gains this flag; old clients get an error rather
-  than a wrong number).
-- Directory opens run on a bounded per-request pool, separate from the query
-  pool; cancellation stops them. Per-user limits: at most 2 concurrent
-  filtered requests per user SID and 8 overall; further requests queue
-  fairly (round-robin by SID) with a short wait, then get `Busy`
-  (review 1 item 12).
+## Search pipeline for a filtered caller
 
-## Timing
+The query engine (Rayon, as SYSTEM, in memory only) produces candidate rows
+in the requested order, in batches; the request thread hands each batch to the
+authorization pool and keeps only authorized rows (rules 1–3), memoising
+per request: `directory → authorized handle or denied`. Rows are emitted only
+after authorization; limits, pagination, `more` (meaning *more authorized
+rows may exist*), byte budgets and highlights apply to authorized rows only.
+Filtered and unfiltered requests are different internal request types, so a
+missing authorization context cannot reach the unfiltered handler (review 2
+suggestion; review 1 item 9).
 
-Hidden rows still cost scan time, so response time can depend on how many
-hidden names match. Mitigations: the work budget caps the worst case; elapsed
-times are not returned to filtered callers. The residual timing channel —
-learning roughly how many hidden names match a pattern, not the names — is
-documented as accepted (review 1 item 11, P2).
+**Ordering.** Candidates are ordered by indexed values; the page is re-sorted
+by the fresh values before it is returned. Across pages, a row's position can
+still reflect its indexed (older) size or date — see residual risks.
+
+**Count.** A filtered count authorizes every candidate (rules 1–3). It is
+exact if it finishes within the request budget, else returned as a lower
+bound (`at_least`).
+
+## Budgets, stalls and fairness (review 2 items 7 and 8)
+
+- Each filtered request has a total budget (default 1 s for searches, 3 s for
+  counts) covering parsing, scanning, authorization and serialisation.
+- An authorization job that exceeds 200 ms marks its **volume** as stalled for
+  filtered callers: rows from it are treated as hidden until the job
+  completes. The response never waits for a stalled job; the stalled thread
+  keeps its token until the OS returns, then reverts and releases it.
+  At most 4 jobs can be outstanding (the pool size); when all threads are
+  stalled, filtered requests get `Busy`. Unfiltered requests never use the
+  pool.
+- Connections: at most 4 per user SID; the handshake must complete within 2 s;
+  an idle filtered connection closes after 30 s; 4 of the 32 connection slots
+  are reserved for SYSTEM and elevated administrators. At most 2 filtered
+  requests per SID run at once, scheduled round-robin across SIDs; the queue
+  holds at most 16 requests, then `Busy`.
 
 ## Status and errors
 
-`Status` for a filtered caller is built from an allowlist: protocol version,
-`visibility: filtered`, service state (ready / scanning). No entry totals,
-no report strings, no paths, no error samples (review 1 item 10). Errors to
-filtered callers never include paths. The protocol version is bumped; the
-filtered status is a new variant.
+Unchanged from revision 2: a versioned filtered `Status` built from an
+allowlist (protocol version, `visibility: filtered`, ready/scanning), no
+totals, report strings, paths or samples; errors to filtered callers carry no
+paths.
 
-## What the service indexes
+## Residual risks the owner must accept (review 2 item 9)
 
-By default every fixed drive, counting a `subst` alias once (an alias whose
-`QueryDosDeviceW` target starts with `\??\` is skipped; deduplication is
-not a security boundary). Roots and excludes become a service setting only
-administrators can change; the setup checkbox stays.
+These cannot be removed without per-user indexes, and are stated so they can
+be accepted or rejected explicitly:
+
+1. **Existence inference by chosen queries.** A caller can type a guessed name
+   or prefix and learn from response time, budget exhaustion, `partial` or
+   `at_least` whether hidden names matching it exist (not what they are, and
+   not where).
+2. **Cross-page ordering by older metadata.** When sorting by size or date,
+   the page a currently listable file appears on is chosen from its indexed
+   value, which may be older than the fresh value shown.
+
+Mitigations: budgets cap the signal's resolution; elapsed times are not sent
+to filtered callers.
 
 ## Unix
 
-Linux and macOS keep the current rule (root only) until a revision covers
-them: `getgrouplist` is not the caller's effective group set, and macOS ACLs
-and sandbox/TCC cannot be checked from mode bits (review 1 items 5 and 6).
-The service on Unix answers non-root callers with `Unauthorized`, and the app
-there keeps its own index.
+Unchanged: non-root callers stay `Unauthorized` until a revision covers
+effective groups, ACLs and MAC (review 1 items 5 and 6).
 
-## App behaviour
+## Tests (merge gates; disposable Windows CI only)
 
-The app searches the service when it is reachable and answers; otherwise it
-falls back to its own index, and the status bar says which. Partial pages and
-lower-bound counts are shown as such ("at least 12 400").
+Two local users A and B, the installed service, a prepared tree:
 
-## Tests (merge gates, disposable CI only)
-
-Windows (`windows-latest`, elevated): create two local users and run the
-installed service.
-
-- Static matrix: A-only, B-only, both, denied parent with allowed child,
-  inherit-only and deny ACEs, owner-rights ACE, mandatory label `High` on a
-  folder (low/medium caller), a junction and a symlink in a path, a hard link
-  in an A-only and a B-only folder, a configured root whose ancestor denies B.
-- Revocation: B searches, A removes B's access, B's next search no longer
-  shows the rows; restored access shows them again.
-- Tokens: a restricted token and a low-integrity process for A see less than
-  A; a non-elevated admin is filtered; an elevated admin is not.
-- Squatting: a test pipe server running as A, created before the service,
-  never receives a write from B's client.
-- Every query kind: small and broad queries, prefix, OR/NOT, each sort,
-  count (exact and lower-bound), partial page, highlights, Status contents.
-- Fairness: user A's broad queries do not starve user B (latency bound).
-- Native comparison: results equal a native `Get-ChildItem -Recurse` run as
-  the test user over the test tree.
-
-Never on the owner's PC: these tests create users and change ACLs.
+- **Static:** A-only, B-only, both; deny on a parent with allow on a child;
+  inherit-only and deny ACEs; owner-rights ACE; an explicit **no-read-up**
+  mandatory label against a medium caller; traverse denied for a caller
+  without `SeChangeNotifyPrivilege`; a junction, a symlink and a mount point in
+  a path; hard links in an A-only and a B-only folder; a configured root whose
+  ancestor denies B; expected sets defined for this stricter policy (not plain
+  equality with `Get-ChildItem`).
+- **Freshness:** revoke and restore access between two searches; move a file
+  out of a folder, then grant B the folder (old name must not appear); replace
+  a file by another of the same name (fresh metadata only); delete and reuse.
+- **Binding:** swap a directory for a junction during the scan (mocked
+  scheduler in unit tests, real swap in CI); an index file without identity
+  records; a changed volume serial.
+- **Tokens:** restricted token and low-integrity process for A; a
+  non-elevated admin is filtered; an elevated admin is not; a failed
+  `SetThreadToken`/`RevertToSelf` (fault injection) terminates the service;
+  no token outlives its request (handle counts).
+- **Squatting:** a pipe server running as A, created first and **able to
+  impersonate**, never receives a write from B's client and never holds B's
+  token.
+- **Stalls and fairness:** a mocked blocked open; all pool threads stalled →
+  `Busy`; A holding 4 idle connections and many broad queries does not starve
+  B or an administrator.
+- **Every query kind:** small/broad, prefix, OR/NOT, each sort, count exact and
+  lower-bound, partial page, highlights, filtered Status.
 
 ## Performance
 
-Unfiltered callers: unchanged (the paired gate stays strict). Filtered
-callers: the CI bench gains a filtered arm on the installed service with a
-real directory tree, reporting first page and count with cold per-request
-caches; targets are the SPEC §3 first-page numbers plus the measured open
-cost, and the budgets above.
+Unfiltered callers: unchanged; the paired gate stays strict. Filtered callers:
+a CI arm on the installed service over a real tree reports first page and
+count with cold per-request memos, split into scan, authorization and
+serialisation; the open cost is measured, not assumed.
 
 ## Not decided here
 
-Unix filtering, live updates (ADR 0005), cross-request caching (only with a
-freshness mechanism that a future review accepts).
+Unix filtering, live updates (ADR 0005), any cross-request authorization
+cache (only with a freshness mechanism a future review accepts).
