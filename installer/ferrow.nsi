@@ -414,7 +414,7 @@ Function .onInit
   ${EndIf}
   ClearErrors
   ; Fresh installs get the service; upgrades keep what is there.
-  ; /NOSERVICE leaves it out.
+  ; /SERVICE adds it, /NOSERVICE leaves it out (or removes it).
   StrCpy $WantService ${BST_CHECKED}
   ${If} $IsUpgrade == 1
     Call QueryService
@@ -427,6 +427,11 @@ Function .onInit
   ${GetOptions} $0 "/NOSERVICE" $1
   ${IfNot} ${Errors}
     StrCpy $WantService ${BST_UNCHECKED}
+  ${EndIf}
+  ClearErrors
+  ${GetOptions} $0 "/SERVICE" $1
+  ${IfNot} ${Errors}
+    StrCpy $WantService ${BST_CHECKED}
   ${EndIf}
   ClearErrors
   ; Was the app open in this session? Then reopen it after an upgrade.

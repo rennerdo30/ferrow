@@ -12,7 +12,7 @@ Download `Ferrow-<version>-setup.exe` from the [releases page](https://github.co
 
 Setup writes nothing into your profile and never changes PATH.
 
-**Silent install:** `Ferrow-<version>-setup.exe /S`. Add `/NOSERVICE` to leave the service out (or remove it on an upgrade). Exit code 0 means success. The log is `%TEMP%\Ferrow-installer-<version>.log`.
+**Silent install:** `Ferrow-<version>-setup.exe /S`. Add `/NOSERVICE` to leave the service out (or remove it on an upgrade), or `/SERVICE` to add it on an upgrade; a plain upgrade keeps the service as it is. Exit code 0 means success. The log is `%TEMP%\Ferrow-installer-<version>.log`.
 
 ## Updating
 

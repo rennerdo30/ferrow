@@ -82,7 +82,9 @@ Assert (!(Get-ChildItem -LiteralPath $env:ProgramFiles -Directory -Filter 'Ferro
 # Upgrade without the service.
 Assert ((Invoke-Bounded $Setup @('/S', '/NOSERVICE')) -eq 0) 'upgrade with /NOSERVICE exits 0'
 Assert (!(Get-Service ferrowd -ErrorAction SilentlyContinue)) '/NOSERVICE removes the service'
-Assert ((Invoke-Bounded $Setup @('/S')) -eq 0) 'upgrade back with the service'
+Assert ((Invoke-Bounded $Setup @('/S')) -eq 0) 'plain upgrade exits 0'
+Assert (!(Get-Service ferrowd -ErrorAction SilentlyContinue)) 'a plain upgrade keeps the service off'
+Assert ((Invoke-Bounded $Setup @('/S', '/SERVICE')) -eq 0) 'upgrade with /SERVICE exits 0'
 Assert ((Get-Service ferrowd).Status -eq 'Running') 'service is back'
 
 # Silent uninstall. NSIS copies the uninstaller to TEMP and returns early;
