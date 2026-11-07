@@ -14,6 +14,13 @@ pub fn open(path: &Path) {
     spawn(Command::new("xdg-open").arg(path));
 }
 
+/// Open a web page in the default browser.
+pub fn open_url(url: &str) {
+    if url.starts_with("https://") {
+        open(Path::new(url));
+    }
+}
+
 /// Show the item selected in the system file manager.
 pub fn reveal(path: &Path) {
     #[cfg(windows)]
@@ -90,6 +97,17 @@ fn read_from(mut command: Command) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Close the window when setup asks (Windows): setup signals the event
+/// `Global\Ferrow.Exit.S<session>` for every session where the app runs,
+/// and waits for the app to exit instead of killing it. The waiting
+/// thread is blocked in the kernel, so it costs nothing while idle.
+pub fn listen_for_setup_exit(on_exit: impl Fn() + Send + 'static) {
+    #[cfg(windows)]
+    win::listen_for_setup_exit(on_exit);
+    #[cfg(not(windows))]
+    let _ = on_exit;
 }
 
 /// True inside a Remote Desktop (RDP) session. Other remote tools
@@ -234,6 +252,66 @@ pub fn apply_backdrop(window: &impl raw_window_handle::HasWindowHandle, dark: bo
 
 #[cfg(windows)]
 mod win {
+    pub fn listen_for_setup_exit(on_exit: impl Fn() + Send + 'static) {
+        use windows_sys::Win32::Foundation::{LocalFree, WAIT_OBJECT_0};
+        use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, GetCurrentProcessId, INFINITE, WaitForSingleObject,
+        };
+        let mut session = 0u32;
+        // SAFETY: the current process id and a live output.
+        if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &raw mut session) } == 0 {
+            return;
+        }
+        // The owner (this user) has full access; administrators and SYSTEM
+        // may only signal and wait (setup runs elevated).
+        let sddl: Vec<u16> = "D:(A;;0x1F0003;;;OW)(A;;0x100002;;;BA)(A;;0x100002;;;SY)"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: terminated input, live output; freed below.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &raw mut sd,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return;
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let name: Vec<u16> = format!("Global\\Ferrow.Exit.S{session}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        // Manual reset: every instance in the session sees one signal.
+        // SAFETY: initialized attributes and a terminated name.
+        let event = unsafe { CreateEventW(&attrs, 1, 0, name.as_ptr()) };
+        // SAFETY: the descriptor was allocated above; the event copied it.
+        unsafe { LocalFree(sd) };
+        if event.is_null() {
+            return;
+        }
+        let event = event as usize;
+        let _ = std::thread::Builder::new()
+            .name("ferrow-setup-exit".into())
+            .spawn(move || {
+                // SAFETY: the event handle stays open for the process lifetime.
+                if unsafe { WaitForSingleObject(event as _, INFINITE) } == WAIT_OBJECT_0 {
+                    on_exit();
+                }
+            });
+    }
+
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 

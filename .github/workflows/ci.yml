@@ -1,7 +1,9 @@
 name: ci
 on:
   push:
-    branches: [main]
+    # main: development; beta: the beta line; release/*: stable lines
+    # (docs/RELEASING.md).
+    branches: [main, beta, 'release/**']
   pull_request:
 permissions:
   contents: read
@@ -109,6 +111,44 @@ jobs:
           test -n "$ok"
           "$bin/ferrow" search ci-needle | grep -q "ci-needle.txt"
           kill $daemon_pid
+  installer:
+    name: installer (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show active-toolchain
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Release build
+        run: cargo build --release --locked -p ferrow-gui -p ferrow -p ferrowd -p ferrow-update
+      - name: Package the setup (pinned NSIS)
+        shell: pwsh
+        run: |
+          $makensis = ./scripts/fetch-nsis.ps1 -Destination "$env:RUNNER_TEMP/nsis"
+          ./scripts/package.ps1 -MakeNsis $makensis -BinDir target/release
+      - name: Install, upgrade, update refusals, uninstall (disposable runner)
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem artifacts/installer/Ferrow-*-setup.exe | Select-Object -First 1
+          $version = $setup.Name -replace '^Ferrow-(.+)-setup\.exe$', '$1'
+          ./scripts/test-installer.ps1 -Setup $setup.FullName -Version $version
+      - name: Installer log
+        if: always()
+        shell: pwsh
+        run: Get-ChildItem $env:TEMP -Filter 'Ferrow-installer-*.log' | ForEach-Object { Get-Content $_.FullName }
+      # A development build for testing, not a release (docs/RELEASING.md).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ferrow-setup-${{ github.sha }}
+          path: |
+            artifacts/installer/Ferrow-*-setup.exe
+            artifacts/installer/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
   bench:
     name: bench (5M fixture)
     runs-on: ubuntu-latest

@@ -1,6 +1,24 @@
 # Milestone 4: installer, service setup and updates
 
-Status: **specified 2026-11-07.** This builds on M2b (`ferrowd`, `ferrow service install`) and [`../SPEC.md`](../SPEC.md). The model is the owner's Corewright installer, adapted to Ferrow's rules.
+Status: **specified 2026-11-07; Windows part implemented 2026-11-07** (branch `m4-installer`). This builds on M2b (`ferrowd`, `ferrow service install`) and [`../SPEC.md`](../SPEC.md). The model is the owner's Corewright installer, adapted to Ferrow's rules.
+
+## Implementation state (2026-11-07)
+
+Done:
+- `installer/ferrow.nsi`, `scripts/package.ps1` (+ `package.bat`), the pinned NSIS download (`scripts/fetch-nsis.ps1`), artwork (`scripts/build-installer-art.py`).
+- The service is registered through `ferrow service install`. Its binary moved to its own administrator-only folder `%ProgramFiles%\Ferrow\service`, because `%ProgramFiles%\Ferrow` also holds the app, which every user must be able to run. Failure actions are set in the same code path (5, 15, 60 seconds). The service is optional on the options page and with `/NOSERVICE`.
+- Upgrades: the app is asked to close through `Global\Ferrow.Exit.S<session>` in every session (never killed), payload locks are checked first, and the service is stopped, re-registered and started; a failure after removal registers the installed build again.
+- `ferrow-update.exe` (crate `ferrow-update`) and Settings → Updates with Stable, Beta and Automatic channels.
+- CI: an `installer` job that builds, packages and runs `scripts/test-installer.ps1` on every push and pull request; `release.yml` builds, tests and creates a **draft** release from a version tag. The branch model (`main`, `beta`, `release/X.Y`) is in [`../RELEASING.md`](../RELEASING.md).
+
+Not yet, and why:
+- **Start at sign-in:** left out until the app has a notification-area mode; today it would open a window at every sign-in.
+- **Different-administrator CI test** (a second local admin on the runner): the code path exists (per-user steps are skipped and logged when the WTS session user differs from the elevated account; the comparison is by user name), but the CI test is still open.
+- **Reopening the app in other sessions** after an update: it reopens only in the session that ran the update; other sessions start it from the Start menu.
+- **The app does not use the service index yet**; the CLI does. Connecting them needs M2c (per-user visibility).
+- **Linux and macOS packages.**
+- **Idle CPU with the updater present** is by construction (no timers; blocked threads only) but not yet measured in CI.
+
 
 Releases and publication need the owner's yes. This milestone builds and tests the installer in CI; it publishes nothing.
 

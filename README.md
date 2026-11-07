@@ -138,8 +138,11 @@ Helper scripts build and start Ferrow in one step. Arguments after the optional 
 | CLI (debug build) | `scripts\run.bat search report` | `./scripts/run.ps1` | `./scripts/run.sh` |
 | CLI (optimised build) | `scripts\run.bat --release search report` | `./scripts/run.ps1 -Release "*.rs"` | `./scripts/run.sh --release '*.rs'` |
 | Run all CI checks | `scripts\check.bat` | `./scripts/check.ps1` | `./scripts/check.sh` |
+| Build the Windows setup | `scripts\package.bat <makensis.exe>` | `./scripts/package.ps1 -MakeNsis <makensis.exe>` | |
 
 The check scripts run the same steps as CI on every push (format, clippy with warnings as errors, tests).
+
+Installing, updating and uninstalling are described in [`docs/INSTALL.md`](docs/INSTALL.md); versions, branches, update channels and releases in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Contributing
 
