@@ -1,6 +1,6 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 2** (2026-11-07). Revision 1 (scan-time
+Status: proposed, **revision 2, review 2 requires changes** (`0002-visibility-review-2.md`, 2026-11-07). Revision 1 (scan-time
 descriptors) was accepted only with 13 required changes
 (`0002-visibility-review-1.md`); the owner chose per-search checks by
 Windows itself. Needs a new security review before the ordinary-caller gate
