@@ -2,6 +2,13 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## 0.1.0-beta.2
+
+- **Filters by size, date and attributes:** `size:>10mb`, `size:1mb..5mb`, `dm:today`, `dm:last10minutes`, `dm:2026-01-01..2026-02-01`, `dc:`/`da:` for created and accessed, `attrib:H`. They combine with everything else, for example `*.log dm:last7days` or `!attrib:H`.
+- **Faster first page for rare filters:** a filter few files match (such as `size:<1mb` on 5 million files) shows its first results about 5x sooner.
+- **Fixed:** clicking a column header (Date modified, Size, ...) did not change the sort.
+- **Setup:** an easier-to-read welcome page.
+
 ## 0.1.0-beta.1
 
 The first beta.
