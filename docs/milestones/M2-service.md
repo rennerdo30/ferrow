@@ -38,11 +38,7 @@ Each package gets its own branch and PR, stacked in this order. Each one is revi
 
 ### M2c: per-user visibility (security-relevant, ADR first)
 - **Rule:** the service only returns entries that the calling user could list. That means every ancestor directory is traversable and the containing directory is listable for that user.
-- **ADR `0002-visibility.md` before any code:**
-  - Windows: `AccessCheck` with the caller's impersonation token against the directory security descriptors (`FILE_LIST_DIRECTORY`, `FILE_TRAVERSE`).
-  - Unix: uid/gid/supplementary groups against mode bits, plus POSIX ACLs where present.
-  - Decisions are cached per (caller identity, directory id) and invalidated on change events.
-  - Fail-closed: when a check errors, the entry is hidden.
+- **Design:** [ADR 0002](../decisions/0002-visibility.md), accepted by security review 7 on 2026-11-07 after seven rounds. Per search, acting as the caller: the folder chain is opened handle-relative and held without delete sharing inside per-volume hold windows, the child is opened and its current path compared exactly, and metadata and the whole query are re-evaluated fresh. Fail-closed: any error hides the entry. No cross-request permission cache. Unix stays root-only for now.
 - **Tests:** a two-user matrix wherever CI can create a second user (Linux and Windows hosted runners can), plus unit tests of the cache and invalidation.
 - **Review:** a separate security review before merge.
 
@@ -62,6 +58,24 @@ These are measured with additive timings (shared rule S10) on the CI bench:
 - the load path's derived-data validation cost.
 
 Goal: move toward the SPEC §3 targets: load ≤ 300 ms and full count ≤ 50 ms at 5 M entries.
+
+## Open security gaps (accepted, to fix)
+
+- **G1, name and metadata inference through the system service**
+  (accepted by the owner 2026-11-07; details and fix options in
+  [ADR 0002](../decisions/0002-visibility.md#known-gap-g1-name-and-metadata-inference-accepted-2026-11-07-open-todo)).
+  Any caller the service admits whose token cannot list some indexed folder
+  (another local account, or a restricted, low-integrity or AppContainer
+  process of the same account) can, with many guessed queries, reconstruct
+  names and folder paths of files it cannot list and estimate every indexed
+  property (size, dates, attributes, type); it can never open or read them.
+  **TODO:** per-user candidate structures (or constant-work queries) built on
+  live updates (M2d), with a new design and security review. Until then the
+  service docs, the install guide and the setup page state the gap.
+- **G2, revocation during a hold window** (owner accepted 50 ms on 2026-11-07; revisions 6–7 shrink it to 10 ms; [ADR 0002](../decisions/0002-visibility.md#known-gap-g2-revocation-during-a-hold-window-accepted-2026-11-07-open-todo)):
+  a permission removed while a search holds that folder chain (at most one
+  10 ms window) may still let rows of that hold through. **TODO:** measure
+  hold times and shorten the window if the open cost allows.
 
 ## Not in M2
 The Linux fanotify and macOS FSEvents live backends (M3), the GUI (its toolkit spike runs separately), installers, and release builds. Installers and releases need the owner's yes.
