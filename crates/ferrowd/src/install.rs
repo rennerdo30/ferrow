@@ -103,10 +103,25 @@ pub fn install() -> Result<String, String> {
         account_password: None,
     };
     let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG)
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
         .map_err(|e| admin_hint("install", &e))?;
     let _ = service
         .set_description("Indexes file names and answers Ferrow searches over a local pipe.");
+    // Restart after a crash: 5 s, 15 s, then 60 s; the count resets daily.
+    let restart = |seconds| windows_service::service::ServiceAction {
+        action_type: windows_service::service::ServiceActionType::Restart,
+        delay: std::time::Duration::from_secs(seconds),
+    };
+    service
+        .update_failure_actions(windows_service::service::ServiceFailureActions {
+            reset_period: windows_service::service::ServiceFailureResetPeriod::After(
+                std::time::Duration::from_secs(86_400),
+            ),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart(5), restart(15), restart(60)]),
+        })
+        .map_err(|e| admin_hint("install", &e))?;
     Ok(format!(
         "service {SERVICE_NAME} installed (LocalSystem, automatic start). Start it with: sc start {SERVICE_NAME}"
     ))

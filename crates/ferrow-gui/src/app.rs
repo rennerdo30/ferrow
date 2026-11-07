@@ -103,6 +103,8 @@ pub struct FerrowApp {
     sort_pending: bool,
     /// The index has no data for the chosen sort column.
     sort_unavailable: bool,
+    /// Settings → Updates.
+    updater: crate::update::Updater,
 }
 
 impl FerrowApp {
@@ -120,6 +122,12 @@ impl FerrowApp {
         platform::install_frame(cc, dark, move || frame_wake.request_repaint());
         let wake = ctx.clone();
         let engine = Engine::start(move || wake.request_repaint());
+        // Setup asks running copies to close before it replaces files.
+        let closer = ctx.clone();
+        platform::listen_for_setup_exit(move || {
+            closer.send_viewport_cmd(egui::ViewportCommand::Close);
+            closer.request_repaint();
+        });
         Ok(FerrowApp {
             engine,
             state: State::Loading,
@@ -155,6 +163,7 @@ impl FerrowApp {
             columns_need_rebuild: false,
             sort_pending: false,
             sort_unavailable: false,
+            updater: crate::update::Updater::new(),
         })
     }
 
@@ -1135,6 +1144,8 @@ impl eframe::App for FerrowApp {
         self.sync_theme(&ctx, frame);
         self.drain_events();
         self.auto_rebuild(&ctx);
+        self.updates_on_open(&ctx);
+        self.updater.poll();
 
         // Every keystroke starts a new (cancelling) search on the worker.
         if self.page == Page::Settings

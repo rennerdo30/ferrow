@@ -234,6 +234,31 @@ pub struct Settings {
     pub columns: Vec<ColumnConfig>,
     pub sort: SortChoice,
     pub sort_descending: bool,
+    /// Which releases Settings → Updates offers.
+    pub update_channel: UpdateChannel,
+    /// Unix seconds of the last update check (at most one a day on open).
+    pub last_update_check: Option<u64>,
+}
+
+/// Update channel choice. `Auto` follows the running version: a beta
+/// build updates on Beta, a stable build on Stable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    #[default]
+    Auto,
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn resolve(self, current: &ferrow_update::Version) -> ferrow_update::Channel {
+        match self {
+            UpdateChannel::Auto => ferrow_update::Channel::default_for(current),
+            UpdateChannel::Stable => ferrow_update::Channel::Stable,
+            UpdateChannel::Beta => ferrow_update::Channel::Beta,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -250,6 +275,8 @@ impl Default for Settings {
             columns: default_columns(),
             sort: SortChoice::default(),
             sort_descending: false,
+            update_channel: UpdateChannel::default(),
+            last_update_check: None,
         }
     }
 }

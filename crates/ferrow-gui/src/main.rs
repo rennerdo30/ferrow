@@ -15,6 +15,7 @@ mod logo;
 mod platform;
 mod settings;
 mod theme;
+mod update;
 
 use eframe::egui;
 

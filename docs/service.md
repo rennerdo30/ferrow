@@ -33,7 +33,7 @@ only the OS user who started it. Per-user result filtering remains M2c.
 
 ## Install (needs admin/root once)
 
-Installation copies `ferrowd` into `%ProgramFiles%\Ferrow\` on Windows
+Installation copies `ferrowd` into its own administrator-only folder `%ProgramFiles%\Ferrow\service\` on Windows
 or `/usr/local/libexec/ferrow/` on Unix and registers only that fixed path.
 Unix directories and binaries must be root-owned 0755, with no group/other
 write access or symbolic-link component. Existing unsafe paths are refused.

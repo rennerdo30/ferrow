@@ -10,8 +10,9 @@ use eframe::egui::{
 
 use super::{FerrowApp, Page, PickTarget};
 use crate::platform;
-use crate::settings::{SourceKind, ThemeChoice};
+use crate::settings::{SourceKind, ThemeChoice, UpdateChannel};
 use crate::theme;
+use crate::update::{self, UpdateState};
 
 const CARD_GAP: f32 = 4.0;
 const SECTION_GAP: f32 = 20.0;
@@ -52,6 +53,8 @@ impl FerrowApp {
                         self.index_section(ui);
                         ui.add_space(SECTION_GAP);
                         self.appearance_section(ui);
+                        ui.add_space(SECTION_GAP);
+                        self.updates_section(ui);
                         ui.add_space(SECTION_GAP);
                         self.about_section(ui);
                         ui.add_space(SECTION_GAP);
@@ -430,6 +433,138 @@ impl FerrowApp {
         });
     }
 
+    /// Installed copies check once when they open, at most once a day.
+    pub(super) fn updates_on_open(&mut self, ctx: &egui::Context) {
+        if self.updater.opened {
+            return;
+        }
+        self.updater.opened = true;
+        if !update::can_install() {
+            return;
+        }
+        let now = unix_now();
+        if self
+            .settings
+            .last_update_check
+            .is_some_and(|t| now.saturating_sub(t) < 24 * 3600)
+        {
+            return;
+        }
+        self.check_for_updates(ctx);
+    }
+
+    fn check_for_updates(&mut self, ctx: &egui::Context) {
+        let channel = self
+            .settings
+            .update_channel
+            .resolve(&update::current_version());
+        let wake = ctx.clone();
+        self.updater.check(channel, move || wake.request_repaint());
+        self.settings.last_update_check = Some(unix_now());
+        self.save_settings();
+    }
+
+    fn updates_section(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
+        let ctx = ui.ctx().clone();
+        let current = update::current_version();
+        section_title(ui, &p, "Updates");
+        card(ui, &p, |ui| {
+            ui.horizontal(|ui| {
+                let (title, detail) = match &self.updater.state {
+                    UpdateState::Idle => (
+                        format!("Ferrow {current}"),
+                        "Not checked yet in this session.".to_owned(),
+                    ),
+                    UpdateState::Checking => (
+                        format!("Ferrow {current}"),
+                        "Checking for updates…".to_owned(),
+                    ),
+                    UpdateState::UpToDate => {
+                        (format!("Ferrow {current}"), "You're up to date.".to_owned())
+                    }
+                    UpdateState::Available(r) => (
+                        format!("Ferrow {} is available", r.version),
+                        format!("You have {current}."),
+                    ),
+                    UpdateState::CheckFailed(e) => (
+                        format!("Ferrow {current}"),
+                        format!("The check failed: {e}"),
+                    ),
+                    UpdateState::Installing => (
+                        "Installing the update…".to_owned(),
+                        "Approve the administrator prompt. Ferrow closes and reopens.".to_owned(),
+                    ),
+                    UpdateState::InstallFailed(e) => {
+                        ("The update was not installed".to_owned(), e.clone())
+                    }
+                };
+                row_text(ui, &p, &title, &detail);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let busy = self.updater.busy();
+                    if let UpdateState::Available(release) = &self.updater.state {
+                        let release = release.clone();
+                        if update::can_install() && release.has_setup {
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    accent_button(&p, "Install update", 130.0, !busy),
+                                )
+                                .clicked()
+                            {
+                                let wake = ctx.clone();
+                                self.updater
+                                    .install(&release.version, move || wake.request_repaint());
+                            }
+                        } else if ui.add(std_button(&p, "Download", 100.0)).clicked() {
+                            platform::open_url(&ferrow_update::release_page(&release.version));
+                        }
+                    }
+                    if ui
+                        .add_enabled(!busy, std_button(&p, "Check now", 100.0))
+                        .clicked()
+                    {
+                        self.check_for_updates(&ctx);
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let auto = match UpdateChannel::Auto.resolve(&current) {
+                    ferrow_update::Channel::Beta => "Automatic (Beta)",
+                    ferrow_update::Channel::Stable => "Automatic (Stable)",
+                };
+                row_text(
+                    ui,
+                    &p,
+                    "Update channel",
+                    "Stable gets tested releases. Beta also gets previews of the next version.",
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut choice = self.settings.update_channel;
+                    egui::ComboBox::from_id_salt("update-channel")
+                        .width(170.0)
+                        .selected_text(match choice {
+                            UpdateChannel::Auto => auto,
+                            UpdateChannel::Stable => "Stable",
+                            UpdateChannel::Beta => "Beta",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut choice, UpdateChannel::Auto, auto);
+                            ui.selectable_value(&mut choice, UpdateChannel::Stable, "Stable");
+                            ui.selectable_value(&mut choice, UpdateChannel::Beta, "Beta");
+                        });
+                    if choice != self.settings.update_channel && !self.updater.busy() {
+                        self.settings.update_channel = choice;
+                        // A release found on the other channel is no longer offered.
+                        self.updater.state = UpdateState::Idle;
+                        self.save_settings();
+                    }
+                });
+            });
+        });
+    }
+
     fn about_section(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
         section_title(ui, &p, "About");
@@ -736,4 +871,10 @@ fn remove_button(ui: &mut egui::Ui, p: &theme::Palette, row: egui::Rect) -> egui
         vec2(84.0, 30.0),
     );
     ui.put(btn, std_button(p, "Remove", 84.0))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }

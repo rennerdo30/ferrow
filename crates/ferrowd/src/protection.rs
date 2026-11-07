@@ -11,7 +11,10 @@ pub fn binary_path() -> io::Result<PathBuf> {
     {
         Ok(
             windows::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)?
-                .join("Ferrow/ferrowd.exe"),
+                // Its own administrator-only folder: the install folder
+                // above it also holds the desktop app, which every user
+                // must be able to run (M4 setup).
+                .join("Ferrow/service/ferrowd.exe"),
         )
     }
     #[cfg(unix)]
@@ -27,7 +30,15 @@ pub fn install_binary(source: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| refused("missing installation directory"))?;
     #[cfg(windows)]
     {
-        windows::validate_path(parent.parent().unwrap(), windows::Role::Ancestor)?;
+        let install = parent
+            .parent()
+            .ok_or_else(|| refused("missing installation directory"))?;
+        // Setup creates the install folder; a CLI-only install makes it
+        // here, inheriting %ProgramFiles%' administrator-only write access.
+        if !install.try_exists()? {
+            std::fs::create_dir(install)?;
+        }
+        windows::validate_path(install, windows::Role::Ancestor)?;
         windows::create_directory(parent, "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
         windows::validate_path(parent, windows::Role::Directory)?;
     }
@@ -62,6 +73,53 @@ pub fn install_binary(source: &Path) -> io::Result<PathBuf> {
     }
     result?;
     Ok(target)
+}
+
+/// The updater's staging folder: a fresh `%ProgramFiles%\<prefix><random>`
+/// created with an administrator-only DACL (never an existing path), with
+/// every ancestor checked without following reparse points. Elevated.
+#[cfg(windows)]
+pub fn update_stage(prefix: &str) -> io::Result<PathBuf> {
+    let parent = windows::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)?;
+    windows::validate_path(&parent, windows::Role::Ancestor)?;
+    let mut nonce = [0u8; 16];
+    getrandom(&mut nonce)?;
+    let name: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let stage = parent.join(format!("{prefix}{name}"));
+    if stage.try_exists()? {
+        return Err(refused("update stage already exists"));
+    }
+    windows::create_directory(&stage, "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
+    windows::validate_path(&stage, windows::Role::Directory)?;
+    Ok(stage)
+}
+
+/// A file inside a protected folder that no non-administrator can change.
+#[cfg(windows)]
+pub fn validate_protected_file(path: &Path) -> io::Result<()> {
+    windows::validate_path(path, windows::Role::Binary)
+}
+
+#[cfg(windows)]
+fn getrandom(buf: &mut [u8]) -> io::Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    // SAFETY: valid writable buffer of the stated length; system RNG needs no handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "random source failed: {status:#x}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_binary(path: &Path) -> io::Result<()> {
