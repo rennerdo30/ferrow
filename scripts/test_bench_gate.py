@@ -33,6 +33,8 @@ def metadata_fixture():
     for query in sorted(gate.QUERIES):
         for prefix in ("FERROW-MODIFIED-QUERY", "FERROW-MODIFIED-SERVICE"):
             lines.append(f'{prefix} query="{query}" first_page_ms=1 page_hits=2 full_count_ms=10 total_hits=2')
+    for query in sorted(gate.FILTER_QUERIES):
+        lines.append(f'FERROW-FILTER-QUERY query="{query}" first_page_ms=1 page_hits=2 full_count_ms=10 total_hits=2')
     return "\n".join(lines)
 
 
@@ -124,8 +126,8 @@ class GateTests(unittest.TestCase):
         rows, report = gate.metadata_observations(metadata_fixture(), self.head, 16)
         self.assertEqual(gate.PAIRED_METRICS, 26)
         self.assertEqual(gate.EXPECTED_METRICS, 46)
-        self.assertEqual(gate.EXPECTED_TOTAL_METRICS, 72)
-        self.assertEqual(len(rows), 26)
+        self.assertEqual(gate.EXPECTED_TOTAL_METRICS, 82)
+        self.assertEqual(len(rows), 36)
         self.assertEqual(len(self.rows()) + len(rows), gate.EXPECTED_TOTAL_METRICS)
         self.assertIn("head-only", report)
         self.head[1]["a"]["full_count_ms"] = 20
@@ -148,7 +150,10 @@ class GateTests(unittest.TestCase):
                         text.replace("default_heap_bytes=1044", "default_heap_bytes=1300"),
                         text.replace("load_ms_median=200", "load_ms_median=nan"),
                         text.replace("page_hits=2", "page_hits=3"), text.replace("total_hits=2", "total_hits=3"),
-                        text.replace("errors=0", "errors=1"), text + "\n" + text):
+                        text.replace("errors=0", "errors=1"), text + "\n" + text,
+                        text.replace('FERROW-FILTER-QUERY query="size:<1mb"', 'IGNORE query="size:<1mb"'),
+                        text.replace('FERROW-FILTER-QUERY query="size:<1mb" first_page_ms=1 page_hits=2', 'FERROW-FILTER-QUERY query="size:<1mb" first_page_ms=1 page_hits=1'),
+                        text + '\nFERROW-FILTER-QUERY query="size:>2gb" first_page_ms=1 page_hits=2 full_count_ms=10 total_hits=2'):
             with self.subTest(invalid=invalid), self.assertRaises((ValueError, KeyError)):
                 gate.metadata_observations(invalid, self.head, 16)
 

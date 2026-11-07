@@ -1,4 +1,8 @@
 //! Hosted-only default-column observations; never a local performance workload.
+//!
+//! `FERROW-FILTER-QUERY` lines time the `size:` and `dm:` filters over the
+//! fixture's size and modified columns (name order, first page and count).
+//! Dates are absolute: the fixture's times span 2023-11-14 to 2024-11-13.
 use ferrow_index::{ColumnSet, Index, IndexBuilder};
 use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, count, search};
 use std::time::Instant;
@@ -134,5 +138,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             median(counts)
         );
     }
+    for text in FILTER_QUERIES {
+        let query = Query::parse(text)?;
+        let mut pages = Vec::new();
+        let mut counts = Vec::new();
+        let mut hits = 0;
+        let mut total = 0;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let result = search(
+                &index,
+                &query,
+                &SearchOptions {
+                    limit: Some(100),
+                    ..Default::default()
+                },
+            );
+            pages.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert!(!result.cancelled);
+            hits = result.hits.len();
+            let t = Instant::now();
+            let (n, cancelled) = count(&index, &query, &CancelToken::new());
+            counts.push(t.elapsed().as_secs_f64() * 1000.0);
+            assert!(!cancelled);
+            total = n;
+        }
+        println!(
+            "FERROW-FILTER-QUERY query={text:?} first_page_ms={:.6} page_hits={hits} full_count_ms={:.6} total_hits={total}",
+            median(pages),
+            median(counts)
+        );
+    }
     Ok(())
 }
+
+/// Broad and rare size filters, a date range, and filters combined with a
+/// wildcard and a word. Keep in step with `FILTER_QUERIES` in
+/// `scripts/bench-gate.py`.
+const FILTER_QUERIES: &[&str] = &[
+    "size:>1gb",
+    "size:<1mb",
+    "dm:2024-03-01..2024-03-31",
+    "*.log dm:>=2024-06-01",
+    "report size:<1gb",
+];
