@@ -87,6 +87,11 @@ impl FerrowApp {
         let font = FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into()));
         let mut sort_changed = false;
         let mut resized = false;
+        // Right-click anywhere on the header: choose the columns. Registered
+        // first so it lies *below* the cells: egui gives a click to the
+        // last-registered widget under the pointer, and a header-wide area
+        // added after the cells swallowed every sort click.
+        let mut all = ui.interact(header, egui::Id::unique("col-header-menu"), Sense::click());
         for (i, col) in cols.iter().enumerate() {
             let cell = Rect::from_min_max(
                 pos2(col.left, header.top()),
@@ -140,6 +145,8 @@ impl FerrowApp {
             } else {
                 resp
             };
+            // A right-click on a cell opens the same column menu.
+            all = all.union(resp.clone());
             if resp.clicked()
                 && let Some(key) = col.id.sort_key()
             {
@@ -179,8 +186,6 @@ impl FerrowApp {
                 }
             }
         }
-        // Right-click anywhere on the header: choose the columns.
-        let all = ui.interact(header, egui::Id::unique("col-header-menu"), Sense::click());
         let mut columns_changed = false;
         all.context_menu(|ui| {
             ui.set_min_width(220.0);
@@ -331,6 +336,42 @@ pub(super) fn missing_text(p: &Palette) -> (&'static str, Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ordering `column_header` relies on: a header-wide click area
+    /// registered before a cell must not take the cell's click (the
+    /// reverse order did, so sorting by a column did nothing).
+    #[test]
+    fn cell_click_wins_over_the_header_area_beneath_it() {
+        let ctx = egui::Context::default();
+        let header = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 30.0));
+        let cell = Rect::from_min_size(pos2(200.0, 0.0), vec2(100.0, 30.0));
+        let at = pos2(250.0, 15.0);
+        let frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut clicked = (false, false);
+            let mut output = ctx.run_ui(input, |ui| {
+                let all = ui.interact(header, egui::Id::new("all"), Sense::click());
+                let c = ui.interact(cell, egui::Id::new("cell"), Sense::click());
+                clicked = (c.clicked(), all.clicked());
+            });
+            output.textures_delta.clear();
+            clicked
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![egui::Event::PointerMoved(at)]);
+        frame(vec![button(true)]);
+        assert_eq!(frame(vec![button(false)]), (true, false));
+    }
 
     #[test]
     fn sizes() {
