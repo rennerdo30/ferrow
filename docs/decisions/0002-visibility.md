@@ -5,7 +5,7 @@ Status: proposed, **revision 5** (2026-11-07). Review 4 required 4 changes
 reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
 `-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
 **accepted known gap G1 below** (name, path and old-metadata inference
-by repeated guessing) and known gap G2 (50 ms revocation window). Needs review 4 before code; the ordinary-caller gate
+by repeated guessing) and known gap G2 (50 ms revocation window). Needs review 5 before code; the ordinary-caller gate
 stays closed until a review accepts it. Live updates (ADR 0005) are separate.
 
 ## Goal and threat model
