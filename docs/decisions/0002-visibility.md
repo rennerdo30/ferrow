@@ -1,12 +1,13 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 6** (2026-11-07). Review 5 required 1 change
-(`0002-visibility-review-5.md`, ancestor swap), applied here as rule 4;
-review 4 required 4 (`0002-visibility-review-4.md`). Revisions 1–3 and their
+Status: proposed, **revision 7** (2026-11-07). Review 6 required 2 changes
+(`0002-visibility-review-6.md`, hold availability), applied in rule 4 and
+"Hold windows"; review 5 required 1 (ancestor swap, rule 4); review 4
+required 4 (`0002-visibility-review-4.md`). Revisions 1–3 and their
 reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
 `-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
 **accepted known gap G1 below** (name, path and old-metadata inference
-by repeated guessing) and known gap G2 (revocation window, now at most one row's 5 ms hold, rule 4). Needs review 6 before code; the ordinary-caller gate
+by repeated guessing) and known gap G2 (revocation window, now at most one 10 ms hold window, rule 4). Needs review 7 before code; the ordinary-caller gate
 stays closed until a review accepts it. Live updates (ADR 0005) are separate.
 
 ## Goal and threat model
@@ -65,22 +66,27 @@ and **acting as the caller on the OS thread doing the work**:
    another directory. If any open fails with a sharing violation (someone
    holds the directory with `DELETE` access, or without sharing), or the
    per-job handle limit is reached: hidden for this request.
-   **Hold limit.** One held chain may serve several rows below it (rows of a
-   batch with the same parent are checked together), but a hold lasts at most
-   **5 ms** from the chain's first open to the last row's attachment check,
-   measured on the monotonic clock; a row whose check ends later is hidden,
-   and the chain is released and reopened for the remaining rows. Windows
-   checks access when a handle is opened and never revokes it, so the
-   guarantee is: **a revocation is honoured for every row whose hold began
-   after the revocation completed**; one completed during a hold may still
-   admit rows of that hold, at most 5 ms later (known gap G2, below).
+   **Never wait while holding (review 6 item 1).** Every open made while any
+   handle of a chain is held uses `FILE_COMPLETE_IF_OPLOCKED`: if it returns
+   `STATUS_OPLOCK_BREAK_IN_PROGRESS` (another process holds an oplock and
+   would make the open wait for its acknowledgement, which has no timeout),
+   any returned handle is closed at once and the row is hidden; the service
+   never waits for another process's oplock break, so no other process can
+   extend a hold. A sharing violation is returned immediately and also hides
+   the row.
+   **Hold windows.** Holds happen only inside the volume's hold windows (see
+   "Hold windows", below): a hold starts in a window's first 5 ms and every
+   handle of it is closed by the window's end, **10 ms** after it opened. One
+   held chain may serve several rows below it (rows of a batch with the same
+   parent are checked together); a row whose attachment check has not
+   finished when the window closes is hidden for this window and may be
+   retried in a later one within the request budget. Windows checks access
+   when a handle is opened and never revokes it, so the guarantee is: **a
+   revocation is honoured for every row whose hold began after the
+   revocation completed**; one completed during a hold may still admit rows
+   of that hold, at most 10 ms later (known gap G2, below).
    Only **denials** may be remembered across holds (`directory id → denied`,
    at most 50 ms, within the request); a stale denial can only hide a row.
-   **Side effect on other programs:** while held (at most 5 ms per hold),
-   renaming, moving or deleting that directory fails with a sharing
-   violation, as it does while antivirus or the Windows Search indexer has it
-   open. Programs that retry succeed; the docs state it. Only filtered
-   callers' searches hold directories.
 5. **Fresh metadata.** Size, dates, attributes and the file/folder type
    returned for the row are read from that child handle now, never from the
    index. The **whole query expression** is evaluated again on the fresh
@@ -110,6 +116,50 @@ tokens, traverse with the caller's own privileges.
 
 "Stricter than the OS" (a folder reachable only by knowing its path is
 hidden) was accepted as policy in review 1.
+
+## Hold windows (review 6 items 1 and 2)
+
+Rule 4 holds directories without delete sharing, so while a directory is
+held another program cannot rename, move or delete it. To bound that for
+other programs **across all requests, users and pool threads**, holds on a
+volume are coordinated by one per-volume hold gate in the service:
+
+- **Windows and gaps.** The gate alternates a **hold window** of at most
+  10 ms with a **free gap of at least 20 ms**. New holds may start only in
+  the first 5 ms of a window; at the window's end the gate makes sure no
+  hold remains (below) before the gap begins. During a gap no handle of any
+  directory on that volume is held by the service for authorization, by any
+  request. Jobs that need the volume wait for the next window (counted
+  against the request budget), so overlapping or back-to-back holds by
+  different jobs or requests can never join into a longer exclusion
+  (review 6 item 2). The volume root is exempt (it cannot be renamed,
+  moved or deleted anyway) and is never the reason for a window.
+- **Forced end.** At the window's end a gate timer thread (one per service,
+  a high-resolution waitable timer) checks each job still in a hold. A job
+  between system calls sees the closed window and closes its hold's handles
+  itself before any further call. A job inside a system call gets
+  `CancelSynchronousIo` on its thread and closes its handles as soon as the
+  call returns; its rows are hidden. Opens never wait on other processes
+  (rule 4, `FILE_COMPLETE_IF_OPLOCKED`), so a call that does not return
+  promptly is a **device or driver stall**, not something another user can
+  cause: the job then follows the stall rules (below), the volume is marked
+  stalled and no new window opens on it until every job on it has returned.
+  Handles are never closed from another thread (a handle value closed under
+  a running call could be reused for a different object).
+- **Resulting bound for other programs.** On a healthy volume, a directory
+  is never held by the service for more than 10 ms at a stretch, and never
+  for more than 10 ms in any 30 ms; a program that retries a failed rename
+  or delete once after 10–20 ms always finds a free gap. A program that
+  does not retry and lands in a window gets a "folder in use" error, the
+  same as when antivirus or Windows Search has the folder open. Only a
+  device or driver stall can extend a hold, and then that volume is already
+  stalled for every program. Only searches by filtered callers open
+  windows; with no such search running the gate is idle.
+- **Throughput.** At most a third of the time is window time, so filtered
+  authorization runs at up to about a third of its unthrottled rate per
+  volume; first pages (100 rows) fit in one or two windows. Unfiltered
+  callers never use the gate. The indexing-time pre-filter (below) reduces
+  the holds needed.
 
 ## Who is filtered
 
@@ -312,16 +362,17 @@ or a sandboxed or restricted program of the same account) may be able to
 work out the names, folder paths, sizes, dates and other searchable
 properties of files in it, never their contents, through the service.
 
-## Known gap G2: revocation during a row's hold (accepted 2026-11-07, open TODO)
+## Known gap G2: revocation during a hold window (accepted 2026-11-07, open TODO)
 
 Windows checks permissions when a handle is opened and never revokes a
-granted handle. Rule 4 holds a row's folder chain for at most 5 ms, so a
-permission removed while that chain is held may still let rows of that hold
-through, at most 5 ms after the removal. Any later hold and any later
-request honours it. The owner accepted a 50 ms window on 2026-11-07;
-revision 6 (rule 4, review 5) shrinks it to the 5 ms hold. TODO: measure
-typical hold times and lower the limit if the open cost allows. Tracked with
-G1 in `docs/milestones/M2-service.md` and Pair Desk.
+granted handle. Rule 4 holds a row's folder chain at most until the end of
+its 10 ms hold window, so a permission removed while that chain is held may
+still let rows of that hold through, at most 10 ms after the removal. Any
+later hold and any later request honours it. The owner accepted a 50 ms
+window on 2026-11-07; revisions 6 and 7 (rule 4, reviews 5 and 6) shrink it
+to the 10 ms window. TODO: measure typical hold times and shorten the window
+if the open cost allows. Tracked with G1 in `docs/milestones/M2-service.md`
+and Pair Desk.
 
 ## Planned optimisation: indexing-time pre-filter (after the first version)
 
@@ -383,7 +434,7 @@ Two local users A and B, the installed service, a prepared tree:
 - **Review 4 probes:** after a directory grant, revoke B's access and move a
   previously indexed secret into that folder (deterministic, mocked
   scheduler and real CI): no row whose hold began after the revocation shows
-  it, and no hold exceeds 5 ms; a move of `d` from `A` to `a` in a case-sensitive folder
+  it, and no hold outlives its 10 ms window; a move of `d` from `A` to `a` in a case-sensitive folder
   where B may list `A` but not `a`: hidden; a hard link whose handle reports
   the other link: hidden; Query and Count agree for a replaced file with
   different metadata, with OR/NOT; a restricted and an AppContainer process
@@ -395,9 +446,19 @@ Two local users A and B, the installed service, a prepared tree:
   `secret.txt` into D. Each rename of a held directory fails with a sharing
   violation; if the sequence instead completes before the chain is opened,
   rule 1 fails at A₂. The secret is never returned. Also: a directory held
-  with `DELETE` access by another process → hidden, not blocked; a hold
-  exceeding 5 ms (mocked slow open) → the row is hidden; Explorer-style
-  rename with retry succeeds while a broad filtered search runs.
+  with `DELETE` access by another process → hidden, not blocked; a row
+  whose check is unfinished at the window end (mocked slow open) → hidden.
+- **Review 6 probes:** (disposable CI and mocked) another process holds a
+  chain directory with `DELETE` access and a Read-Handle oplock and withholds
+  the break acknowledgement: the open returns at once, the row is hidden,
+  and the already held ancestors are released by the window end; a mocked
+  stall **after ancestors are held**: `CancelSynchronousIo` is issued at the
+  window end, handles are closed when the call returns, the volume is
+  marked stalled and no new window opens until it returns; two pool threads
+  and two requests overlapping holds on the same ancestor while a competing
+  program retries `MoveFileEx` every 15 ms: the rename succeeds within two
+  retries, and no directory is held for more than 10 ms in any 30 ms
+  (handle traces).
 - **Squatting:** a pipe server running as A, created first and **able to
   impersonate**, never receives a write from B's client and never holds B's
   token.
@@ -423,8 +484,8 @@ Two local users A and B, the installed service, a prepared tree:
 Unfiltered callers: unchanged; the paired gate stays strict. Filtered callers:
 a CI arm on the installed service over a real tree reports first page and
 count with cold per-request memos, split into scan, authorization and
-serialisation; the open cost (one chain per hold, depth-dependent) and the
-hold times are measured, not assumed. The indexing-time pre-filter (above)
+serialisation; the open cost (one chain per hold, depth-dependent), the hold
+times and the hold-window throughput limit are measured, not assumed. The indexing-time pre-filter (above)
 is the planned answer if chain opens dominate.
 
 ## Not decided here
