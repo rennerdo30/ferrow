@@ -25,7 +25,7 @@ FONT_REGULAR = 'C:/Windows/Fonts/segoeui.ttf'
 
 BG = (25, 25, 25)
 INK = (242, 242, 242)
-INK2 = (170, 170, 170)
+INK2 = (214, 214, 214)
 
 
 def bmp_frame(img: Image.Image) -> bytes:
@@ -73,8 +73,8 @@ def welcome():
     logo = LOGO.resize((144, 144), Image.LANCZOS)
     img.paste(logo, ((w - 144) // 2, 150), logo)
     d.text((w // 2, 340), 'Ferrow', font=ImageFont.truetype(FONT, 44), fill=INK, anchor='mm')
-    d.text((w // 2, 384), 'Find any file by name,', font=ImageFont.truetype(FONT_REGULAR, 20), fill=INK2, anchor='mm')
-    d.text((w // 2, 410), 'as fast as you type.', font=ImageFont.truetype(FONT_REGULAR, 20), fill=INK2, anchor='mm')
+    d.text((w // 2, 390), 'Find any file by name,', font=ImageFont.truetype(FONT_REGULAR, 25), fill=INK2, anchor='mm')
+    d.text((w // 2, 422), 'as fast as you type.', font=ImageFont.truetype(FONT_REGULAR, 25), fill=INK2, anchor='mm')
     img.save(OUT / 'welcome.bmp')
 
 
