@@ -45,7 +45,7 @@ VIAddVersionKey "LegalCopyright" "rennerdo30, MIT licence"
 !define MUI_HEADERIMAGE_UNBITMAP "art\header.bmp"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Install Ferrow ${VERSION}"
-!define MUI_WELCOMEPAGE_TEXT "Ferrow finds any file on your PC by name, as fast as you type.$\r$\n$\r$\nSetup installs:$\r$\n$\r$\n  - the Ferrow app and the ferrow command line in $INSTDIR,$\r$\n  - optionally the Ferrow index service, which starts with Windows,$\r$\n  - a Start menu entry for all users.$\r$\n$\r$\nYour index and settings are kept when you update or uninstall."
+!define MUI_WELCOMEPAGE_TEXT "Ferrow finds any file on your PC by name, as fast as you type.$\r$\n$\r$\nSetup installs the Ferrow app and the ferrow command line, and adds Ferrow to the Start menu.$\r$\n$\r$\nOn the next page you choose whether to add the Ferrow index service.$\r$\n$\r$\nUpdating or uninstalling keeps your index and settings."
 
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_FUNCTION StartApp
