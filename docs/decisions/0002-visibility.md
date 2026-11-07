@@ -1,6 +1,6 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 3** (2026-11-07). Revision 1 (scan-time
+Status: proposed, **revision 3, review 3 requires 5 changes** (`0002-visibility-review-3.md`, 2026-11-07). Revision 1 (scan-time
 descriptors): review 1 required 13 changes. Revision 2 (per-search checks):
 review 2 required 10 more (`0002-visibility-review-2.md`). The owner chose
 strict filtering over simpler options. Needs review 3 before code; the
