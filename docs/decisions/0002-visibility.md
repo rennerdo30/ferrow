@@ -5,7 +5,7 @@ Status: proposed, **revision 5** (2026-11-07). Review 4 required 4 changes
 reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
 `-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
 **accepted known gap G1 below** (name, path and old-metadata inference
-by repeated guessing). Needs review 4 before code; the ordinary-caller gate
+by repeated guessing) and known gap G2 (50 ms revocation window). Needs review 4 before code; the ordinary-caller gate
 stays closed until a review accepts it. Live updates (ADR 0005) are separate.
 
 ## Goal and threat model
@@ -284,7 +284,7 @@ design and security review. Until G1 is done, the docs (`docs/service.md`,
 accounts other users may be able to infer file names (not contents) through
 the service.
 
-## Known gap G2: 50 ms revocation window (open TODO)
+## Known gap G2: 50 ms revocation window (accepted 2026-11-07, open TODO)
 
 Windows checks permissions when a handle is opened and never revokes a
 granted handle. Rule 4 reuses a directory grant within a request for at most
@@ -292,8 +292,8 @@ granted handle. Rule 4 reuses a directory grant within a request for at most
 check may still let that row through in that request. Any later request
 honours it. Lowering the window costs directory opens (each path's chain is
 opened again); 0 ms means opening every chain per row. Tracked with G1 in
-`docs/milestones/M2-service.md`; acceptance by the owner is required before
-the gate opens.
+`docs/milestones/M2-service.md` and Pair Desk. **Accepted by the owner on
+2026-11-07**; TODO: measure the open cost and shrink the window.
 
 ## Unix
 

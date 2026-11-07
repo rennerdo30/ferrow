@@ -76,7 +76,7 @@ Goal: move toward the SPEC §3 targets: load ≤ 300 ms and full count ≤ 50 ms
   **TODO:** per-user candidate structures (or constant-work queries) built on
   live updates (M2d), with a new design and security review. Until then the
   service docs, the install guide and the setup page state the gap.
-- **G2, 50 ms revocation window** ([ADR 0002](../decisions/0002-visibility.md#known-gap-g2-50-ms-revocation-window-open-todo)):
+- **G2, 50 ms revocation window** (accepted by the owner 2026-11-07; [ADR 0002](../decisions/0002-visibility.md#known-gap-g2-50-ms-revocation-window-accepted-2026-11-07-open-todo)):
   a permission removed less than 50 ms before a row is admitted may still let
   that row through in the same request. **TODO:** shrink or remove the window
   if directory-open cost allows.
