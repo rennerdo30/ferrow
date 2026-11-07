@@ -241,6 +241,7 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
         matcher.candidates(index)
     };
     let reverse = options.sort == SortKey::Name && options.descending;
+    let bits = prefilter_bits(index, matcher, sorted.len(), options.limit, &options.cancel);
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
     // completed prefix. A slow early chunk cannot accumulate unbounded
@@ -313,6 +314,12 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
                     &sorted[start + offset..start + end]
                 };
                 for &id in ids {
+                    if bits
+                        .as_ref()
+                        .is_some_and(|b| b[id as usize / 64] >> (id % 64) & 1 == 0)
+                    {
+                        continue;
+                    }
                     if matcher.matches(index, id, &mut scratch, &options.cancel)
                         && options.limit.is_none_or(|limit| found.len() < limit)
                     {
@@ -386,6 +393,77 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
         timings.total = t.elapsed();
     }
     (result, timings)
+}
+
+/// Indexes smaller than this always use the plain ordered scan.
+const PREFILTER_MIN_ENTRIES: usize = 1 << 16;
+/// Selectivity sample: this many runs of `PREFILTER_SAMPLE_RUN` consecutive
+/// ids. 8 x 4096 cost about 0.4 ms on a broad 5M query on CI; 8 x 1024
+/// still separates "fills the page early" from "visits most of the index".
+const PREFILTER_SAMPLE_RUNS: usize = 8;
+const PREFILTER_SAMPLE_RUN: usize = 1_024;
+
+/// For a query with metadata-only conjuncts that few entries pass, mark the
+/// passing ids in one id-order pass first.
+///
+/// The ordered scan walks name (or metadata) order, so each metadata read
+/// is a random access into id-ordered columns. With a rare filter the scan
+/// visits nearly every entry that way before the page fills; a sequential
+/// pass plus one bit test per visited entry is several times cheaper. A
+/// broad filter fills the page within a few blocks and keeps the plain scan.
+/// The bits only skip entries; every hit still runs the full matcher.
+fn prefilter_bits<M: EntryMatcher>(
+    index: &Index,
+    matcher: &M,
+    candidates: usize,
+    limit: Option<usize>,
+    cancel: &CancelToken,
+) -> Option<Vec<u64>> {
+    let n = index.len();
+    if !matcher.has_prefilter() || candidates < PREFILTER_MIN_ENTRIES {
+        return None;
+    }
+    // Evenly spaced runs of consecutive ids: sequential reads.
+    let stride = n / PREFILTER_SAMPLE_RUNS;
+    let (mut sampled, mut passed) = (0usize, 0usize);
+    for run in 0..PREFILTER_SAMPLE_RUNS {
+        let start = run * stride;
+        for id in start..(start + PREFILTER_SAMPLE_RUN).min(n) {
+            sampled += 1;
+            passed += usize::from(matcher.prefilter(index, id as u32));
+        }
+    }
+    let build = match limit {
+        // Every candidate is visited; skip only when most pass anyway.
+        None => passed * 2 < sampled,
+        // Expected visits to fill the page: limit / pass rate.
+        Some(limit) => {
+            passed == 0 || (limit.saturating_mul(sampled) / passed).min(candidates) > n / 8
+        }
+    };
+    if !build || cancel.is_cancelled() {
+        return None;
+    }
+    let mut bits = vec![0u64; n.div_ceil(64)];
+    bits.par_chunks_mut(BLOCK_SIZE / 64)
+        .enumerate()
+        .for_each(|(chunk, words)| {
+            let start = chunk * BLOCK_SIZE;
+            for (w, word) in words.iter_mut().enumerate() {
+                if w % (CANCEL_INTERVAL / 64) == 0 && cancel.is_cancelled() {
+                    return;
+                }
+                let base = start + w * 64;
+                let mut value = 0u64;
+                for bit in 0..64.min(n - base) {
+                    value |= u64::from(matcher.prefilter(index, (base + bit) as u32)) << bit;
+                }
+                *word = value;
+            }
+        });
+    // A cancelled build is incomplete; the scan sees the cancellation and
+    // returns an empty exact prefix.
+    Some(bits)
 }
 
 /// Count all hits without storing them. Returns the count found and

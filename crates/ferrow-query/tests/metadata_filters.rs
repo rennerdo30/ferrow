@@ -1,7 +1,7 @@
 //! `size:`, `dm:`/`dc:`/`da:` and `attrib:` end to end, against a naive
 //! oracle over the same entries.
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, flags};
-use ferrow_query::{Query, SearchOptions, search};
+use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, count, search};
 
 const SECOND: i64 = 10_000_000;
 
@@ -171,4 +171,147 @@ fn filter_values_parse_with_comparisons_and_groups() {
         let err = Query::parse(bad).unwrap_err();
         assert_eq!(err.span().start, at, "{bad}: {err:?}");
     }
+}
+
+/// Above the prefilter threshold, rare and broad filters (alone, negated,
+/// with a name term, in name and metadata order, with and without a limit)
+/// return exactly the oracle's hits in the oracle's order.
+#[test]
+fn prefiltered_pages_match_the_oracle() {
+    const N: u64 = 70_000;
+    let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+    for i in 0..N {
+        let size = if i.is_multiple_of(997) {
+            7
+        } else {
+            1_000_000 + i
+        };
+        let meta = EntryMetadata {
+            size: Some(size),
+            modified: Some(((i * 7_919) % N) as i64 * SECOND),
+            ..Default::default()
+        };
+        let name = format!(
+            "{}-{i:06}.{}",
+            ["a", "b"][i as usize % 2],
+            ["log", "txt"][i as usize % 3 % 2]
+        );
+        b.add_with_metadata(ROOT_PARENT, name.as_bytes(), 0, meta);
+    }
+    let index = b.freeze();
+    let names = |hits: &[u32]| -> Vec<String> {
+        hits.iter()
+            .map(|&id| String::from_utf8_lossy(index.name(id)).into_owned())
+            .collect()
+    };
+    for (query, keep) in [
+        (
+            "size:<1kb",
+            (|i: u64| i.is_multiple_of(997)) as fn(u64) -> bool,
+        ),
+        ("*.log size:<1kb", |i| {
+            i.is_multiple_of(997) && i % 3 % 2 == 0
+        }),
+        ("!size:>1kb b-", |i| i.is_multiple_of(997) && i % 2 == 1),
+        ("size:>1kb", |i| !i.is_multiple_of(997)),
+    ] {
+        let q = Query::parse(query).unwrap();
+        let expected: Vec<u64> = (0..N).filter(|&i| keep(i)).collect();
+        let mut by_name: Vec<String> = expected
+            .iter()
+            .map(|&i| {
+                format!(
+                    "{}-{i:06}.{}",
+                    ["a", "b"][i as usize % 2],
+                    ["log", "txt"][i as usize % 3 % 2]
+                )
+            })
+            .collect();
+        by_name.sort();
+        for limit in [Some(100), None] {
+            let result = search(
+                &index,
+                &q,
+                &SearchOptions {
+                    limit,
+                    ..Default::default()
+                },
+            );
+            assert!(!result.cancelled);
+            let want = &by_name[..limit.unwrap_or(usize::MAX).min(by_name.len())];
+            assert_eq!(names(&result.hits), want, "{query} {limit:?}");
+            let reverse = search(
+                &index,
+                &q,
+                &SearchOptions {
+                    limit,
+                    descending: true,
+                    ..Default::default()
+                },
+            );
+            let mut want: Vec<_> = by_name.iter().rev().cloned().collect();
+            want.truncate(limit.unwrap_or(usize::MAX));
+            assert_eq!(names(&reverse.hits), want, "{query} {limit:?} descending");
+        }
+        // Metadata order: modified ascending is (i * 7919) % N.
+        index.request_sort(SortKey::Modified);
+        assert_eq!(
+            index
+                .sort_ticket(SortKey::Modified)
+                .unwrap()
+                .wait_timeout(std::time::Duration::from_secs(30)),
+            ferrow_index::SortStatus::Ready
+        );
+        let mut by_modified = expected.clone();
+        by_modified.sort_by_key(|&i| (i * 7_919) % N);
+        let result = search(
+            &index,
+            &q,
+            &SearchOptions {
+                sort: SortKey::Modified,
+                limit: Some(50),
+                ..Default::default()
+            },
+        );
+        let got: Vec<u64> = names(&result.hits)
+            .iter()
+            .map(|n| n[2..8].parse().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            by_modified[..50.min(by_modified.len())],
+            "{query} by modified"
+        );
+        assert_eq!(
+            count(&index, &q, &CancelToken::new()).0,
+            expected.len(),
+            "{query} count"
+        );
+    }
+}
+
+/// A cancelled search with a rare filter returns promptly and empty.
+#[test]
+fn prefiltered_search_honours_cancellation() {
+    let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+    for i in 0..70_000u64 {
+        let meta = EntryMetadata {
+            size: Some(1_000_000 + i),
+            ..Default::default()
+        };
+        b.add_with_metadata(ROOT_PARENT, format!("f{i}").as_bytes(), 0, meta);
+    }
+    let index = b.freeze();
+    let cancel = CancelToken::new();
+    cancel.cancel();
+    let q = Query::parse("size:<1kb").unwrap();
+    let result = search(
+        &index,
+        &q,
+        &SearchOptions {
+            cancel,
+            ..Default::default()
+        },
+    );
+    assert!(result.cancelled && result.hits.is_empty());
 }
