@@ -87,11 +87,14 @@ Assert (!(Get-Service ferrowd -ErrorAction SilentlyContinue)) 'a plain upgrade k
 Assert ((Invoke-Bounded $Setup @('/S', '/SERVICE')) -eq 0) 'upgrade with /SERVICE exits 0'
 Assert ((Get-Service ferrowd).Status -eq 'Running') 'service is back'
 
-# Silent uninstall. NSIS copies the uninstaller to TEMP and returns early;
-# wait for its results instead of terminating anything.
-Invoke-Bounded (Join-Path $dir 'uninstall.exe') @('/S') | Out-Null
-$deadline = (Get-Date).AddSeconds(120)
-while (((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath (Join-Path $dir 'ferrow-gui.exe'))) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+# Silent uninstall. Run a copy outside the install folder with _?= so the run
+# is synchronous and its exit code is visible (the documented NSIS way).
+$copy = Join-Path $env:RUNNER_TEMP 'ferrow-uninstall-copy.exe'
+Copy-Item -LiteralPath (Join-Path $dir 'uninstall.exe') -Destination $copy -Force
+# One raw argument string: NSIS reads everything after _?= verbatim (no quotes).
+$code = Invoke-Bounded $copy @("/S _?=$dir")
+Get-ChildItem $env:TEMP -Filter 'Ferrow-installer-*.log' | ForEach-Object { Write-Host "--- $($_.Name)"; Get-Content $_.FullName -Tail 15 }
+Assert ($code -eq 0) "silent uninstall exits 0 (got $code)"
 Assert (!(Get-Service ferrowd -ErrorAction SilentlyContinue)) 'service removed'
 Assert (!(Test-Path -LiteralPath $key)) 'Installed apps entry removed'
 Assert (!(Test-Path -LiteralPath $shortcut)) 'Start menu entry removed'
