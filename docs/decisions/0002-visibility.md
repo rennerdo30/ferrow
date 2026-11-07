@@ -1,14 +1,13 @@
 # ADR 0002: per-user visibility in the system service (M2c)
 
-Status: proposed, **revision 7** (2026-11-07). Review 6 required 2 changes
-(`0002-visibility-review-6.md`, hold availability), applied in rule 4 and
-"Hold windows"; review 5 required 1 (ancestor swap, rule 4); review 4
-required 4 (`0002-visibility-review-4.md`). Revisions 1–3 and their
-reviews: `0002-visibility-review-1.md` (13 changes), `-review-2.md` (10),
-`-review-3.md` (5). The owner chose strict filtering and, on 2026-11-07,
-**accepted known gap G1 below** (name, path and old-metadata inference
-by repeated guessing) and known gap G2 (revocation window, now at most one 10 ms hold window, rule 4). Needs review 7 before code; the ordinary-caller gate
-stays closed until a review accepts it. Live updates (ADR 0005) are separate.
+Status: **accepted** by security review 7 (2026-11-07, revision 7,
+`0002-visibility-review-7.md`), with the owner-accepted known gaps G1
+(name, path and indexed-property inference by repeated guessing) and G2
+(revocation window, at most one 10 ms hold window) and the owner-accepted
+hold-window bound. Earlier rounds: reviews 1–6
+(`0002-visibility-review-1.md` … `-review-6.md`: 13, 10, 5, 4, 1 and 2
+required changes). The ordinary-caller gate opens only when the
+implementation passes the tests below in CI. Live updates (ADR 0005) are separate.
 
 ## Goal and threat model
 
@@ -462,6 +461,11 @@ Two local users A and B, the installed service, a prepared tree:
   program retries `MoveFileEx` every 15 ms: the rename succeeds within two
   retries, and no directory is held for more than 10 ms in any 30 ms
   (handle traces).
+- **Review 7 suggestions:** the withheld-acknowledgement probe also for the
+  other applicable oplock types and an atomic create-with-oplock; window
+  expiry racing with system-call entry and return; traces of **actual**
+  handle release and of the full free gap after it (a returned
+  `CancelSynchronousIo` proves nothing about completion).
 - **Squatting:** a pipe server running as A, created first and **able to
   impersonate**, never receives a write from B's client and never holds B's
   token.

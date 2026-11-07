@@ -38,11 +38,7 @@ Each package gets its own branch and PR, stacked in this order. Each one is revi
 
 ### M2c: per-user visibility (security-relevant, ADR first)
 - **Rule:** the service only returns entries that the calling user could list. That means every ancestor directory is traversable and the containing directory is listable for that user.
-- **ADR `0002-visibility.md` before any code:**
-  - Windows: `AccessCheck` with the caller's impersonation token against the directory security descriptors (`FILE_LIST_DIRECTORY`, `FILE_TRAVERSE`).
-  - Unix: uid/gid/supplementary groups against mode bits, plus POSIX ACLs where present.
-  - Decisions are cached per (caller identity, directory id) and invalidated on change events.
-  - Fail-closed: when a check errors, the entry is hidden.
+- **Design:** [ADR 0002](../decisions/0002-visibility.md), accepted by security review 7 on 2026-11-07 after seven rounds. Per search, acting as the caller: the folder chain is opened handle-relative and held without delete sharing inside per-volume hold windows, the child is opened and its current path compared exactly, and metadata and the whole query are re-evaluated fresh. Fail-closed: any error hides the entry. No cross-request permission cache. Unix stays root-only for now.
 - **Tests:** a two-user matrix wherever CI can create a second user (Linux and Windows hosted runners can), plus unit tests of the cache and invalidation.
 - **Review:** a separate security review before merge.
 
