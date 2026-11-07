@@ -10,12 +10,21 @@ pub enum Expr {
     Not(Box<Expr>),
 }
 
-/// Metadata predicates reserved for Part 2, after optional index columns land.
+/// Metadata predicates (ADR 0004, Part 2). They need the matching index
+/// column; see [`Query::required_columns`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataFilter {
+    /// Inclusive byte bounds. Matches files only.
     Size { min: Option<u64>, max: Option<u64> },
-    Date { field: DateField, value: String },
-    Attributes(Vec<String>),
+    /// Half-open `[start, end)` range in Unix 100-ns ticks, resolved
+    /// against the local clock when the query is parsed.
+    Date {
+        field: DateField,
+        start: Option<i64>,
+        end: Option<i64>,
+    },
+    /// Every one of these attribute bits must be set.
+    Attributes(u32),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DateField {
@@ -153,6 +162,26 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 impl Query {
+    /// Index columns the query's metadata filters read. Entries of an
+    /// index without them never match those filters.
+    pub fn required_columns(&self) -> ferrow_index::ColumnSet {
+        use ferrow_index::ColumnSet;
+        self.terms.iter().fold(ColumnSet::NONE, |set, term| {
+            set.union(match &term.pattern {
+                Pattern::Filter(Filter::Metadata(m)) => match m {
+                    MetadataFilter::Size { .. } => ColumnSet::SIZE,
+                    MetadataFilter::Date { field, .. } => match field {
+                        DateField::Modified => ColumnSet::MODIFIED,
+                        DateField::Created => ColumnSet::CREATED,
+                        DateField::Accessed => ColumnSet::ACCESSED,
+                    },
+                    MetadataFilter::Attributes(_) => ColumnSet::ATTRIBUTES,
+                },
+                _ => ColumnSet::NONE,
+            })
+        })
+    }
+
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         let mut p = Parser {
             input,
@@ -309,13 +338,6 @@ impl Parser<'_> {
                 "ext:", "parent:", "depth:", "size:", "dm:", "dc:", "da:", "attrib:",
             ] {
                 if self.input[self.at..].starts_with(prefix) {
-                    if matches!(prefix, "size:" | "dm:" | "dc:" | "da:" | "attrib:") {
-                        return Err(self.error(
-                            self.at,
-                            self.at + prefix.len(),
-                            "metadata filter requires Part 2",
-                        ));
-                    }
                     filter = Some(prefix);
                     self.at += prefix.len();
                     break;
@@ -335,6 +357,14 @@ impl Parser<'_> {
                 });
             }
         } else {
+            // Size and date values may start with a comparison
+            // (`size:>10mb`, `dm:<=2026-01-01`); elsewhere `<` and `>`
+            // group terms.
+            if matches!(filter, Some("size:" | "dm:" | "dc:" | "da:")) {
+                while self.byte().is_some_and(|b| b"<>=".contains(&b)) {
+                    self.at += 1;
+                }
+            }
             while self
                 .byte()
                 .is_some_and(|b| !b.is_ascii_whitespace() && !b"!|<>\"".contains(&b))
@@ -368,6 +398,26 @@ impl Parser<'_> {
                     Filter::Extension(values)
                 }
                 "parent:" => Filter::Parent(text.clone()),
+                "size:" => {
+                    let (min, max) = crate::filters::parse_size(&text)
+                        .map_err(|e| self.error(value_start, self.at, &e))?;
+                    Filter::Metadata(MetadataFilter::Size { min, max })
+                }
+                "dm:" | "dc:" | "da:" => {
+                    let field = match prefix {
+                        "dm:" => DateField::Modified,
+                        "dc:" => DateField::Created,
+                        _ => DateField::Accessed,
+                    };
+                    let (start, end) =
+                        crate::filters::parse_date(&text, &crate::filters::Clock::local())
+                            .map_err(|e| self.error(value_start, self.at, &e))?;
+                    Filter::Metadata(MetadataFilter::Date { field, start, end })
+                }
+                "attrib:" => Filter::Metadata(MetadataFilter::Attributes(
+                    crate::filters::parse_attributes(&text)
+                        .map_err(|e| self.error(value_start, self.at, &e))?,
+                )),
                 _ => Filter::Depth(text.parse().map_err(|_| {
                     self.error(value_start, self.at, "depth must be a nonnegative u32")
                 })?),

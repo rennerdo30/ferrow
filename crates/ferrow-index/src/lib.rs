@@ -96,6 +96,15 @@ impl Index {
     pub fn metadata(&self, id: u32) -> EntryMetadata {
         self.metadata.get(id)
     }
+    /// One metadata value without decoding the other columns (size in
+    /// bytes or a time in ticks); `None` when absent or not indexed.
+    pub fn metadata_value(&self, key: SortKey, id: u32) -> Option<i128> {
+        self.metadata.value(key, id)
+    }
+    /// Attribute bits of one entry; `None` when absent or not indexed.
+    pub fn attributes(&self, id: u32) -> Option<u32> {
+        self.metadata.attributes(id)
+    }
     /// Ready metadata order; `None` means the column was not indexed.
     pub fn metadata_order(&self, key: SortKey, descending: bool) -> Option<MetadataOrder<'_>> {
         self.metadata.order(key, descending)

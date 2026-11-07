@@ -101,7 +101,20 @@ term; for example `case:file:Report*`. Quote regex operators inside the query,
 such as `regex:"report|draft"`. `ext:txt;md` filters extensions,
 `parent:"/folder"` selects direct children by indexed path, and `depth:2`
 counts parent edges from an indexed root (depth zero). Paths use the native
-separator. Size, date and attribute filters are reserved for Part 2.
+separator.
+
+Metadata filters read the index's metadata columns:
+
+- `size:>10mb`, `size:<=1kb`, `size:1mb..5mb` (binary units b, kb, mb, gb, tb; files only);
+- `dm:` (modified), `dc:` (created), `da:` (accessed) with `today`, `yesterday`,
+  `thisweek`, `thismonth`, `thisyear`, rolling windows such as `last10minutes`,
+  `last2hours` or `last7days`, a date `2026-11-07`, comparisons `dm:>=2026-01-01`
+  and ranges `dm:2026-01-01..2026-01-31` (local time; open ends allowed);
+- `attrib:H`, `attrib:RS`: every listed attribute set (R H S D A T P L C O I E).
+
+`*.log dm:last10minutes` finds the log written a moment ago. An index built
+without a column (only size and modified are indexed by default) matches none
+of its filters; show the column in the app and rebuild.
 See [ADR 0004](docs/decisions/0004-query-language.md) for details and bounds.
 
 ## Background service (milestone 2, in progress)

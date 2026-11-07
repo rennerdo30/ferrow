@@ -20,7 +20,8 @@ fn precedence_modifiers_and_error_spans() {
         "folder:file:a",
         "ext:a;",
         "depth:-1",
-        "size:>10mb",
+        "size:>10zb",
+        "dm:someday",
         "regex:[",
     ] {
         let error = Query::parse(input).unwrap_err();

@@ -14,6 +14,7 @@ pub use ferrow_index::{SortKey, SortStatus};
 
 use rayon::prelude::*;
 
+mod filters;
 mod parser;
 pub use parser::{
     DateField, Expr, Filter, MetadataFilter, ParseError, Pattern, Query, RegexPlan, Term,
