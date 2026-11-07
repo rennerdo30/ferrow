@@ -309,8 +309,11 @@ fn unavailable_column_is_explicit_and_available_order_stops_early() {
         },
     );
     assert_eq!(result.sort_unavailable, Some(SortKey::Created));
+    // The scan admits one block per worker ahead of the completed prefix,
+    // so "stops early" needs more blocks than workers (32 threads locally).
+    let n = (20_000).max((rayon::current_num_threads() + 2) * ferrow_query::BLOCK) as i64;
     let b = IndexBuilder::with_columns(ColumnSet::MODIFIED);
-    for i in 0..20_000 {
+    for i in 0..n {
         b.add_with_metadata(
             ROOT_PARENT,
             b"hit",
@@ -340,7 +343,10 @@ fn unavailable_column_is_explicit_and_available_order_stops_early() {
             ..SearchOptions::default()
         },
     );
-    assert_eq!(result.hits, (19_990..20_000).rev().collect::<Vec<_>>());
+    assert_eq!(
+        result.hits,
+        (n as u32 - 10..n as u32).rev().collect::<Vec<_>>()
+    );
     assert!(result.visited < index.len());
 }
 

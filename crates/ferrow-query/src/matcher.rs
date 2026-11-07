@@ -203,12 +203,42 @@ thread_local! { static COMPACT_PLAN: std::cell::Cell<Option<bool>> = const { std
 pub fn take_compact_plan_for_test() -> Option<bool> {
     COMPACT_PLAN.with(|plan| plan.take())
 }
+fn metadata(filter: &MetadataFilter, index: &Index, id: u32) -> bool {
+    match filter {
+        MetadataFilter::Size { min, max } => {
+            index.flags(id) & flags::DIR == 0
+                && index.metadata_value(SortKey::Size, id).is_some_and(|v| {
+                    min.is_none_or(|m| v >= i128::from(m)) && max.is_none_or(|m| v <= i128::from(m))
+                })
+        }
+        MetadataFilter::Date { field, start, end } => {
+            let key = match field {
+                DateField::Modified => SortKey::Modified,
+                DateField::Created => SortKey::Created,
+                DateField::Accessed => SortKey::Accessed,
+            };
+            index.metadata_value(key, id).is_some_and(|v| {
+                start.is_none_or(|s| v >= i128::from(s)) && end.is_none_or(|e| v < i128::from(e))
+            })
+        }
+        MetadataFilter::Attributes(all) => index.attributes(id).is_some_and(|a| a & all == *all),
+    }
+}
 pub(crate) trait EntryMatcher: Sync {
     const CANCELLABLE_TERM: bool;
     fn candidates<'a>(&self, index: &'a Index) -> &'a [u32] {
         index.sorted()
     }
     fn matches(&self, index: &Index, id: u32, scratch: &mut Scratch, cancel: &CancelToken) -> bool;
+    /// Whether the query has conjuncts that read only metadata columns.
+    fn has_prefilter(&self) -> bool {
+        false
+    }
+    /// Those conjuncts alone: a necessary condition for `matches`. Reads
+    /// only the id-ordered metadata columns, so an id-order pass is cheap.
+    fn prefilter(&self, _index: &Index, _id: u32) -> bool {
+        true
+    }
 }
 pub(crate) struct PlainMatcher {
     // Preserve main's compact layout and exact memmem loop.
@@ -269,6 +299,8 @@ impl Matcher {
 pub(crate) struct GeneralMatcher {
     terms: Vec<Prepared>,
     expression: Option<Expr>,
+    /// Top-level conjuncts that are (possibly negated) metadata filters.
+    prefilter: Vec<Expr>,
 }
 impl EntryMatcher for GeneralMatcher {
     const CANCELLABLE_TERM: bool = true;
@@ -280,6 +312,14 @@ impl EntryMatcher for GeneralMatcher {
         self.expression
             .as_ref()
             .is_none_or(|e| self.eval(e, index, id, scratch, cancel))
+    }
+    fn has_prefilter(&self) -> bool {
+        !self.prefilter.is_empty()
+    }
+    fn prefilter(&self, index: &Index, id: u32) -> bool {
+        self.prefilter
+            .iter()
+            .all(|e| self.metadata_eval(e, index, id))
     }
 }
 impl GeneralMatcher {
@@ -367,13 +407,49 @@ impl GeneralMatcher {
                 _ => (),
             }
         }
+        fn metadata_only(expr: &Expr, terms: &[Term]) -> bool {
+            match expr {
+                Expr::Term(i) => matches!(terms[*i].pattern, Pattern::Filter(Filter::Metadata(_))),
+                Expr::Not(e) => metadata_only(e, terms),
+                _ => false,
+            }
+        }
         let mut expression = query.expression.clone();
         if let Some(e) = &mut expression {
             order(e, &query.terms);
         }
+        let prefilter = match &expression {
+            Some(Expr::And(v)) => v
+                .iter()
+                .filter(|e| metadata_only(e, &query.terms))
+                .cloned()
+                .collect(),
+            Some(e) if metadata_only(e, &query.terms) => vec![e.clone()],
+            _ => Vec::new(),
+        };
         Self {
             terms: query.terms.iter().map(Prepared::new).collect(),
             expression,
+            prefilter,
+        }
+    }
+    /// `eval` for a (possibly negated) metadata filter term; no scratch.
+    fn metadata_eval(&self, expr: &Expr, index: &Index, id: u32) -> bool {
+        match expr {
+            Expr::Not(e) => !self.metadata_eval(e, index, id),
+            Expr::Term(i) => {
+                let p = &self.terms[*i];
+                let Pattern::Filter(Filter::Metadata(filter)) = &p.term.pattern else {
+                    unreachable!("prefilter holds metadata filters only")
+                };
+                let found = p
+                    .term
+                    .directory
+                    .is_none_or(|d| d == (index.flags(id) & flags::DIR != 0))
+                    && metadata(filter, index, id);
+                found != p.term.negated
+            }
+            _ => unreachable!("prefilter holds metadata filters only"),
         }
     }
     fn eval(
@@ -409,29 +485,7 @@ impl GeneralMatcher {
     ) -> bool {
         match &p.term.pattern {
             Pattern::EntryType => true,
-            Pattern::Filter(Filter::Metadata(filter)) => match filter {
-                MetadataFilter::Size { min, max } => {
-                    index.flags(id) & flags::DIR == 0
-                        && index.metadata_value(SortKey::Size, id).is_some_and(|v| {
-                            min.is_none_or(|m| v >= i128::from(m))
-                                && max.is_none_or(|m| v <= i128::from(m))
-                        })
-                }
-                MetadataFilter::Date { field, start, end } => {
-                    let key = match field {
-                        DateField::Modified => SortKey::Modified,
-                        DateField::Created => SortKey::Created,
-                        DateField::Accessed => SortKey::Accessed,
-                    };
-                    index.metadata_value(key, id).is_some_and(|v| {
-                        start.is_none_or(|s| v >= i128::from(s))
-                            && end.is_none_or(|e| v < i128::from(e))
-                    })
-                }
-                MetadataFilter::Attributes(all) => {
-                    index.attributes(id).is_some_and(|a| a & all == *all)
-                }
-            },
+            Pattern::Filter(Filter::Metadata(filter)) => metadata(filter, index, id),
             Pattern::Filter(Filter::Extension(_)) => {
                 let name = if p.term.case_sensitive {
                     index.name(id)
