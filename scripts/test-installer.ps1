@@ -37,7 +37,7 @@ function Invoke-Bounded([string]$File, [string[]]$Arguments, [int]$Seconds = 180
 
 # Fresh install.
 Assert ((Invoke-Bounded $Setup @('/S')) -eq 0) 'silent install exits 0'
-foreach ($file in 'ferrow-gui.exe', 'ferrow.exe', 'ferrowd.exe', 'ferrow-update.exe', 'ferrow.ico', 'LICENSE.txt', 'uninstall.exe', 'install-manifest.txt', 'service/ferrowd.exe') {
+foreach ($file in 'ferrow-gui.exe', 'ferrow.exe', 'ferrowd.exe', 'ferrow-update.exe', 'ferrow_winsearch.dll', 'ferrow.ico', 'LICENSE.txt', 'uninstall.exe', 'install-manifest.txt', 'service/ferrowd.exe') {
     Assert (Test-Path -LiteralPath (Join-Path $dir $file)) "installed $file"
 }
 $service = Get-CimInstance Win32_Service -Filter "Name='ferrowd'"

@@ -124,7 +124,7 @@ jobs:
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Release build
-        run: cargo build --release --locked -p ferrow-gui -p ferrow -p ferrowd -p ferrow-update
+        run: cargo build --release --locked -p ferrow-gui -p ferrow -p ferrowd -p ferrow-update -p ferrow-winsearch
       - name: Package the setup (pinned NSIS)
         shell: pwsh
         run: |

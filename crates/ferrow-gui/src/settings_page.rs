@@ -265,6 +265,7 @@ impl FerrowApp {
             });
         });
 
+        let mut winsearch_changed = false;
         if cfg!(windows) {
             ui.add_space(SECTION_GAP);
             section_title(ui, &p, "Windows");
@@ -289,6 +290,23 @@ impl FerrowApp {
                     row_text(
                         ui,
                         &p,
+                        "Power Windows Search with Ferrow",
+                        "Use Ferrow's index to answer file and folder searches in the Windows Start menu.",
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if toggle(ui, &p, &mut self.settings.windows.windows_search).changed() {
+                            changed = true;
+                            winsearch_changed = true;
+                        }
+                    });
+                });
+            });
+            ui.add_space(CARD_GAP);
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    row_text(
+                        ui,
+                        &p,
                         "Fast NTFS index and live updates",
                         "Reads the NTFS file table and change journal through the background service. Coming in a later version.",
                     );
@@ -302,6 +320,9 @@ impl FerrowApp {
 
         if changed {
             self.save_settings();
+        }
+        if winsearch_changed {
+            self.sync_windows_search();
         }
         if let Some(err) = &self.settings_error {
             ui.add_space(6.0);

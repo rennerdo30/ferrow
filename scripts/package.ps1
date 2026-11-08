@@ -50,11 +50,11 @@ function Invoke-Bounded([string]$File, [string[]]$Arguments, [int]$Seconds) {
     } finally { $process.Dispose() }
 }
 
-$programs = 'ferrow-gui.exe', 'ferrow.exe', 'ferrowd.exe', 'ferrow-update.exe'
+$programs = 'ferrow-gui.exe', 'ferrow.exe', 'ferrowd.exe', 'ferrow-update.exe', 'ferrow_winsearch.dll'
 if (!$BinDir) {
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
     $cargo = (Get-Command cargo -ErrorAction Stop).Source
-    Invoke-Bounded $cargo @('build', '--release', '--locked', '-j', '8', '-p', 'ferrow-gui', '-p', 'ferrow', '-p', 'ferrowd', '-p', 'ferrow-update') 3600
+    Invoke-Bounded $cargo @('build', '--release', '--locked', '-j', '8', '-p', 'ferrow-gui', '-p', 'ferrow', '-p', 'ferrowd', '-p', 'ferrow-update', '-p', 'ferrow-winsearch') 3600
     $BinDir = Join-Path $target 'release'
 }
 foreach ($program in $programs) {
@@ -72,15 +72,15 @@ Copy-Item -LiteralPath (Join-Path $root 'installer/art/ferrow.ico') -Destination
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
 
 # Exact payload list for uninstall, and a lock check for every file setup
-# replaces. ferrow-update.exe is skipped: it runs setup during in-app updates,
-# so setup moves it aside instead (MoveAsideRunning in ferrow.nsi).
+# replaces. ferrow-update.exe and ferrow_winsearch.dll are skipped: setup
+# moves them aside instead (MoveAsideRunning in ferrow.nsi).
 function Quote-Nsis([string]$Value) { $Value.Replace('$', '$$').Replace('"', '$\"') }
 $manifest = [Collections.Generic.List[string]]::new()
 $preflight = [Collections.Generic.List[string]]::new()
 foreach ($file in Get-ChildItem -LiteralPath $stage -File -Recurse) {
     $relative = Quote-Nsis ([IO.Path]::GetRelativePath($stage, $file.FullName))
     $manifest.Add('FileWrite $8 "F|' + $relative + '$\r$\n"')
-    if ($relative -eq 'ferrow-update.exe') { continue }
+    if ($relative -in 'ferrow-update.exe', 'ferrow_winsearch.dll') { continue }
     $preflight.Add('${If} ${FileExists} "$INSTDIR\' + $relative + '"')
     $preflight.Add('ClearErrors')
     $preflight.Add('FileOpen $7 "$INSTDIR\' + $relative + '" a')
