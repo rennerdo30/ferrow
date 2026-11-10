@@ -106,6 +106,36 @@ mod windows_tests {
 
     const DIALECT: GUID = GUID::from_u128(0xc8b521fb_5cf3_11ce_ade5_00aa0044773d);
 
+    /// COM tests share process-wide state (the vtable hook, the active
+    /// index, pooled test-thread apartments): run them one at a time.
+    static COM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn com_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        match COM_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Balanced COM init: uninitialize only when this call actually
+    /// initialized (S_OK/S_FALSE), never after RPC_E_CHANGED_MODE.
+    struct ComGuard(bool);
+
+    fn com_init() -> ComGuard {
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        ComGuard(hr.is_ok())
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
     fn execute_sql(command: &ICommandText, sql: &str) -> Result<IRowset> {
         unsafe {
             let text: Vec<u16> = sql.encode_utf16().chain(Some(0)).collect();
@@ -145,9 +175,8 @@ mod windows_tests {
 
     #[test]
     fn vtable_hook_routes_when_enabled_and_restores_when_disabled() -> Result<()> {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        }
+        let _lock = com_test_lock();
+        let _com = com_init();
         let temp_dir =
             std::env::temp_dir().join(format!("ferrow-winsearch-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -183,9 +212,6 @@ mod windows_tests {
             eprintln!("skipping: native Windows Search catalog unavailable here");
             set_active_index(None);
             let _ = std::fs::remove_dir_all(&temp_dir);
-            unsafe {
-                CoUninitialize();
-            }
             return Ok(());
         };
 
@@ -210,9 +236,6 @@ mod windows_tests {
         drop(command);
         set_active_index(None);
         let _ = std::fs::remove_dir_all(&temp_dir);
-        unsafe {
-            CoUninitialize();
-        }
         Ok(())
     }
 
@@ -221,9 +244,8 @@ mod windows_tests {
     /// runners where Windows Search itself never answers.
     #[test]
     fn rowset_contract_without_native_catalog() -> Result<()> {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        }
+        let _lock = com_test_lock();
+        let _com = com_init();
         let columns: Vec<String> = rowset::DEFAULT_COLUMNS
             .iter()
             .map(|(name, _, _)| (*name).to_owned())
@@ -239,9 +261,6 @@ mod windows_tests {
         let rows = rowset::build_for_hits(&columns, hits)?;
         rowset::verify_rowset(&rows, "ferrow-native-query-proof.txt")?;
         drop(rows);
-        unsafe {
-            CoUninitialize();
-        }
         Ok(())
     }
 }
