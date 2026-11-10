@@ -17,6 +17,7 @@ use ferrow_index::osname::name_to_bytes;
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, metadata_timestamp};
 
 mod identity;
+pub mod ntfs;
 
 use identity::{FileId, file_id};
 
@@ -33,6 +34,10 @@ pub struct WalkOptions {
     pub excludes: Vec<PathBuf>,
     /// Descend into symlinked directories. Off by default.
     pub follow_symlinks: bool,
+    /// Read NTFS volumes' master file table directly when possible
+    /// (needs administrator rights; seconds instead of minutes). Roots
+    /// it cannot serve are walked. Off by default.
+    pub fast_ntfs: bool,
 }
 
 /// Outcome of a scan.
@@ -661,6 +666,19 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         }
     }
 
+    // Fast path: roots on NTFS volumes are filled from the volume's MFT
+    // when it can be read (administrator or SYSTEM); the rest are walked.
+    let mut modes: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    let root_dirs = if options.follow_symlinks || !options.fast_ntfs {
+        root_dirs
+    } else {
+        scan_from_mft(root_dirs, &walker, &mut modes)
+    };
+    if !root_dirs.is_empty() {
+        modes.push("parallel read_dir".to_string());
+    }
+
     rayon::scope(|scope| {
         for (dir, id, identity) in root_dirs {
             let ancestors = if walker.follow_symlinks {
@@ -679,8 +697,11 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
 
     let entries = builder.len();
     let index = builder.freeze();
+    if modes.is_empty() {
+        modes.push("parallel read_dir".to_string());
+    }
     let report = ScanReport {
-        mode: "parallel read_dir".to_string(),
+        mode: modes.join(" + "),
         threads: rayon::current_num_threads(),
         entries,
         errors: errors.count.load(Ordering::Relaxed),
@@ -689,6 +710,166 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         elapsed: started.elapsed(),
     };
     (index, report)
+}
+
+/// Fill every root on a readable NTFS volume from its MFT (one read per
+/// volume) and return the roots that still need the directory walk.
+#[cfg(windows)]
+fn scan_from_mft(
+    root_dirs: Vec<(PathBuf, u32, Option<FileId>)>,
+    walker: &Walker<'_>,
+    modes: &mut Vec<String>,
+) -> Vec<(PathBuf, u32, Option<FileId>)> {
+    let mut pending: Vec<(PathBuf, u32, Option<FileId>)> = root_dirs;
+    let mut walk = Vec::new();
+    while let Some((dir, id, identity)) = pending.pop() {
+        let started = Instant::now();
+        let (device, volume) = match ntfs::read_volume(&dir) {
+            Ok(v) => v,
+            Err(reason) => {
+                modes.push(format!("walk {} ({reason})", dir.display()));
+                walk.push((dir, id, identity));
+                continue;
+            }
+        };
+        let read = started.elapsed();
+        // Every other pending root on the same volume reuses this read.
+        let mut here = vec![(dir, id, identity)];
+        let mut rest = Vec::new();
+        for root in pending.drain(..) {
+            if ntfs_device_of(&root.0).as_deref() == Some(device.as_str()) {
+                here.push(root);
+            } else {
+                rest.push(root);
+            }
+        }
+        pending = rest;
+        let mut entries = 0usize;
+        for (dir, id, identity) in here {
+            let identity = match identity.map(Ok).unwrap_or_else(|| file_id(&dir)) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    walker.errors.add(format!("{}: {e}", dir.display()));
+                    walk.push((dir, id, None));
+                    continue;
+                }
+            };
+            if identity.kind != 1 || identity.volume != volume.serial {
+                walk.push((dir, id, Some(identity)));
+                continue;
+            }
+            let record = (identity.id as u64) & 0x0000_FFFF_FFFF_FFFF;
+            if volume.info(record).is_none() {
+                walk.push((dir, id, Some(identity)));
+                continue;
+            }
+            entries += emit_mft_subtree(&volume, record, id, &dir, walker);
+        }
+        modes.push(format!(
+            "mft {device} ({} records read in {:.2} s, {entries} entries)",
+            volume.infos.len(),
+            read.as_secs_f64()
+        ));
+    }
+    walk
+}
+
+#[cfg(windows)]
+fn ntfs_device_of(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut mount = [0u16; 1024];
+    let mut guid = [0u16; 128];
+    // SAFETY: NUL-terminated inputs; outputs and their lengths match.
+    let ok = unsafe {
+        GetVolumePathNameW(path_w.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) != 0
+            && GetVolumeNameForVolumeMountPointW(
+                mount.as_ptr(),
+                guid.as_mut_ptr(),
+                guid.len() as u32,
+            ) != 0
+    };
+    if !ok {
+        return None;
+    }
+    let len = guid.iter().position(|&c| c == 0).unwrap_or(0);
+    let mut device = String::from_utf16_lossy(&guid[..len]);
+    while device.ends_with('\\') {
+        device.pop();
+    }
+    Some(device)
+}
+
+/// Add everything below directory `record` (already added as `root_id`)
+/// to the builder, applying excludes like the walk does. Returns the
+/// number of entries added.
+#[cfg(windows)]
+fn emit_mft_subtree(
+    volume: &ntfs::Volume,
+    record: u64,
+    root_id: u32,
+    root_path: &Path,
+    walker: &Walker<'_>,
+) -> usize {
+    let excluding = !walker.excludes.is_empty();
+    let mut added = 0usize;
+    // Paths are only needed to resolve link targets against excludes.
+    let mut stack: Vec<(u64, u32, Option<PathBuf>)> =
+        vec![(record, root_id, excluding.then(|| root_path.to_path_buf()))];
+    while let Some((dir, dir_id, dir_path)) = stack.pop() {
+        for (name, bytes) in volume.children(dir) {
+            let Some(info) = volume.info(name.record) else {
+                continue;
+            };
+            let surrogate = info.is_name_surrogate();
+            let is_dir = info.is_dir && !surrogate;
+            let mut ent_flags = 0u16;
+            if is_dir {
+                ent_flags |= flags::DIR;
+            }
+            if surrogate {
+                ent_flags |= flags::SYMLINK;
+            }
+            if info.attributes & 0x2 != 0 {
+                ent_flags |= flags::HIDDEN;
+            }
+            let child_path = dir_path
+                .as_ref()
+                .map(|p| p.join(ferrow_index::osname::bytes_to_os(bytes)));
+            if excluding {
+                let identity = FileId {
+                    kind: 1,
+                    volume: volume.serial,
+                    id: (name.record | (info.sequence as u64) << 48) as u128,
+                };
+                let skip = if is_dir {
+                    walker.excludes.dirs.contains(&identity)
+                } else if surrogate {
+                    let path = child_path.as_deref().expect("paths kept while excluding");
+                    walker.candidate_excluded(path, false, true, None).0
+                } else {
+                    walker.excludes.files.contains(&identity)
+                };
+                if skip {
+                    continue;
+                }
+            }
+            let id = walker.builder.add_with_metadata(
+                dir_id,
+                bytes,
+                ent_flags,
+                info.metadata(walker.columns),
+            );
+            added += 1;
+            if is_dir {
+                stack.push((name.record, id, child_path));
+            }
+        }
+    }
+    added
 }
 
 #[cfg(test)]
@@ -847,6 +1028,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
+            fast_ntfs: false,
         });
         assert_eq!(report.errors, 0, "{:?}", report.error_samples);
         assert!(
@@ -859,6 +1041,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
+            fast_ntfs: false,
         });
         assert!(
             !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
@@ -878,6 +1061,7 @@ mod tests {
             roots: vec![link.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
+            fast_ntfs: false,
         });
         assert!(
             !(0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
@@ -892,6 +1076,7 @@ mod tests {
             roots: vec![link],
             follow_symlinks: true,
             excludes: Vec::new(),
+            fast_ntfs: false,
         });
         assert!(
             (0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
@@ -910,6 +1095,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
+            fast_ntfs: false,
         });
         // root, f.txt, a, g.txt, loop — the loop is a leaf, never descended.
         assert_eq!(idx.len(), 5, "cycle was not bounded");
@@ -925,6 +1111,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
+            fast_ntfs: false,
         });
         assert!(
             idx.is_empty(),
@@ -942,6 +1129,7 @@ mod tests {
             roots: vec![dir.0.join("sub")],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
+            fast_ntfs: false,
         });
         assert!(
             idx.is_empty(),
@@ -962,6 +1150,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("KEEPDIR")],
             follow_symlinks: false,
+            fast_ntfs: false,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -981,6 +1170,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("skip")],
             follow_symlinks: false,
+            fast_ntfs: false,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1002,6 +1192,7 @@ mod tests {
                 roots: vec![root],
                 excludes: vec![exclude],
                 follow_symlinks: false,
+                fast_ntfs: false,
             });
             assert!(
                 idx.is_empty(),
@@ -1042,6 +1233,7 @@ mod tests {
                     roots: vec![scan_root],
                     excludes: vec![exclude],
                     follow_symlinks: false,
+                    fast_ntfs: false,
                 });
                 assert!(
                     idx.is_empty(),
@@ -1061,6 +1253,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("no-such-exclude")],
             follow_symlinks: false,
+            fast_ntfs: false,
         });
         assert!(by_name(&idx).contains_key("keep.txt"));
         assert_eq!(report.fatal_error, None, "missing exclude must not abort");
@@ -1083,6 +1276,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("secret.txt")],
             follow_symlinks: false,
+            fast_ntfs: false,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1162,6 +1356,7 @@ mod tests {
                 roots: vec![fx.root.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
+                fast_ntfs: false,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1185,6 +1380,7 @@ mod tests {
                 roots: vec![fx.aliases.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
+                fast_ntfs: false,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1213,6 +1409,7 @@ mod tests {
                 roots: vec![root_dir.0.clone()],
                 excludes: vec![exclude.clone()],
                 follow_symlinks: follow,
+                fast_ntfs: false,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1237,6 +1434,7 @@ mod tests {
                     roots: vec![root.clone()],
                     excludes: vec![fx.exclude.clone()],
                     follow_symlinks: follow,
+                    fast_ntfs: false,
                 });
                 assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
                 assert_eq!(idx.len(), 1, "follow={follow}");
@@ -1278,6 +1476,7 @@ mod tests {
                     roots: vec![root.clone()],
                     excludes: excludes.clone(),
                     follow_symlinks: follow,
+                    fast_ntfs: false,
                 });
                 assert_eq!(
                     report.errors, 0,
@@ -1291,6 +1490,7 @@ mod tests {
                         roots: vec![scan_root.clone()],
                         excludes: excludes.clone(),
                         follow_symlinks: follow,
+                        fast_ntfs: false,
                     });
                     assert_eq!(
                         report.errors, 1,
@@ -1355,6 +1555,7 @@ mod tests {
                 roots: vec![root.clone()],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
+                fast_ntfs: false,
             });
             assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
             assert_eq!(idx.len(), 1, "follow={follow}: control");
@@ -1364,6 +1565,7 @@ mod tests {
                 roots: vec![root],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
+                fast_ntfs: false,
             });
             assert_eq!(report.errors, 1, "follow={follow}: {report:?}");
             assert!(
@@ -1401,6 +1603,7 @@ mod tests {
                 roots: vec![root.0.clone()],
                 excludes: vec![exclude],
                 follow_symlinks: true,
+                fast_ntfs: false,
             });
             assert!(
                 !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),

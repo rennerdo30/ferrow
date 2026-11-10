@@ -320,6 +320,7 @@ fn cmd_index(args: Args) -> Result<(), String> {
             .collect(),
         excludes: args.excludes,
         follow_symlinks: args.follow_symlinks,
+        fast_ntfs: true,
     });
     println!("{}", report.summary());
     for sample in &report.error_samples {

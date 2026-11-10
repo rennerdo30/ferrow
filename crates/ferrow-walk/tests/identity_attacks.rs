@@ -146,6 +146,7 @@ fn excludes_support_long_paths_that_std_can_scan() {
                     roots: vec![scan_root.clone()],
                     excludes: vec![exclude.clone()],
                     follow_symlinks: follow,
+                    fast_ntfs: false,
                 });
                 if !index.is_empty() || report.errors != 0 {
                     failures.push(format!("root={scan_root:?}, exclude={exclude:?}, follow={follow}: {} entries, {report:?}", index.len()));
@@ -165,6 +166,7 @@ fn excludes_support_long_paths_that_std_can_scan() {
             roots: vec![scan_root.clone()],
             excludes: vec![],
             follow_symlinks: true,
+            fast_ntfs: false,
         });
         if index.len() != expected
             || report.errors != 1
@@ -210,6 +212,7 @@ fn explicitly_excluded_directory_symlink_is_absent_with_following_off() {
                 roots: vec![root.clone()],
                 excludes: vec![exclude.clone()],
                 follow_symlinks: follow,
+                fast_ntfs: false,
             });
             if index.len() != 1 || report.errors != 0 {
                 failures.push(format!(
@@ -314,6 +317,7 @@ fn file_alias_checks_resolved_parent_even_after_hardlink_root() {
         roots: vec![keep.clone(), alias],
         excludes: vec![private],
         follow_symlinks: false,
+        fast_ntfs: false,
     });
     assert_eq!(report.errors, 0, "{report:?}");
     assert_eq!(index.len(), 1);

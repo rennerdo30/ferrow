@@ -95,6 +95,7 @@ pub fn run(root: &Path, excludes: Vec<PathBuf>, follow: bool) -> ferrow_index::I
         roots: vec![root.to_path_buf()],
         excludes,
         follow_symlinks: follow,
+        fast_ntfs: false,
     });
     assert_eq!(report.errors, 0, "{report:?}");
     index
