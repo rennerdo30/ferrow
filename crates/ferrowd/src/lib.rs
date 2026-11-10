@@ -396,7 +396,7 @@ fn handle_authorized_cancel(
     cancel: CancelToken,
 ) -> Vec<Response> {
     let allowed = if system {
-        caller.is_system_administrator()
+        caller.is_admin_account()
     } else {
         #[cfg(windows)]
         {
@@ -411,7 +411,7 @@ fn handle_authorized_cancel(
     };
     if !allowed {
         return vec![Response::Error { code: ErrorCode::Unauthorized,
-            msg: "per-user visibility not yet available; system access requires SYSTEM/Administrators or root; development access requires its owner".into() }];
+            msg: "per-user visibility not yet available; the system service answers SYSTEM, accounts in the Administrators group (not sandboxed) or root; development access requires its owner".into() }];
     }
     handle_cancel(store, request, cancel)
 }
