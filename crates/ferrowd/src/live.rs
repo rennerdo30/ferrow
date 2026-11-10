@@ -635,7 +635,7 @@ mod tests {
     /// root(5)/Docs(20)/a.txt(21), root/b.txt(22)
     fn fixture() -> (Arc<Index>, VolumeMap) {
         let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
-        let root = b.add_root(b"C:\\", flags::DIR);
+        let root = b.add_root(b"C:", flags::DIR);
         let docs = b.add_with_metadata(
             root,
             b"Docs",
@@ -706,7 +706,7 @@ mod tests {
             out.extend(
                 r.hits
                     .iter()
-                    .map(|&id| index.path(id).to_string_lossy().into_owned()),
+                    .map(|&id| index.path(id).to_string_lossy().replace('/', "\\")),
             );
             let (n, _) = ferrow_query::count_allowed(index, &q, &CancelToken::new(), Some(allowed));
             assert_eq!(n, r.hits.len());
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(r, Applied::default());
         assert_eq!(
             paths(&base, &live.view()),
-            ["C:\\", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\b.txt"]
+            ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\b.txt"]
         );
     }
 
@@ -754,7 +754,7 @@ mod tests {
         let view = live.view();
         assert_eq!(
             paths(&base, &view),
-            ["C:\\", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\Docs\\new.txt"]
+            ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\Docs\\new.txt"]
         );
         let q = Query::parse("size:100").unwrap();
         let hit = ferrow_query::search(
@@ -771,7 +771,7 @@ mod tests {
         live.apply(&[change(40, false)], &f);
         assert_eq!(
             paths(&base, &live.view()),
-            ["C:\\", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\moved.txt"]
+            ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\moved.txt"]
         );
     }
 
@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(view.delta.len(), 0, "no copies for a folder's own dates");
         assert_eq!(
             paths(&base, &view),
-            ["C:\\", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\b.txt"]
+            ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\b.txt"]
         );
     }
 
@@ -808,7 +808,7 @@ mod tests {
         live.apply(&[change(20, false)], &f);
         assert_eq!(
             paths(&base, &live.view()),
-            ["C:\\", "C:\\Papers", "C:\\Papers\\a.txt", "C:\\b.txt"]
+            ["C:", "C:\\Papers", "C:\\Papers\\a.txt", "C:\\b.txt"]
         );
         // The moved child is still tracked by its record.
         f.set(21, file_info(5), &[(20, "a2.txt")]);
@@ -817,7 +817,7 @@ mod tests {
         assert_eq!(
             paths(&base, &live.view()),
             [
-                "C:\\",
+                "C:",
                 "C:\\Papers",
                 "C:\\Papers\\a2.txt",
                 "C:\\Papers\\fresh.txt",
@@ -827,7 +827,7 @@ mod tests {
         // Deleting the folder hides everything below it.
         f.0.remove(&20);
         live.apply(&[change(20, false)], &f);
-        assert_eq!(paths(&base, &live.view()), ["C:\\", "C:\\b.txt"]);
+        assert_eq!(paths(&base, &live.view()), ["C:", "C:\\b.txt"]);
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(
             paths(&base, &live.view()),
             [
-                "C:\\",
+                "C:",
                 "C:\\Docs",
                 "C:\\Docs\\a.txt",
                 "C:\\NewDir",
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(r.changed, 1);
         assert_eq!(
             paths(&base, &live.view()),
-            ["C:\\", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\b.txt"]
+            ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\b.txt"]
         );
         f.0.remove(&5);
         live.apply(&[change(5, false)], &f);
@@ -898,7 +898,7 @@ mod tests {
         assert_eq!(
             paths(&base, &live.view()),
             [
-                "C:\\",
+                "C:",
                 "C:\\Docs",
                 "C:\\Docs\\a.txt",
                 "C:\\Docs\\b-link.txt",
@@ -909,12 +909,7 @@ mod tests {
         live.apply(&[change(22, false)], &f);
         assert_eq!(
             paths(&base, &live.view()),
-            [
-                "C:\\",
-                "C:\\Docs",
-                "C:\\Docs\\a.txt",
-                "C:\\Docs\\b-link.txt"
-            ]
+            ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\Docs\\b-link.txt"]
         );
     }
 }
