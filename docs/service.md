@@ -6,8 +6,33 @@ local, access-controlled IPC channel (crate `ferrow-ipc`). The CLI
 rights to read every directory (and, in later milestones, the
 Windows MFT/USN journal).
 
+## Indexing on Windows: MFT and live updates
+
+- **What it indexes.** Without roots on its command line, the system
+  service indexes every local fixed drive (drive letters that are only
+  `subst` aliases are skipped). `ferrow service install <folders…>`
+  limits it to the given roots.
+- **Fast scan.** A root that is a whole NTFS volume is read from the
+  volume's master file table in one sequential, unbuffered pass: names,
+  folders, sizes, dates and attributes for millions of files in seconds
+  on an SSD. Folder roots, other file systems and processes without raw
+  volume access fall back to the parallel directory walk.
+- **Live updates.** After the scan, one thread per NTFS volume sleeps
+  inside the change journal read until the volume changes (no polling;
+  0 % CPU while nothing changes). Changes are applied in 200 ms batches
+  and searches see them within a second. The frozen index is never
+  rebuilt for a change: replaced entries are hidden, new ones live in a
+  small second index, and a background rescan folds them in once that
+  grows large or the journal is reset.
+- **Start.** The service answers from its saved index at once (or an
+  empty one on first start) while the first scan runs.
+
 ## Modes
 
+- **The app.** When the system service answers (an administrator
+  account; see the access rule below), the Ferrow app searches through
+  it, loads further rows while scrolling and refreshes its results on
+  live changes. Otherwise it keeps its own index.
 - **Service mode (default when reachable).** `ferrow search`
   connects to the daemon and streams results from it.
 - **In-process fallback.** When no daemon answers — or when

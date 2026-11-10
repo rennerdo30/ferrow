@@ -469,10 +469,10 @@ Function OptionsPage
   !insertmacro MUI_HEADER_TEXT "Ferrow options" "What Ferrow installs."
   nsDialogs::Create 1018
   Pop $0
-  ${NSD_CreateCheckbox} 0 0 100% 14u "Install the Ferrow index service"
+  ${NSD_CreateCheckbox} 0 0 100% 14u "Install the Ferrow index service (recommended)"
   Pop $ServiceBox
   ${NSD_SetState} $ServiceBox $WantService
-  ${NSD_CreateLabel} 12u 15u -12u 44u "A Windows service named ferrowd runs as SYSTEM and starts with Windows. It keeps a file index that the ferrow command line searches; its index is readable by administrators only. The Ferrow app keeps its own index in your profile, so the app works with or without it."
+  ${NSD_CreateLabel} 12u 15u -12u 44u "A Windows service named ferrowd runs as SYSTEM and starts with Windows. It indexes all your internal drives in seconds and keeps the index current as files change, so you never rebuild. The Ferrow app and the ferrow command line use it for administrator accounts. Without it, the app keeps a slower index of its own."
   Pop $0
   ${NSD_CreateLabel} 0 70u 100% 24u "Installs to $INSTDIR. Setup changes nothing in your profile; Ferrow's own settings stay where they are."
   Pop $0
