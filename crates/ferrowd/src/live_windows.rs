@@ -46,7 +46,13 @@ impl RecordSource for Volumes {
 pub fn start(store: SnapshotStore, options: WalkOptions) {
     // Without raw volume access (not elevated) there is nothing live to
     // keep; the initial walk stands.
-    if !options.roots.iter().any(|r| ntfs::can_read_volume(r)) {
+    let fast = |root: &std::path::Path| {
+        (options.ntfs == ferrow_walk::NtfsMode::AllRoots
+            || (options.ntfs == ferrow_walk::NtfsMode::VolumeRoots
+                && ferrow_walk::is_volume_root(root)))
+            && ntfs::can_read_volume(root)
+    };
+    if !options.roots.iter().any(|r| fast(r)) {
         return;
     }
     let spawned = std::thread::Builder::new()

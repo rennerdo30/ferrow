@@ -57,7 +57,7 @@ fn file_changes_appear_in_searches_within_a_second() {
         &store,
         WalkOptions {
             roots: vec![dir.clone()],
-            fast_ntfs: true,
+            ntfs: ferrow_walk::NtfsMode::AllRoots,
             ..WalkOptions::default()
         },
     );

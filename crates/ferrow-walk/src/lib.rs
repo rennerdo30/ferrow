@@ -845,7 +845,7 @@ fn scan_from_mft(
 
 /// Whether `path` is the root of a volume (a drive or a mounted volume).
 #[cfg(windows)]
-fn is_volume_root(path: &Path) -> bool {
+pub fn is_volume_root(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
     let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

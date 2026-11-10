@@ -644,7 +644,7 @@ pub fn serve(
                 roots: config.roots.clone(),
                 excludes: config.excludes.clone(),
                 follow_symlinks: config.follow_symlinks,
-                fast_ntfs: true,
+                ntfs: ferrow_walk::NtfsMode::VolumeRoots,
             },
         );
     }
