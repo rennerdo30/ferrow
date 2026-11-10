@@ -166,7 +166,7 @@ pub fn attach_in_process(data_dir: PathBuf) -> Result<()> {
         .lock()
         .map_err(|_| Error::from_hresult(E_FAIL))?;
     if let Ok(mut slot) = data_dir_slot().lock() {
-        *slot = Some(data_dir);
+        *slot = Some(data_dir.clone());
     }
 
     unsafe {
@@ -175,6 +175,11 @@ pub fn attach_in_process(data_dir: PathBuf) -> Result<()> {
         let res = install_vtable_hook();
         if initialized_com {
             CoUninitialize();
+        }
+        if res.is_ok() {
+            // Warm the closed-app index cache in the background so the
+            // query path never loads from disk synchronously.
+            ipc::preload_disk_index(&data_dir);
         }
         res
     }

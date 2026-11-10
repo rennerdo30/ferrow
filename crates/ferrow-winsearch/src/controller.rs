@@ -21,12 +21,14 @@ use windows::Win32::Foundation::{
     HLOCAL, HMODULE, LocalFree, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_W,
+    ConvertSidToStringSidW, ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS,
+    GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+    TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR, PSID,
+    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
+    NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, TOKEN_APPCONTAINER_INFORMATION,
+    TOKEN_QUERY, TokenAppContainerSid,
 };
 use windows::Win32::Storage::FileSystem::DELETE;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -43,7 +45,8 @@ use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetCurrentProcessId, GetExitCodeThread, IsWow64Process2, OpenProcess,
-    PROCESS_ACCESS_RIGHTS, WaitForSingleObject,
+    OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_FORMAT, QueryFullProcessImageNameW,
+    WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR, s, w};
 
@@ -89,6 +92,7 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
             std::fs::remove_file(&marker)
                 .map_err(|e| format!("Could not disable Windows Search integration: {e}"))?;
         }
+        revoke_searchhost_access(data_dir);
         record_attach_error(None);
         return Ok(());
     }
@@ -97,14 +101,12 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
     std::fs::create_dir_all(&ws_dir)
         .map_err(|e| format!("Could not create Windows Search state folder: {e}"))?;
 
-    grant_appcontainer_access(data_dir, false)
-        .map_err(|e| format!("Could not grant AppContainer read access on data folder: {e}"))?;
-    grant_appcontainer_access(&ws_dir, true)
-        .map_err(|e| format!("Could not grant AppContainer access on winsearch folder: {e}"))?;
-
-    let index_path = data_dir.join("index.bin");
-    if index_path.is_file() {
-        let _ = grant_appcontainer_access(&index_path, false);
+    // Bridge access goes to the SearchHost package alone, never to all
+    // AppContainer apps. If SearchHost is not running yet, attachment
+    // applies the same grants when it opens the verified process.
+    if let Ok((sid, sid_text)) = resolve_searchhost_sid() {
+        grant_searchhost_access(data_dir, &sid, &sid_text)
+            .map_err(|e| format!("Could not grant SearchHost access on the bridge folders: {e}"))?;
     }
 
     ipc::ensure_responder_started(data_dir);
@@ -199,15 +201,31 @@ pub fn attach_searchhost_now(data_dir: &Path) -> Result<bool, String> {
     result
 }
 
-/// Grant `ALL APPLICATION PACKAGES` (`S-1-15-2-1`) Read+Execute (or Modify when
-/// `writable` is true) on `path`, with container/object inheritance for folders.
-pub fn grant_appcontainer_access(path: &Path, writable: bool) -> io::Result<()> {
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut sid = PSID::default();
-    // SAFETY: S-1-15-2-1 is a well-known constant SID; freed via LocalFree below.
-    unsafe {
-        ConvertStringSidToSidW(w!("S-1-15-2-1"), &mut sid).map_err(io::Error::from)?;
+/// File in the winsearch folder recording which AppContainer SID was
+/// granted bridge access, so disable can revoke exactly that grant.
+const GRANTED_SID_FILE: &str = "granted-sid";
+/// Legacy pre-review grant trustee. Revoked opportunistically so folders
+/// enabled by older builds do not stay open to every AppContainer app.
+const LEGACY_ALL_PACKAGES_SID: &str = "S-1-15-2-1";
+
+/// How much access the SearchHost AppContainer gets on one path.
+#[derive(Clone, Copy)]
+enum AccessKind {
+    /// Pass through the folder without reading its contents.
+    Traverse,
+    ReadExecute,
+    Modify,
+}
+
+/// Grant (`kind = Some`) or revoke (`kind = None`) access for `sid` on
+/// `path`, with container/object inheritance for folders.
+fn apply_sid_access(path: &Path, sid_bytes: &[u8], kind: Option<AccessKind>) -> io::Result<()> {
+    if sid_bytes.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty SID"));
     }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: sid_bytes holds a valid self-relative SID for this call.
+    let sid = PSID(sid_bytes.as_ptr().cast_mut().cast::<c_void>());
 
     let mut old_dacl: *mut ACL = ptr::null_mut();
     let mut sd = PSECURITY_DESCRIPTOR::default();
@@ -224,18 +242,21 @@ pub fn grant_appcontainer_access(path: &Path, writable: bool) -> io::Result<()> 
         )
     };
     if get_err != ERROR_SUCCESS {
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(sid.0)));
-        }
         return Err(io::Error::from_raw_os_error(get_err.0 as i32));
     }
 
-    let perms = if writable {
-        GENERIC_READ.0 | GENERIC_WRITE.0 | GENERIC_EXECUTE.0 | DELETE.0
-    } else {
-        GENERIC_READ.0 | GENERIC_EXECUTE.0
+    // FILE_TRAVERSE (0x20) | FILE_READ_ATTRIBUTES (0x80): reach children
+    // by full path without listing or reading the folder itself.
+    let (perms, mode) = match kind {
+        Some(AccessKind::Traverse) => (0x20u32 | 0x80, GRANT_ACCESS),
+        Some(AccessKind::ReadExecute) => (GENERIC_READ.0 | GENERIC_EXECUTE.0, GRANT_ACCESS),
+        Some(AccessKind::Modify) => (
+            GENERIC_READ.0 | GENERIC_WRITE.0 | GENERIC_EXECUTE.0 | DELETE.0,
+            GRANT_ACCESS,
+        ),
+        None => (0, REVOKE_ACCESS),
     };
-    let inheritance = if path.is_dir() {
+    let inheritance = if kind.is_some() && path.is_dir() {
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
     } else {
         NO_INHERITANCE
@@ -243,7 +264,7 @@ pub fn grant_appcontainer_access(path: &Path, writable: bool) -> io::Result<()> 
 
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: perms,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: mode,
         grfInheritance: inheritance,
         Trustee: TRUSTEE_W {
             TrusteeForm: TRUSTEE_IS_SID,
@@ -257,7 +278,6 @@ pub fn grant_appcontainer_access(path: &Path, writable: bool) -> io::Result<()> 
     if acl_err != ERROR_SUCCESS {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(sd.0)));
-            let _ = LocalFree(Some(HLOCAL(sid.0)));
         }
         return Err(io::Error::from_raw_os_error(acl_err.0 as i32));
     }
@@ -277,13 +297,206 @@ pub fn grant_appcontainer_access(path: &Path, writable: bool) -> io::Result<()> 
     unsafe {
         let _ = LocalFree(Some(HLOCAL(new_dacl.cast())));
         let _ = LocalFree(Some(HLOCAL(sd.0)));
-        let _ = LocalFree(Some(HLOCAL(sid.0)));
     }
 
     if set_err != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(set_err.0 as i32));
     }
     Ok(())
+}
+
+fn sid_bytes_to_string(sid_bytes: &[u8]) -> io::Result<String> {
+    // SAFETY: sid_bytes holds a valid SID; the returned buffer is freed.
+    unsafe {
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(PSID(sid_bytes.as_ptr().cast_mut().cast()), &mut text)
+            .map_err(io::Error::from)?;
+        let value = text.to_string();
+        let _ = LocalFree(Some(HLOCAL(text.as_ptr().cast())));
+        value.map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+fn sid_string_to_bytes(text: &str) -> io::Result<Vec<u8>> {
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: the allocated SID is copied out and freed before returning.
+    unsafe {
+        let mut sid = PSID::default();
+        ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut sid).map_err(io::Error::from)?;
+        let len = GetLengthSid(sid) as usize;
+        let bytes = std::slice::from_raw_parts(sid.0.cast::<u8>(), len).to_vec();
+        let _ = LocalFree(Some(HLOCAL(sid.0)));
+        Ok(bytes)
+    }
+}
+
+/// Verify an opened process handle really is this session's
+/// `SearchHost.exe`. Checking identity from the handle (not the earlier
+/// pid snapshot) closes the pid-reuse race between enumeration and use.
+fn verify_searchhost_identity(proc_handle: HANDLE, pid: u32) -> io::Result<()> {
+    let mut my_session = 0u32;
+    let mut proc_session = 0u32;
+    unsafe {
+        ProcessIdToSessionId(GetCurrentProcessId(), &mut my_session).map_err(io::Error::from)?;
+        ProcessIdToSessionId(pid, &mut proc_session).map_err(io::Error::from)?;
+    }
+    if proc_session != my_session {
+        return Err(io::Error::other(
+            "SearchHost candidate is in another session",
+        ));
+    }
+    let mut buffer = [0u16; 1024];
+    let mut len = buffer.len() as u32;
+    // SAFETY: buffer/len follow the QueryFullProcessImageNameW contract.
+    unsafe {
+        QueryFullProcessImageNameW(
+            proc_handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+        .map_err(io::Error::from)?;
+    }
+    let image = String::from_utf16_lossy(&buffer[..len as usize]);
+    let file_name = image.rsplit(['\\', '/']).next().unwrap_or("");
+    if !file_name.eq_ignore_ascii_case("SearchHost.exe") {
+        return Err(io::Error::other(format!(
+            "pid {pid} is {file_name}, not SearchHost.exe"
+        )));
+    }
+    Ok(())
+}
+
+/// The AppContainer SID of the process behind an already-verified
+/// handle, as `(sid bytes, sid string)`. Fails closed when the process
+/// is not an AppContainer: bridge access is then never granted broadly.
+fn appcontainer_sid_of_process(proc_handle: HANDLE) -> io::Result<(Vec<u8>, String)> {
+    // SAFETY: token handle is closed on every path; the two-call
+    // GetTokenInformation sizing pattern follows the API contract.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(proc_handle, TOKEN_QUERY, &mut token).map_err(io::Error::from)?;
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenAppContainerSid, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return Err(io::Error::other(
+                "SearchHost token reports no AppContainer SID",
+            ));
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        let fetched = GetTokenInformation(
+            token,
+            TokenAppContainerSid,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        fetched.map_err(io::Error::from)?;
+        let info = &*buffer.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>();
+        if info.TokenAppContainer.0.is_null() {
+            return Err(io::Error::other(
+                "SearchHost token reports no AppContainer SID",
+            ));
+        }
+        let len = GetLengthSid(info.TokenAppContainer) as usize;
+        let bytes = std::slice::from_raw_parts(info.TokenAppContainer.0.cast::<u8>(), len).to_vec();
+        let text = sid_bytes_to_string(&bytes)?;
+        Ok((bytes, text))
+    }
+}
+
+/// Resolve the running SearchHost's AppContainer SID by opening and
+/// verifying its process handle. `NotFound` while it is not running.
+fn resolve_searchhost_sid() -> io::Result<(Vec<u8>, String)> {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    for pid in find_searchhost_pids()? {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_LIMITED_INFORMATION | 0x0400),
+                false,
+                pid,
+            )
+        };
+        let Ok(handle) = handle else { continue };
+        let result = verify_searchhost_identity(handle, pid)
+            .and_then(|()| appcontainer_sid_of_process(handle));
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        if result.is_ok() {
+            return result;
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "SearchHost.exe is not running",
+    ))
+}
+
+/// The bridge paths the SearchHost package may touch, narrowest first:
+/// pass through the data folder, use the bridge folder, read the index.
+fn bridge_paths(data_dir: &Path) -> Vec<(PathBuf, AccessKind)> {
+    vec![
+        (data_dir.to_path_buf(), AccessKind::Traverse),
+        (ipc::winsearch_dir(data_dir), AccessKind::Modify),
+        (data_dir.join("index.bin"), AccessKind::ReadExecute),
+    ]
+}
+
+/// Grant the SearchHost package (and only it) the bridge access, record
+/// its SID for later revocation, and drop any legacy all-packages grant.
+fn grant_searchhost_access(data_dir: &Path, sid: &[u8], sid_text: &str) -> io::Result<()> {
+    for (path, kind) in bridge_paths(data_dir) {
+        if path.exists() {
+            apply_sid_access(&path, sid, Some(kind))?;
+        }
+    }
+    let ws_dir = ipc::winsearch_dir(data_dir);
+    let _ = std::fs::write(ws_dir.join(GRANTED_SID_FILE), sid_text);
+    if let Ok(legacy) = sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID) {
+        for (path, _) in bridge_paths(data_dir) {
+            if path.exists() {
+                let _ = apply_sid_access(&path, &legacy, None);
+            }
+        }
+        let staged = ws_dir.join(DLL_NAME);
+        if staged.exists() {
+            let _ = apply_sid_access(&staged, &legacy, None);
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort undo of [`grant_searchhost_access`] on disable: revoke
+/// the recorded package grant (and the legacy one) and remove the
+/// staged DLL copy. The loaded copy inside SearchHost stays inert
+/// behind the removed marker until the shell restarts it.
+fn revoke_searchhost_access(data_dir: &Path) {
+    let ws_dir = ipc::winsearch_dir(data_dir);
+    let mut sids: Vec<Vec<u8>> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(ws_dir.join(GRANTED_SID_FILE))
+        && let Ok(bytes) = sid_string_to_bytes(text.trim())
+    {
+        sids.push(bytes);
+    }
+    if let Ok(legacy) = sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID) {
+        sids.push(legacy);
+    }
+    let staged = ws_dir.join(DLL_NAME);
+    for sid in &sids {
+        for (path, _) in bridge_paths(data_dir) {
+            if path.exists() {
+                let _ = apply_sid_access(&path, sid, None);
+            }
+        }
+        if staged.exists() {
+            let _ = apply_sid_access(&staged, sid, None);
+        }
+    }
+    let _ = std::fs::remove_file(ws_dir.join(GRANTED_SID_FILE));
+    let _ = std::fs::remove_file(&staged);
 }
 
 fn find_source_dll() -> Option<PathBuf> {
@@ -321,10 +534,8 @@ fn stage_attachment_dll(ws_dir: &Path) -> io::Result<PathBuf> {
         }
     }
     if staged.is_file() {
-        let _ = grant_appcontainer_access(&staged, false);
         Ok(staged)
     } else if let Some(src) = find_source_dll() {
-        let _ = grant_appcontainer_access(&src, false);
         Ok(src)
     } else {
         Err(io::Error::new(
@@ -445,6 +656,14 @@ unsafe fn attach_to_process_handle(
     dll_name_lower: &str,
     data_dir: &Path,
 ) -> io::Result<bool> {
+    // Identity and bridge access come from THIS handle, never from the
+    // pid snapshot taken earlier: a reused pid must not be injected,
+    // and only the verified SearchHost package gets bridge access.
+    verify_searchhost_identity(proc_handle, pid)?;
+    let (sid, sid_text) = appcontainer_sid_of_process(proc_handle)?;
+    grant_searchhost_access(data_dir, &sid, &sid_text)?;
+    apply_sid_access(dll_path, &sid, Some(AccessKind::ReadExecute))?;
+
     let mut proc_machine = IMAGE_FILE_MACHINE(0);
     let mut native_machine = IMAGE_FILE_MACHINE(0);
     unsafe {
@@ -603,4 +822,28 @@ unsafe fn run_remote_thread(
         let _ = VirtualFreeEx(proc_handle, remote_mem, 0, MEM_RELEASE);
     }
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When SearchHost runs here, its token must yield a package SID —
+    /// the narrow bridge grant depends on it. Hosts without a shell
+    /// search process (CI runners) skip like the catalog test does.
+    #[test]
+    fn resolves_searchhost_package_sid_when_running() {
+        match resolve_searchhost_sid() {
+            Ok((bytes, text)) => {
+                assert!(!bytes.is_empty());
+                assert!(text.starts_with("S-1-15-2-"), "unexpected SID: {text}");
+                assert_ne!(text, LEGACY_ALL_PACKAGES_SID);
+                let round_trip = sid_string_to_bytes(&text).expect("SID round-trips");
+                assert_eq!(round_trip, bytes);
+            }
+            Err(error) => {
+                eprintln!("skipping: SearchHost AppContainer SID unavailable here: {error}");
+            }
+        }
+    }
 }

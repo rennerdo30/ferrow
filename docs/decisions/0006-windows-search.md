@@ -43,7 +43,10 @@ Crate `ferrow-winsearch` (cdylib `ferrow_winsearch.dll` + rlib used by
 
 - `sql`: extracts projection columns, `TOP` limit (clamped 1..=100) and
   search terms from `CONTAINS`/`LIKE` predicates on `SystemIndex`.
-  Anything else returns "unsupported" and the native provider runs.
+  Anything else returns "unsupported" and the native provider runs —
+  including any `NOT`, and `OR` between different term sets, because
+  Ferrow ANDs terms and either would change the result set. The
+  observed same-terms-across-columns `OR` shape is kept.
   Folder-only `System.Kind` predicates map to `folder:`.
 - `hook`: pins its own module, verifies the `ICommandText::Execute`
   vtable slot (slot 4 on `CLSID_CollatorDataSource`) belongs to
@@ -63,8 +66,10 @@ Crate `ferrow-winsearch` (cdylib `ferrow_winsearch.dll` + rlib used by
   `Arc<Index>` in local mode, otherwise one deadline-bound
   `ferrow-ipc` `Page` query against `ferrowd` (200 ms budget inside the
   shell's 250 ms wait; reconnect with 800 ms budget and 2 s backoff on
-  the responder thread only). With the GUI closed, local mode may read
-  `index.bin` directly in `SearchHost.exe` (<= 256 MiB, cached by mtime);
+  the responder thread only). With the GUI closed, local mode searches
+  a preloaded `index.bin` cache in `SearchHost.exe` (<= 256 MiB, loaded
+  off the query path at attach, searched with a 200 ms cancellation
+  deadline; a cold cache answers natively until the preload lands);
   service mode never serves that stale file (the service index in
   `C:\ProgramData\Ferrow` is SYSTEM-protected), so native search answers.
 - `controller` (GUI side): stages the DLL into the winsearch folder,
@@ -76,7 +81,9 @@ Crate `ferrow-winsearch` (cdylib `ferrow_winsearch.dll` + rlib used by
   architectures report an error instead of silently doing nothing.
 
 Bounds: at most 100 rows per query, 250 ms shell-side wait, token/framing
-caps in `sql.rs` and `ferrow-ipc`. The DLL is built with the `winsearch`
+caps in `sql.rs` and `ferrow-ipc`. Accessor bindings are validated
+against the caller's declared row-buffer size at creation and again in
+`GetData`, so the rowset can never write outside it. The DLL is built with the `winsearch`
 profile (`panic = "unwind"`; `panic` cannot be set per package) so the
 detour's `catch_unwind` works; everything else keeps `panic = "abort"`.
 `scripts/package.ps1` and the workflows build the DLL separately.
@@ -96,16 +103,19 @@ security-relevant code. Deliberate properties:
   In local mode only the user's own index can answer. Either way, Start
   results for a user come from an index that user could already search
   in the app.
-- **AppContainer grants (accepted widening).** For the LowBox shell to
-  reach the bridge, enabling grants `ALL APPLICATION PACKAGES`
-  (S-1-15-2-1) read+execute on the app data folder and `index.bin`, and
-  read/write/delete on the `winsearch` folder. Consequence: any
-  AppContainer app running as this user can read the local index's file
-  names and submit bridge queries. The data folder is per-user, the
-  grants are applied only when the user turns the feature on, and the
-  toggle copy does not hide this class of trade-off. Grants are **not**
-  removed on disable or uninstall today (user data is kept by design);
-  recorded as follow-up (1).
+- **AppContainer grants, scoped to the shell package.** For the LowBox
+  shell to reach the bridge, enabling grants access to the AppContainer
+  SID read from the verified `SearchHost.exe` token — never to `ALL
+  APPLICATION PACKAGES`: traverse-only (no listing/reading) on the app
+  data folder, read on `index.bin` and the staged DLL, modify on the
+  `winsearch` bridge folder. Other AppContainer apps get nothing;
+  full-trust processes of the same user already had equivalent access.
+  Identity is verified from the opened process handle (image name +
+  session), closing the pid-reuse race. Grants are recorded
+  (`granted-sid`) and revoked on disable, which also removes the staged
+  DLL copy; legacy all-packages grants from earlier builds are revoked
+  on enable. Uninstall without disabling first still leaves the
+  per-user grants behind (user data is kept by design); follow-up (1).
 - **Bridge files are transient.** Request files hold one query string;
   they are deleted when handled or on timeout, and leftovers are swept
   after 10 s. No query text is logged. Responses carry the same paths
@@ -154,8 +164,9 @@ security-relevant code. Deliberate properties:
 
 ## Follow-ups
 
-1. Remove the AppContainer grants and staged DLL on disable/uninstall
-   (needs a per-user cleanup step; uninstall keeps user data today).
+1. Remove the per-user AppContainer grants on uninstall when the
+   feature was still enabled (disable already revokes them; uninstall
+   keeps user data today, so this needs a per-user cleanup step).
 2. Offer detach (`FerrowDetach`) on disable so upgrades do not rely on
    move-aside plus shell restart.
 3. Ranking beyond name order (run count / recency) once the app has it.

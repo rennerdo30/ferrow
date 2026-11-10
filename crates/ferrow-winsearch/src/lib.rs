@@ -101,7 +101,7 @@ mod windows_tests {
     use windows::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
     };
-    use windows::Win32::System::Search::{ICommandText, IRowset};
+    use windows::Win32::System::Search::{DBBINDING, HACCESSOR, IAccessor, ICommandText, IRowset};
     use windows::core::{GUID, Interface, PCWSTR, Result};
 
     const DIALECT: GUID = GUID::from_u128(0xc8b521fb_5cf3_11ce_ade5_00aa0044773d);
@@ -260,6 +260,66 @@ mod windows_tests {
         }];
         let rows = rowset::build_for_hits(&columns, hits)?;
         rowset::verify_rowset(&rows, "ferrow-native-query-proof.txt")?;
+
+        // Hostile accessors are rejected at creation: GetData must
+        // never be able to write outside the declared row buffer.
+        let accessor_iface: IAccessor = rows.cast()?;
+        for (binding, row_size, expected_status) in [
+            // Offset far past the 64-byte row buffer.
+            (
+                DBBINDING {
+                    iOrdinal: 1,
+                    obValue: 1_000_000,
+                    dwPart: 1,
+                    cbMaxLen: 16,
+                    wType: 130,
+                    ..Default::default()
+                },
+                64usize,
+                3u32,
+            ),
+            // Offset near usize::MAX: offset + width must not wrap.
+            (
+                DBBINDING {
+                    iOrdinal: 1,
+                    obStatus: usize::MAX - 2,
+                    dwPart: 4,
+                    ..Default::default()
+                },
+                usize::MAX,
+                3u32,
+            ),
+            // Ordinal beyond the 15-column schema.
+            (
+                DBBINDING {
+                    iOrdinal: 99,
+                    obValue: 0,
+                    dwPart: 1,
+                    cbMaxLen: 16,
+                    wType: 130,
+                    ..Default::default()
+                },
+                64usize,
+                1u32,
+            ),
+        ] {
+            let mut handle = HACCESSOR(0);
+            let mut status = 0u32;
+            let created = unsafe {
+                accessor_iface.CreateAccessor(
+                    2,
+                    1,
+                    &binding,
+                    row_size,
+                    &mut handle,
+                    Some(&mut status),
+                )
+            };
+            assert!(created.is_err(), "malformed binding must be rejected");
+            assert_eq!(handle.0, 0, "rejected accessor must stay null");
+            assert_eq!(status, expected_status);
+        }
+
         drop(rows);
         Ok(())
     }

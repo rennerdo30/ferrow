@@ -10,8 +10,9 @@
 //! Replies are atomically renamed `resp-<id>.tmp` to `resp-<id>.r`.
 //!
 //! When `ferrow-gui` is not running, the app's own index is the source and
-//! `<data_dir>/index.bin` is `<= 256 MiB`, the attachment DLL loads and
-//! caches `index.bin` directly by modification time. In service mode the
+//! `<data_dir>/index.bin` is `<= 256 MiB`, the attachment DLL searches a
+//! copy preloaded off the query path at attach (deadline-bounded). In
+//! service mode the
 //! DLL never serves that stale local file; `SearchHost.exe` falls back to
 //! native Windows Search instead (the service index under
 //! `C:\ProgramData` is SYSTEM-protected and unreadable from the shell).
@@ -24,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ferrow_index::{Index, flags, osname};
 use ferrow_ipc::{Client, Endpoint, FileRow, Sort, Stream};
-use ferrow_query::{Query, SearchOptions, search};
+use ferrow_query::{CancelToken, Query, SearchOptions, search};
 
 /// Maximum `index.bin` size loaded directly inside `SearchHost.exe` when
 /// `ferrow-gui` is not running (256 MiB). Larger indexes are served over IPC
@@ -41,6 +42,14 @@ const SERVICE_CONNECT_BUDGET: Duration = Duration::from_millis(800);
 /// Budget for one service page query on an established connection, kept
 /// inside [`IPC_TIMEOUT`] so the reply can still reach `SearchHost.exe`.
 const SERVICE_QUERY_BUDGET: Duration = Duration::from_millis(200);
+/// Budget for one search over the preloaded on-disk index inside
+/// `SearchHost.exe`. Loading never happens on the query path (see
+/// [`preload_disk_index`]); this caps the search itself.
+const DISK_SEARCH_BUDGET: Duration = Duration::from_millis(200);
+/// After a bridge timeout the DLL skips IPC for this long instead of
+/// deleting the responder marker: a slow first service connect must
+/// not disable the bridge until the next app sync.
+const IPC_COOLDOWN: Duration = Duration::from_secs(5);
 /// After a failed service connect or query, wait this long before the
 /// responder tries the service again (native fallback meanwhile).
 const SERVICE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
@@ -49,6 +58,16 @@ type CachedIndex = (PathBuf, SystemTime, Arc<Index>);
 
 static REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 static RESPONDER_STARTED: AtomicBool = AtomicBool::new(false);
+static DISK_LOAD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Millisecond timestamp (against [`millis_now`]) until which the DLL
+/// skips bridge attempts after a timeout. The responder marker file is
+/// never deleted by the shell side.
+static IPC_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn millis_now() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 static ACTIVE_INDEX: OnceLock<Mutex<Option<Arc<Index>>>> = OnceLock::new();
 static CACHED_DISK_INDEX: OnceLock<Mutex<Option<CachedIndex>>> = OnceLock::new();
 
@@ -150,14 +169,49 @@ pub fn is_enabled(data_dir: &Path) -> bool {
 }
 
 /// Execute `query_str` against `index` and materialize up to `limit` rows.
+pub fn hits_from_index(index: &Index, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
+    hits_from_index_inner(index, query_str, limit, CancelToken::new())
+}
+
+/// Like [`hits_from_index`], but the scan is cancelled after `budget`
+/// and a cancelled (partial) scan returns `None` so the shell falls
+/// back to native results instead of showing an arbitrary prefix.
+fn hits_from_index_deadline(
+    index: &Index,
+    query_str: &str,
+    limit: usize,
+    budget: Duration,
+) -> Option<Vec<SearchHitRow>> {
+    let token = CancelToken::new();
+    let watchdog = token.clone();
+    let _ = std::thread::Builder::new()
+        .name("ferrow-winsearch-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(budget);
+            watchdog.cancel();
+        });
+    let rows = hits_from_index_inner(index, query_str, limit, token.clone())?;
+    if token.is_cancelled() {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
 #[allow(
     clippy::needless_update,
     reason = "SearchOptions has extra fields when ferrow-query test-hooks is enabled"
 )]
-pub fn hits_from_index(index: &Index, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
+fn hits_from_index_inner(
+    index: &Index,
+    query_str: &str,
+    limit: usize,
+    cancel: CancelToken,
+) -> Option<Vec<SearchHitRow>> {
     let query = Query::parse(query_str).ok()?;
     let options = SearchOptions {
         limit: Some(limit.clamp(1, 100)),
+        cancel,
         ..Default::default()
     };
     let res = search(index, &query, &options);
@@ -267,8 +321,8 @@ impl ServiceLink {
 /// 1. In-process `ACTIVE_INDEX` if present in this process,
 /// 2. The `ferrow-gui` responder over `<data_dir>/winsearch` if active
 ///    (which itself answers from the local index or the `ferrowd` service),
-/// 3. Direct cached load of `<data_dir>/index.bin` if `<= 256 MiB` and the
-///    app's own index is the published source.
+/// 3. The preloaded `<data_dir>/index.bin` cache if ready (loading
+///    happens off the query path in [`preload_disk_index`]).
 pub fn query_hits(data_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
     if !is_enabled(data_dir) {
         return None;
@@ -291,6 +345,9 @@ pub fn query_hits(data_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<
 }
 
 fn query_via_ipc(ws_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
+    if millis_now() < IPC_COOLDOWN_UNTIL_MS.load(Ordering::Acquire) {
+        return None;
+    }
     let pid = std::process::id();
     let seq = REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
     let req_id = format!("{pid}-{seq}");
@@ -314,18 +371,29 @@ fn query_via_ipc(ws_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<Sea
             let content = std::fs::read_to_string(&resp_path).ok();
             let _ = std::fs::remove_file(&resp_path);
             let _ = std::fs::remove_file(&req_path);
+            IPC_COOLDOWN_UNTIL_MS.store(0, Ordering::Release);
             return content.map(|c| deserialize_rows(&c));
         }
         if Instant::now() >= deadline {
             let _ = std::fs::remove_file(&req_path);
             let _ = std::fs::remove_file(&resp_path);
-            let _ = std::fs::remove_file(ws_dir.join("server.pid"));
+            // Keep server.pid: it is the responder's liveness marker,
+            // owned by ferrow-gui. Back off briefly instead so one
+            // slow connect cannot disable the bridge for the session.
+            IPC_COOLDOWN_UNTIL_MS.store(
+                millis_now() + IPC_COOLDOWN.as_millis() as u64,
+                Ordering::Release,
+            );
             return None;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
 }
 
+/// The closed-app local fallback, bounded for the shell query thread:
+/// it only ever searches an already-loaded cache (with a deadline) and
+/// kicks off background loading otherwise, returning `None` so this
+/// query falls back to native results instead of blocking on disk I/O.
 fn query_via_disk_index(
     data_dir: &Path,
     query_str: &str,
@@ -343,21 +411,86 @@ fn query_via_disk_index(
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-    let index = {
-        let mut guard = cached_disk_index_slot().lock().ok()?;
-        if let Some((cached_path, cached_mtime, cached_idx)) = guard.as_ref()
-            && cached_path == &index_path
-            && *cached_mtime == mtime
-        {
-            cached_idx.clone()
-        } else {
-            let loaded = Arc::new(Index::load(&index_path).ok()?);
-            *guard = Some((index_path, mtime, loaded.clone()));
-            loaded
+    let cached = {
+        let guard = cached_disk_index_slot().lock().ok()?;
+        match guard.as_ref() {
+            Some((cached_path, _, cached_idx)) if cached_path == &index_path => {
+                Some(cached_idx.clone())
+            }
+            _ => None,
         }
     };
+    let Some(index) = cached else {
+        ensure_disk_index_loading(data_dir);
+        return None;
+    };
+    // Serve the loaded copy now; refresh it in the background if the
+    // file changed since it was loaded.
+    let fresh = {
+        let guard = cached_disk_index_slot().lock().ok()?;
+        matches!(guard.as_ref(), Some((p, t, _)) if p == &index_path && *t == mtime)
+    };
+    if !fresh {
+        ensure_disk_index_loading(data_dir);
+    }
+    hits_from_index_deadline(&index, query_str, limit, DISK_SEARCH_BUDGET)
+}
 
-    hits_from_index(&index, query_str, limit)
+/// Load `<data_dir>/index.bin` into the process cache. Blocking; run
+/// only off the shell query path (preload thread, tests).
+fn load_disk_index_blocking(data_dir: &Path) -> bool {
+    if source_from_marker(data_dir) == Some(IndexSource::Service) {
+        return false;
+    }
+    let index_path = data_dir.join("index.bin");
+    let Ok(meta) = std::fs::metadata(&index_path) else {
+        return false;
+    };
+    if meta.len() > MAX_INPROC_INDEX_BYTES {
+        return false;
+    }
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    {
+        let Ok(guard) = cached_disk_index_slot().lock() else {
+            return false;
+        };
+        if matches!(guard.as_ref(), Some((p, t, _)) if p == &index_path && *t == mtime) {
+            return true;
+        }
+    }
+    let Ok(loaded) = Index::load(&index_path) else {
+        return false;
+    };
+    if let Ok(mut guard) = cached_disk_index_slot().lock() {
+        *guard = Some((index_path, mtime, Arc::new(loaded)));
+        true
+    } else {
+        false
+    }
+}
+
+fn ensure_disk_index_loading(data_dir: &Path) {
+    if DISK_LOAD_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let dir_owned = data_dir.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("ferrow-winsearch-preload".into())
+        .spawn(move || {
+            load_disk_index_blocking(&dir_owned);
+            DISK_LOAD_IN_FLIGHT.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        DISK_LOAD_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Warm the closed-app disk cache off the query path (called when the
+/// DLL attaches). No-op in service mode or over the size cap.
+pub fn preload_disk_index(data_dir: &Path) {
+    if source_from_marker(data_dir) != Some(IndexSource::Service) {
+        ensure_disk_index_loading(data_dir);
+    }
 }
 
 static DIAG_LOG: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -701,11 +834,39 @@ mod tests {
         set_source(&temp_dir, IndexSource::Service);
         assert!(query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).is_none());
 
-        // Local mode: the same file answers again.
+        // Local mode: a cold cache never loads synchronously on the
+        // query path; after the off-path preload, the file answers.
         set_source(&temp_dir, IndexSource::Local);
+        assert!(query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).is_none());
+        assert!(load_disk_index_blocking(&temp_dir));
         let hits = query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "ferrow-service-mode-guard.txt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn ipc_timeout_keeps_responder_marker_and_recovers() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("ferrow-winsearch-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let ws_dir = winsearch_dir(&temp_dir);
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join("server.pid"), b"99999").unwrap();
+        IPC_COOLDOWN_UNTIL_MS.store(0, Ordering::Release);
+
+        // No responder answers: the query times out, the marker the
+        // responder owns survives, and a retry after the cooldown
+        // works once a responder reply path exists again (here: the
+        // cooldown is the only state that changed).
+        assert!(query_via_ipc(&ws_dir, "anything", 5).is_none());
+        assert!(
+            ws_dir.join("server.pid").is_file(),
+            "shell side must never delete the responder marker"
+        );
+        assert!(IPC_COOLDOWN_UNTIL_MS.load(Ordering::Acquire) > millis_now());
+        IPC_COOLDOWN_UNTIL_MS.store(0, Ordering::Release);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

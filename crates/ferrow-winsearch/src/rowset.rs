@@ -103,7 +103,54 @@ struct ColBinding {
 struct AccessorEntry {
     flags: u32,
     cols: Vec<ColBinding>,
+    /// Caller-declared row buffer size from `CreateAccessor`. Every
+    /// `GetData` write is checked against it: binding offsets come
+    /// from the consumer and must never address outside its buffer.
+    row_size: usize,
     refs: u32,
+}
+
+/// Bytes one binding's value part occupies in the caller's buffer.
+fn binding_value_width(b: &ColBinding) -> usize {
+    let base_type = b.w_type & !0x4000;
+    let by_ref = (b.w_type & 0x4000) != 0;
+    match base_type {
+        12 => {
+            if by_ref {
+                size_of::<*mut c_void>()
+            } else {
+                size_of::<VARIANT>()
+            }
+        }
+        130 => {
+            if by_ref {
+                size_of::<*mut c_void>()
+            } else {
+                b.cb_max_len
+            }
+        }
+        8 => size_of::<*const u16>(),
+        3 | 19 => 4,
+        7 => 8,
+        _ => 0,
+    }
+}
+
+fn part_in_bounds(offset: usize, width: usize, row_size: usize) -> bool {
+    offset.checked_add(width).is_some_and(|end| end <= row_size)
+}
+
+/// True when every requested part of the binding lies inside a buffer
+/// of `row_size` bytes. Checked at accessor creation and again in
+/// `GetData`, so no accessor can ever direct a write outside the
+/// caller's row buffer.
+fn binding_in_bounds(b: &ColBinding, row_size: usize) -> bool {
+    let has_val = (b.dw_part & (DBPART_VALUE.0 as u32)) != 0;
+    let has_len = (b.dw_part & (DBPART_LENGTH.0 as u32)) != 0;
+    let has_status = (b.dw_part & (DBPART_STATUS.0 as u32)) != 0;
+    (!has_val || part_in_bounds(b.ob_value, binding_value_width(b), row_size))
+        && (!has_len || part_in_bounds(b.ob_length, size_of::<usize>(), row_size))
+        && (!has_status || part_in_bounds(b.ob_status, size_of::<u32>(), row_size))
 }
 
 #[derive(Default)]
@@ -550,6 +597,11 @@ impl IRowset_Impl for MemoryRowset_Impl {
                 if b.ordinal == 0 || b.ordinal > item.len() {
                     continue;
                 }
+                // Defense in depth next to CreateAccessor validation:
+                // never write outside the declared row buffer.
+                if !binding_in_bounds(b, entry.row_size) {
+                    continue;
+                }
                 let val = &item[b.ordinal - 1];
                 let has_val = (b.dw_part & (DBPART_VALUE.0 as u32)) != 0;
                 let has_len = (b.dw_part & (DBPART_LENGTH.0 as u32)) != 0;
@@ -786,11 +838,16 @@ impl IAccessor_Impl for MemoryRowset_Impl {
         flags: u32,
         count: usize,
         bindings: *const DBBINDING,
-        _row_size: usize,
+        row_size: usize,
         accessor: *mut HACCESSOR,
         statuses: *mut u32,
     ) -> Result<()> {
-        if accessor.is_null() || (count > 0 && bindings.is_null()) {
+        // DBBINDSTATUS values (oledb.h): OK, BADORDINAL, BADBINDINFO.
+        const BIND_OK: u32 = 0;
+        const BIND_BADORDINAL: u32 = 1;
+        const BIND_BADBINDINFO: u32 = 3;
+
+        if accessor.is_null() || (count > 0 && bindings.is_null()) || count > 1024 {
             return Err(E_INVALIDARG.into());
         }
         unsafe {
@@ -800,9 +857,10 @@ impl IAccessor_Impl for MemoryRowset_Impl {
             return Err(E_INVALIDARG.into());
         }
         let mut cols = Vec::with_capacity(count);
+        let mut any_invalid = false;
         for n in 0..count {
             let b = unsafe { &*bindings.add(n) };
-            cols.push(ColBinding {
+            let binding = ColBinding {
                 ordinal: b.iOrdinal,
                 ob_value: b.obValue,
                 ob_length: b.obLength,
@@ -810,12 +868,24 @@ impl IAccessor_Impl for MemoryRowset_Impl {
                 dw_part: b.dwPart,
                 cb_max_len: b.cbMaxLen,
                 w_type: b.wType,
-            });
+            };
+            let status = if binding.ordinal > self.schema.len() {
+                BIND_BADORDINAL
+            } else if !binding_in_bounds(&binding, row_size) {
+                BIND_BADBINDINFO
+            } else {
+                BIND_OK
+            };
+            any_invalid |= status != BIND_OK;
+            cols.push(binding);
             if !statuses.is_null() {
                 unsafe {
-                    statuses.add(n).write(0);
+                    statuses.add(n).write(status);
                 }
             }
+        }
+        if any_invalid {
+            return Err(E_INVALIDARG.into());
         }
         let mut state = self.state.lock().map_err(|_| Error::from_hresult(E_FAIL))?;
         state.next_accessor += 1;
@@ -825,6 +895,7 @@ impl IAccessor_Impl for MemoryRowset_Impl {
             AccessorEntry {
                 flags,
                 cols,
+                row_size,
                 refs: 1,
             },
         );

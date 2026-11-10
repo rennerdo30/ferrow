@@ -65,9 +65,43 @@ pub fn parse_windows_search_sql(sql: &str) -> Option<ParsedSql> {
     let (_before_from, after_from) = split_from_system_index(sql)?;
     let predicate = extract_where_predicate(after_from)?;
 
-    let mut terms = extract_contains_terms(predicate);
-    if terms.is_empty() {
-        terms = extract_like_terms(predicate);
+    // Boolean meaning must survive translation. Ferrow terms are ANDed,
+    // so NOT anywhere (at SQL level or inside a CONTAINS condition) and
+    // OR between *different* term sets are unsupported: native answers.
+    // The one observed OR shape — the same terms repeated across
+    // columns (`CONTAINS(name, ...) OR CONTAINS(*, ...)`) — is kept.
+    if contains_word_outside_single_quotes(predicate, "NOT") {
+        return None;
+    }
+
+    let mut terms: Vec<String> = Vec::new();
+    match extract_contains_term_sets(predicate) {
+        None => return None,
+        Some(sets) if !sets.is_empty() => {
+            let mut distinct: Vec<Vec<String>> = Vec::new();
+            for set in &sets {
+                let mut normalized: Vec<String> =
+                    set.iter().map(|t| t.to_ascii_lowercase()).collect();
+                normalized.sort();
+                if !distinct.contains(&normalized) {
+                    distinct.push(normalized);
+                }
+            }
+            if distinct.len() > 1 && contains_word_outside_single_quotes(predicate, "OR") {
+                return None;
+            }
+            for set in sets {
+                for term in set {
+                    push_unique_term(&mut terms, term);
+                }
+            }
+        }
+        Some(_) => {
+            terms = extract_like_terms(predicate);
+            if terms.len() > 1 && contains_word_outside_single_quotes(predicate, "OR") {
+                return None;
+            }
+        }
     }
     if terms.is_empty() {
         return None;
@@ -131,17 +165,52 @@ fn find_clause_end_outside_quotes(s: &str) -> usize {
     s.len()
 }
 
-fn extract_contains_terms(predicate: &str) -> Vec<String> {
-    let mut terms = Vec::new();
+/// Whole word `word` present in `s` outside single-quoted SQL
+/// literals (`''` is an escaped quote). Word characters are
+/// alphanumerics and `_`, so e.g. `CANNOT` does not match `NOT`.
+fn contains_word_outside_single_quotes(s: &str, word: &str) -> bool {
+    let bytes = s.as_bytes();
+    let needle = word.as_bytes();
+    let mut in_single = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if in_single && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single
+            && i + needle.len() <= bytes.len()
+            && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after = i + needle.len();
+            let after_ok = after == bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// One term set per accepted `CONTAINS` call (kind/itemtype calls are
+/// skipped: they filter kinds, handled separately). `None` when any
+/// condition itself uses unsupported boolean structure.
+fn extract_contains_term_sets(predicate: &str) -> Option<Vec<Vec<String>>> {
+    let mut sets = Vec::new();
     let upper = predicate.to_ascii_uppercase();
     let mut search_from = 0;
 
     while let Some(rel) = upper[search_from..].find("CONTAINS(") {
         let start = search_from + rel;
-        // Skip `NOT CONTAINS(...)` exclusion clauses.
-        let before = upper[..start].trim_end();
-        let is_negated = before.ends_with("NOT");
-
         let args_start = start + "CONTAINS(".len();
         let Some((prop_prefix, literal, next_pos)) = parse_contains_call(&predicate[args_start..])
         else {
@@ -150,20 +219,15 @@ fn extract_contains_terms(predicate: &str) -> Vec<String> {
         };
         search_from = args_start + next_pos;
 
-        if is_negated {
-            continue;
-        }
         let prop_lower = prop_prefix.to_ascii_lowercase();
         if prop_lower.contains("kind") || prop_lower.contains("itemtype") {
             continue;
         }
 
-        for token in parse_contains_condition(&literal) {
-            push_unique_term(&mut terms, token);
-        }
+        sets.push(parse_contains_condition(&literal)?);
     }
 
-    terms
+    Some(sets)
 }
 
 /// Parses `<prop>, '<literal>' ...)` or `'<literal>' ...)` starting right after `CONTAINS(`.
@@ -192,10 +256,14 @@ fn parse_contains_call(s: &str) -> Option<(&str, String, usize)> {
     Some((prop_prefix, literal, end_offset))
 }
 
-fn parse_contains_condition(condition: &str) -> Vec<String> {
+/// Terms of one CONTAINS condition. `None` when the condition uses
+/// OR or NOT: Ferrow ANDs terms, so either operator inside a single
+/// condition would change the result set.
+fn parse_contains_condition(condition: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut in_quotes = false;
     let mut current = String::new();
+    let mut outside = String::new();
     let mut saw_quotes = false;
 
     for ch in condition.chars() {
@@ -212,14 +280,23 @@ fn parse_contains_condition(condition: &str) -> Vec<String> {
             }
         } else if in_quotes {
             current.push(ch);
+        } else {
+            outside.push(ch);
         }
+    }
+
+    let unsupported_operator = outside
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w.eq_ignore_ascii_case("NOT") || w.eq_ignore_ascii_case("OR"));
+    if unsupported_operator {
+        return None;
     }
 
     if !saw_quotes {
         for word in condition.split_whitespace() {
             if matches!(
                 word.to_ascii_uppercase().as_str(),
-                "AND" | "OR" | "NOT" | "NEAR" | "FORMSOF" | "INFLECTIONAL"
+                "AND" | "NEAR" | "FORMSOF" | "INFLECTIONAL"
             ) {
                 continue;
             }
@@ -229,7 +306,7 @@ fn parse_contains_condition(condition: &str) -> Vec<String> {
         }
     }
 
-    out
+    Some(out)
 }
 
 fn extract_like_terms(predicate: &str) -> Vec<String> {
@@ -353,6 +430,34 @@ mod tests {
         assert_eq!(parsed.columns.len(), 19);
         assert_eq!(parsed.limit, 30);
         assert_eq!(parsed.query, "budget 2026");
+    }
+
+    #[test]
+    fn rejects_booleans_whose_meaning_would_change() {
+        for unsupported in [
+            // SQL-level NOT CONTAINS exclusion.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"report*\"') AND NOT CONTAINS(System.FileName, '\"private*\"')",
+            // NOT inside one CONTAINS condition, quoted form.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"report*\" AND NOT \"private*\"')",
+            // NOT inside one CONTAINS condition, unquoted form.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, 'report AND NOT private')",
+            // OR between different term sets (union, not AND).
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') OR CONTAINS(System.FileName, '\"beta*\"')",
+            // OR inside one CONTAINS condition.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\" OR \"beta*\"')",
+            // OR between different LIKE patterns.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE System.FileName LIKE '%alpha%' OR System.FileName LIKE '%beta%'",
+        ] {
+            assert!(
+                parse_windows_search_sql(unsupported).is_none(),
+                "expected None (native fallback) for: {unsupported}"
+            );
+        }
+
+        // A search *term* containing the letters is not an operator.
+        let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"cannot*\" AND \"notes*\"')";
+        let parsed = parse_windows_search_sql(sql).expect("terms resembling operators still parse");
+        assert_eq!(parsed.query, "cannot notes");
     }
 
     #[test]
