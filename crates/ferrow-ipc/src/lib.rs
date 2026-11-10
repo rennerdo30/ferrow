@@ -264,6 +264,10 @@ impl<S: DeadlineIo> Client<S> {
 
     fn expect(&mut self, id: u32) -> std::io::Result<Response> {
         self.begin_operation()?;
+        self.read_reply(id)
+    }
+
+    fn read_reply(&mut self, id: u32) -> std::io::Result<Response> {
         match read_message(&mut self.stream)? {
             Some(envelope) if envelope.id == id => match envelope.message {
                 Message::Response(response) => Ok(response),
@@ -434,7 +438,10 @@ impl<S: DeadlineIo> Client<S> {
     /// (`u64::MAX` returns the current one at once).
     pub fn watch(&mut self, generation: u64) -> std::io::Result<u64> {
         let id = self.send(Request::Watch { generation })?;
-        match Self::check(self.expect(id)?)? {
+        // The reply can take arbitrarily long: no per-operation deadline.
+        self.stream
+            .set_deadline(Instant::now() + Duration::from_secs(365 * 24 * 3600))?;
+        match Self::check(self.read_reply(id)?)? {
             Response::Changed { generation } => Ok(generation),
             _ => Err(io_invalid("expected Changed".into())),
         }

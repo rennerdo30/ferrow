@@ -241,29 +241,46 @@ impl FerrowApp {
             });
         });
         ui.add_space(CARD_GAP);
-        card(ui, &p, |ui| {
-            ui.horizontal(|ui| {
-                let detail = match (&self.scan_status, &self.index) {
-                    (Some(s), _) => s.clone(),
-                    (None, Some(index)) => format!(
-                        "{} entries, loaded in {}.",
-                        super::group(index.len()),
-                        super::fmt_ms(self.load_time)
-                    ),
-                    (None, None) => "No index yet.".to_owned(),
-                };
-                row_text(ui, &p, "Rebuild index", &detail);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let can = self.settings.has_locations() && self.scan_status.is_none();
-                    let resp = ui.add_enabled(can, accent_button(&p, "Rebuild now", 120.0, can));
-                    if !self.settings.has_locations() {
-                        resp.on_disabled_hover_text("Add a location to index first.");
-                    } else if resp.clicked() {
-                        self.rebuild_index();
-                    }
+        if let Some(entries) = self.service_entries {
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    row_text(
+                        ui,
+                        &p,
+                        "Index",
+                        &format!(
+                            "The Ferrow service indexes every drive ({} entries) and keeps it up to date as files change. Nothing to rebuild.",
+                            super::group(entries as usize)
+                        ),
+                    );
                 });
             });
-        });
+        } else {
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    let detail = match (&self.scan_status, &self.index) {
+                        (Some(s), _) => s.clone(),
+                        (None, Some(index)) => format!(
+                            "{} entries, loaded in {}.",
+                            super::group(index.len()),
+                            super::fmt_ms(self.load_time)
+                        ),
+                        (None, None) => "No index yet.".to_owned(),
+                    };
+                    row_text(ui, &p, "Rebuild index", &detail);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let can = self.settings.has_locations() && self.scan_status.is_none();
+                        let resp =
+                            ui.add_enabled(can, accent_button(&p, "Rebuild now", 120.0, can));
+                        if !self.settings.has_locations() {
+                            resp.on_disabled_hover_text("Add a location to index first.");
+                        } else if resp.clicked() {
+                            self.rebuild_index();
+                        }
+                    });
+                });
+            });
+        }
 
         if cfg!(windows) {
             ui.add_space(SECTION_GAP);
@@ -660,6 +677,10 @@ impl FerrowApp {
     }
 
     pub(super) fn rebuild_index(&mut self) {
+        if self.service_entries.is_some() {
+            // The service's index is live; a local scan would go unused.
+            return;
+        }
         let fixed = if self.settings.windows.all_fixed_drives {
             platform::fixed_drive_roots()
         } else {
