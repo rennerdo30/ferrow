@@ -247,7 +247,7 @@ fn handler(request: Request) -> Vec<Response> {
             report: "test backend".into(),
         }],
         Request::Cancel { .. } => vec![Response::Count { n: 0 }],
-        Request::Hello { .. } => vec![],
+        Request::Hello { .. } | Request::Page { .. } | Request::Watch { .. } => vec![],
     }
 }
 

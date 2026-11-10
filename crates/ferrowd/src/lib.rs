@@ -105,6 +105,8 @@ pub struct SnapshotStore {
     inner: Arc<arc_swap::ArcSwap<Snapshot>>,
     generation: Arc<std::sync::atomic::AtomicU64>,
     changes: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
+    /// Wakes `Watch` requests on publication; `true` once the server stops.
+    watchers: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl SnapshotStore {
@@ -113,7 +115,37 @@ impl SnapshotStore {
             inner: Arc::new(arc_swap::ArcSwap::from_pointee(snapshot)),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             changes: Arc::new(std::sync::Mutex::new(None)),
+            watchers: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
         }
+    }
+
+    /// Publication counter: changes whenever a new snapshot is swapped in.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Block until the generation differs from `seen` (no polling). `None`
+    /// once the server is stopping.
+    pub fn wait_change(&self, seen: u64) -> Option<u64> {
+        let (closing, wake) = &*self.watchers;
+        let mut stopped = closing.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if *stopped {
+                return None;
+            }
+            let now = self.generation();
+            if now != seen {
+                return Some(now);
+            }
+            stopped = wake.wait(stopped).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Release every waiting `Watch` (server shutdown).
+    pub fn close_watchers(&self) {
+        let (closing, wake) = &*self.watchers;
+        *closing.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_all();
     }
 
     pub fn get(&self) -> Arc<Snapshot> {
@@ -134,6 +166,13 @@ impl SnapshotStore {
         // A saver reads the generation before acquiring its snapshot, so it
         // may conservatively save again but cannot certify an older snapshot.
         self.generation.fetch_add(1, Ordering::AcqRel);
+        {
+            // Take the lock so a watcher between its check and its wait
+            // cannot miss this wake.
+            let (closing, wake) = &*self.watchers;
+            drop(closing.lock().unwrap_or_else(|e| e.into_inner()));
+            wake.notify_all();
+        }
         if let Some(sender) = self
             .changes
             .lock()
@@ -371,6 +410,19 @@ fn snapshot_count(snapshot: &Snapshot, query: &Query, cancel: &CancelToken) -> (
     }
 }
 
+/// Rows per `Page` request.
+const MAX_PAGE_ROWS: usize = 2_000;
+
+fn sort_key(sort: ferrow_ipc::Sort) -> ferrow_query::SortKey {
+    match sort {
+        ferrow_ipc::Sort::Name => ferrow_query::SortKey::Name,
+        ferrow_ipc::Sort::Size => ferrow_query::SortKey::Size,
+        ferrow_ipc::Sort::Modified => ferrow_query::SortKey::Modified,
+        ferrow_ipc::Sort::Created => ferrow_query::SortKey::Created,
+        ferrow_ipc::Sort::Accessed => ferrow_query::SortKey::Accessed,
+    }
+}
+
 /// Page budgets for streamed `Results` (well under the frame cap).
 const MAX_QUERY_RESULTS: usize = 10_000;
 const PAGE_MAX_PATHS: usize = 512;
@@ -471,6 +523,9 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                                 created: m.created,
                                 accessed: m.accessed,
                                 attributes: m.attributes,
+                                is_dir: snapshot.index_of(hit).flags(hit.id)
+                                    & ferrow_index::flags::DIR
+                                    != 0,
                             }
                         })
                         .collect();
@@ -511,6 +566,86 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
             }
             pages.push(response(page, &hits[page_start..], false));
             pages
+        }
+        Request::Page {
+            text,
+            offset,
+            limit,
+            sort,
+            flags,
+        } => {
+            if flags & !ferrow_ipc::protocol::QUERY_DESCENDING != 0 {
+                return vec![bad_request("unsupported page flags".into())];
+            }
+            if limit as usize > MAX_PAGE_ROWS {
+                return vec![bad_request(format!(
+                    "at most {MAX_PAGE_ROWS} rows per page"
+                ))];
+            }
+            let query = match Query::parse(&text) {
+                Ok(q) => q,
+                Err(e) => return vec![bad_request(e.to_string())],
+            };
+            let options = SearchOptions {
+                sort: sort_key(sort),
+                descending: flags & ferrow_ipc::protocol::QUERY_DESCENDING != 0,
+                limit: Some(offset as usize + limit as usize),
+                cancel,
+                ..SearchOptions::default()
+            };
+            let (hits, result) = snapshot_search(&snapshot, &query, &options);
+            if let Some(key) = result.sort_unavailable {
+                return vec![bad_request(format!(
+                    "{key:?} column unavailable; enable the column and rebuild"
+                ))];
+            }
+            if result.cancelled {
+                return vec![Response::Error {
+                    code: ErrorCode::Cancelled,
+                    msg: "query cancelled".into(),
+                }];
+            }
+            let mut rows = Vec::new();
+            let mut bytes = 32usize;
+            let mut buf = Vec::new();
+            for &hit in hits.iter().skip(offset as usize) {
+                snapshot.index_of(hit).path_bytes(hit.id, &mut buf);
+                bytes += buf.len() + 41;
+                if bytes > ferrow_ipc::MAX_FRAME_BYTES
+                    || buf.len() > ferrow_ipc::protocol::MAX_PATH_BYTES
+                {
+                    break;
+                }
+                let m = snapshot.metadata_of(hit);
+                rows.push(ferrow_ipc::FileRow {
+                    path: buf.clone(),
+                    size: m.size,
+                    modified: m.modified,
+                    created: m.created,
+                    accessed: m.accessed,
+                    attributes: m.attributes,
+                    is_dir: snapshot.index_of(hit).flags(hit.id) & ferrow_index::flags::DIR != 0,
+                });
+            }
+            vec![Response::Rows {
+                rows,
+                columns: snapshot.index.columns_present().bits(),
+                sort_pending: result.sort_status == ferrow_query::SortStatus::Pending,
+                more: false,
+            }]
+        }
+        Request::Watch { generation } => {
+            let now = store.generation();
+            if generation == u64::MAX || generation != now {
+                return vec![Response::Changed { generation: now }];
+            }
+            match store.wait_change(generation) {
+                Some(generation) => vec![Response::Changed { generation }],
+                None => vec![Response::Error {
+                    code: ErrorCode::Cancelled,
+                    msg: "service stopping".into(),
+                }],
+            }
         }
         Request::Count { text } => {
             let query = match Query::parse(&text) {
@@ -703,6 +838,7 @@ pub fn serve(
         }
         Ok(())
     })();
+    store.close_watchers();
     for (control, _) in &workers {
         let _ = control.shutdown();
     }
