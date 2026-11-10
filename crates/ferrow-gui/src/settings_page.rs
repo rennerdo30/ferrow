@@ -674,6 +674,7 @@ impl FerrowApp {
             excludes: self.settings.excludes.clone(),
             follow_symlinks: self.settings.follow_symlinks,
             columns: self.settings.index_columns(),
+            ntfs: ferrow_walk::NtfsMode::VolumeRoots,
         });
         self.settings.last_rebuild = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -17,6 +17,7 @@ use ferrow_index::osname::name_to_bytes;
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, metadata_timestamp};
 
 mod identity;
+pub mod ntfs;
 
 use identity::{FileId, file_id};
 
@@ -33,6 +34,24 @@ pub struct WalkOptions {
     pub excludes: Vec<PathBuf>,
     /// Descend into symlinked directories. Off by default.
     pub follow_symlinks: bool,
+    /// Read NTFS volumes' master file table directly when possible
+    /// (needs administrator rights; seconds instead of minutes on whole
+    /// drives). Roots it cannot serve are walked. Off by default.
+    pub ntfs: NtfsMode,
+}
+
+/// When to read an NTFS volume's MFT instead of walking a root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NtfsMode {
+    /// Always walk.
+    #[default]
+    Off,
+    /// Roots that are whole volumes (`C:\`, a mounted volume's folder).
+    /// The MFT read costs the same however small the root is, so folder
+    /// roots are walked.
+    VolumeRoots,
+    /// Every root on an NTFS volume (tests).
+    AllRoots,
 }
 
 /// Outcome of a scan.
@@ -541,8 +560,35 @@ fn root_name_bytes(path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// Which index entries an NTFS volume's MFT records became, so a live
+/// updater can apply the volume's change journal to the scan result.
+#[derive(Debug, Clone, Default)]
+pub struct VolumeMap {
+    /// `\\?\Volume{…}` device path.
+    pub device: String,
+    pub serial: u64,
+    /// Change journal id and the position to continue reading from.
+    pub journal: Option<(u64, i64)>,
+    pub record_size: usize,
+    /// `(record number, entry id)` for every entry from this volume,
+    /// including root entries. A record with several names (hard links)
+    /// appears once per name.
+    pub entries: Vec<(u64, u32)>,
+    /// Record numbers of excluded files and directories on this volume.
+    pub excluded: Vec<u64>,
+    /// Root entries filled from this volume: `(root record, entry id)`.
+    pub roots: Vec<(u64, u32)>,
+}
+
 /// Scan all roots and freeze the index.
 pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
+    let (index, report, _) = scan_with_maps(options);
+    (index, report)
+}
+
+/// [`scan`], also returning the record-to-entry maps of every volume
+/// that was read through its MFT.
+pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMap>) {
     let started = Instant::now();
     let builder = IndexBuilder::with_columns(options.columns);
     let errors = Errors::new();
@@ -562,7 +608,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
                 fatal_error: Some(fatal),
                 elapsed: started.elapsed(),
             };
-            return (builder.freeze(), report);
+            return (builder.freeze(), report, Vec::new());
         }
     };
     let walker = Walker {
@@ -661,6 +707,26 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         }
     }
 
+    // Fast path: roots on NTFS volumes are filled from the volume's MFT
+    // when it can be read (administrator or SYSTEM); the rest are walked.
+    let mut modes: Vec<String> = Vec::new();
+    #[allow(unused_mut, reason = "only filled on Windows")]
+    let mut maps: Vec<VolumeMap> = Vec::new();
+    #[cfg(windows)]
+    let root_dirs = if options.follow_symlinks || options.ntfs == NtfsMode::Off {
+        root_dirs
+    } else {
+        let (mft, walk): (Vec<_>, Vec<_>) = root_dirs
+            .into_iter()
+            .partition(|(dir, _, _)| options.ntfs == NtfsMode::AllRoots || is_volume_root(dir));
+        let mut rest = scan_from_mft(mft, &walker, &mut modes, &mut maps);
+        rest.extend(walk);
+        rest
+    };
+    if !root_dirs.is_empty() {
+        modes.push("parallel read_dir".to_string());
+    }
+
     rayon::scope(|scope| {
         for (dir, id, identity) in root_dirs {
             let ancestors = if walker.follow_symlinks {
@@ -679,8 +745,11 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
 
     let entries = builder.len();
     let index = builder.freeze();
+    if modes.is_empty() {
+        modes.push("parallel read_dir".to_string());
+    }
     let report = ScanReport {
-        mode: "parallel read_dir".to_string(),
+        mode: modes.join(" + "),
         threads: rayon::current_num_threads(),
         entries,
         errors: errors.count.load(Ordering::Relaxed),
@@ -688,13 +757,222 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         fatal_error: None,
         elapsed: started.elapsed(),
     };
-    (index, report)
+    (index, report, maps)
+}
+
+/// Fill every root on a readable NTFS volume from its MFT (one read per
+/// volume) and return the roots that still need the directory walk.
+#[cfg(windows)]
+fn scan_from_mft(
+    root_dirs: Vec<(PathBuf, u32, Option<FileId>)>,
+    walker: &Walker<'_>,
+    modes: &mut Vec<String>,
+    maps: &mut Vec<VolumeMap>,
+) -> Vec<(PathBuf, u32, Option<FileId>)> {
+    let mut pending: Vec<(PathBuf, u32, Option<FileId>)> = root_dirs;
+    let mut walk = Vec::new();
+    while let Some((dir, id, identity)) = pending.pop() {
+        let started = Instant::now();
+        let (device, volume) = match ntfs::read_volume(&dir) {
+            Ok(v) => v,
+            Err(reason) => {
+                modes.push(format!("walk {} ({reason})", dir.display()));
+                walk.push((dir, id, identity));
+                continue;
+            }
+        };
+        let read = started.elapsed();
+        // Every other pending root on the same volume reuses this read.
+        let mut here = vec![(dir, id, identity)];
+        let mut rest = Vec::new();
+        for root in pending.drain(..) {
+            if ntfs_device_of(&root.0).as_deref() == Some(device.as_str()) {
+                here.push(root);
+            } else {
+                rest.push(root);
+            }
+        }
+        pending = rest;
+        let mut entries = 0usize;
+        let mut map = VolumeMap {
+            device: device.clone(),
+            serial: volume.serial,
+            journal: volume.journal,
+            record_size: volume.record_size,
+            excluded: walker
+                .excludes
+                .dirs
+                .iter()
+                .chain(&walker.excludes.files)
+                .filter(|id| id.kind == 1 && id.volume == volume.serial)
+                .map(|id| (id.id as u64) & 0x0000_FFFF_FFFF_FFFF)
+                .collect(),
+            ..VolumeMap::default()
+        };
+        for (dir, id, identity) in here {
+            let identity = match identity.map(Ok).unwrap_or_else(|| file_id(&dir)) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    walker.errors.add(format!("{}: {e}", dir.display()));
+                    walk.push((dir, id, None));
+                    continue;
+                }
+            };
+            if identity.kind != 1 || identity.volume != volume.serial {
+                walk.push((dir, id, Some(identity)));
+                continue;
+            }
+            let record = (identity.id as u64) & 0x0000_FFFF_FFFF_FFFF;
+            if volume.info(record).is_none() {
+                walk.push((dir, id, Some(identity)));
+                continue;
+            }
+            map.roots.push((record, id));
+            map.entries.push((record, id));
+            entries += emit_mft_subtree(&volume, record, id, &dir, walker, &mut map.entries);
+        }
+        if !map.roots.is_empty() {
+            maps.push(map);
+        }
+        modes.push(format!(
+            "mft {device} ({} records read in {:.2} s, {entries} entries)",
+            volume.infos.len(),
+            read.as_secs_f64()
+        ));
+    }
+    walk
+}
+
+/// Whether `path` is the root of a volume (a drive or a mounted volume).
+#[cfg(windows)]
+fn is_volume_root(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut mount = [0u16; 1024];
+    // SAFETY: NUL-terminated input; output buffer and its length match.
+    if unsafe { GetVolumePathNameW(path_w.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } == 0 {
+        return false;
+    }
+    let len = mount.iter().position(|&c| c == 0).unwrap_or(0);
+    let trim = |s: &[u16]| {
+        let mut s = s.to_vec();
+        while s
+            .last()
+            .is_some_and(|&c| c == u16::from(b'\\') || c == u16::from(b'/'))
+        {
+            s.pop();
+        }
+        String::from_utf16_lossy(&s).to_lowercase()
+    };
+    let given: Vec<u16> = path.as_os_str().encode_wide().collect();
+    trim(&mount[..len]) == trim(&given)
+}
+
+#[cfg(windows)]
+fn ntfs_device_of(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut mount = [0u16; 1024];
+    let mut guid = [0u16; 128];
+    // SAFETY: NUL-terminated inputs; outputs and their lengths match.
+    let ok = unsafe {
+        GetVolumePathNameW(path_w.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) != 0
+            && GetVolumeNameForVolumeMountPointW(
+                mount.as_ptr(),
+                guid.as_mut_ptr(),
+                guid.len() as u32,
+            ) != 0
+    };
+    if !ok {
+        return None;
+    }
+    let len = guid.iter().position(|&c| c == 0).unwrap_or(0);
+    let mut device = String::from_utf16_lossy(&guid[..len]);
+    while device.ends_with('\\') {
+        device.pop();
+    }
+    Some(device)
+}
+
+/// Add everything below directory `record` (already added as `root_id`)
+/// to the builder, applying excludes like the walk does. Returns the
+/// number of entries added.
+#[cfg(windows)]
+fn emit_mft_subtree(
+    volume: &ntfs::Volume,
+    record: u64,
+    root_id: u32,
+    root_path: &Path,
+    walker: &Walker<'_>,
+    pairs: &mut Vec<(u64, u32)>,
+) -> usize {
+    let excluding = !walker.excludes.is_empty();
+    let mut added = 0usize;
+    // Paths are only needed to resolve link targets against excludes.
+    let mut stack: Vec<(u64, u32, Option<PathBuf>)> =
+        vec![(record, root_id, excluding.then(|| root_path.to_path_buf()))];
+    while let Some((dir, dir_id, dir_path)) = stack.pop() {
+        for (name, bytes) in volume.children(dir) {
+            let Some(info) = volume.info(name.record) else {
+                continue;
+            };
+            let surrogate = info.is_name_surrogate();
+            let is_dir = info.is_descended_dir();
+            let ent_flags = info.entry_flags();
+            let child_path = dir_path
+                .as_ref()
+                .map(|p| p.join(ferrow_index::osname::bytes_to_os(bytes)));
+            if excluding {
+                let identity = FileId {
+                    kind: 1,
+                    volume: volume.serial,
+                    id: (name.record | (info.sequence as u64) << 48) as u128,
+                };
+                let skip = if is_dir {
+                    walker.excludes.dirs.contains(&identity)
+                } else if surrogate {
+                    let path = child_path.as_deref().expect("paths kept while excluding");
+                    walker.candidate_excluded(path, false, true, None).0
+                } else {
+                    walker.excludes.files.contains(&identity)
+                };
+                if skip {
+                    continue;
+                }
+            }
+            let id = walker.builder.add_with_metadata(
+                dir_id,
+                bytes,
+                ent_flags,
+                info.metadata(walker.columns),
+            );
+            added += 1;
+            pairs.push((name.record, id));
+            if is_dir {
+                stack.push((name.record, id, child_path));
+            }
+        }
+    }
+    added
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ferrow_index::ROOT_PARENT;
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_roots_are_recognised() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(is_volume_root(Path::new(&format!("{system}\\"))));
+        assert!(is_volume_root(Path::new(&system.to_lowercase())));
+        assert!(!is_volume_root(&std::env::temp_dir()));
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -847,6 +1125,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
+            ntfs: NtfsMode::Off,
         });
         assert_eq!(report.errors, 0, "{:?}", report.error_samples);
         assert!(
@@ -859,6 +1138,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
+            ntfs: NtfsMode::Off,
         });
         assert!(
             !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
@@ -878,6 +1158,7 @@ mod tests {
             roots: vec![link.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
+            ntfs: NtfsMode::Off,
         });
         assert!(
             !(0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
@@ -892,6 +1173,7 @@ mod tests {
             roots: vec![link],
             follow_symlinks: true,
             excludes: Vec::new(),
+            ntfs: NtfsMode::Off,
         });
         assert!(
             (0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
@@ -910,6 +1192,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
+            ntfs: NtfsMode::Off,
         });
         // root, f.txt, a, g.txt, loop — the loop is a leaf, never descended.
         assert_eq!(idx.len(), 5, "cycle was not bounded");
@@ -925,6 +1208,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             idx.is_empty(),
@@ -942,6 +1226,7 @@ mod tests {
             roots: vec![dir.0.join("sub")],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             idx.is_empty(),
@@ -962,6 +1247,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("KEEPDIR")],
             follow_symlinks: false,
+            ntfs: NtfsMode::Off,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -981,6 +1267,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("skip")],
             follow_symlinks: false,
+            ntfs: NtfsMode::Off,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1002,6 +1289,7 @@ mod tests {
                 roots: vec![root],
                 excludes: vec![exclude],
                 follow_symlinks: false,
+                ntfs: NtfsMode::Off,
             });
             assert!(
                 idx.is_empty(),
@@ -1042,6 +1330,7 @@ mod tests {
                     roots: vec![scan_root],
                     excludes: vec![exclude],
                     follow_symlinks: false,
+                    ntfs: NtfsMode::Off,
                 });
                 assert!(
                     idx.is_empty(),
@@ -1061,6 +1350,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("no-such-exclude")],
             follow_symlinks: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(by_name(&idx).contains_key("keep.txt"));
         assert_eq!(report.fatal_error, None, "missing exclude must not abort");
@@ -1083,6 +1373,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("secret.txt")],
             follow_symlinks: false,
+            ntfs: NtfsMode::Off,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1162,6 +1453,7 @@ mod tests {
                 roots: vec![fx.root.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1185,6 +1477,7 @@ mod tests {
                 roots: vec![fx.aliases.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1213,6 +1506,7 @@ mod tests {
                 roots: vec![root_dir.0.clone()],
                 excludes: vec![exclude.clone()],
                 follow_symlinks: follow,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1237,6 +1531,7 @@ mod tests {
                     roots: vec![root.clone()],
                     excludes: vec![fx.exclude.clone()],
                     follow_symlinks: follow,
+                    ntfs: NtfsMode::Off,
                 });
                 assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
                 assert_eq!(idx.len(), 1, "follow={follow}");
@@ -1278,6 +1573,7 @@ mod tests {
                     roots: vec![root.clone()],
                     excludes: excludes.clone(),
                     follow_symlinks: follow,
+                    ntfs: NtfsMode::Off,
                 });
                 assert_eq!(
                     report.errors, 0,
@@ -1291,6 +1587,7 @@ mod tests {
                         roots: vec![scan_root.clone()],
                         excludes: excludes.clone(),
                         follow_symlinks: follow,
+                        ntfs: NtfsMode::Off,
                     });
                     assert_eq!(
                         report.errors, 1,
@@ -1355,6 +1652,7 @@ mod tests {
                 roots: vec![root.clone()],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
             assert_eq!(idx.len(), 1, "follow={follow}: control");
@@ -1364,6 +1662,7 @@ mod tests {
                 roots: vec![root],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(report.errors, 1, "follow={follow}: {report:?}");
             assert!(
@@ -1401,6 +1700,7 @@ mod tests {
                 roots: vec![root.0.clone()],
                 excludes: vec![exclude],
                 follow_symlinks: true,
+                ntfs: NtfsMode::Off,
             });
             assert!(
                 !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),

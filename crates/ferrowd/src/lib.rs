@@ -191,6 +191,7 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
             roots: config.roots.clone(),
             excludes: config.excludes.clone(),
             follow_symlinks: config.follow_symlinks,
+            ntfs: ferrow_walk::NtfsMode::VolumeRoots,
         };
         let (snapshot, report) = Snapshot::from_scan(&options);
         for sample in &report.error_samples {
