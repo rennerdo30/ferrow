@@ -81,3 +81,7 @@ is needed in either direction.
   design.
 - **Everything is native again after closing Ferrow** — expected in
   service mode; see Limits.
+- **For a support report:** start Ferrow with the environment variable
+  `FERROW_WINSEARCH_DIAG` set to a file path. The responder then logs
+  one line per Start request (request id, hit count, answering source;
+  never your search text). Attach that file to the report.

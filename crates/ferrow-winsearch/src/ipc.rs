@@ -360,6 +360,32 @@ fn query_via_disk_index(
     hits_from_index(&index, query_str, limit)
 }
 
+static DIAG_LOG: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Opt-in responder diagnostics: when `FERROW_WINSEARCH_DIAG` names a
+/// file, the responder appends one line per request with the request id,
+/// limit, hit count and answering source. Query text is never logged.
+fn diag_log_path() -> Option<&'static Path> {
+    DIAG_LOG
+        .get_or_init(|| {
+            std::env::var_os("FERROW_WINSEARCH_DIAG")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+        .as_deref()
+}
+
+fn diag_line(line: String) {
+    if let Some(path) = diag_log_path()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// Start the background IPC responder thread in `ferrow-gui` if not already running.
 pub fn ensure_responder_started(data_dir: &Path) {
     let ws_dir = winsearch_dir(data_dir);
@@ -482,10 +508,20 @@ fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut S
     // loaded, otherwise the ferrowd service. An empty reply makes the DLL
     // fall back to native Windows Search for this query.
     let index_opt = active_index_slot().lock().ok().and_then(|g| g.clone());
-    let rows = match index_opt {
-        Some(index) => hits_from_index(&index, query_str, limit).unwrap_or_default(),
-        None => link.query(query_str, limit).unwrap_or_default(),
+    let (rows, answered_by) = match index_opt {
+        Some(index) => (
+            hits_from_index(&index, query_str, limit).unwrap_or_default(),
+            "local",
+        ),
+        None => match link.query(query_str, limit) {
+            Some(rows) => (rows, "service"),
+            None => (Vec::new(), "service-error"),
+        },
     };
+    diag_line(format!(
+        "resp id={req_id} limit={limit} hits={} source={answered_by}",
+        rows.len()
+    ));
 
     let serialized = serialize_rows(&rows);
     let tmp_resp = ws_dir.join(format!("resp-{req_id}.tmp"));
