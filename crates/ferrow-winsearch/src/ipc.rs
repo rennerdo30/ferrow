@@ -1,23 +1,29 @@
 //! File-backed zero-idle-CPU query bridge and standalone index cache.
 //!
-//! When `ferrow-gui` is running, it already holds the user's `Arc<Index>` in
-//! memory (which can be several gigabytes for full-drive indexes). A background
-//! responder thread in `ferrow-gui` blocks in the kernel on
-//! `ReadDirectoryChangesW` (`0%` idle CPU) watching `<data_dir>/winsearch` for
-//! `req-<id>.q` files written by `SearchHost.exe`, runs `ferrow_query::search`
-//! on the in-memory `Arc<Index>`, and atomically renames `resp-<id>.tmp` to
-//! `resp-<id>.r`.
+//! When `ferrow-gui` is running, a background responder thread blocks in the
+//! kernel on `ReadDirectoryChangesW` (`0%` idle CPU) watching
+//! `<data_dir>/winsearch` for `req-<id>.q` files written by `SearchHost.exe`.
+//! It answers from the same source the app itself searches: the in-memory
+//! `Arc<Index>` when the app uses its own index, or the `ferrowd` service
+//! over `ferrow-ipc` when the service answers (the normal installed setup,
+//! whose live index can be several gigabytes and belongs to the service).
+//! Replies are atomically renamed `resp-<id>.tmp` to `resp-<id>.r`.
 //!
-//! When `ferrow-gui` is not running and `<data_dir>/index.bin` is `<= 256 MiB`,
-//! the attachment DLL loads and caches `index.bin` directly by modification time.
+//! When `ferrow-gui` is not running, the app's own index is the source and
+//! `<data_dir>/index.bin` is `<= 256 MiB`, the attachment DLL loads and
+//! caches `index.bin` directly by modification time. In service mode the
+//! DLL never serves that stale local file; `SearchHost.exe` falls back to
+//! native Windows Search instead (the service index under
+//! `C:\ProgramData` is SYSTEM-protected and unreadable from the shell).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use ferrow_index::{Index, flags, osname};
+use ferrow_ipc::{Client, Endpoint, FileRow, Sort, Stream};
 use ferrow_query::{Query, SearchOptions, search};
 
 /// Maximum `index.bin` size loaded directly inside `SearchHost.exe` when
@@ -27,6 +33,17 @@ const MAX_INPROC_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum time `SearchHost.exe` waits for an IPC reply from `ferrow-gui`.
 const IPC_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Budget for (re)connecting the responder to the `ferrowd` service. Runs
+/// on the responder thread only; `SearchHost.exe` has already fallen back
+/// to native results after [`IPC_TIMEOUT`], so this never stalls the shell.
+const SERVICE_CONNECT_BUDGET: Duration = Duration::from_millis(800);
+/// Budget for one service page query on an established connection, kept
+/// inside [`IPC_TIMEOUT`] so the reply can still reach `SearchHost.exe`.
+const SERVICE_QUERY_BUDGET: Duration = Duration::from_millis(200);
+/// After a failed service connect or query, wait this long before the
+/// responder tries the service again (native fallback meanwhile).
+const SERVICE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 type CachedIndex = (PathBuf, SystemTime, Arc<Index>);
 
@@ -59,6 +76,61 @@ fn cached_disk_index_slot() -> &'static Mutex<Option<CachedIndex>> {
 pub fn set_active_index(index: Option<Arc<Index>>) {
     if let Ok(mut guard) = active_index_slot().lock() {
         *guard = index;
+    }
+}
+
+/// Which index answers Start menu searches, mirroring the app's own source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexSource {
+    /// The app's own in-memory / on-disk index.
+    Local,
+    /// The `ferrowd` service index, queried over `ferrow-ipc`.
+    Service,
+}
+
+static ACTIVE_SOURCE: AtomicU8 = AtomicU8::new(0);
+
+fn source_code(source: IndexSource) -> u8 {
+    match source {
+        IndexSource::Local => 1,
+        IndexSource::Service => 2,
+    }
+}
+
+/// The source currently answering in this process, if one was published.
+pub fn source() -> Option<IndexSource> {
+    match ACTIVE_SOURCE.load(Ordering::Acquire) {
+        1 => Some(IndexSource::Local),
+        2 => Some(IndexSource::Service),
+        _ => None,
+    }
+}
+
+/// Publish the answering source: in memory for the responder and Settings
+/// status, and as the `source` marker the DLL in `SearchHost.exe` reads
+/// before considering the on-disk local index.
+pub fn set_source(data_dir: &Path, source: IndexSource) {
+    ACTIVE_SOURCE.store(source_code(source), Ordering::Release);
+    let text = match source {
+        IndexSource::Local => b"local".as_slice(),
+        IndexSource::Service => b"service".as_slice(),
+    };
+    let _ = std::fs::write(source_marker_path(data_dir), text);
+}
+
+/// Path to the `source` marker file inside the winsearch folder.
+pub fn source_marker_path(data_dir: &Path) -> PathBuf {
+    winsearch_dir(data_dir).join("source")
+}
+
+fn source_from_marker(data_dir: &Path) -> Option<IndexSource> {
+    match std::fs::read_to_string(source_marker_path(data_dir))
+        .ok()?
+        .trim()
+    {
+        "local" => Some(IndexSource::Local),
+        "service" => Some(IndexSource::Service),
+        _ => None,
     }
 }
 
@@ -113,10 +185,90 @@ pub fn hits_from_index(index: &Index, query_str: &str, limit: usize) -> Option<V
     Some(rows)
 }
 
+/// Convert `ferrowd` service rows (full-path bytes with metadata and
+/// folder flags, protocol 4) into Windows Search hit rows. Date ticks
+/// pass through unchanged: both sides use signed Unix-epoch 100 ns ticks.
+pub fn rows_from_service(rows: Vec<FileRow>) -> Vec<SearchHitRow> {
+    rows.into_iter()
+        .map(|row| {
+            let full_path = osname::path_from_bytes(&row.path)
+                .to_string_lossy()
+                .into_owned();
+            let split = row
+                .path
+                .iter()
+                .rposition(|&b| b == b'\\' || b == b'/')
+                .filter(|&at| at + 1 < row.path.len());
+            let file_name = match split {
+                Some(at) => osname::bytes_to_os(&row.path[at + 1..])
+                    .to_string_lossy()
+                    .into_owned(),
+                None => full_path.clone(),
+            };
+            SearchHitRow {
+                file_name,
+                full_path,
+                is_dir: row.is_dir,
+                modified_ticks: row.modified,
+                created_ticks: row.created,
+                accessed_ticks: row.accessed,
+            }
+        })
+        .collect()
+}
+
+/// The responder's reusable connection to the `ferrowd` service. Owned by
+/// the responder thread; every operation is deadline-bound and any error
+/// drops the connection (a timed-out stream may be mid-frame), with a
+/// short backoff before reconnecting.
+#[derive(Default)]
+pub struct ServiceLink {
+    client: Option<Client<Stream>>,
+    retry_at: Option<Instant>,
+}
+
+impl ServiceLink {
+    fn query(&mut self, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
+        if self.client.is_none() {
+            if self.retry_at.is_some_and(|at| Instant::now() < at) {
+                return None;
+            }
+            let deadline = Instant::now() + SERVICE_CONNECT_BUDGET;
+            match Client::connect_deadline(&Endpoint::default_service(), deadline) {
+                Ok(mut client) => {
+                    client.clear_deadline();
+                    self.client = Some(client);
+                    self.retry_at = None;
+                }
+                Err(_) => {
+                    self.retry_at = Some(Instant::now() + SERVICE_RETRY_BACKOFF);
+                    return None;
+                }
+            }
+        }
+        let client = self.client.as_mut()?;
+        let _ = client.set_deadline(Instant::now() + SERVICE_QUERY_BUDGET);
+        let page = client.page(query_str, 0, limit as u32, Sort::Name, false);
+        match page {
+            Ok((rows, _, _)) => {
+                client.clear_deadline();
+                Some(rows_from_service(rows))
+            }
+            Err(_) => {
+                self.client = None;
+                self.retry_at = Some(Instant::now() + SERVICE_RETRY_BACKOFF);
+                None
+            }
+        }
+    }
+}
+
 /// Query Ferrow for `query_str` using:
 /// 1. In-process `ACTIVE_INDEX` if present in this process,
-/// 2. The `ferrow-gui` responder over `<data_dir>/winsearch` if active,
-/// 3. Direct cached load of `<data_dir>/index.bin` if `<= 256 MiB`.
+/// 2. The `ferrow-gui` responder over `<data_dir>/winsearch` if active
+///    (which itself answers from the local index or the `ferrowd` service),
+/// 3. Direct cached load of `<data_dir>/index.bin` if `<= 256 MiB` and the
+///    app's own index is the published source.
 pub fn query_hits(data_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
     if !is_enabled(data_dir) {
         return None;
@@ -179,6 +331,11 @@ fn query_via_disk_index(
     query_str: &str,
     limit: usize,
 ) -> Option<Vec<SearchHitRow>> {
+    // In service mode the local index.bin is stale by definition (the
+    // service owns the live index): prefer native Windows Search.
+    if source_from_marker(data_dir) == Some(IndexSource::Service) {
+        return None;
+    }
     let index_path = data_dir.join("index.bin");
     let meta = std::fs::metadata(&index_path).ok()?;
     if meta.len() > MAX_INPROC_INDEX_BYTES {
@@ -218,18 +375,19 @@ pub fn ensure_responder_started(data_dir: &Path) {
 }
 
 fn responder_loop(ws_dir: &Path) {
-    process_pending_requests(ws_dir);
+    let mut link = ServiceLink::default();
+    process_pending_requests(ws_dir, &mut link);
     #[cfg(windows)]
-    watch_directory_windows(ws_dir);
+    watch_directory_windows(ws_dir, &mut link);
     #[cfg(not(windows))]
     loop {
         std::thread::sleep(Duration::from_millis(50));
-        process_pending_requests(ws_dir);
+        process_pending_requests(ws_dir, &mut link);
     }
 }
 
 #[cfg(windows)]
-fn watch_directory_windows(ws_dir: &Path) {
+fn watch_directory_windows(ws_dir: &Path, link: &mut ServiceLink) {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME,
@@ -274,7 +432,7 @@ fn watch_directory_windows(ws_dir: &Path) {
         if ok.is_err() {
             break;
         }
-        process_pending_requests(ws_dir);
+        process_pending_requests(ws_dir, link);
     }
     // SAFETY: closing owned directory handle on loop exit.
     unsafe {
@@ -283,7 +441,7 @@ fn watch_directory_windows(ws_dir: &Path) {
 }
 
 /// Process all currently queued `req-*.q` files in `ws_dir`.
-pub fn process_pending_requests(ws_dir: &Path) {
+pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
     let Ok(entries) = std::fs::read_dir(ws_dir) else {
         return;
     };
@@ -294,7 +452,7 @@ pub fn process_pending_requests(ws_dir: &Path) {
             continue;
         };
         if let Some(req_id) = name.strip_prefix("req-").and_then(|s| s.strip_suffix(".q")) {
-            handle_one_request(ws_dir, &path, req_id);
+            handle_one_request(ws_dir, &path, req_id, link);
         } else if (name.ends_with(".tmp") || name.ends_with(".r"))
             && let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
@@ -305,7 +463,7 @@ pub fn process_pending_requests(ws_dir: &Path) {
     }
 }
 
-fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str) {
+fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut ServiceLink) {
     let Ok(text) = std::fs::read_to_string(req_path) else {
         return;
     };
@@ -320,10 +478,13 @@ fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str) {
         return;
     };
 
+    // Answer from the app's own source: its in-memory index when one is
+    // loaded, otherwise the ferrowd service. An empty reply makes the DLL
+    // fall back to native Windows Search for this query.
     let index_opt = active_index_slot().lock().ok().and_then(|g| g.clone());
     let rows = match index_opt {
         Some(index) => hits_from_index(&index, query_str, limit).unwrap_or_default(),
-        None => Vec::new(),
+        None => link.query(query_str, limit).unwrap_or_default(),
     };
 
     let serialized = serialize_rows(&rows);
@@ -452,5 +613,64 @@ mod tests {
         assert!(hits[0].full_path.ends_with("ferrow-native-query-proof.txt"));
         assert!(!hits[0].is_dir);
         assert_eq!(hits[0].modified_ticks, Some(17_123_456_000_000_000));
+    }
+
+    #[test]
+    fn converts_service_rows_with_names_flags_and_dates() {
+        let rows = rows_from_service(vec![
+            FileRow {
+                path: br"C:\Work\report-2026.txt".to_vec(),
+                modified: Some(17_123_456_000_000_000),
+                created: Some(16_000_000_000_000_000),
+                is_dir: false,
+                ..Default::default()
+            },
+            FileRow {
+                path: br"E:\Projects".to_vec(),
+                is_dir: true,
+                ..Default::default()
+            },
+            FileRow {
+                path: br"C:\root-file.log".to_vec(),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].file_name, "report-2026.txt");
+        assert_eq!(rows[0].full_path, r"C:\Work\report-2026.txt");
+        assert!(!rows[0].is_dir);
+        assert_eq!(rows[0].modified_ticks, Some(17_123_456_000_000_000));
+        assert_eq!(rows[0].created_ticks, Some(16_000_000_000_000_000));
+        assert_eq!(rows[0].accessed_ticks, None);
+        assert_eq!(rows[1].file_name, "Projects");
+        assert!(rows[1].is_dir);
+        assert_eq!(rows[2].file_name, "root-file.log");
+        assert_eq!(rows[2].full_path, r"C:\root-file.log");
+    }
+
+    #[test]
+    fn disk_fallback_never_serves_local_index_in_service_mode() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("ferrow-winsearch-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(winsearch_dir(&temp_dir)).unwrap();
+
+        let builder = IndexBuilder::new();
+        let root = builder.add_root(br"C:\Work", flags::DIR);
+        builder.add(root, b"ferrow-service-mode-guard.txt", 0);
+        let index = builder.freeze();
+        index.save(&temp_dir.join("index.bin")).unwrap();
+
+        // Service mode: the stale local file must not be served.
+        set_source(&temp_dir, IndexSource::Service);
+        assert!(query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).is_none());
+
+        // Local mode: the same file answers again.
+        set_source(&temp_dir, IndexSource::Local);
+        let hits = query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file_name, "ferrow-service-mode-guard.txt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

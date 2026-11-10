@@ -1,5 +1,10 @@
 //! Host controller for enabling/disabling Windows Search integration and
 //! attaching `ferrow_winsearch.dll` to `SearchHost.exe`.
+//!
+//! A watcher thread blocks on the `SearchHost.exe` process handle (0% CPU
+//! while waiting) and re-attaches whenever Windows restarts the shell
+//! search host, so the integration survives shell restarts for as long as
+//! `ferrow-gui` runs. Attachment state is exposed via [`attach_status`].
 
 use std::ffi::c_void;
 use std::io;
@@ -7,7 +12,9 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_SUCCESS, FreeLibrary, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE,
@@ -47,6 +54,32 @@ const DLL_NAME: &str = "ferrow_winsearch.dll";
 const ATTACH_ACCESS: u32 = 0x10043A | 0x0010;
 
 static LAST_ATTACHED_PID: AtomicU32 = AtomicU32::new(0);
+static WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
+static ATTACH_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn attach_lock() -> &'static Mutex<()> {
+    ATTACH_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn last_error_slot() -> &'static Mutex<Option<String>> {
+    LAST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn record_attach_error(error: Option<String>) {
+    if let Ok(mut guard) = last_error_slot().lock() {
+        *guard = error;
+    }
+}
+
+/// `(attached SearchHost pid, most recent attachment failure)` for the
+/// Settings status line. Attachment is best-effort and retried by the
+/// watcher, so an error here is informational, not fatal.
+pub fn attach_status() -> (Option<u32>, Option<String>) {
+    let pid = LAST_ATTACHED_PID.load(Ordering::Acquire);
+    let error = last_error_slot().lock().ok().and_then(|g| g.clone());
+    (if pid == 0 { None } else { Some(pid) }, error)
+}
 
 /// Synchronize the live Windows Search integration state with the user's setting.
 pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
@@ -56,6 +89,7 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
             std::fs::remove_file(&marker)
                 .map_err(|e| format!("Could not disable Windows Search integration: {e}"))?;
         }
+        record_attach_error(None);
         return Ok(());
     }
 
@@ -84,17 +118,85 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
         .spawn(move || {
             let _ = attach_searchhost_now(&dir_owned);
         });
+    ensure_watcher_started(data_dir);
 
     Ok(())
 }
 
+/// Start the `SearchHost.exe` lifetime watcher once per process. The
+/// watcher attaches (when enabled), blocks on the process handle until
+/// the shell search host exits, then attaches to its successor.
+fn ensure_watcher_started(data_dir: &Path) {
+    if WATCHER_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let dir_owned = data_dir.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("ferrow-winsearch-watch".into())
+        .spawn(move || watcher_loop(&dir_owned));
+}
+
+fn watcher_loop(data_dir: &Path) {
+    loop {
+        let pids = find_searchhost_pids().unwrap_or_default();
+        let Some(&pid) = pids.first() else {
+            // SearchHost is not running (rare outside logon): the only
+            // waiting done by sleeping, and only until it appears.
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if ipc::is_enabled(data_dir) {
+            let _ = attach_searchhost_now(data_dir);
+        }
+        wait_for_process_exit(pid);
+        if LAST_ATTACHED_PID.load(Ordering::Acquire) == pid {
+            LAST_ATTACHED_PID.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Block until `pid` exits. Prefers a kernel wait on the process handle
+/// (0% CPU); if the handle cannot be opened, falls back to noticing the
+/// pid disappear.
+fn wait_for_process_exit(pid: u32) {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let opened = unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS(SYNCHRONIZE), false, pid) };
+    match opened {
+        Ok(handle) => unsafe {
+            // INFINITE: block until SearchHost exits.
+            let _ = WaitForSingleObject(handle, u32::MAX);
+            let _ = CloseHandle(handle);
+        },
+        Err(_) => loop {
+            std::thread::sleep(Duration::from_secs(2));
+            match find_searchhost_pids() {
+                Ok(pids) if pids.contains(&pid) => continue,
+                _ => break,
+            }
+        },
+    }
+}
+
 /// Synchronously stage `ferrow_winsearch.dll` and attach it to `SearchHost.exe`.
+/// Serialized across the immediate attach and the watcher; the outcome is
+/// recorded for [`attach_status`].
 pub fn attach_searchhost_now(data_dir: &Path) -> Result<bool, String> {
-    let ws_dir = ipc::winsearch_dir(data_dir);
-    let staged_dll = stage_attachment_dll(&ws_dir)
-        .map_err(|e| format!("Could not stage ferrow_winsearch.dll: {e}"))?;
-    attach_to_searchhost(&staged_dll, data_dir)
-        .map_err(|e| format!("Could not attach to SearchHost.exe: {e}"))
+    let _guard = match attach_lock().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let result = (|| -> Result<bool, String> {
+        let ws_dir = ipc::winsearch_dir(data_dir);
+        let staged_dll = stage_attachment_dll(&ws_dir)
+            .map_err(|e| format!("Could not stage ferrow_winsearch.dll: {e}"))?;
+        attach_to_searchhost(&staged_dll, data_dir)
+            .map_err(|e| format!("Could not attach to SearchHost.exe: {e}"))
+    })();
+    match &result {
+        Ok(_) => record_attach_error(None),
+        Err(error) => record_attach_error(Some(error.clone())),
+    }
+    result
 }
 
 /// Grant `ALL APPLICATION PACKAGES` (`S-1-15-2-1`) Read+Execute (or Modify when
@@ -301,7 +403,9 @@ fn list_remote_modules(pid: u32) -> io::Result<Vec<(String, usize, usize)>> {
 
 fn attach_to_searchhost(dll_path: &Path, data_dir: &Path) -> io::Result<bool> {
     if size_of::<*const c_void>() != 8 {
-        return Ok(false);
+        return Err(io::Error::other(
+            "Windows Search integration needs a 64-bit Ferrow build",
+        ));
     }
     let pids = find_searchhost_pids()?;
     let Some(&pid) = pids.first() else {
@@ -348,7 +452,9 @@ unsafe fn attach_to_process_handle(
             .map_err(io::Error::from)?;
     }
     if proc_machine.0 != 0 || native_machine.0 != 0x8664 {
-        return Ok(false);
+        return Err(io::Error::other(
+            "Windows Search integration supports 64-bit x86 Windows only",
+        ));
     }
 
     let remote_mods = list_remote_modules(pid)?;

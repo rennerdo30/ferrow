@@ -3,7 +3,8 @@
 //! Provides:
 //! - [`sql`]: Windows Search SQL (`SystemIndex`) parser and query extractor.
 //! - [`ipc`]: Zero-idle-CPU file-backed query responder (`ReadDirectoryChangesW`)
-//!   and standalone `index.bin` reader.
+//!   answering from the app's in-memory index or the `ferrowd` service,
+//!   plus the standalone `index.bin` reader for local mode.
 //! - `rowset` (Windows): In-process OLE DB `IRowset` + `IAccessor` +
 //!   `IColumnsInfo` + `IGetRow` (`IPropertyStore`) implementation compatible
 //!   with `SearchHost.exe`'s LowBox AppContainer.
@@ -44,11 +45,52 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
 }
 
 /// Share the newly loaded `Arc<Index>` and ensure the Windows Search responder
-/// and attachment match `enabled`.
+/// and attachment match `enabled`. The app's own index is now the source.
 pub fn on_index_loaded(data_dir: Option<&Path>, index: Arc<Index>, enabled: bool) {
     set_active_index(Some(index));
-    if enabled && let Some(dir) = data_dir {
-        let _ = sync_state(dir, true);
+    if let Some(dir) = data_dir {
+        if enabled {
+            let _ = sync_state(dir, true);
+        }
+        ipc::set_source(dir, ipc::IndexSource::Local);
+    }
+}
+
+/// The `ferrowd` service now answers the app's searches: publish it as the
+/// Start menu source (the responder queries it over `ferrow-ipc`) and
+/// ensure the attachment matches `enabled`. Any previously shared local
+/// index stops answering, so Start results track the service's live index.
+pub fn on_service_connected(data_dir: Option<&Path>, enabled: bool) {
+    set_active_index(None);
+    if let Some(dir) = data_dir {
+        if enabled {
+            let _ = sync_state(dir, true);
+        }
+        ipc::set_source(dir, ipc::IndexSource::Service);
+    }
+}
+
+/// Live state of the integration for the Settings page.
+#[derive(Clone, Debug, Default)]
+pub struct IntegrationStatus {
+    /// `SearchHost.exe` pid the DLL is attached to, if attached.
+    pub attached_pid: Option<u32>,
+    /// Which index answers Start menu searches, once known.
+    pub source: Option<ipc::IndexSource>,
+    /// Most recent attachment failure, if attachment has failed.
+    pub last_error: Option<String>,
+}
+
+/// Current attachment and answering source. Cheap; safe to poll per frame.
+pub fn status() -> IntegrationStatus {
+    #[cfg(windows)]
+    let (attached_pid, last_error) = controller::attach_status();
+    #[cfg(not(windows))]
+    let (attached_pid, last_error) = (None, None);
+    IntegrationStatus {
+        attached_pid,
+        source: ipc::source(),
+        last_error,
     }
 }
 
@@ -128,8 +170,24 @@ mod windows_tests {
         );
         let empty_sql = "SELECT TOP 1 System.ItemName FROM SystemIndex WHERE System.ItemName = 'ferrow-native-query-poc-82e561d9-never-created.txt'";
 
-        let command = hook::create_native_command()?;
-        assert_eq!(row_count(&execute_sql(&command, &query_sql)?)?, 0);
+        // The native catalog is a host service, not Ferrow code: where it
+        // is unavailable (for example CI runners without Windows Search),
+        // skip instead of failing. Where it answers, every assertion
+        // below stays strict.
+        let probe = (|| -> Result<ICommandText> {
+            let command = hook::create_native_command()?;
+            assert_eq!(row_count(&execute_sql(&command, &query_sql)?)?, 0);
+            Ok(command)
+        })();
+        let Ok(command) = probe else {
+            eprintln!("skipping: native Windows Search catalog unavailable here");
+            set_active_index(None);
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            unsafe {
+                CoUninitialize();
+            }
+            return Ok(());
+        };
 
         // Enable marker and attach hook in-process.
         std::fs::write(ipc::enabled_marker_path(&temp_dir), b"1").unwrap();
@@ -152,6 +210,35 @@ mod windows_tests {
         drop(command);
         set_active_index(None);
         let _ = std::fs::remove_dir_all(&temp_dir);
+        unsafe {
+            CoUninitialize();
+        }
+        Ok(())
+    }
+
+    /// The rowset contract (columns, `IGetRow`, `IAccessor`) without the
+    /// native catalog, so every Windows test host covers it, including
+    /// runners where Windows Search itself never answers.
+    #[test]
+    fn rowset_contract_without_native_catalog() -> Result<()> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let columns: Vec<String> = rowset::DEFAULT_COLUMNS
+            .iter()
+            .map(|(name, _, _)| (*name).to_owned())
+            .collect();
+        let hits = vec![ipc::SearchHitRow {
+            file_name: "ferrow-native-query-proof.txt".into(),
+            full_path: r"C:\Work\ferrow-native-query-proof.txt".into(),
+            is_dir: false,
+            modified_ticks: Some(17_123_456_000_000_000),
+            created_ticks: None,
+            accessed_ticks: None,
+        }];
+        let rows = rowset::build_for_hits(&columns, hits)?;
+        rowset::verify_rowset(&rows, "ferrow-native-query-proof.txt")?;
+        drop(rows);
         unsafe {
             CoUninitialize();
         }

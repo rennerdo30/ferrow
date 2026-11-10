@@ -54,8 +54,12 @@ $programs = 'ferrow-gui.exe', 'ferrow.exe', 'ferrowd.exe', 'ferrow-update.exe', 
 if (!$BinDir) {
     $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
     $cargo = (Get-Command cargo -ErrorAction Stop).Source
-    Invoke-Bounded $cargo @('build', '--release', '--locked', '-j', '8', '-p', 'ferrow-gui', '-p', 'ferrow', '-p', 'ferrowd', '-p', 'ferrow-update', '-p', 'ferrow-winsearch') 3600
+    Invoke-Bounded $cargo @('build', '--release', '--locked', '-j', '8', '-p', 'ferrow-gui', '-p', 'ferrow', '-p', 'ferrowd', '-p', 'ferrow-update') 3600
+    # The SearchHost DLL uses the unwind `winsearch` profile (see Cargo.toml),
+    # so a panic in Ferrow code can never abort the shell process.
+    Invoke-Bounded $cargo @('build', '--profile', 'winsearch', '--locked', '-j', '8', '-p', 'ferrow-winsearch') 3600
     $BinDir = Join-Path $target 'release'
+    Copy-Item -LiteralPath (Join-Path $target 'winsearch/ferrow_winsearch.dll') -Destination $BinDir -Force
 }
 foreach ($program in $programs) {
     if (!(Test-Path -LiteralPath (Join-Path $BinDir $program) -PathType Leaf)) { throw "Missing $program in $BinDir" }

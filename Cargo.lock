@@ -1172,6 +1172,7 @@ name = "ferrow-winsearch"
 version = "0.1.0-beta.4"
 dependencies = [
  "ferrow-index",
+ "ferrow-ipc",
  "ferrow-query",
  "windows",
  "windows-core",

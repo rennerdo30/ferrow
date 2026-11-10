@@ -60,7 +60,13 @@ jobs:
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Release build
-        run: cargo build --release --locked -p ferrow-gui -p ferrow -p ferrowd -p ferrow-update -p ferrow-winsearch
+        run: cargo build --release --locked -p ferrow-gui -p ferrow -p ferrowd -p ferrow-update
+      - name: Windows Search DLL (unwind profile)
+        shell: pwsh
+        run: |
+          cargo build --profile winsearch --locked -p ferrow-winsearch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target/winsearch/ferrow_winsearch.dll target/release/ -Force
       - name: Package the setup (pinned NSIS)
         shell: pwsh
         run: |

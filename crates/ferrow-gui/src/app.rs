@@ -220,6 +220,12 @@ impl FerrowApp {
                     self.service_entries = Some(entries);
                     self.index_source = format!("Ferrow service: {report}");
                     if first {
+                        let data_dir = crate::engine::default_index_path()
+                            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+                        ferrow_winsearch::on_service_connected(
+                            data_dir.as_deref(),
+                            self.settings.windows.windows_search,
+                        );
                         // The service's index covers every drive and stays
                         // current: no local index or rebuilds needed.
                         self.index = Some(Arc::new(ferrow_index::IndexBuilder::new().freeze()));

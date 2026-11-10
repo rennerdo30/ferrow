@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ferrow-index = { path = "../ferrow-index" }
+ferrow-ipc = { path = "../ferrow-ipc" }
 ferrow-query = { path = "../ferrow-query" }
 
 [target.'cfg(windows)'.dependencies]
