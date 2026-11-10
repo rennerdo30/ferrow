@@ -843,6 +843,49 @@ fn scan_from_mft(
     walk
 }
 
+/// Every local fixed drive's root (`C:\`, `E:\`, …), skipping drive
+/// letters that are only `subst` aliases of a folder (indexed through
+/// their real drive). The system service indexes these by default.
+#[cfg(windows)]
+pub fn fixed_local_drives() -> Vec<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetLogicalDrives, QueryDosDeviceW,
+    };
+    const DRIVE_FIXED: u32 = 3;
+    // SAFETY: no preconditions.
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| b'A' + i)
+        .filter(|&letter| {
+            let root = [letter as u16, u16::from(b':'), u16::from(b'\\'), 0];
+            let name = [letter as u16, u16::from(b':'), 0];
+            let mut target = [0u16; 1024];
+            // SAFETY: NUL-terminated inputs; output buffer and its length match.
+            unsafe {
+                GetDriveTypeW(root.as_ptr()) == DRIVE_FIXED
+                    && !{
+                        let n = QueryDosDeviceW(
+                            name.as_ptr(),
+                            target.as_mut_ptr(),
+                            target.len() as u32,
+                        );
+                        // A subst alias maps to `\??\<folder>`.
+                        n >= 4
+                            && target[..4]
+                                == [
+                                    u16::from(b'\\'),
+                                    u16::from(b'?'),
+                                    u16::from(b'?'),
+                                    u16::from(b'\\'),
+                                ]
+                    }
+            }
+        })
+        .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+        .collect()
+}
+
 /// Whether `path` is the root of a volume (a drive or a mounted volume).
 #[cfg(windows)]
 pub fn is_volume_root(path: &Path) -> bool {

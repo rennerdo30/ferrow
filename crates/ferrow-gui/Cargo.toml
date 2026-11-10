@@ -17,6 +17,7 @@ path = "src/main.rs"
 ferrow-index = { path = "../ferrow-index" }
 ferrow-query = { path = "../ferrow-query" }
 ferrow-walk = { path = "../ferrow-walk" }
+ferrow-ipc = { path = "../ferrow-ipc" }
 ferrow-update = { path = "../ferrow-update" }
 # default_fonts is off on purpose: the bundled fonts are not under a
 # licence on the deny.toml allow list. The app loads the OS UI font.

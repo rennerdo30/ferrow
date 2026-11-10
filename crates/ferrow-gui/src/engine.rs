@@ -16,6 +16,10 @@ use ferrow_query::{CancelToken, Query, SearchOptions, SortKey, SortStatus};
 
 /// Hits shown before the full result list is ready.
 const FIRST_PAGE: usize = 200;
+/// Rows fetched from the Ferrow service per request.
+const REMOTE_PAGE: usize = 500;
+/// Loaded service rows kept per query; scrolling far away drops the rest.
+const REMOTE_KEEP: usize = 20_000;
 
 /// The current result set.
 #[derive(Clone)]
@@ -24,6 +28,19 @@ pub enum Hits {
     All,
     /// Entry ids in name order.
     Some(Arc<Vec<u32>>),
+    /// Results from the Ferrow service: the rows loaded so far, held in
+    /// a small index of their own.
+    Remote(Arc<RemoteView>),
+}
+
+/// The loaded part of a service result list.
+pub struct RemoteView {
+    pub generation: u64,
+    /// Rows in the whole result list.
+    pub total: usize,
+    /// The loaded rows: each folder is a root, each row an entry below it.
+    pub index: Arc<Index>,
+    ids: std::collections::HashMap<usize, u32>,
 }
 
 impl Hits {
@@ -31,6 +48,7 @@ impl Hits {
         match self {
             Hits::All => index.len(),
             Hits::Some(ids) => ids.len(),
+            Hits::Remote(view) => view.total,
         }
     }
 
@@ -38,6 +56,23 @@ impl Hits {
         match self {
             Hits::All => index.sorted().get(row).copied(),
             Hits::Some(ids) => ids.get(row).copied(),
+            Hits::Remote(view) => view.ids.get(&row).copied(),
+        }
+    }
+
+    /// The index the hit ids refer to, when it is not the app's own.
+    pub fn own_index(&self) -> Option<Arc<Index>> {
+        match self {
+            Hits::Remote(view) => Some(view.index.clone()),
+            _ => None,
+        }
+    }
+
+    /// For service results: the generation whose missing rows to fetch.
+    pub fn remote_generation(&self) -> Option<u64> {
+        match self {
+            Hits::Remote(view) => Some(view.generation),
+            _ => None,
         }
     }
 }
@@ -70,6 +105,14 @@ pub enum Event {
     },
     /// A background sort order became ready: search again.
     SortReady,
+    /// The Ferrow service answers this app: searches go to it.
+    Remote {
+        /// Entries in the service's index.
+        entries: u64,
+        report: String,
+    },
+    /// The service's index changed (live update): search again.
+    IndexChanged,
     /// The query text does not parse.
     QueryError {
         generation: u64,
@@ -88,6 +131,11 @@ enum Command {
         descending: bool,
     },
     Scan(ferrow_walk::WalkOptions),
+    /// Load the service rows around `offset` for query `generation`.
+    Rows {
+        generation: u64,
+        offset: usize,
+    },
     /// Pass an event from a background thread to the UI (with a wake).
     Forward(Event),
     /// A background scan finished; swap in its index.
@@ -104,6 +152,8 @@ pub struct Engine {
     events: Receiver<Event>,
     generation: u64,
     in_flight: Option<Arc<AtomicBool>>,
+    /// Service pages already asked for: `(generation, offset)`.
+    requested: std::collections::HashSet<(u64, usize)>,
 }
 
 impl Engine {
@@ -128,6 +178,7 @@ impl Engine {
             events,
             generation: 0,
             in_flight: None,
+            requested: std::collections::HashSet::new(),
         }
     }
 
@@ -138,6 +189,7 @@ impl Engine {
             old.store(true, Ordering::Relaxed);
         }
         self.generation += 1;
+        self.requested.clear();
         let cancel = Arc::new(AtomicBool::new(false));
         self.in_flight = Some(cancel.clone());
         let _ = self.commands.send(Command::Search {
@@ -148,6 +200,15 @@ impl Engine {
             descending,
         });
         self.generation
+    }
+
+    /// Load the service rows around `row` of the results of `generation`
+    /// (no-op for local results or a superseded query).
+    pub fn fetch_rows(&mut self, generation: u64, row: usize) {
+        let offset = row / REMOTE_PAGE * REMOTE_PAGE;
+        if self.requested.insert((generation, offset)) {
+            let _ = self.commands.send(Command::Rows { generation, offset });
+        }
     }
 
     /// Rebuild the index in the background. Search keeps working on the
@@ -165,6 +226,8 @@ struct Worker<W: Fn()> {
     events: Sender<Event>,
     wake: W,
     index: Option<Arc<Index>>,
+    /// Set while the Ferrow service answers searches.
+    remote: Option<Remote>,
     /// Lets scan threads hand their result back to this worker.
     commands: Option<Sender<Command>>,
 }
@@ -175,6 +238,7 @@ impl<W: Fn()> Worker<W> {
             events,
             wake,
             index: None,
+            remote: None,
             commands: None,
         }
     }
@@ -190,7 +254,9 @@ impl<W: Fn()> Worker<W> {
     }
 
     fn run(mut self, commands: Receiver<Command>) {
-        self.load_default();
+        if !self.connect_service() {
+            self.load_default();
+        }
         while let Ok(mut command) = commands.recv() {
             // Only the newest search matters; skip superseded ones.
             while let Ok(next) = commands.try_recv() {
@@ -216,8 +282,15 @@ impl<W: Fn()> Worker<W> {
                 cancel,
                 sort,
                 descending,
-            } => self.search(generation, &text, cancel, sort, descending),
+            } => {
+                if self.remote.is_some() {
+                    self.remote_search(generation, &text, sort, descending);
+                } else {
+                    self.search(generation, &text, cancel, sort, descending);
+                }
+            }
             Command::Scan(options) => self.scan(options),
+            Command::Rows { generation, offset } => self.remote_rows(generation, offset),
             Command::ScanDone {
                 index,
                 elapsed,
@@ -297,6 +370,156 @@ impl<W: Fn()> Worker<W> {
         if let Err(e) = spawned {
             self.send(Event::Failed(format!("Could not start indexing: {e}")));
         }
+    }
+
+    /// Use the Ferrow service when it runs and answers this user: its
+    /// index covers every drive and stays current by itself. Starts a
+    /// watcher that reports its live changes. Returns false to use the
+    /// app's own index instead.
+    fn connect_service(&mut self) -> bool {
+        let endpoint = ferrow_ipc::Endpoint::default_service();
+        let connect = || {
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let mut client = ferrow_ipc::Client::connect_deadline(&endpoint, deadline)?;
+            client.clear_deadline();
+            std::io::Result::Ok(client)
+        };
+        let Ok(mut client) = connect() else {
+            return false;
+        };
+        let Ok((entries, _mode, report)) = client.status() else {
+            return false;
+        };
+        self.remote = Some(Remote {
+            client,
+            current: None,
+        });
+        self.send(Event::Remote { entries, report });
+        if let (Some(commands), Ok(mut watcher)) = (self.commands.clone(), connect()) {
+            let _ = std::thread::Builder::new()
+                .name("ferrow-watch".into())
+                .spawn(move || {
+                    let Ok(mut seen) = watcher.watch(u64::MAX) else {
+                        return;
+                    };
+                    // Sleeps until the service publishes a change.
+                    while let Ok(now) = watcher.watch(seen) {
+                        seen = now;
+                        if let Ok((entries, _, report)) = watcher.status() {
+                            let _ =
+                                commands.send(Command::Forward(Event::Remote { entries, report }));
+                        }
+                        if commands
+                            .send(Command::Forward(Event::IndexChanged))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+        }
+        true
+    }
+
+    /// The service stopped answering: continue with the app's own index.
+    fn service_lost(&mut self, error: std::io::Error) {
+        self.remote = None;
+        self.send(Event::Failed(format!(
+            "The Ferrow service stopped answering ({error}); using this app's own index."
+        )));
+        self.load_default();
+    }
+
+    fn remote_search(&mut self, generation: u64, text: &str, sort: SortKey, descending: bool) {
+        let started = Instant::now();
+        if let Err(e) = Query::parse(text) {
+            self.send(Event::QueryError {
+                generation,
+                message: e.to_string(),
+                span: e.span(),
+            });
+            return;
+        }
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let client = &mut remote.client;
+        let result = client.count(text).and_then(|total| {
+            let (rows, columns, pending) =
+                client.page(text, 0, REMOTE_PAGE as u32, remote_sort(sort), descending)?;
+            Ok((total, rows, columns, pending))
+        });
+        let (total, rows, columns, pending) = match result {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                // The service refused the query (for example a column it
+                // does not index): show its reason, keep the connection.
+                self.send(Event::QueryError {
+                    generation,
+                    message: e.to_string(),
+                    span: 0..0,
+                });
+                return;
+            }
+            Err(e) => return self.service_lost(e),
+        };
+        let mut query = RemoteQuery {
+            generation,
+            text: text.to_owned(),
+            sort,
+            descending,
+            total: total as usize,
+            columns,
+            rows: std::collections::BTreeMap::new(),
+        };
+        query.insert(0, rows);
+        let hits = query.hits();
+        if let Some(remote) = self.remote.as_mut() {
+            remote.current = Some(query);
+        }
+        self.send(Event::Results {
+            generation,
+            hits,
+            complete: true,
+            elapsed: started.elapsed(),
+            sort_pending: pending,
+            sort_unavailable: false,
+        });
+    }
+
+    fn remote_rows(&mut self, generation: u64, offset: usize) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(query) = remote
+            .current
+            .as_mut()
+            .filter(|q| q.generation == generation)
+        else {
+            return;
+        };
+        let started = Instant::now();
+        let page = remote.client.page(
+            &query.text,
+            offset as u32,
+            REMOTE_PAGE as u32,
+            remote_sort(query.sort),
+            query.descending,
+        );
+        let (rows, _, pending) = match page {
+            Ok(page) => page,
+            Err(e) => return self.service_lost(e),
+        };
+        query.insert(offset, rows);
+        let hits = query.hits();
+        self.send(Event::Results {
+            generation,
+            hits,
+            complete: true,
+            elapsed: started.elapsed(),
+            sort_pending: pending,
+            sort_unavailable: false,
+        });
     }
 
     #[allow(
@@ -416,6 +639,106 @@ impl<W: Fn()> Worker<W> {
     }
 }
 
+struct Remote {
+    client: ferrow_ipc::Client<ferrow_ipc::Stream>,
+    current: Option<RemoteQuery>,
+}
+
+struct RemoteQuery {
+    generation: u64,
+    text: String,
+    sort: SortKey,
+    descending: bool,
+    total: usize,
+    columns: u32,
+    rows: std::collections::BTreeMap<usize, ferrow_ipc::FileRow>,
+}
+
+impl RemoteQuery {
+    fn insert(&mut self, offset: usize, rows: Vec<ferrow_ipc::FileRow>) {
+        for (i, row) in rows.into_iter().enumerate() {
+            self.rows.insert(offset + i, row);
+        }
+        // Keep memory bounded: drop the rows farthest from this page.
+        while self.rows.len() > REMOTE_KEEP {
+            let first = *self.rows.keys().next().expect("non-empty");
+            let last = *self.rows.keys().next_back().expect("non-empty");
+            let drop = if offset.abs_diff(first) > offset.abs_diff(last) {
+                first
+            } else {
+                last
+            };
+            self.rows.remove(&drop);
+        }
+    }
+
+    /// The loaded rows as hits over a small index of their own.
+    fn hits(&self) -> Hits {
+        let columns = ferrow_index::ColumnSet::from_bits(self.columns).unwrap_or_default();
+        let builder = ferrow_index::IndexBuilder::with_columns(columns);
+        let mut folders: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+        let mut ids = std::collections::HashMap::with_capacity(self.rows.len());
+        for (&row, file) in &self.rows {
+            let metadata = ferrow_index::EntryMetadata {
+                size: file.size,
+                modified: file.modified,
+                created: file.created,
+                accessed: file.accessed,
+                attributes: file.attributes,
+            };
+            let flags = if file.is_dir {
+                ferrow_index::flags::DIR
+            } else {
+                0
+            };
+            let split = file
+                .path
+                .iter()
+                .rposition(|&b| b == b'\\' || b == b'/')
+                .filter(|&at| at + 1 < file.path.len());
+            let id = match split {
+                Some(at) => {
+                    // `C:\a.txt` and `/a.txt` live in the drive root itself:
+                    // keep its separator.
+                    let folder_end = if file.path[..at].iter().any(|&b| b == b'\\' || b == b'/') {
+                        at
+                    } else {
+                        at + 1
+                    };
+                    let folder = &file.path[..folder_end];
+                    let parent = *folders
+                        .entry(folder)
+                        .or_insert_with(|| builder.add_root(folder, ferrow_index::flags::DIR));
+                    builder.add_with_metadata(parent, &file.path[at + 1..], flags, metadata)
+                }
+                None => builder.add_with_metadata(
+                    ferrow_index::ROOT_PARENT,
+                    &file.path,
+                    flags,
+                    metadata,
+                ),
+            };
+            ids.insert(row, id);
+        }
+        Hits::Remote(Arc::new(RemoteView {
+            generation: self.generation,
+            total: self.total,
+            index: Arc::new(builder.freeze()),
+            ids,
+        }))
+    }
+}
+
+fn remote_sort(sort: SortKey) -> ferrow_ipc::Sort {
+    match sort {
+        SortKey::Name => ferrow_ipc::Sort::Name,
+        SortKey::Size => ferrow_ipc::Sort::Size,
+        SortKey::Modified => ferrow_ipc::Sort::Modified,
+        SortKey::Created => ferrow_ipc::Sort::Created,
+        SortKey::Accessed => ferrow_ipc::Sort::Accessed,
+    }
+}
+
 /// Same location as the CLI's default index.
 pub fn default_index_path() -> Option<PathBuf> {
     let base = |name: &str| {
@@ -476,6 +799,56 @@ mod tests {
             }
         }
         last
+    }
+
+    // Service paths are Windows paths.
+    #[cfg(windows)]
+    #[test]
+    fn service_rows_become_folder_and_name_entries() {
+        let row = |path: &str, is_dir| ferrow_ipc::FileRow {
+            path: path.as_bytes().to_vec(),
+            size: Some(5),
+            is_dir,
+            ..Default::default()
+        };
+        let mut q = RemoteQuery {
+            generation: 3,
+            text: String::new(),
+            sort: SortKey::Name,
+            descending: false,
+            total: 10,
+            columns: ferrow_index::ColumnSet::SIZE.bits(),
+            rows: std::collections::BTreeMap::new(),
+        };
+        q.insert(
+            4,
+            vec![
+                row(r"C:\a.txt", false),
+                row(r"C:\Users\me\Docs", true),
+                row(r"C:\", true),
+            ],
+        );
+        let hits = q.hits();
+        let index = hits.own_index().unwrap();
+        assert_eq!(hits.len(&index), 10);
+        assert_eq!(hits.remote_generation(), Some(3));
+        assert!(hits.get(&index, 0).is_none(), "not loaded yet");
+        let path = |row| {
+            let id = hits.get(&index, row).unwrap();
+            (
+                index.path(id).to_string_lossy().into_owned(),
+                index.flags(id) & flags::DIR != 0,
+            )
+        };
+        let sep = std::path::MAIN_SEPARATOR;
+        // Folder roots keep the service's spelling; the app joins the name
+        // with its own separator.
+        assert_eq!(path(4).0, r"C:\a.txt");
+        assert_eq!(path(5), (format!(r"C:\Users\me{sep}Docs"), true));
+        assert_eq!(path(6), (r"C:\".to_string(), true));
+        let id = hits.get(&index, 4).unwrap();
+        assert_eq!(index.name(id), b"a.txt");
+        assert_eq!(index.metadata(id).size, Some(5));
     }
 
     #[test]

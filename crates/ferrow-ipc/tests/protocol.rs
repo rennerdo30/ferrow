@@ -98,6 +98,7 @@ fn every_message_round_trips() {
                     created: (mask & 4 != 0).then_some(i64::MAX),
                     accessed: (mask & 8 != 0).then_some(-1),
                     attributes: (mask & 16 != 0).then_some(u32::MAX),
+                    is_dir: mask & 1 != 0,
                 }],
                 columns: u32::from(mask),
                 more: false,
@@ -122,6 +123,23 @@ fn every_message_round_trips() {
     round_trip(8, Message::Request(Request::Count { text: "x".into() }));
     round_trip(9, Message::Request(Request::Status));
     round_trip(10, Message::Request(Request::Cancel { target_id: 7 }));
+    round_trip(
+        14,
+        Message::Request(Request::Page {
+            text: "ä*.log".into(),
+            offset: u32::MAX,
+            limit: 256,
+            sort: Sort::Accessed,
+            flags: 1,
+        }),
+    );
+    round_trip(
+        15,
+        Message::Request(Request::Watch {
+            generation: u64::MAX,
+        }),
+    );
+    round_trip(16, Message::Response(Response::Changed { generation: 7 }));
     round_trip(
         0,
         Message::Response(Response::HelloOk {

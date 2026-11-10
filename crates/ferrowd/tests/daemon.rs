@@ -336,3 +336,90 @@ fn controlled_shutdown_saves_the_latest_replaced_snapshot() {
         [ferrow_ipc::Response::Count { n: 1 }]
     ));
 }
+
+#[test]
+fn pages_return_rows_from_an_offset_with_folder_flags() {
+    let b = ferrow_index::IndexBuilder::with_columns(ferrow_index::ColumnSet::DEFAULT);
+    let root = b.add_root(b"root", ferrow_index::flags::DIR);
+    b.add(root, b"dir-a", ferrow_index::flags::DIR);
+    for i in 0..10 {
+        b.add(root, format!("file-{i}").as_bytes(), 0);
+    }
+    let store = SnapshotStore::new(Snapshot {
+        index: std::sync::Arc::new(b.freeze()),
+        live: None,
+        mode: "fixture".into(),
+        report: "fixture".into(),
+    });
+    let page = |offset, limit| match &ferrowd::handle(
+        &store,
+        ferrow_ipc::Request::Page {
+            text: String::new(),
+            offset,
+            limit,
+            sort: ferrow_ipc::protocol::Sort::Name,
+            flags: 0,
+        },
+    )[..]
+    {
+        [
+            ferrow_ipc::Response::Rows {
+                rows, more: false, ..
+            },
+        ] => rows.clone(),
+        other => panic!("{other:?}"),
+    };
+    let first = page(0, 3);
+    assert_eq!(first.len(), 3);
+    assert!(first[0].is_dir, "dir-a sorts first");
+    assert!(!first[1].is_dir);
+    let later = page(10, 5);
+    assert_eq!(later.len(), 2, "12 entries in total");
+    assert!(String::from_utf8_lossy(&later[0].path).ends_with("file-9"));
+    assert!(later[1].is_dir, "the root sorts last");
+}
+
+#[test]
+fn watch_answers_at_once_or_after_the_next_publication() {
+    let store = SnapshotStore::new(Snapshot::empty());
+    let now = match &ferrowd::handle(
+        &store,
+        ferrow_ipc::Request::Watch {
+            generation: u64::MAX,
+        },
+    )[..]
+    {
+        [ferrow_ipc::Response::Changed { generation }] => *generation,
+        other => panic!("{other:?}"),
+    };
+    let waiter = store.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        tx.send(ferrowd::handle(
+            &waiter,
+            ferrow_ipc::Request::Watch { generation: now },
+        ))
+        .unwrap();
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "an unchanged index keeps the watch waiting"
+    );
+    store.swap(Snapshot::empty());
+    let answer = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(&answer[..], [ferrow_ipc::Response::Changed { generation }] if *generation != now)
+    );
+    thread.join().unwrap();
+    // A stopping server releases waiters.
+    let waiter = store.clone();
+    let seen = store.generation();
+    let thread = std::thread::spawn(move || {
+        ferrowd::handle(&waiter, ferrow_ipc::Request::Watch { generation: seen })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    store.close_watchers();
+    let answer = thread.join().unwrap();
+    assert!(matches!(&answer[..], [ferrow_ipc::Response::Error { .. }]));
+}

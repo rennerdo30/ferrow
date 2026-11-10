@@ -1102,6 +1102,7 @@ dependencies = [
  "chrono",
  "eframe",
  "ferrow-index",
+ "ferrow-ipc",
  "ferrow-query",
  "ferrow-update",
  "ferrow-walk",
