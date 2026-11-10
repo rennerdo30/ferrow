@@ -83,6 +83,11 @@ pub struct SearchOptions {
     pub limit: Option<usize>,
     /// Cancellation flag shared with the caller.
     pub cancel: CancelToken,
+    /// Only entries whose bit is set here are considered (bit `id % 64` of
+    /// word `id / 64`); `None` considers every entry. Must cover every id
+    /// of the index. Live updates use it to hide replaced entries without
+    /// rebuilding the index.
+    pub allowed: Option<Arc<Vec<u64>>>,
     /// Test hook invoked after a completed chunk with its chunk index.
     /// Other admitted chunks can run concurrently. Only present with the
     /// non-default `test-hooks` feature, so normal builds neither
@@ -241,7 +246,26 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
         matcher.candidates(index)
     };
     let reverse = options.sort == SortKey::Name && options.descending;
-    let bits = prefilter_bits(index, matcher, sorted.len(), options.limit, &options.cancel);
+    if let Some(allowed) = &options.allowed {
+        assert!(
+            allowed.len() * 64 >= index.len(),
+            "allowed set must cover every id"
+        );
+    }
+    let bits: Option<std::borrow::Cow<'_, [u64]>> = match (
+        prefilter_bits(index, matcher, sorted.len(), options.limit, &options.cancel),
+        options.allowed.as_deref(),
+    ) {
+        (Some(mut pre), Some(allowed)) => {
+            for (word, allow) in pre.iter_mut().zip(allowed) {
+                *word &= allow;
+            }
+            Some(std::borrow::Cow::Owned(pre))
+        }
+        (Some(pre), None) => Some(std::borrow::Cow::Owned(pre)),
+        (None, Some(allowed)) => Some(std::borrow::Cow::Borrowed(allowed.as_slice())),
+        (None, None) => None,
+    };
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
     // completed prefix. A slow early chunk cannot accumulate unbounded
@@ -469,7 +493,24 @@ fn prefilter_bits<M: EntryMatcher>(
 /// Count all hits without storing them. Returns the count found and
 /// whether the count was cut short by cancellation.
 pub fn count(index: &Index, query: &Query, cancel: &CancelToken) -> (usize, bool) {
-    count_impl::<false>(index, query, cancel).0
+    count_impl::<false>(index, query, cancel, None).0
+}
+
+/// [`count`] restricted to entries whose bit is set in `allowed` (see
+/// [`SearchOptions::allowed`]).
+pub fn count_allowed(
+    index: &Index,
+    query: &Query,
+    cancel: &CancelToken,
+    allowed: Option<&[u64]>,
+) -> (usize, bool) {
+    if let Some(allowed) = allowed {
+        assert!(
+            allowed.len() * 64 >= index.len(),
+            "allowed set must cover every id"
+        );
+    }
+    count_impl::<false>(index, query, cancel, allowed).0
 }
 
 pub fn count_with_timings(
@@ -477,19 +518,20 @@ pub fn count_with_timings(
     query: &Query,
     cancel: &CancelToken,
 ) -> ((usize, bool), QueryTimings) {
-    count_impl::<true>(index, query, cancel)
+    count_impl::<true>(index, query, cancel, None)
 }
 
 fn count_impl<const TIMED: bool>(
     index: &Index,
     query: &Query,
     cancel: &CancelToken,
+    allowed: Option<&[u64]>,
 ) -> ((usize, bool), QueryTimings) {
     let started = TIMED.then(std::time::Instant::now);
     let matcher = Matcher::new(query);
     let (result, mut timings) = match &matcher {
-        Matcher::Plain(m) => count_prepared::<TIMED, _>(index, m, cancel, started),
-        Matcher::General(m) => count_prepared::<TIMED, _>(index, m, cancel, started),
+        Matcher::Plain(m) => count_prepared::<TIMED, _>(index, m, cancel, started, allowed),
+        Matcher::General(m) => count_prepared::<TIMED, _>(index, m, cancel, started, allowed),
     };
     drop(matcher);
     if let Some(t) = started {
@@ -503,6 +545,7 @@ fn count_prepared<const TIMED: bool, M: EntryMatcher>(
     matcher: &M,
     cancel: &CancelToken,
     started: Option<std::time::Instant>,
+    allowed: Option<&[u64]>,
 ) -> ((usize, bool), QueryTimings) {
     let mut timings = QueryTimings::default();
     if let Some(t) = started {
@@ -520,9 +563,18 @@ fn count_prepared<const TIMED: bool, M: EntryMatcher>(
                 if cancel.is_cancelled() {
                     break;
                 }
-                total += (start..(start + CANCEL_INTERVAL).min(end))
-                    .filter(|&id| matcher.matches(index, id as u32, &mut scratch, cancel))
-                    .count();
+                let range = start..(start + CANCEL_INTERVAL).min(end);
+                total += match allowed {
+                    None => range
+                        .filter(|&id| matcher.matches(index, id as u32, &mut scratch, cancel))
+                        .count(),
+                    Some(bits) => range
+                        .filter(|&id| {
+                            bits[id / 64] >> (id % 64) & 1 != 0
+                                && matcher.matches(index, id as u32, &mut scratch, cancel)
+                        })
+                        .count(),
+                };
             }
             total
         })
@@ -559,6 +611,27 @@ mod tests {
             .iter()
             .map(|&id| String::from_utf8(idx.name(id).to_vec()).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn allowed_set_hides_entries_from_search_and_count() {
+        let idx = sample();
+        let q = Query::parse("2024").unwrap();
+        let all = search(&idx, &q, &SearchOptions::default());
+        assert_eq!(names(&idx, &all).len(), 2);
+        let hidden = all.hits[0];
+        let mut allowed = vec![u64::MAX; idx.len().div_ceil(64)];
+        allowed[hidden as usize / 64] &= !(1 << (hidden % 64));
+        let allowed = Arc::new(allowed);
+        let opts = SearchOptions {
+            allowed: Some(allowed.clone()),
+            ..SearchOptions::default()
+        };
+        let some = search(&idx, &q, &opts);
+        assert_eq!(some.hits, vec![all.hits[1]]);
+        let cancel = CancelToken::new();
+        assert_eq!(count_allowed(&idx, &q, &cancel, Some(&allowed)), (1, false));
+        assert_eq!(count_allowed(&idx, &q, &cancel, None), (2, false));
     }
 
     #[test]

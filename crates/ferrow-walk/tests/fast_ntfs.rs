@@ -6,12 +6,13 @@
 //! must be taken and match the walk entry for entry.
 #![cfg(windows)]
 
+#[allow(dead_code)]
 mod support;
 
 use std::collections::BTreeMap;
 
 use ferrow_index::{ColumnSet, Index};
-use ferrow_walk::{WalkOptions, scan};
+use ferrow_walk::{WalkOptions, scan, scan_with_maps};
 use support::Fixture;
 
 fn entries(index: &Index) -> BTreeMap<String, (u16, Option<u64>, Option<i64>)> {
@@ -57,7 +58,7 @@ fn fast_ntfs_matches_the_walk() {
         fast_ntfs,
     };
     let (walked, walk_report) = scan(&options(false));
-    let (fast, fast_report) = scan(&options(true));
+    let (fast, fast_report, maps) = scan_with_maps(&options(true));
     assert_eq!(walk_report.errors, 0, "{walk_report:?}");
     assert_eq!(fast_report.errors, 0, "{fast_report:?}");
     eprintln!("fast path: {}", fast_report.mode);
@@ -67,6 +68,27 @@ fn fast_ntfs_matches_the_walk() {
             "the elevated CI runner must take the MFT path: {}",
             fast_report.mode
         );
+        // Every entry is mapped to its MFT record; both hard links share one.
+        assert_eq!(maps.len(), 1);
+        let map = &maps[0];
+        assert_eq!(map.entries.len(), fast.len());
+        assert_eq!(map.roots.len(), 1);
+        assert!(
+            map.journal.is_some(),
+            "NTFS system volumes keep a change journal"
+        );
+        let record_of = |name: &str| {
+            map.entries
+                .iter()
+                .find(|(_, id)| fast.path(*id).ends_with(name))
+                .map(|(r, _)| *r)
+                .unwrap()
+        };
+        assert_eq!(record_of("report.txt"), record_of("report-link.txt"));
+        assert_ne!(record_of("report.txt"), record_of("tiny.bin"));
+        assert_eq!(map.excluded.len(), 2);
+    } else {
+        assert!(maps.is_empty());
     }
     let walked = entries(&walked);
     let fast = entries(&fast);

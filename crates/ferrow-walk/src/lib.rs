@@ -546,8 +546,35 @@ fn root_name_bytes(path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// Which index entries an NTFS volume's MFT records became, so a live
+/// updater can apply the volume's change journal to the scan result.
+#[derive(Debug, Clone, Default)]
+pub struct VolumeMap {
+    /// `\\?\Volume{…}` device path.
+    pub device: String,
+    pub serial: u64,
+    /// Change journal id and the position to continue reading from.
+    pub journal: Option<(u64, i64)>,
+    pub record_size: usize,
+    /// `(record number, entry id)` for every entry from this volume,
+    /// including root entries. A record with several names (hard links)
+    /// appears once per name.
+    pub entries: Vec<(u64, u32)>,
+    /// Record numbers of excluded files and directories on this volume.
+    pub excluded: Vec<u64>,
+    /// Root entries filled from this volume: `(root record, entry id)`.
+    pub roots: Vec<(u64, u32)>,
+}
+
 /// Scan all roots and freeze the index.
 pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
+    let (index, report, _) = scan_with_maps(options);
+    (index, report)
+}
+
+/// [`scan`], also returning the record-to-entry maps of every volume
+/// that was read through its MFT.
+pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMap>) {
     let started = Instant::now();
     let builder = IndexBuilder::with_columns(options.columns);
     let errors = Errors::new();
@@ -567,7 +594,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
                 fatal_error: Some(fatal),
                 elapsed: started.elapsed(),
             };
-            return (builder.freeze(), report);
+            return (builder.freeze(), report, Vec::new());
         }
     };
     let walker = Walker {
@@ -669,11 +696,13 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     // Fast path: roots on NTFS volumes are filled from the volume's MFT
     // when it can be read (administrator or SYSTEM); the rest are walked.
     let mut modes: Vec<String> = Vec::new();
+    #[allow(unused_mut, reason = "only filled on Windows")]
+    let mut maps: Vec<VolumeMap> = Vec::new();
     #[cfg(windows)]
     let root_dirs = if options.follow_symlinks || !options.fast_ntfs {
         root_dirs
     } else {
-        scan_from_mft(root_dirs, &walker, &mut modes)
+        scan_from_mft(root_dirs, &walker, &mut modes, &mut maps)
     };
     if !root_dirs.is_empty() {
         modes.push("parallel read_dir".to_string());
@@ -709,7 +738,7 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
         fatal_error: None,
         elapsed: started.elapsed(),
     };
-    (index, report)
+    (index, report, maps)
 }
 
 /// Fill every root on a readable NTFS volume from its MFT (one read per
@@ -719,6 +748,7 @@ fn scan_from_mft(
     root_dirs: Vec<(PathBuf, u32, Option<FileId>)>,
     walker: &Walker<'_>,
     modes: &mut Vec<String>,
+    maps: &mut Vec<VolumeMap>,
 ) -> Vec<(PathBuf, u32, Option<FileId>)> {
     let mut pending: Vec<(PathBuf, u32, Option<FileId>)> = root_dirs;
     let mut walk = Vec::new();
@@ -745,6 +775,21 @@ fn scan_from_mft(
         }
         pending = rest;
         let mut entries = 0usize;
+        let mut map = VolumeMap {
+            device: device.clone(),
+            serial: volume.serial,
+            journal: volume.journal,
+            record_size: volume.record_size,
+            excluded: walker
+                .excludes
+                .dirs
+                .iter()
+                .chain(&walker.excludes.files)
+                .filter(|id| id.kind == 1 && id.volume == volume.serial)
+                .map(|id| (id.id as u64) & 0x0000_FFFF_FFFF_FFFF)
+                .collect(),
+            ..VolumeMap::default()
+        };
         for (dir, id, identity) in here {
             let identity = match identity.map(Ok).unwrap_or_else(|| file_id(&dir)) {
                 Ok(identity) => identity,
@@ -763,7 +808,12 @@ fn scan_from_mft(
                 walk.push((dir, id, Some(identity)));
                 continue;
             }
-            entries += emit_mft_subtree(&volume, record, id, &dir, walker);
+            map.roots.push((record, id));
+            map.entries.push((record, id));
+            entries += emit_mft_subtree(&volume, record, id, &dir, walker, &mut map.entries);
+        }
+        if !map.roots.is_empty() {
+            maps.push(map);
         }
         modes.push(format!(
             "mft {device} ({} records read in {:.2} s, {entries} entries)",
@@ -813,6 +863,7 @@ fn emit_mft_subtree(
     root_id: u32,
     root_path: &Path,
     walker: &Walker<'_>,
+    pairs: &mut Vec<(u64, u32)>,
 ) -> usize {
     let excluding = !walker.excludes.is_empty();
     let mut added = 0usize;
@@ -825,17 +876,8 @@ fn emit_mft_subtree(
                 continue;
             };
             let surrogate = info.is_name_surrogate();
-            let is_dir = info.is_dir && !surrogate;
-            let mut ent_flags = 0u16;
-            if is_dir {
-                ent_flags |= flags::DIR;
-            }
-            if surrogate {
-                ent_flags |= flags::SYMLINK;
-            }
-            if info.attributes & 0x2 != 0 {
-                ent_flags |= flags::HIDDEN;
-            }
+            let is_dir = info.is_descended_dir();
+            let ent_flags = info.entry_flags();
             let child_path = dir_path
                 .as_ref()
                 .map(|p| p.join(ferrow_index::osname::bytes_to_os(bytes)));
@@ -864,6 +906,7 @@ fn emit_mft_subtree(
                 info.metadata(walker.columns),
             );
             added += 1;
+            pairs.push((name.record, id));
             if is_dir {
                 stack.push((name.record, id, child_path));
             }

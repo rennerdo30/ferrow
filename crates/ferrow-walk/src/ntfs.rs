@@ -64,6 +64,28 @@ impl RecordInfo {
         self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && self.reparse_tag & 0x2000_0000 != 0
     }
 
+    /// Index flags for an entry with this record, as the walk sets them.
+    pub fn entry_flags(&self) -> u16 {
+        use ferrow_index::flags;
+        let surrogate = self.is_name_surrogate();
+        let mut out = 0;
+        if self.is_dir && !surrogate {
+            out |= flags::DIR;
+        }
+        if surrogate {
+            out |= flags::SYMLINK;
+        }
+        if self.attributes & 0x2 != 0 {
+            out |= flags::HIDDEN;
+        }
+        out
+    }
+
+    /// A directory the index descends into (not an alias).
+    pub fn is_descended_dir(&self) -> bool {
+        self.is_dir && !self.is_name_surrogate()
+    }
+
     pub fn metadata(&self, set: ColumnSet) -> EntryMetadata {
         let mut out = EntryMetadata::default();
         if set.contains(ColumnSet::SIZE) {
@@ -433,6 +455,8 @@ pub struct Volume {
     /// Change journal id and the position after the read, when the
     /// volume has a journal (the starting point for live updates).
     pub journal: Option<(u64, i64)>,
+    /// Bytes per MFT record.
+    pub record_size: usize,
 }
 
 impl Volume {
@@ -485,6 +509,7 @@ impl Volume {
             first,
             serial,
             journal: None,
+            record_size: 1024,
         }
     }
 
@@ -728,6 +753,7 @@ mod platform {
         };
         let mut out = Volume::from_parsed(parsed, records, serial);
         out.journal = journal;
+        out.record_size = record_size;
         Ok((device, out))
     }
 
