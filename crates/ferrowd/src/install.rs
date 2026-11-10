@@ -61,7 +61,7 @@ fn admin_hint(action: &str, e: &dyn std::fmt::Display) -> String {
 }
 
 #[cfg(windows)]
-pub fn install() -> Result<String, String> {
+pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
     use windows_service::service::{
         ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
     };
@@ -92,12 +92,21 @@ pub fn install() -> Result<String, String> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe,
-        launch_arguments: vec![
-            "--run-as-service".into(),
-            "--service-endpoint".into(),
-            "--index".into(),
-            index.into_os_string(),
-        ],
+        launch_arguments: {
+            let mut args: Vec<std::ffi::OsString> = vec![
+                "--run-as-service".into(),
+                "--service-endpoint".into(),
+                "--index".into(),
+                index.into_os_string(),
+            ];
+            // No roots: every local fixed drive (see ferrowd's main).
+            for root in roots {
+                let root = std::path::absolute(root).map_err(|e| e.to_string())?;
+                args.push("--root".into());
+                args.push(root.into_os_string());
+            }
+            args
+        },
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
@@ -301,7 +310,10 @@ fn root_hint(action: &str, e: &std::io::Error) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub fn install() -> Result<String, String> {
+pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
+    if !roots.is_empty() {
+        return Err("choosing index roots at install is only supported on Windows".into());
+    }
     let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     crate::definition::write(std::path::Path::new(UNIT_PATH), &systemd_unit())
         .map_err(|e| root_hint("install", &e))?;
@@ -400,7 +412,10 @@ fn plist_path() -> String {
 }
 
 #[cfg(target_os = "macos")]
-pub fn install() -> Result<String, String> {
+pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
+    if !roots.is_empty() {
+        return Err("choosing index roots at install is only supported on Windows".into());
+    }
     let _exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
     let path = plist_path();
     crate::definition::write(std::path::Path::new(&path), &launchd_plist())
@@ -501,7 +516,10 @@ pub fn uninstall() -> Result<String, String> {
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-pub fn install() -> Result<String, String> {
+pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
+    if !roots.is_empty() {
+        return Err("choosing index roots at install is only supported on Windows".into());
+    }
     Err("service install is not supported on this platform".into())
 }
 

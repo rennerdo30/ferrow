@@ -43,16 +43,22 @@ impl RecordSource for Volumes {
 
 /// Start the maintainer: a full scan now (the saved index is only a quick
 /// start), then live updates for every NTFS volume with a journal.
-pub fn start(store: SnapshotStore, options: WalkOptions) {
-    // Without raw volume access (not elevated) there is nothing live to
-    // keep; the initial walk stands.
+/// Whether [`start`] would keep `options` live: some root is read through
+/// its MFT (raw volume access, administrator or SYSTEM).
+pub fn will_run(options: &WalkOptions) -> bool {
     let fast = |root: &std::path::Path| {
         (options.ntfs == ferrow_walk::NtfsMode::AllRoots
             || (options.ntfs == ferrow_walk::NtfsMode::VolumeRoots
                 && ferrow_walk::is_volume_root(root)))
             && ntfs::can_read_volume(root)
     };
-    if !options.roots.iter().any(|r| fast(r)) {
+    !options.follow_symlinks && options.roots.iter().any(|r| fast(r))
+}
+
+pub fn start(store: SnapshotStore, options: WalkOptions) {
+    // Without raw volume access (not elevated) there is nothing live to
+    // keep; the initial walk stands.
+    if !will_run(&options) {
         return;
     }
     let spawned = std::thread::Builder::new()

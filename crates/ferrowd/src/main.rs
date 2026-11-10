@@ -106,6 +106,13 @@ fn service_config(
     excludes: Vec<PathBuf>,
     follow_symlinks: bool,
 ) -> Result<DaemonConfig, String> {
+    // The system service indexes every local fixed drive unless told
+    // otherwise (aliases of other drives are skipped).
+    let roots = if roots.is_empty() && endpoint == Endpoint::default_service() {
+        ferrow_walk::fixed_local_drives()
+    } else {
+        roots
+    };
     Ok(DaemonConfig {
         index_path: Some(match index_path {
             Some(path) => path,

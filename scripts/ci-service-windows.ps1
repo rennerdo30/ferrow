@@ -44,7 +44,9 @@ try {
     $tree = Join-Path $env:RUNNER_TEMP 'svc-tree'
     New-Item -ItemType Directory -Force $tree | Out-Null
     Set-Content (Join-Path $tree 'ci-needle.txt') 'x'
-    Invoke-Bounded (Join-Path $bin 'ferrow.exe') @('service', 'install') | Write-Host
+    # A quiet folder root: the idle-CPU check below must not see live
+    # updates reacting to the runner's own disk activity on whole drives.
+    Invoke-Bounded (Join-Path $bin 'ferrow.exe') @('service', 'install', $tree) | Write-Host
     Invoke-Bounded (Join-Path $bin 'ferrow.exe') @('index', $tree, '--out', 'C:\ProgramData\Ferrow\index.bin') | Write-Host
     Invoke-Bounded sc.exe @('start', 'ferrowd') | Write-Host
     $service = Get-CimInstance Win32_Service -Filter "Name='ferrowd'"

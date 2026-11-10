@@ -204,6 +204,19 @@ pub struct DaemonConfig {
     pub follow_symlinks: bool,
 }
 
+impl DaemonConfig {
+    /// How this configuration scans: MFT for whole NTFS volumes.
+    pub fn walk_options(&self) -> WalkOptions {
+        WalkOptions {
+            columns: Default::default(),
+            roots: self.roots.clone(),
+            excludes: self.excludes.clone(),
+            follow_symlinks: self.follow_symlinks,
+            ntfs: ferrow_walk::NtfsMode::VolumeRoots,
+        }
+    }
+}
+
 /// The system service's index file: readable only by the
 /// service and administrators. The directory and file policy is validated
 /// before system loads and saves, including atomic index replacements.
@@ -256,13 +269,19 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
         return Snapshot::from_file(path);
     }
     if !config.roots.is_empty() {
-        let options = WalkOptions {
-            columns: Default::default(),
-            roots: config.roots.clone(),
-            excludes: config.excludes.clone(),
-            follow_symlinks: config.follow_symlinks,
-            ntfs: ferrow_walk::NtfsMode::VolumeRoots,
-        };
+        let options = config.walk_options();
+        // The live maintainer scans in the background (seconds with the MFT
+        // reader); answer from an empty index meanwhile rather than delay
+        // the start.
+        #[cfg(windows)]
+        if live_windows::will_run(&options) {
+            return Ok(Snapshot {
+                index: Arc::new(IndexBuilder::new().freeze()),
+                live: None,
+                mode: "indexing".into(),
+                report: "first scan running".into(),
+            });
+        }
         let (snapshot, report) = Snapshot::from_scan(&options);
         for sample in &report.error_samples {
             eprintln!("ferrowd: warning: {sample}");
@@ -772,16 +791,7 @@ pub fn serve(
     let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
     #[cfg(windows)]
     if !config.roots.is_empty() {
-        live_windows::start(
-            store.clone(),
-            WalkOptions {
-                columns: Default::default(),
-                roots: config.roots.clone(),
-                excludes: config.excludes.clone(),
-                follow_symlinks: config.follow_symlinks,
-                ntfs: ferrow_walk::NtfsMode::VolumeRoots,
-            },
-        );
+        live_windows::start(store.clone(), config.walk_options());
     }
     eprintln!("ferrowd: listening on {}", config.endpoint);
     let budget = admission::Admission::new(32);

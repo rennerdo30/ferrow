@@ -776,7 +776,12 @@ fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
             };
             ferrowd::serve_foreground(&config).map_err(|e| e.to_string())
         }
-        "install" => ferrowd::install::install().map(|msg| println!("{msg}")),
+        "install" => {
+            // Optional folders or drives to index; none means every local
+            // fixed drive (Windows).
+            let roots: Vec<PathBuf> = rest[1..].iter().map(PathBuf::from).collect();
+            ferrowd::install::install(&roots).map(|msg| println!("{msg}"))
+        }
         "uninstall" => ferrowd::install::uninstall().map(|msg| println!("{msg}")),
         other => Err(format!(
             "unknown service subcommand: {other} (install | uninstall | status | run)"
