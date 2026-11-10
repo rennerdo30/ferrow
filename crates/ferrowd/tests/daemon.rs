@@ -16,6 +16,7 @@ fn service_plain_count_and_query_use_the_compact_factory() {
     b.add(root, b"Report 2024.txt", 0);
     let store = SnapshotStore::new(Snapshot {
         index: std::sync::Arc::new(b.freeze()),
+        live: None,
         mode: "fixture".into(),
         report: "fixture".into(),
     });
@@ -174,6 +175,7 @@ fn metadata_sort_keeps_values_aligned_across_pages() {
     }
     let store = SnapshotStore::new(Snapshot {
         index: std::sync::Arc::new(b.freeze()),
+        live: None,
         mode: "fixture".into(),
         report: String::new(),
     });
@@ -246,6 +248,7 @@ fn unlimited_service_queries_have_an_explicit_overall_result_budget() {
     }
     let store = SnapshotStore::new(Snapshot {
         index: std::sync::Arc::new(builder.freeze()),
+        live: None,
         mode: "fixture".into(),
         report: "fixture".into(),
     });

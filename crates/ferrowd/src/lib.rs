@@ -24,12 +24,17 @@ mod admission;
 #[cfg(any(unix, test))]
 mod definition;
 pub mod install;
+pub mod live;
+#[cfg(windows)]
+mod live_windows;
 pub mod persistence;
 pub mod protection;
 
 /// One immutable index plus how it was produced.
 pub struct Snapshot {
     pub index: Arc<Index>,
+    /// Live changes on top of `index` (M2d); `None` for a plain index.
+    pub live: Option<Arc<live::LiveView>>,
     /// Short mode label, e.g. `walk`, `loaded index file`, `empty`.
     pub mode: String,
     /// Backend report line for `Status` replies.
@@ -37,9 +42,33 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Entries a search can return.
+    pub fn entries(&self) -> usize {
+        self.live
+            .as_ref()
+            .map_or(self.index.len(), |live| live.entries)
+    }
+
+    /// The index holding a hit.
+    fn index_of(&self, hit: Hit) -> &Index {
+        match (hit.delta, &self.live) {
+            (true, Some(live)) => &live.delta,
+            _ => &self.index,
+        }
+    }
+
+    fn metadata_of(&self, hit: Hit) -> ferrow_index::EntryMetadata {
+        match (hit.delta, &self.live) {
+            (true, Some(live)) => live.delta.metadata(hit.id),
+            (false, Some(live)) => live.base_metadata(&self.index, hit.id),
+            _ => self.index.metadata(hit.id),
+        }
+    }
+
     pub fn empty() -> Snapshot {
         Snapshot {
             index: Arc::new(IndexBuilder::new().freeze()),
+            live: None,
             mode: "empty".into(),
             report: "no index loaded".into(),
         }
@@ -50,6 +79,7 @@ impl Snapshot {
         let (index, report) = ferrow_walk::scan(options);
         let snapshot = Snapshot {
             index: Arc::new(index),
+            live: None,
             mode: "walk".into(),
             report: report.summary(),
         };
@@ -62,6 +92,7 @@ impl Snapshot {
         Ok(Snapshot {
             report: format!("loaded {} entries from {}", index.len(), path.display()),
             index: Arc::new(index),
+            live: None,
             mode: "loaded index file".into(),
         })
     }
@@ -209,6 +240,137 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
     Ok(Snapshot::empty())
 }
 
+/// Start live updates for `options` on `store` (Windows, with raw volume
+/// access): a full scan, then change-journal updates. Does nothing when
+/// the volumes cannot be read directly. `serve` calls this itself.
+pub fn start_live(store: &SnapshotStore, options: WalkOptions) {
+    #[cfg(windows)]
+    live_windows::start(store.clone(), options);
+    #[cfg(not(windows))]
+    let _ = (store, options);
+}
+
+/// One search hit: an entry of the frozen index or of the live delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hit {
+    delta: bool,
+    id: u32,
+}
+
+/// Search the snapshot, merging live changes into the frozen index's
+/// order. Returns the hits and the frozen search's status fields.
+fn snapshot_search(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &SearchOptions,
+) -> (Vec<Hit>, ferrow_query::SearchResult) {
+    let Some(live) = &snapshot.live else {
+        let mut result = ferrow_query::search(&snapshot.index, query, options);
+        let hits = result
+            .hits
+            .iter()
+            .map(|&id| Hit { delta: false, id })
+            .collect();
+        result.hits.clear();
+        return (hits, result);
+    };
+    let mut result = ferrow_query::search(
+        &snapshot.index,
+        query,
+        &SearchOptions {
+            allowed: Some(live.allowed.clone()),
+            ..options.clone()
+        },
+    );
+    // The delta is small: search it in name order, then order its hits
+    // the way the frozen search ordered its own.
+    let delta = ferrow_query::search(
+        &live.delta,
+        query,
+        &SearchOptions {
+            sort: ferrow_query::SortKey::Name,
+            descending: false,
+            limit: None,
+            allowed: Some(live.delta_allowed.clone()),
+            cancel: options.cancel.clone(),
+            ..SearchOptions::default()
+        },
+    );
+    result.cancelled |= delta.cancelled;
+    let key = if result.sort_status == ferrow_query::SortStatus::Ready {
+        options.sort
+    } else {
+        ferrow_query::SortKey::Name
+    };
+    let descending = options.descending
+        && (key != ferrow_query::SortKey::Name || options.sort == ferrow_query::SortKey::Name);
+    let compare = |a: Hit, b: Hit| -> std::cmp::Ordering {
+        let (ia, ib) = (snapshot.index_of(a), snapshot.index_of(b));
+        let by_name = || {
+            ia.folded_name(a.id)
+                .cmp(ib.folded_name(b.id))
+                .then_with(|| ia.name(a.id).cmp(ib.name(b.id)))
+                .then(a.delta.cmp(&b.delta))
+        };
+        if key == ferrow_query::SortKey::Name {
+            let o = by_name();
+            return if descending { o.reverse() } else { o };
+        }
+        let value = |h: Hit, i: &Index| i.metadata_value(key, h.id);
+        match (value(a, ia), value(b, ib)) {
+            (Some(x), Some(y)) => {
+                let o = x.cmp(&y);
+                (if descending { o.reverse() } else { o }).then_with(by_name)
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => by_name(),
+        }
+    };
+    let mut extra: Vec<Hit> = delta
+        .hits
+        .iter()
+        .map(|&id| Hit { delta: true, id })
+        .collect();
+    extra.sort_by(|&a, &b| compare(a, b));
+    let base: Vec<Hit> = result
+        .hits
+        .iter()
+        .map(|&id| Hit { delta: false, id })
+        .collect();
+    let mut merged = Vec::with_capacity(base.len() + extra.len());
+    let (mut i, mut j) = (0, 0);
+    while i < base.len() || j < extra.len() {
+        let take_base = j == extra.len()
+            || (i < base.len() && compare(base[i], extra[j]) != std::cmp::Ordering::Greater);
+        if take_base {
+            merged.push(base[i]);
+            i += 1;
+        } else {
+            merged.push(extra[j]);
+            j += 1;
+        }
+    }
+    if let Some(limit) = options.limit {
+        merged.truncate(limit);
+    }
+    result.hits.clear();
+    (merged, result)
+}
+
+fn snapshot_count(snapshot: &Snapshot, query: &Query, cancel: &CancelToken) -> (usize, bool) {
+    match &snapshot.live {
+        None => ferrow_query::count(&snapshot.index, query, cancel),
+        Some(live) => {
+            let (a, x) =
+                ferrow_query::count_allowed(&snapshot.index, query, cancel, Some(&live.allowed));
+            let (b, y) =
+                ferrow_query::count_allowed(&live.delta, query, cancel, Some(&live.delta_allowed));
+            (a + b, x || y)
+        }
+    }
+}
+
 /// Page budgets for streamed `Results` (well under the frame cap).
 const MAX_QUERY_RESULTS: usize = 10_000;
 const PAGE_MAX_PATHS: usize = 512;
@@ -268,7 +430,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 cancel,
                 ..SearchOptions::default()
             };
-            let result = ferrow_query::search(&snapshot.index, &query, &options);
+            let (hits, result) = snapshot_search(&snapshot, &query, &options);
             if let Some(key) = result.sort_unavailable {
                 return vec![bad_request(format!(
                     "{key:?} column unavailable; enable the column and rebuild"
@@ -283,7 +445,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                     msg: "query cancelled".into(),
                 }];
             }
-            if result.hits.len() > MAX_QUERY_RESULTS {
+            if hits.len() > MAX_QUERY_RESULTS {
                 return vec![Response::Error {
                     code: ErrorCode::TooLarge,
                     msg: "service result budget exceeded; use --limit".into(),
@@ -295,13 +457,13 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
             let mut page_bytes = 0usize;
             let mut buf: Vec<u8> = Vec::new();
             let mut page_start = 0;
-            let response = |paths: Vec<Vec<u8>>, ids: &[u32], more| {
+            let response = |paths: Vec<Vec<u8>>, ids: &[Hit], more| {
                 if metadata {
                     let rows = paths
                         .into_iter()
                         .zip(ids)
-                        .map(|(path, &id)| {
-                            let m = snapshot.index.metadata(id);
+                        .map(|(path, &hit)| {
+                            let m = snapshot.metadata_of(hit);
                             ferrow_ipc::FileRow {
                                 path,
                                 size: m.size,
@@ -322,8 +484,8 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                     Response::Results { paths, more }
                 }
             };
-            for (position, &id) in result.hits.iter().enumerate() {
-                snapshot.index.path_bytes(id, &mut buf);
+            for (position, &hit) in hits.iter().enumerate() {
+                snapshot.index_of(hit).path_bytes(hit.id, &mut buf);
                 total_bytes = total_bytes.saturating_add(buf.len() + if metadata { 41 } else { 4 });
                 if total_bytes > ferrow_ipc::MAX_FRAME_BYTES
                     || buf.len() > ferrow_ipc::protocol::MAX_PATH_BYTES
@@ -338,7 +500,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 {
                     pages.push(response(
                         std::mem::take(&mut page),
-                        &result.hits[page_start..position],
+                        &hits[page_start..position],
                         true,
                     ));
                     page_start = position;
@@ -347,7 +509,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 page_bytes += buf.len() + if metadata { 41 } else { 4 };
                 page.push(buf.clone());
             }
-            pages.push(response(page, &result.hits[page_start..], false));
+            pages.push(response(page, &hits[page_start..], false));
             pages
         }
         Request::Count { text } => {
@@ -355,7 +517,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
                 Ok(q) => q,
                 Err(e) => return vec![bad_request(e.to_string())],
             };
-            let (n, cancelled) = ferrow_query::count(&snapshot.index, &query, &cancel);
+            let (n, cancelled) = snapshot_count(&snapshot, &query, &cancel);
             if cancelled {
                 return vec![Response::Error {
                     code: ErrorCode::Cancelled,
@@ -365,7 +527,7 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
             vec![Response::Count { n: n as u64 }]
         }
         Request::Status => vec![Response::Status {
-            entries: snapshot.index.len() as u64,
+            entries: snapshot.entries() as u64,
             mode: snapshot.mode.clone(),
             report: snapshot.report.clone(),
         }],
@@ -473,6 +635,19 @@ pub fn serve(
     let owner = CallerIdentity::current()?;
     let system = config.endpoint == Endpoint::default_service();
     let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
+    #[cfg(windows)]
+    if !config.roots.is_empty() {
+        live_windows::start(
+            store.clone(),
+            WalkOptions {
+                columns: Default::default(),
+                roots: config.roots.clone(),
+                excludes: config.excludes.clone(),
+                follow_symlinks: config.follow_symlinks,
+                fast_ntfs: true,
+            },
+        );
+    }
     eprintln!("ferrowd: listening on {}", config.endpoint);
     let budget = admission::Admission::new(32);
     let mut workers: Vec<(ferrow_ipc::Stream, std::thread::JoinHandle<()>)> =

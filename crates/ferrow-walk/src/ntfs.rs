@@ -405,6 +405,9 @@ pub fn mft_runs(record0: &[u8]) -> Option<Vec<(Option<u64>, u64)>> {
     None
 }
 
+/// `(parent record, stored name bytes)` for each of a file's names.
+pub type Names = Vec<(u64, Vec<u8>)>;
+
 /// One change journal record (version 2 layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsnRecord {
@@ -545,7 +548,10 @@ impl Volume {
 }
 
 #[cfg(windows)]
-pub use platform::{fetch_record, query_journal, read_journal, read_volume};
+pub use platform::{
+    can_read_volume, fetch_record, fetch_state, open_volume, query_journal, read_journal,
+    read_volume, wait_journal,
+};
 
 #[cfg(windows)]
 mod platform {
@@ -822,6 +828,102 @@ mod platform {
             )
         };
         (ok != 0).then_some((data.UsnJournalID, data.FirstUsn, data.NextUsn))
+    }
+
+    /// Whether this process may read the NTFS volume holding `path`
+    /// directly (administrator or SYSTEM): a cheap probe, no MFT read.
+    pub fn can_read_volume(path: &Path) -> bool {
+        ntfs_volume_device(path).is_ok_and(|device| open_volume(&device).is_ok())
+    }
+
+    /// Open a volume device (`\\?\Volume{…}`) for journal and record reads.
+    pub fn open_volume(device: &str) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(7)
+            .open(device)
+    }
+
+    /// Block until the journal has records after `start` (no polling: the
+    /// thread sleeps in the kernel), then return them and the next
+    /// position. Use a handle of its own: a blocked call holds the handle.
+    pub fn wait_journal(
+        volume: &std::fs::File,
+        journal: u64,
+        start: i64,
+    ) -> std::io::Result<(i64, Vec<UsnRecord>)> {
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::{FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1};
+        let mut buf = vec![0u64; 64 * 1024 / 8];
+        let input = READ_USN_JOURNAL_DATA_V1 {
+            StartUsn: start,
+            ReasonMask: 0xFFFF_FFFF,
+            ReturnOnlyOnClose: 0,
+            Timeout: 0,
+            BytesToWaitFor: 1,
+            UsnJournalID: journal,
+            MinMajorVersion: 2,
+            MaxMajorVersion: 2,
+        };
+        let mut returned = 0u32;
+        // SAFETY: live volume handle; buffers live for the call, sizes match.
+        let ok = unsafe {
+            DeviceIoControl(
+                volume.as_raw_handle(),
+                FSCTL_READ_USN_JOURNAL,
+                (&raw const input).cast(),
+                size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &raw mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the buffer holds `returned` initialized bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), returned as usize) };
+        let Some(next) = bytes
+            .get(0..8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        else {
+            return Err(std::io::Error::other("short change journal read"));
+        };
+        Ok((next, parse_usn_records(&bytes[8..])))
+    }
+
+    /// A record's current info and non-DOS names, read through the file
+    /// system; `None` when it is not in use (deleted).
+    pub fn fetch_state(
+        volume: &std::fs::File,
+        record: u64,
+        size: usize,
+    ) -> Option<(super::RecordInfo, super::Names)> {
+        let mut rec = fetch_record(volume, record, size)?;
+        let mut copy = rec.clone();
+        if apply_fixup(&mut copy) {
+            rec = copy;
+        }
+        if rec.get(0..4) != Some(b"FILE") {
+            return None;
+        }
+        let mut parsed = Parsed::default();
+        parse_record(&rec, record, &mut parsed);
+        let (_, info) = parsed.infos.first().copied()?;
+        let names = parsed
+            .names
+            .iter()
+            .map(|n| {
+                let off = n.name_offset as usize;
+                (
+                    n.parent_record,
+                    parsed.arena[off..off + n.name_len as usize].to_vec(),
+                )
+            })
+            .collect();
+        Some((info, names))
     }
 
     /// Read journal records from `start` up to the journal's end without

@@ -38,7 +38,22 @@ impl Persistence {
         store: &SnapshotStore,
         shutdown: &Shutdown,
     ) -> io::Result<Option<Self>> {
-        Self::start_with_saver(config, store, shutdown, save)
+        // Live updates publish often but keep the same frozen index; only
+        // a new frozen index (a scan) is worth writing again.
+        let mut last: Option<std::sync::Weak<ferrow_index::Index>> = None;
+        Self::start_with_saver(config, store, shutdown, move |config, snapshot| {
+            if last
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|saved| Arc::ptr_eq(&saved, &snapshot.index))
+            {
+                return Ok(());
+            }
+            let index = Arc::downgrade(&snapshot.index);
+            save(config, snapshot)?;
+            last = Some(index);
+            Ok(())
+        })
     }
 
     fn start_with_saver(
