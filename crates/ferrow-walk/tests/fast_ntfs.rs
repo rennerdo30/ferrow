@@ -12,7 +12,7 @@ mod support;
 use std::collections::BTreeMap;
 
 use ferrow_index::{ColumnSet, Index};
-use ferrow_walk::{WalkOptions, scan, scan_with_maps};
+use ferrow_walk::{NtfsMode, WalkOptions, scan, scan_with_maps};
 use support::Fixture;
 
 fn entries(index: &Index) -> BTreeMap<String, (u16, Option<u64>, Option<i64>)> {
@@ -50,15 +50,15 @@ fn fast_ntfs_matches_the_walk() {
     assert!(status.success());
     fx.junction(&root.join("Docs"), &root.join("docs-junction"));
 
-    let options = |fast_ntfs| WalkOptions {
+    let options = |ntfs| WalkOptions {
         roots: vec![root.clone()],
         excludes: vec![root.join("excluded"), root.join("skip-me.txt")],
         columns: ColumnSet::DEFAULT,
         follow_symlinks: false,
-        fast_ntfs,
+        ntfs,
     };
-    let (walked, walk_report) = scan(&options(false));
-    let (fast, fast_report, maps) = scan_with_maps(&options(true));
+    let (walked, walk_report) = scan(&options(NtfsMode::Off));
+    let (fast, fast_report, maps) = scan_with_maps(&options(NtfsMode::AllRoots));
     assert_eq!(walk_report.errors, 0, "{walk_report:?}");
     assert_eq!(fast_report.errors, 0, "{fast_report:?}");
     eprintln!("fast path: {}", fast_report.mode);

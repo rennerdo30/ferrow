@@ -559,7 +559,47 @@ mod platform {
     use std::path::Path;
 
     /// Bytes read per request; a multiple of every record and cluster size.
-    const CHUNK: usize = 4 << 20;
+    const CHUNK: usize = 16 << 20;
+    /// `FILE_FLAG_NO_BUFFERING`: raw MFT reads bypass the file cache, so a
+    /// scan never evicts other programs' cached data.
+    const NO_BUFFERING: u32 = 0x2000_0000;
+    /// Unbuffered reads need sector-aligned memory; 4 KiB covers every disk.
+    const ALIGN: usize = 4096;
+
+    /// A zeroed, 4 KiB-aligned byte buffer for unbuffered reads.
+    struct Aligned {
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+    }
+
+    // SAFETY: the buffer is uniquely owned; moving it between threads is fine.
+    unsafe impl Send for Aligned {}
+
+    impl Aligned {
+        fn layout(len: usize) -> std::alloc::Layout {
+            std::alloc::Layout::from_size_align(len.max(ALIGN).next_multiple_of(ALIGN), ALIGN)
+                .expect("valid read buffer layout")
+        }
+        fn new(len: usize) -> Aligned {
+            let layout = Self::layout(len);
+            // SAFETY: non-zero size, valid alignment.
+            let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+            let ptr = std::ptr::NonNull::new(raw)
+                .unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+            Aligned { ptr, len }
+        }
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            // SAFETY: `len` initialized (zeroed) bytes owned by this buffer.
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        }
+    }
+
+    impl Drop for Aligned {
+        fn drop(&mut self) {
+            // SAFETY: allocated in `new` with this exact layout.
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), Self::layout(self.len)) }
+        }
+    }
 
     fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
@@ -639,7 +679,7 @@ mod platform {
         let volume = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(7) // read | write | delete: never block other programs
-            .custom_flags(0)
+            .custom_flags(NO_BUFFERING)
             .open(&device)
             .map_err(|e| format!("open {device}: {e}"))?;
         // SAFETY: zeroed POD output buffer.
@@ -668,14 +708,17 @@ mod platform {
             || record_size < 512
             || !record_size.is_multiple_of(512)
             || !CHUNK.is_multiple_of(record_size)
+            || !(CHUNK as u64).is_multiple_of(cluster)
+            || !cluster.is_multiple_of(512)
         {
             return Err("unexpected NTFS geometry".into());
         }
-        let mut record0 = vec![0u8; record_size.max(cluster as usize)];
+        let mut first = Aligned::new(record_size.max(cluster as usize).next_multiple_of(ALIGN));
         volume
-            .seek_read(&mut record0, data.MftStartLcn as u64 * cluster)
+            .seek_read(first.as_mut_slice(), data.MftStartLcn as u64 * cluster)
             .map_err(|e| format!("read MFT record 0: {e}"))?;
-        record0.truncate(record_size);
+        let mut record0 = first.as_mut_slice()[..record_size].to_vec();
+        drop(first);
         if !apply_fixup(&mut record0) {
             return Err("MFT record 0 is damaged".into());
         }
@@ -687,7 +730,7 @@ mod platform {
 
         // Reader thread: sequential reads; this thread parses in parallel.
         let parsed = std::thread::scope(|scope| -> Result<Parsed, String> {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(2);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Aligned)>(2);
             let volume = &volume;
             let reader = scope.spawn(move || -> Result<(), String> {
                 let mut mft_offset = 0u64;
@@ -695,18 +738,17 @@ mod platform {
                     let run_bytes = clusters * cluster;
                     let mut done = 0u64;
                     while done < run_bytes && mft_offset + done < valid {
+                        // Whole clusters keep every read sector-aligned.
                         let want = (run_bytes - done)
                             .min(CHUNK as u64)
-                            .min(valid - mft_offset - done);
-                        let want = (want as usize).div_ceil(record_size) * record_size;
+                            .min((valid - mft_offset - done).next_multiple_of(cluster))
+                            as usize;
                         let first_record = (mft_offset + done) / record_size as u64;
-                        let mut buf = vec![0u8; want];
+                        let mut buf = Aligned::new(want);
                         if let Some(lcn) = lcn {
                             let disk = lcn * cluster + done;
-                            // Volume reads must be sector-aligned; record
-                            // sizes and clusters are.
                             volume
-                                .seek_read(&mut buf, disk)
+                                .seek_read(buf.as_mut_slice(), disk)
                                 .map_err(|e| format!("read MFT at {disk}: {e}"))?;
                         }
                         if tx.send((first_record, buf)).is_err() {
@@ -724,11 +766,13 @@ mod platform {
             let mut all = Parsed::default();
             for (first_record, mut buf) in rx {
                 let part = buf
+                    .as_mut_slice()
                     .par_chunks_mut(record_size)
                     .enumerate()
                     .fold(Parsed::default, |mut acc, (i, rec)| {
-                        if apply_fixup(rec) {
-                            parse_record(rec, first_record + i as u64, &mut acc);
+                        let number = first_record + i as u64;
+                        if number < records && apply_fixup(rec) {
+                            parse_record(rec, number, &mut acc);
                         }
                         acc
                     })

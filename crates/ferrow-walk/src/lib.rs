@@ -35,9 +35,23 @@ pub struct WalkOptions {
     /// Descend into symlinked directories. Off by default.
     pub follow_symlinks: bool,
     /// Read NTFS volumes' master file table directly when possible
-    /// (needs administrator rights; seconds instead of minutes). Roots
-    /// it cannot serve are walked. Off by default.
-    pub fast_ntfs: bool,
+    /// (needs administrator rights; seconds instead of minutes on whole
+    /// drives). Roots it cannot serve are walked. Off by default.
+    pub ntfs: NtfsMode,
+}
+
+/// When to read an NTFS volume's MFT instead of walking a root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NtfsMode {
+    /// Always walk.
+    #[default]
+    Off,
+    /// Roots that are whole volumes (`C:\`, a mounted volume's folder).
+    /// The MFT read costs the same however small the root is, so folder
+    /// roots are walked.
+    VolumeRoots,
+    /// Every root on an NTFS volume (tests).
+    AllRoots,
 }
 
 /// Outcome of a scan.
@@ -699,10 +713,15 @@ pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMa
     #[allow(unused_mut, reason = "only filled on Windows")]
     let mut maps: Vec<VolumeMap> = Vec::new();
     #[cfg(windows)]
-    let root_dirs = if options.follow_symlinks || !options.fast_ntfs {
+    let root_dirs = if options.follow_symlinks || options.ntfs == NtfsMode::Off {
         root_dirs
     } else {
-        scan_from_mft(root_dirs, &walker, &mut modes, &mut maps)
+        let (mft, walk): (Vec<_>, Vec<_>) = root_dirs
+            .into_iter()
+            .partition(|(dir, _, _)| options.ntfs == NtfsMode::AllRoots || is_volume_root(dir));
+        let mut rest = scan_from_mft(mft, &walker, &mut modes, &mut maps);
+        rest.extend(walk);
+        rest
     };
     if !root_dirs.is_empty() {
         modes.push("parallel read_dir".to_string());
@@ -824,6 +843,32 @@ fn scan_from_mft(
     walk
 }
 
+/// Whether `path` is the root of a volume (a drive or a mounted volume).
+#[cfg(windows)]
+fn is_volume_root(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    let path_w: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut mount = [0u16; 1024];
+    // SAFETY: NUL-terminated input; output buffer and its length match.
+    if unsafe { GetVolumePathNameW(path_w.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } == 0 {
+        return false;
+    }
+    let len = mount.iter().position(|&c| c == 0).unwrap_or(0);
+    let trim = |s: &[u16]| {
+        let mut s = s.to_vec();
+        while s
+            .last()
+            .is_some_and(|&c| c == u16::from(b'\\') || c == u16::from(b'/'))
+        {
+            s.pop();
+        }
+        String::from_utf16_lossy(&s).to_lowercase()
+    };
+    let given: Vec<u16> = path.as_os_str().encode_wide().collect();
+    trim(&mount[..len]) == trim(&given)
+}
+
 #[cfg(windows)]
 fn ntfs_device_of(path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
@@ -919,6 +964,15 @@ fn emit_mft_subtree(
 mod tests {
     use super::*;
     use ferrow_index::ROOT_PARENT;
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_roots_are_recognised() {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(is_volume_root(Path::new(&format!("{system}\\"))));
+        assert!(is_volume_root(Path::new(&system.to_lowercase())));
+        assert!(!is_volume_root(&std::env::temp_dir()));
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -1071,7 +1125,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert_eq!(report.errors, 0, "{:?}", report.error_samples);
         assert!(
@@ -1084,7 +1138,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
@@ -1104,7 +1158,7 @@ mod tests {
             roots: vec![link.clone()],
             follow_symlinks: false,
             excludes: Vec::new(),
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             !(0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
@@ -1119,7 +1173,7 @@ mod tests {
             roots: vec![link],
             follow_symlinks: true,
             excludes: Vec::new(),
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             (0..idx.len() as u32).any(|id| idx.name(id) == b"private-leaf.txt"),
@@ -1138,7 +1192,7 @@ mod tests {
             roots: vec![root.0.clone()],
             follow_symlinks: true,
             excludes: Vec::new(),
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         // root, f.txt, a, g.txt, loop — the loop is a leaf, never descended.
         assert_eq!(idx.len(), 5, "cycle was not bounded");
@@ -1154,7 +1208,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             idx.is_empty(),
@@ -1172,7 +1226,7 @@ mod tests {
             roots: vec![dir.0.join("sub")],
             excludes: vec![dir.0.clone()],
             follow_symlinks: false,
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(
             idx.is_empty(),
@@ -1193,7 +1247,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("KEEPDIR")],
             follow_symlinks: false,
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1213,7 +1267,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("skip")],
             follow_symlinks: false,
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1235,7 +1289,7 @@ mod tests {
                 roots: vec![root],
                 excludes: vec![exclude],
                 follow_symlinks: false,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert!(
                 idx.is_empty(),
@@ -1276,7 +1330,7 @@ mod tests {
                     roots: vec![scan_root],
                     excludes: vec![exclude],
                     follow_symlinks: false,
-                    fast_ntfs: false,
+                    ntfs: NtfsMode::Off,
                 });
                 assert!(
                     idx.is_empty(),
@@ -1296,7 +1350,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("no-such-exclude")],
             follow_symlinks: false,
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         assert!(by_name(&idx).contains_key("keep.txt"));
         assert_eq!(report.fatal_error, None, "missing exclude must not abort");
@@ -1319,7 +1373,7 @@ mod tests {
             roots: vec![dir.0.clone()],
             excludes: vec![dir.0.join("secret.txt")],
             follow_symlinks: false,
-            fast_ntfs: false,
+            ntfs: NtfsMode::Off,
         });
         let names = by_name(&idx);
         assert!(names.contains_key("keep.txt"));
@@ -1399,7 +1453,7 @@ mod tests {
                 roots: vec![fx.root.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1423,7 +1477,7 @@ mod tests {
                 roots: vec![fx.aliases.clone()],
                 excludes: vec![fx.exclude.clone()],
                 follow_symlinks: follow,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1452,7 +1506,7 @@ mod tests {
                 roots: vec![root_dir.0.clone()],
                 excludes: vec![exclude.clone()],
                 follow_symlinks: follow,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(
                 report.errors, 1,
@@ -1477,7 +1531,7 @@ mod tests {
                     roots: vec![root.clone()],
                     excludes: vec![fx.exclude.clone()],
                     follow_symlinks: follow,
-                    fast_ntfs: false,
+                    ntfs: NtfsMode::Off,
                 });
                 assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
                 assert_eq!(idx.len(), 1, "follow={follow}");
@@ -1519,7 +1573,7 @@ mod tests {
                     roots: vec![root.clone()],
                     excludes: excludes.clone(),
                     follow_symlinks: follow,
-                    fast_ntfs: false,
+                    ntfs: NtfsMode::Off,
                 });
                 assert_eq!(
                     report.errors, 0,
@@ -1533,7 +1587,7 @@ mod tests {
                         roots: vec![scan_root.clone()],
                         excludes: excludes.clone(),
                         follow_symlinks: follow,
-                        fast_ntfs: false,
+                        ntfs: NtfsMode::Off,
                     });
                     assert_eq!(
                         report.errors, 1,
@@ -1598,7 +1652,7 @@ mod tests {
                 roots: vec![root.clone()],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(report.errors, 0, "follow={follow}: {report:?}");
             assert_eq!(idx.len(), 1, "follow={follow}: control");
@@ -1608,7 +1662,7 @@ mod tests {
                 roots: vec![root],
                 excludes: vec![secret.clone()],
                 follow_symlinks: follow,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert_eq!(report.errors, 1, "follow={follow}: {report:?}");
             assert!(
@@ -1646,7 +1700,7 @@ mod tests {
                 roots: vec![root.0.clone()],
                 excludes: vec![exclude],
                 follow_symlinks: true,
-                fast_ntfs: false,
+                ntfs: NtfsMode::Off,
             });
             assert!(
                 !(0..idx.len() as u32).any(|id| idx.name(id) == b"target-leaf.txt"),
