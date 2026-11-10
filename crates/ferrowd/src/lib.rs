@@ -276,7 +276,9 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
         #[cfg(windows)]
         if live_windows::will_run(&options) {
             return Ok(Snapshot {
-                index: Arc::new(IndexBuilder::new().freeze()),
+                // The columns the scan will fill, so sorting by them works
+                // (empty) instead of failing while the first scan runs.
+                index: Arc::new(IndexBuilder::with_columns(options.columns).freeze()),
                 live: None,
                 mode: "indexing".into(),
                 report: "first scan running".into(),
