@@ -105,6 +105,10 @@ pub struct FerrowApp {
     sort_unavailable: bool,
     /// Settings → Updates.
     updater: crate::update::Updater,
+    /// Set while the Ferrow service answers searches: its entry count.
+    pub(crate) service_entries: Option<u64>,
+    /// Re-run the query for a live change without jumping to the top.
+    refreshing: bool,
 }
 
 impl FerrowApp {
@@ -164,6 +168,8 @@ impl FerrowApp {
             sort_pending: false,
             sort_unavailable: false,
             updater: crate::update::Updater::new(),
+            service_entries: None,
+            refreshing: false,
         };
         if app.settings.windows.windows_search {
             app.sync_windows_search();
@@ -209,8 +215,34 @@ impl FerrowApp {
                     self.sent_query = None; // re-run the current query
                 }
                 Event::NoIndex { path } => self.state = State::NoIndex { path },
+                Event::Remote { entries, report } => {
+                    let first = self.service_entries.is_none();
+                    self.service_entries = Some(entries);
+                    self.index_source = format!("Ferrow service: {report}");
+                    if first {
+                        // The service's index covers every drive and stays
+                        // current: no local index or rebuilds needed.
+                        self.index = Some(Arc::new(ferrow_index::IndexBuilder::new().freeze()));
+                        self.scan_status = None;
+                        self.columns_need_rebuild = false;
+                        self.state = State::Ready;
+                        self.sent_query = None;
+                    }
+                }
+                Event::IndexChanged => {
+                    // A live change: search again, keeping the view.
+                    if self.service_entries.is_some() {
+                        self.refreshing = true;
+                        self.sent_query = None;
+                    }
+                }
                 Event::Failed(msg) => {
                     self.scan_status = None;
+                    if self.service_entries.take().is_some() {
+                        // The engine falls back to the app's own index.
+                        self.index = None;
+                        self.hits = None;
+                    }
                     if self.index.is_some() {
                         // Keep searching the current index; report the error.
                         self.settings_error = Some(msg);
@@ -242,9 +274,15 @@ impl FerrowApp {
                         continue;
                     }
                     if generation > self.shown_generation {
-                        // A new query: start at the top.
-                        self.scroll = 0.0;
-                        self.selected = None;
+                        if self.refreshing {
+                            // The same query after a live change: keep
+                            // the scroll position and selection.
+                            self.refreshing = false;
+                        } else {
+                            // A new query: start at the top.
+                            self.scroll = 0.0;
+                            self.selected = None;
+                        }
                     }
                     self.shown_generation = generation;
                     self.hits = Some(hits);
@@ -319,9 +357,16 @@ impl FerrowApp {
         }
     }
 
+    /// Entries in the index being searched (the service's or the app's).
+    fn object_count(&self, index: &Index) -> usize {
+        self.service_entries.map_or(index.len(), |n| n as usize)
+    }
+
     fn path_of_row(&self, row: usize) -> Option<PathBuf> {
-        let index = self.index.as_ref()?;
-        let id = self.hits.as_ref()?.get(index, row)?;
+        let hits = self.hits.as_ref()?;
+        let index = hits.own_index().or_else(|| self.index.clone())?;
+        let index = &index;
+        let id = hits.get(index, row)?;
         Some(index.path(id))
     }
 
@@ -636,6 +681,8 @@ impl FerrowApp {
         let Some(hits) = self.hits.clone() else {
             return;
         };
+        // Service results carry the index of their loaded rows.
+        let index = hits.own_index().unwrap_or(index);
         let rows = hits.len(&index);
         if rows == 0 {
             return self.placeholder(ui, outer, "No results", Some("Try fewer or shorter words."));
@@ -655,11 +702,16 @@ impl FerrowApp {
             self.selected = None;
         }
         if self.sort_unavailable {
+            let hint = if self.service_entries.is_some() {
+                "The Ferrow service is still building its index; this fills in by itself. Or sort by another column."
+            } else {
+                "Rebuild the index in Settings to add it, or sort by another column."
+            };
             return self.placeholder(
                 ui,
                 list,
                 "This index has no data for that column",
-                Some("Rebuild the index in Settings to add it, or sort by another column."),
+                Some(hint),
             );
         }
 
@@ -746,6 +798,12 @@ impl FerrowApp {
         for i in 0..count {
             let row = first + i;
             let Some(id) = hits.get(&index, row) else {
+                // A service row not loaded yet: ask for its page; the
+                // reply repaints.
+                if let Some(generation) = hits.remote_generation() {
+                    self.engine.fetch_rows(generation, row);
+                    continue;
+                }
                 break;
             };
             let top = list.top() + i as f32 * ROW_HEIGHT - offset;
@@ -1105,7 +1163,7 @@ impl FerrowApp {
             (State::Ready, Some(index)) => {
                 let rows = self.row_count();
                 let results = if self.query.trim().is_empty() {
-                    format!("{} objects", group(index.len()))
+                    format!("{} objects", group(self.object_count(index)))
                 } else if self.complete {
                     format!(
                         "{} {}",
@@ -1138,11 +1196,14 @@ impl FerrowApp {
             p.text_secondary,
         );
         if let (State::Ready, Some(index)) = (&self.state, &self.index) {
-            let right = format!(
-                "Local index  ·  {} entries  ·  loaded in {}",
-                group(index.len()),
-                fmt_ms(self.load_time)
-            );
+            let right = match self.service_entries {
+                Some(n) => format!("Ferrow service  ·  {} entries  ·  live", group(n as usize)),
+                None => format!(
+                    "Local index  ·  {} entries  ·  loaded in {}",
+                    group(index.len()),
+                    fmt_ms(self.load_time)
+                ),
+            };
             let resp = ui.interact(rect, egui::Id::unique("status"), Sense::hover());
             painter.text(
                 pos2(rect.right() - 4.0, rect.center().y),

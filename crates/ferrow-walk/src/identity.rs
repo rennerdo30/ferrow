@@ -75,9 +75,9 @@ pub fn is_name_surrogate(path: &Path) -> std::io::Result<bool> {
 /// fallback 64-bit file index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
-    kind: u8,
-    volume: u64,
-    id: u128,
+    pub(crate) kind: u8,
+    pub(crate) volume: u64,
+    pub(crate) id: u128,
 }
 
 #[cfg(unix)]

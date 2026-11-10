@@ -264,6 +264,10 @@ impl<S: DeadlineIo> Client<S> {
 
     fn expect(&mut self, id: u32) -> std::io::Result<Response> {
         self.begin_operation()?;
+        self.read_reply(id)
+    }
+
+    fn read_reply(&mut self, id: u32) -> std::io::Result<Response> {
         match read_message(&mut self.stream)? {
             Some(envelope) if envelope.id == id => match envelope.message {
                 Message::Response(response) => Ok(response),
@@ -394,6 +398,52 @@ impl<S: DeadlineIo> Client<S> {
                 }
                 _ => return Err(io_invalid("expected Results".into())),
             }
+        }
+    }
+
+    /// Rows `offset .. offset + limit` of a query with metadata and
+    /// folder flags. Returns rows, the indexed-column mask and whether
+    /// the requested sort is still being prepared (rows in name order).
+    pub fn page(
+        &mut self,
+        text: &str,
+        offset: u32,
+        limit: u32,
+        sort: Sort,
+        descending: bool,
+    ) -> std::io::Result<(Vec<FileRow>, u32, bool)> {
+        let id = self.send(Request::Page {
+            text: text.to_owned(),
+            offset,
+            limit,
+            sort,
+            flags: if descending {
+                protocol::QUERY_DESCENDING
+            } else {
+                0
+            },
+        })?;
+        match Self::check(self.expect(id)?)? {
+            Response::Rows {
+                rows,
+                columns,
+                sort_pending,
+                more: false,
+            } => Ok((rows, columns, sort_pending)),
+            _ => Err(io_invalid("expected one Rows reply".into())),
+        }
+    }
+
+    /// Wait until the index generation differs from `generation`
+    /// (`u64::MAX` returns the current one at once).
+    pub fn watch(&mut self, generation: u64) -> std::io::Result<u64> {
+        let id = self.send(Request::Watch { generation })?;
+        // The reply can take arbitrarily long: no per-operation deadline.
+        self.stream
+            .set_deadline(Instant::now() + Duration::from_secs(365 * 24 * 3600))?;
+        match Self::check(self.read_reply(id)?)? {
+            Response::Changed { generation } => Ok(generation),
+            _ => Err(io_invalid("expected Changed".into())),
         }
     }
 

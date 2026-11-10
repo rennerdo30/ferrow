@@ -9,6 +9,13 @@ hold-window bound. Earlier rounds: reviews 1–6
 required changes). The ordinary-caller gate opens only when the
 implementation passes the tests below in CI. Live updates (ADR 0005) are separate.
 
+**Interim (owner decision 2026-11-10):** until this design is implemented,
+the service answers every non-sandboxed process of an account in the local
+Administrators group unfiltered, elevated or not, so the normal app can use
+the fast index (`docs/service.md`). Standard accounts stay refused. This
+ADR then filters standard accounts; whether admin accounts stay unfiltered
+is decided with it.
+
 ## Goal and threat model
 
 The system service runs as SYSTEM and indexes every name on fixed local

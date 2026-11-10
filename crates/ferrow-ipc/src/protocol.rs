@@ -19,7 +19,7 @@
 use std::io::{Read, Write};
 
 /// The only protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const QUERY_DESCENDING: u32 = 1;
 pub const QUERY_METADATA: u32 = 2;
 /// Hard cap on one frame's payload. Results are paged to fit.
@@ -36,6 +36,12 @@ const KIND_QUERY: u8 = 2;
 const KIND_COUNT: u8 = 3;
 const KIND_STATUS: u8 = 4;
 const KIND_CANCEL: u8 = 5;
+const KIND_PAGE: u8 = 6;
+const KIND_WATCH: u8 = 7;
+const KIND_CHANGED: u8 = 107;
+/// Row presence bit: the entry is a folder (no payload; allowed with
+/// any column mask).
+const ROW_DIRECTORY: u8 = 32;
 const KIND_HELLO_OK: u8 = 101;
 const KIND_RESULTS: u8 = 102;
 const KIND_COUNT_RESULT: u8 = 103;
@@ -66,9 +72,14 @@ pub struct FileRow {
     pub created: Option<i64>,
     pub accessed: Option<i64>,
     pub attributes: Option<u32>,
+    /// The entry is a folder (protocol 4).
+    pub is_dir: bool,
 }
 impl FileRow {
     fn presence(&self) -> u8 {
+        self.columns() | if self.is_dir { ROW_DIRECTORY } else { 0 }
+    }
+    fn columns(&self) -> u8 {
         u8::from(self.size.is_some())
             | (u8::from(self.modified.is_some()) << 1)
             | (u8::from(self.created.is_some()) << 2)
@@ -98,6 +109,22 @@ pub enum Request {
     /// Cancel the in-flight request with this request id.
     Cancel {
         target_id: u32,
+    },
+    /// Rows `offset .. offset + limit` of a query's results, with
+    /// metadata and folder flags, as one `Rows` reply (protocol 4).
+    Page {
+        text: String,
+        offset: u32,
+        limit: u32,
+        sort: Sort,
+        /// `QUERY_DESCENDING` only.
+        flags: u32,
+    },
+    /// Reply once the index differs from `generation` (`u64::MAX`: reply
+    /// at once with the current generation). Lets a client refresh its
+    /// results on live changes without polling (protocol 4).
+    Watch {
+        generation: u64,
     },
 }
 
@@ -131,6 +158,10 @@ pub enum Response {
     },
     Count {
         n: u64,
+    },
+    /// The index generation changed (reply to `Watch`).
+    Changed {
+        generation: u64,
     },
     Status {
         entries: u64,
@@ -263,6 +294,28 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             KIND_COUNT
         }
         Message::Request(Request::Status) => KIND_STATUS,
+        Message::Request(Request::Page {
+            text,
+            offset,
+            limit,
+            sort,
+            flags,
+        }) => {
+            w.str(text)?;
+            w.u32(*offset);
+            w.u32(*limit);
+            w.u8(sort_code(*sort));
+            w.u32(*flags);
+            KIND_PAGE
+        }
+        Message::Request(Request::Watch { generation }) => {
+            w.u64(*generation);
+            KIND_WATCH
+        }
+        Message::Response(Response::Changed { generation }) => {
+            w.u64(*generation);
+            KIND_CHANGED
+        }
         Message::Request(Request::Cancel { target_id }) => {
             w.u32(*target_id);
             KIND_CANCEL
@@ -313,7 +366,7 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
                 if row.path.len() > MAX_PATH_BYTES || size + row.path.len() + 41 > MAX_FRAME_BYTES {
                     return Err(ProtocolError::TooLarge);
                 }
-                if u32::from(row.presence()) & !columns != 0 {
+                if u32::from(row.columns()) & !columns != 0 {
                     return Err(ProtocolError::InvalidValue("row columns"));
                 }
                 Ok(size + row.path.len() + 41)
@@ -432,6 +485,27 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn sort_code(sort: Sort) -> u8 {
+    match sort {
+        Sort::Name => 0,
+        Sort::Size => 1,
+        Sort::Modified => 2,
+        Sort::Created => 3,
+        Sort::Accessed => 4,
+    }
+}
+
+fn sort_from(code: u8) -> Result<Sort, ProtocolError> {
+    Ok(match code {
+        0 => Sort::Name,
+        1 => Sort::Size,
+        2 => Sort::Modified,
+        3 => Sort::Created,
+        4 => Sort::Accessed,
+        _ => return Err(ProtocolError::InvalidValue("sort")),
+    })
+}
+
 fn error_code(v: u16) -> Result<ErrorCode, ProtocolError> {
     Ok(match v {
         1 => ErrorCode::VersionMismatch,
@@ -484,6 +558,26 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
         }
         KIND_COUNT => Message::Request(Request::Count { text: r.str()? }),
         KIND_STATUS => Message::Request(Request::Status),
+        KIND_PAGE => {
+            let text = r.str()?;
+            let offset = r.u32()?;
+            let limit = r.u32()?;
+            let sort = sort_from(r.u8()?)?;
+            let flags = r.u32()?;
+            Message::Request(Request::Page {
+                text,
+                offset,
+                limit,
+                sort,
+                flags,
+            })
+        }
+        KIND_WATCH => Message::Request(Request::Watch {
+            generation: r.u64()?,
+        }),
+        KIND_CHANGED => Message::Response(Response::Changed {
+            generation: r.u64()?,
+        }),
         KIND_CANCEL => Message::Request(Request::Cancel {
             target_id: r.u32()?,
         }),
@@ -530,7 +624,9 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             let mut rows = Vec::with_capacity(n);
             for _ in 0..n {
                 let path = r.len_prefixed(MAX_PATH_BYTES)?.to_vec();
-                let mask = r.u8()?;
+                let presence = r.u8()?;
+                let is_dir = presence & ROW_DIRECTORY != 0;
+                let mask = presence & !ROW_DIRECTORY;
                 if u32::from(mask) & !columns != 0 {
                     return Err(ProtocolError::InvalidValue("row columns"));
                 }
@@ -558,6 +654,7 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
                     created,
                     accessed,
                     attributes,
+                    is_dir,
                 });
             }
             Message::Response(Response::Rows {

@@ -273,7 +273,9 @@ fn index_then_search_all_modes() {
 
     let out = ferrow(&["index", root, "--out", index]);
     let text = stdout(&out);
+    // A folder root is walked even when the MFT could be read.
     assert!(text.contains("parallel read_dir"), "{text}");
+    assert!(!text.contains("mft"), "{text}");
     assert!(text.contains("entries"), "{text}");
 
     // Plain search: all three report hits, full paths, one per line.

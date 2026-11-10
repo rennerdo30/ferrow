@@ -166,7 +166,13 @@ impl CallerIdentity {
         platform::current_identity()
     }
 
-    pub fn is_system_administrator(&self) -> bool {
+    /// Whether the system service answers this caller unfiltered: SYSTEM,
+    /// or any process of an account in the local Administrators group,
+    /// elevated or not (owner decision 2026-11-10, interim until per-user
+    /// visibility, ADR 0002). Restricted, AppContainer and below-medium
+    /// integrity tokens are refused, so sandboxed processes of an admin
+    /// account do not qualify. Root on Unix.
+    pub fn is_admin_account(&self) -> bool {
         platform::is_privileged(self)
     }
 }
@@ -634,38 +640,105 @@ mod platform {
 
     pub fn is_privileged(caller: &CallerIdentity) -> bool {
         use windows_sys::Win32::Security::{
-            CheckTokenMembership, CreateWellKnownSid, IsTokenRestricted,
+            CreateWellKnownSid, EqualSid, IsTokenRestricted, TOKEN_GROUPS, TokenGroups,
             WinBuiltinAdministratorsSid,
         };
+        const SE_GROUP_ENABLED: u32 = 0x4;
+        const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
         let Some(token) = caller.access_token() else {
             return false;
         };
+        let token = token.as_raw_handle();
         // SAFETY: valid retained token; restricted tokens are conservatively refused.
-        if unsafe { IsTokenRestricted(token.as_raw_handle()) } != 0 {
+        if unsafe { IsTokenRestricted(token) } != 0 {
             return false;
         }
         if caller.user_sid.as_deref() == Some("S-1-5-18") {
             return true;
         }
-        let mut sid = [0usize; 16];
-        let mut len = std::mem::size_of_val(&sid) as u32;
-        let mut member = 0;
-        // SAFETY: aligned SID buffer (128 bytes > SECURITY_MAX_SID_SIZE), valid
-        // impersonation token and output; failed checks never authorize.
-        unsafe {
+        if is_app_container(token) != Some(false) || !at_least_medium_integrity(token) {
+            return false;
+        }
+        let mut admins = [0usize; 16];
+        let mut len = std::mem::size_of_val(&admins) as u32;
+        // SAFETY: aligned SID buffer (128 bytes > SECURITY_MAX_SID_SIZE) and live length.
+        if unsafe {
             CreateWellKnownSid(
                 WinBuiltinAdministratorsSid,
                 std::ptr::null_mut(),
-                sid.as_mut_ptr().cast(),
+                admins.as_mut_ptr().cast(),
                 &raw mut len,
-            ) != 0
-                && CheckTokenMembership(
-                    token.as_raw_handle(),
-                    sid.as_mut_ptr().cast(),
-                    &raw mut member,
-                ) != 0
-                && member != 0
+            )
+        } == 0
+        {
+            return false;
         }
+        let Some(buf) = token_info(token, TokenGroups) else {
+            return false;
+        };
+        // SAFETY: GetTokenInformation(TokenGroups) filled a TOKEN_GROUPS in this
+        // pointer-aligned buffer; its group array and SIDs live inside `buf`.
+        let groups = unsafe { &*buf.as_ptr().cast::<TOKEN_GROUPS>() };
+        // SAFETY: the API wrote `GroupCount` entries starting at `Groups`.
+        let list = unsafe {
+            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+        };
+        // A UAC-filtered admin token keeps Administrators as deny-only; an
+        // elevated one has it enabled. Either means an admin account.
+        list.iter().any(|g| {
+            g.Attributes & (SE_GROUP_ENABLED | SE_GROUP_USE_FOR_DENY_ONLY) != 0
+                // SAFETY: both SIDs are valid for the duration of the call.
+                && unsafe { EqualSid(g.Sid, admins.as_mut_ptr().cast()) } != 0
+        })
+    }
+
+    fn is_app_container(token: HANDLE) -> Option<bool> {
+        use windows_sys::Win32::Security::TokenIsAppContainer;
+        let buf = token_info(token, TokenIsAppContainer)?;
+        Some(buf[0] as u32 != 0)
+    }
+
+    fn at_least_medium_integrity(token: HANDLE) -> bool {
+        use windows_sys::Win32::Security::{
+            GetSidSubAuthority, GetSidSubAuthorityCount, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+        };
+        const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+        let Some(buf) = token_info(token, TokenIntegrityLevel) else {
+            return false;
+        };
+        // SAFETY: the buffer holds a TOKEN_MANDATORY_LABEL whose SID lives in it.
+        let label = unsafe { &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+        let sid = label.Label.Sid;
+        if sid.is_null() {
+            return false;
+        }
+        // SAFETY: valid SID from the token; the last sub-authority is the level.
+        unsafe {
+            let count = *GetSidSubAuthorityCount(sid);
+            count > 0
+                && *GetSidSubAuthority(sid, u32::from(count) - 1) >= SECURITY_MANDATORY_MEDIUM_RID
+        }
+    }
+
+    fn token_info(
+        token: HANDLE,
+        class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> Option<Vec<usize>> {
+        use windows_sys::Win32::Security::GetTokenInformation;
+        let mut len = 0u32;
+        // SAFETY: sizing call with a null buffer.
+        unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &raw mut len) };
+        if len == 0 {
+            // Fixed-size classes may report 0 on some systems; use one word.
+            len = size_of::<usize>() as u32;
+        }
+        let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+        let cap = (buf.len() * size_of::<usize>()) as u32;
+        // SAFETY: pointer-aligned storage of at least `cap` bytes.
+        let ok = unsafe {
+            GetTokenInformation(token, class, buf.as_mut_ptr().cast(), cap, &raw mut len)
+        };
+        if ok == 0 { None } else { Some(buf) }
     }
 
     fn capture_identity(handle: HANDLE, pid: Option<u32>) -> std::io::Result<CallerIdentity> {
@@ -1133,6 +1206,127 @@ mod platform {
             // SAFETY: this test owns the token handle.
             unsafe { CloseHandle(token) };
             assert!(std::mem::align_of_val(&buffer[0]) >= align_of::<TOKEN_USER>());
+        }
+
+        fn process_token() -> OwnedHandle {
+            use windows_sys::Win32::Security::{
+                TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+            };
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+            let mut token = std::ptr::null_mut();
+            let access =
+                TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT;
+            // SAFETY: pseudo-process handle is valid; output owned below.
+            assert_ne!(
+                unsafe { OpenProcessToken(GetCurrentProcess(), access, &raw mut token) },
+                0
+            );
+            // SAFETY: unique owned token handle.
+            unsafe { OwnedHandle::from_raw_handle(token) }
+        }
+
+        fn well_known(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> [usize; 16] {
+            use windows_sys::Win32::Security::CreateWellKnownSid;
+            let mut sid = [0usize; 16];
+            let mut len = std::mem::size_of_val(&sid) as u32;
+            // SAFETY: aligned 128-byte buffer and live length.
+            let ok = unsafe {
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &raw mut len,
+                )
+            };
+            assert_ne!(ok, 0);
+            sid
+        }
+
+        fn identity_of(token: OwnedHandle) -> CallerIdentity {
+            owned_identity(token, None).unwrap()
+        }
+
+        #[test]
+        fn ci_runner_admin_account_is_admitted() {
+            // GitHub's Windows runners run as an elevated administrator.
+            if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                assert!(is_privileged(&identity_of(process_token())));
+            }
+        }
+
+        #[test]
+        fn restricted_token_is_refused() {
+            use windows_sys::Win32::Security::{
+                CreateRestrictedToken, SID_AND_ATTRIBUTES, WinWorldSid,
+            };
+            let base = process_token();
+            let mut world = well_known(WinWorldSid);
+            let restrict = SID_AND_ATTRIBUTES {
+                Sid: world.as_mut_ptr().cast(),
+                Attributes: 0,
+            };
+            let mut out = std::ptr::null_mut();
+            // SAFETY: valid token and one restricting SID that outlives the call.
+            let ok = unsafe {
+                CreateRestrictedToken(
+                    base.as_raw_handle(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    1,
+                    &raw const restrict,
+                    &raw mut out,
+                )
+            };
+            assert_ne!(ok, 0);
+            // SAFETY: unique owned token handle.
+            let token = unsafe { OwnedHandle::from_raw_handle(out) };
+            assert!(!is_privileged(&identity_of(token)));
+        }
+
+        #[test]
+        fn low_integrity_token_is_refused() {
+            use windows_sys::Win32::Security::{
+                DuplicateTokenEx, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
+                TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel, TokenPrimary,
+                WinLowLabelSid,
+            };
+            let base = process_token();
+            let mut out = std::ptr::null_mut();
+            // SAFETY: valid source token; output owned below.
+            let ok = unsafe {
+                DuplicateTokenEx(
+                    base.as_raw_handle(),
+                    TOKEN_ALL_ACCESS,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &raw mut out,
+                )
+            };
+            assert_ne!(ok, 0);
+            // SAFETY: unique owned token handle.
+            let token = unsafe { OwnedHandle::from_raw_handle(out) };
+            let mut low = well_known(WinLowLabelSid);
+            let label = TOKEN_MANDATORY_LABEL {
+                Label: SID_AND_ATTRIBUTES {
+                    Sid: low.as_mut_ptr().cast(),
+                    Attributes: 0x20,
+                },
+            };
+            // SAFETY: lowering the integrity of our own duplicate token.
+            let ok = unsafe {
+                SetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenIntegrityLevel,
+                    (&raw const label).cast(),
+                    size_of::<TOKEN_MANDATORY_LABEL>() as u32 + 16,
+                )
+            };
+            assert_ne!(ok, 0);
+            assert!(!is_privileged(&identity_of(token)));
         }
     }
 }

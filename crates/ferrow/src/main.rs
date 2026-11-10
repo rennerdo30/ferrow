@@ -320,6 +320,7 @@ fn cmd_index(args: Args) -> Result<(), String> {
             .collect(),
         excludes: args.excludes,
         follow_symlinks: args.follow_symlinks,
+        ntfs: ferrow_walk::NtfsMode::VolumeRoots,
     });
     println!("{}", report.summary());
     for sample in &report.error_samples {
@@ -775,7 +776,12 @@ fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
             };
             ferrowd::serve_foreground(&config).map_err(|e| e.to_string())
         }
-        "install" => ferrowd::install::install().map(|msg| println!("{msg}")),
+        "install" => {
+            // Optional folders or drives to index; none means every local
+            // fixed drive (Windows).
+            let roots: Vec<PathBuf> = rest[1..].iter().map(PathBuf::from).collect();
+            ferrowd::install::install(&roots).map(|msg| println!("{msg}"))
+        }
         "uninstall" => ferrowd::install::uninstall().map(|msg| println!("{msg}")),
         other => Err(format!(
             "unknown service subcommand: {other} (install | uninstall | status | run)"

@@ -6,8 +6,33 @@ local, access-controlled IPC channel (crate `ferrow-ipc`). The CLI
 rights to read every directory (and, in later milestones, the
 Windows MFT/USN journal).
 
+## Indexing on Windows: MFT and live updates
+
+- **What it indexes.** Without roots on its command line, the system
+  service indexes every local fixed drive (drive letters that are only
+  `subst` aliases are skipped). `ferrow service install <folders…>`
+  limits it to the given roots.
+- **Fast scan.** A root that is a whole NTFS volume is read from the
+  volume's master file table in one sequential, unbuffered pass: names,
+  folders, sizes, dates and attributes for millions of files in seconds
+  on an SSD. Folder roots, other file systems and processes without raw
+  volume access fall back to the parallel directory walk.
+- **Live updates.** After the scan, one thread per NTFS volume sleeps
+  inside the change journal read until the volume changes (no polling;
+  0 % CPU while nothing changes). Changes are applied in 200 ms batches
+  and searches see them within a second. The frozen index is never
+  rebuilt for a change: replaced entries are hidden, new ones live in a
+  small second index, and a background rescan folds them in once that
+  grows large or the journal is reset.
+- **Start.** The service answers from its saved index at once (or an
+  empty one on first start) while the first scan runs.
+
 ## Modes
 
+- **The app.** When the system service answers (an administrator
+  account; see the access rule below), the Ferrow app searches through
+  it, loads further rows while scrolling and refreshes its results on
+  live changes. Otherwise it keeps its own index.
 - **Service mode (default when reachable).** `ferrow search`
   connects to the daemon and streams results from it.
 - **In-process fallback.** When no daemon answers — or when
@@ -24,12 +49,19 @@ Caller identity always comes from the OS (Windows effective pipe
 token after reads, Linux `SO_PEERCRED`, macOS `getpeereid`), never from the
 client's own claim.
 
-**Interim privacy rule, removed by M2c:** the system service answers
-only OS-authenticated SYSTEM or enabled Administrators on Windows,
-and root (uid 0) on Unix. All others receive `Error{Unauthorized}`
-without paths, counts or status data. The CLI explains the refusal
-and falls back to the per-user saved index. Development mode serves
-only the OS user who started it. Per-user result filtering remains M2c.
+**Interim access rule, replaced by M2c:** the system service answers
+SYSTEM and **any process of an account in the local Administrators
+group, elevated or not** (owner decision 2026-11-10), so the normal,
+non-elevated app of an admin account can use the service's fast index.
+Restricted, AppContainer and below-medium-integrity processes (sandboxes)
+are refused even for admin accounts. On Unix only root (uid 0) is
+answered. Everyone else, including standard (non-admin) accounts,
+receives `Error{Unauthorized}` without paths, counts or status data; the
+CLI and the app explain the refusal and fall back to the per-user saved
+index. An admin account could elevate and read every file name anyway,
+so this exposes nothing new to it. Development mode serves only the OS
+user who started it. Per-user result filtering for standard accounts is
+M2c (ADR 0002).
 
 ## Install (needs admin/root once)
 
