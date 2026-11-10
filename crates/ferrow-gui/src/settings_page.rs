@@ -303,15 +303,21 @@ impl FerrowApp {
             ui.add_space(CARD_GAP);
             card(ui, &p, |ui| {
                 ui.horizontal(|ui| {
+                    let on = self.service_entries.is_some();
                     row_text(
                         ui,
                         &p,
                         "Fast NTFS index and live updates",
-                        "Reads the NTFS file table and change journal through the background service. Coming in a later version.",
+                        if on {
+                            "On: the Ferrow service reads each drive's NTFS file table and follows its change journal, so new, renamed and deleted files show up within a second."
+                        } else {
+                            "Off: install the Ferrow index service with Setup to index all drives in seconds and keep the index current by itself."
+                        },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut off = false;
-                        ui.add_enabled_ui(false, |ui| toggle(ui, &p, &mut off));
+                        // Follows whether the service answers; not a choice.
+                        let mut state = on;
+                        ui.add_enabled_ui(false, |ui| toggle(ui, &p, &mut state));
                     });
                 });
             });

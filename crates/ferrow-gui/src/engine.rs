@@ -451,9 +451,35 @@ impl<W: Fn()> Worker<W> {
         });
         let (total, rows, columns, pending) = match result {
             Ok(r) => r,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::InvalidData
+                    && e.to_string().contains("column unavailable") =>
+            {
+                // The service's index has no data for this sort column
+                // (for example while its first scan runs): say so like a
+                // local index does, never as a search-text error.
+                let empty = RemoteQuery {
+                    generation,
+                    text: text.to_owned(),
+                    sort,
+                    descending,
+                    total: 0,
+                    columns: 0,
+                    rows: std::collections::BTreeMap::new(),
+                };
+                self.send(Event::Results {
+                    generation,
+                    hits: empty.hits(),
+                    complete: true,
+                    elapsed: started.elapsed(),
+                    sort_pending: false,
+                    sort_unavailable: true,
+                });
+                return;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                // The service refused the query (for example a column it
-                // does not index): show its reason, keep the connection.
+                // The service refused the query: show its reason, keep the
+                // connection.
                 self.send(Event::QueryError {
                     generation,
                     message: e.to_string(),

@@ -678,11 +678,16 @@ impl FerrowApp {
             self.selected = None;
         }
         if self.sort_unavailable {
+            let hint = if self.service_entries.is_some() {
+                "The Ferrow service is still building its index; this fills in by itself. Or sort by another column."
+            } else {
+                "Rebuild the index in Settings to add it, or sort by another column."
+            };
             return self.placeholder(
                 ui,
                 list,
                 "This index has no data for that column",
-                Some("Rebuild the index in Settings to add it, or sort by another column."),
+                Some(hint),
             );
         }
 
