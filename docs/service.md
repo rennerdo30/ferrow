@@ -24,12 +24,19 @@ Caller identity always comes from the OS (Windows effective pipe
 token after reads, Linux `SO_PEERCRED`, macOS `getpeereid`), never from the
 client's own claim.
 
-**Interim privacy rule, removed by M2c:** the system service answers
-only OS-authenticated SYSTEM or enabled Administrators on Windows,
-and root (uid 0) on Unix. All others receive `Error{Unauthorized}`
-without paths, counts or status data. The CLI explains the refusal
-and falls back to the per-user saved index. Development mode serves
-only the OS user who started it. Per-user result filtering remains M2c.
+**Interim access rule, replaced by M2c:** the system service answers
+SYSTEM and **any process of an account in the local Administrators
+group, elevated or not** (owner decision 2026-11-10), so the normal,
+non-elevated app of an admin account can use the service's fast index.
+Restricted, AppContainer and below-medium-integrity processes (sandboxes)
+are refused even for admin accounts. On Unix only root (uid 0) is
+answered. Everyone else, including standard (non-admin) accounts,
+receives `Error{Unauthorized}` without paths, counts or status data; the
+CLI and the app explain the refusal and fall back to the per-user saved
+index. An admin account could elevate and read every file name anyway,
+so this exposes nothing new to it. Development mode serves only the OS
+user who started it. Per-user result filtering for standard accounts is
+M2c (ADR 0002).
 
 ## Install (needs admin/root once)
 
