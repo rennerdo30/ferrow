@@ -241,7 +241,8 @@ unsafe fn install_vtable_hook() -> Result<()> {
     }
 }
 
-/// Restore the original `tquery.dll` `Execute` pointer in the vtable.
+/// Restore the original `tquery.dll` `Execute` pointer in the vtable
+/// if and only if this module's detour currently owns the slot.
 pub fn detach_in_process() -> Result<()> {
     let _guard = hook_lock()
         .lock()
@@ -252,6 +253,11 @@ pub fn detach_in_process() -> Result<()> {
         return Ok(());
     }
     unsafe {
+        let atomic_slot = &*(slot_addr as *const AtomicPtr<c_void>);
+        if atomic_slot.load(Ordering::Acquire) != detour as *mut c_void {
+            SLOT_PTR.store(std::ptr::null_mut(), Ordering::Release);
+            return Ok(());
+        }
         let mut old_prot = PAGE_PROTECTION_FLAGS(0);
         VirtualProtect(
             slot_addr.cast(),
@@ -259,8 +265,12 @@ pub fn detach_in_process() -> Result<()> {
             PAGE_READWRITE,
             &mut old_prot,
         )?;
-        let atomic_slot = &*(slot_addr as *const AtomicPtr<c_void>);
-        atomic_slot.store(orig, Ordering::Release);
+        let _ = atomic_slot.compare_exchange(
+            detour as *mut c_void,
+            orig,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         let mut dummy = PAGE_PROTECTION_FLAGS(0);
         let _ = VirtualProtect(
             slot_addr.cast(),
@@ -269,6 +279,7 @@ pub fn detach_in_process() -> Result<()> {
             &mut dummy,
         );
     }
+    SLOT_PTR.store(std::ptr::null_mut(), Ordering::Release);
     Ok(())
 }
 
@@ -297,7 +308,7 @@ pub unsafe extern "system" fn FerrowAttach(data_dir: *const u16) -> u32 {
 /// # Safety
 /// Must only be called within a process where `ferrow_winsearch.dll` is loaded.
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn FerrowDetach() -> u32 {
+pub unsafe extern "system" fn FerrowDetach(_reserved: *mut c_void) -> u32 {
     match std::panic::catch_unwind(detach_in_process) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => e.code().0 as u32,
