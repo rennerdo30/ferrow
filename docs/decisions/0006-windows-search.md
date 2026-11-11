@@ -115,9 +115,11 @@ security-relevant code. Deliberate properties:
   `winsearch` bridge folder. Other AppContainer apps get nothing;
   full-trust processes of the same user already had equivalent access.
   Identity is verified from the opened process handle against the full
-  trusted image path (`%SystemRoot%\SystemApps\
+  trusted image path (`<Windows>\SystemApps\
   MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe`, with
-  `%SystemRoot%` from `GetWindowsDirectoryW`) plus the session, closing
+  `<Windows>` from `GetWindowsDirectoryW` — never the process
+  environment; if the OS does not answer, nothing is trusted) plus the
+  session, closing
   both the pid-reuse race and same-name decoy processes; the grant or
   injection never happens for anything else. Grants are recorded with
   every granted DLL path in `winsearch-granted-sid` in the app data

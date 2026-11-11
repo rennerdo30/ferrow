@@ -340,19 +340,26 @@ fn sid_string_to_bytes(text: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-fn windows_directory() -> PathBuf {
-    // Ask the OS instead of trusting the process environment: this
-    // directory anchors the trusted SearchHost image path.
-    let mut buffer = [0u16; 260];
-    // SAFETY: the fixed buffer follows the GetWindowsDirectoryW contract.
-    let len = unsafe { GetWindowsDirectoryW(Some(&mut buffer)) };
-    if len > 0 && (len as usize) < buffer.len() {
-        return PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize]));
+/// The Windows directory from the OS — never from the process
+/// environment, because it anchors the trusted SearchHost image path.
+/// `None` (fail closed) when the OS does not answer.
+fn windows_directory() -> Option<PathBuf> {
+    // SAFETY: both calls follow the GetWindowsDirectoryW contract; a
+    // return larger than the buffer is the required size.
+    let mut stack = [0u16; 260];
+    let len = unsafe { GetWindowsDirectoryW(Some(&mut stack)) };
+    if len == 0 {
+        return None;
     }
-    std::env::var_os("SystemRoot")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+    if (len as usize) < stack.len() {
+        return Some(PathBuf::from(String::from_utf16_lossy(
+            &stack[..len as usize],
+        )));
+    }
+    let mut heap = vec![0u16; len as usize + 1];
+    let written = unsafe { GetWindowsDirectoryW(Some(&mut heap)) };
+    (written > 0 && (written as usize) < heap.len())
+        .then(|| PathBuf::from(String::from_utf16_lossy(&heap[..written as usize])))
 }
 
 fn normalize_windows_path(path: &Path) -> String {
@@ -418,8 +425,13 @@ fn verify_searchhost_identity(proc_handle: HANDLE, pid: u32) -> io::Result<()> {
             "SearchHost candidate is in another session",
         ));
     }
+    let Some(windows_dir) = windows_directory() else {
+        return Err(io::Error::other(
+            "could not determine the Windows directory; refusing to trust any SearchHost image",
+        ));
+    };
     let image = process_image_path(proc_handle)?;
-    if !is_trusted_searchhost_image(&image, &windows_directory()) {
+    if !is_trusted_searchhost_image(&image, &windows_dir) {
         return Err(io::Error::other(format!(
             "pid {pid} image {} is not the trusted system SearchHost.exe",
             image.display()
@@ -1136,6 +1148,22 @@ mod tests {
             assert!(
                 !is_trusted_searchhost_image(Path::new(decoy), windows),
                 "decoy must be rejected: {decoy}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_directory_comes_from_the_os() {
+        let dir = windows_directory().expect("OS reports its Windows directory");
+        assert!(dir.is_dir(), "not a directory: {}", dir.display());
+        assert!(dir.join("System32").is_dir());
+        // A spoofed environment must not move the trust anchor.
+        assert_ne!(dir, Path::new(r"C:\definitely-not-windows"));
+        let expected = std::env::var_os("SystemRoot").map(PathBuf::from);
+        if let Some(expected) = expected {
+            assert_eq!(
+                normalize_windows_path(&dir),
+                normalize_windows_path(&expected)
             );
         }
     }

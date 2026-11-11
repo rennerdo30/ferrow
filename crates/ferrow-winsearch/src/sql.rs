@@ -10,6 +10,14 @@ use ferrow_query::Query;
 pub const DEFAULT_TOP_LIMIT: usize = 30;
 /// Upper bound on rows materialized per Start menu query.
 pub const MAX_TOP_LIMIT: usize = 100;
+/// Largest SQL command considered. Real shell queries are ~1-2 KiB;
+/// anything bigger falls back to the native provider.
+const MAX_SQL_LEN: usize = 64 * 1024;
+/// Deepest predicate nesting the recursive-descent parser walks. The
+/// parser runs on a `SearchHost.exe` thread, where a stack overflow
+/// aborts the process and cannot be caught — nesting beyond this is
+/// rejected for native fallback long before the stack is at risk.
+const MAX_PREDICATE_DEPTH: usize = 32;
 
 /// Parsed Windows Search SQL query ready for Ferrow execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +69,9 @@ pub fn parse_projection(sql: &str) -> Option<(Vec<String>, usize)> {
 /// zero-term queries, or unsupported SQL predicates so the caller can fall back
 /// to the native provider.
 pub fn parse_windows_search_sql(sql: &str) -> Option<ParsedSql> {
+    if sql.len() > MAX_SQL_LEN {
+        return None;
+    }
     let (columns, limit) = parse_projection(sql)?;
     let (_before_from, after_from) = split_from_system_index(sql)?;
     let predicate = extract_where_predicate(after_from)?;
@@ -174,6 +185,7 @@ fn parse_predicate_expression(predicate: &str) -> Option<(Vec<String>, bool)> {
         predicate,
         bytes: predicate.as_bytes(),
         pos: 0,
+        depth: 0,
         distinct_term_sets: Vec::new(),
         representatives: Vec::new(),
     };
@@ -202,6 +214,7 @@ struct PredicateParser<'a> {
     predicate: &'a str,
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
     distinct_term_sets: Vec<Vec<String>>,
     representatives: Vec<Vec<String>>,
 }
@@ -271,7 +284,15 @@ impl PredicateParser<'_> {
 
     fn parse_unary(&mut self) -> Option<PredicateExpr> {
         if self.consume_byte(b'(') {
-            let expr = self.parse_or()?;
+            // The only recursion in the descent goes through grouping,
+            // so bounding it bounds both parser and reduction stack use.
+            self.depth += 1;
+            if self.depth > MAX_PREDICATE_DEPTH {
+                return None;
+            }
+            let expr = self.parse_or();
+            self.depth -= 1;
+            let expr = expr?;
             self.consume_byte(b')').then_some(expr)
         } else {
             self.parse_leaf().map(PredicateExpr::Leaf)
@@ -704,6 +725,30 @@ mod tests {
                 "expected None (native fallback) for: {unsupported}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_deeply_nested_or_oversized_predicates() {
+        // Nesting far beyond the cap must fall back to native, not
+        // recurse until the SearchHost thread overflows its stack
+        // (an abort `catch_unwind` cannot recover from).
+        let leaf = "CONTAINS(System.FileName, '\"alpha*\"')";
+        let deep = format!("{}{leaf}{}", "(".repeat(5_000), ")".repeat(5_000));
+        let sql = format!("SELECT TOP 30 System.ItemName FROM SystemIndex WHERE {deep}");
+        assert!(parse_windows_search_sql(&sql).is_none());
+
+        // Nesting shell queries actually use still parses.
+        let shallow = format!("{}{leaf}{}", "(".repeat(8), ")".repeat(8));
+        let sql = format!("SELECT TOP 30 System.ItemName FROM SystemIndex WHERE {shallow}");
+        let parsed = parse_windows_search_sql(&sql).expect("shallow nesting parses");
+        assert_eq!(parsed.query, "alpha");
+
+        // Oversized input is rejected before any parsing work.
+        let sql = format!(
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE {leaf} AND {}",
+            "x".repeat(MAX_SQL_LEN)
+        );
+        assert!(parse_windows_search_sql(&sql).is_none());
     }
 
     #[test]
