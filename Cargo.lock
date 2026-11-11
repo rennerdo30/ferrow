@@ -1078,7 +1078,7 @@ checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
 
 [[package]]
 name = "ferrow"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "ferrow-index",
  "ferrow-ipc",
@@ -1090,14 +1090,14 @@ dependencies = [
 
 [[package]]
 name = "ferrow-fixture"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "ferrow-index",
 ]
 
 [[package]]
 name = "ferrow-gui"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "chrono",
  "eframe",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "ferrow-index"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "casefold",
  "crc32fast",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "ferrow-ipc"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "ferrow-query"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "chrono",
  "divan",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "ferrow-update"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "ferrowd",
  "serde_json",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "ferrow-walk"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "ferrow-index",
  "rayon",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "ferrow-winsearch"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "ferrow-index",
  "ferrow-ipc",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "ferrowd"
-version = "0.1.0-beta.5"
+version = "0.1.0-beta.6"
 dependencies = [
  "arc-swap",
  "ferrow-index",
