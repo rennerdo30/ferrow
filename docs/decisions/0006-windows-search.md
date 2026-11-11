@@ -76,12 +76,14 @@ Crate `ferrow-winsearch` (cdylib `ferrow_winsearch.dll` + rlib used by
   deadline; a cold cache answers natively until the preload lands);
   service mode never serves that stale file (the service index in
   `C:\ProgramData\Ferrow` is SYSTEM-protected), so native search answers.
-- `controller` (GUI side): stages the DLL into the winsearch folder,
-  grants AppContainer access (below), attaches to the same-session
-  `SearchHost.exe` via `LoadLibraryW` + `FerrowAttach` remote threads,
-  and runs a watcher that blocks on the process handle and re-attaches
-  after shell restarts. Attachment is serialized; state and the last
-  error feed the Settings status line. 64-bit x86 only; other
+- `controller` (GUI side): stages a content-addressed DLL copy into
+  `winsearch-bin` (outside the `Modify`-granted `winsearch` request
+  folder), grants AppContainer access (below), attaches to the
+  same-session `SearchHost.exe` via `LoadLibraryW` + `FerrowAttach`
+  remote threads (detaching any older mapped `ferrow_winsearch*.dll`
+  first), and runs a watcher that blocks on the process handle and
+  re-attaches after shell restarts. Attachment is serialized; state and
+  the last error feed the Settings status line. 64-bit x86 only; other
   architectures report an error instead of silently doing nothing.
 
 Bounds: at most 100 rows per query, 250 ms shell-side wait, token/framing
