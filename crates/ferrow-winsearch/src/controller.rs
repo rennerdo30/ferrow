@@ -26,9 +26,9 @@ use windows::Win32::Security::Authorization::{
     TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
-    NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, TOKEN_APPCONTAINER_INFORMATION,
-    TOKEN_QUERY, TokenAppContainerSid,
+    ACCESS_ALLOWED_ACE, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetLengthSid, GetTokenInformation, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR,
+    PSID, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY, TokenAppContainerSid,
 };
 use windows::Win32::Storage::FileSystem::DELETE;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -227,11 +227,92 @@ enum AccessKind {
     Modify,
 }
 
+/// `INHERITED_ACE` flag in an ACE header. Inherited ACEs come from the
+/// parent folder (for example Windows' own `ALL APPLICATION PACKAGES`
+/// read access under `Program Files`); they are never grants Ferrow
+/// made and cannot be removed by editing the child's DACL.
+const INHERITED_ACE_FLAG: u8 = 0x10;
+
+/// Whether `dacl` carries an explicit (non-inherited) plain
+/// allowed/denied ACE for `sid` — the only kind Ferrow ever writes.
+fn acl_has_explicit_sid(dacl: *mut ACL, sid: PSID) -> bool {
+    if dacl.is_null() {
+        return false;
+    }
+    // SAFETY: `dacl` is a live DACL from GetNamedSecurityInfoW and
+    // `sid` a valid SID for this call; ACE bodies are read only
+    // through their header-typed layout.
+    unsafe {
+        let count = (*dacl).AceCount as u32;
+        for index in 0..count {
+            let mut ace: *mut c_void = ptr::null_mut();
+            if GetAce(dacl, index, &mut ace).is_err() || ace.is_null() {
+                continue;
+            }
+            let plain = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+            // ACCESS_ALLOWED_ACE_TYPE / ACCESS_DENIED_ACE_TYPE only;
+            // object and callback ACEs have a different SID offset
+            // and are never written by this code.
+            if !matches!(plain.Header.AceType, 0 | 1)
+                || plain.Header.AceFlags & INHERITED_ACE_FLAG != 0
+            {
+                continue;
+            }
+            let ace_sid = PSID(ptr::addr_of!(plain.SidStart).cast_mut().cast::<c_void>());
+            if EqualSid(ace_sid, sid).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Whether `path` currently carries an explicit ACE for `sid_bytes`.
+/// Read-only: succeeds on paths an unelevated process may inspect but
+/// not rewrite (for example the installed DLL under `Program Files`).
+fn has_explicit_sid_ace(path: &Path, sid_bytes: &[u8]) -> io::Result<bool> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: sid_bytes holds a valid self-relative SID for this call.
+    let sid = PSID(sid_bytes.as_ptr().cast_mut().cast::<c_void>());
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: out-params follow the GetNamedSecurityInfoW contract;
+    // the returned descriptor is freed below.
+    let get_err = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            &mut sd,
+        )
+    };
+    if get_err != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(get_err.0 as i32));
+    }
+    let found = acl_has_explicit_sid(dacl, sid);
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    Ok(found)
+}
+
 /// Grant (`kind = Some`) or revoke (`kind = None`) access for `sid` on
 /// `path`, with container/object inheritance for folders.
 fn apply_sid_access(path: &Path, sid_bytes: &[u8], kind: Option<AccessKind>) -> io::Result<()> {
     if sid_bytes.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty SID"));
+    }
+    // Revoking a SID with no explicit ACE on the path is a no-op
+    // success, decided without a DACL write. Without this, cleaning
+    // up paths an unelevated GUI cannot rewrite (the installed DLL
+    // under `Program Files`, whose only AppContainer ACE is Windows'
+    // inherited one) failed with Access denied and blocked enabling.
+    if kind.is_none() && !has_explicit_sid_ace(path, sid_bytes)? {
+        return Ok(());
     }
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // SAFETY: sid_bytes holds a valid self-relative SID for this call.
@@ -631,11 +712,11 @@ fn access_paths(data_dir: &Path, extra_dll_paths: &[PathBuf]) -> Vec<PathBuf> {
     if !paths.contains(&staged) {
         paths.push(staged);
     }
-    if let Some(source) = find_source_dll()
-        && !paths.contains(&source)
-    {
-        paths.push(source);
-    }
+    // Deliberately no `find_source_dll()`: granted DLL paths are
+    // revoked from the grant record (`extra_dll_paths`), and in the
+    // installed layout the source DLL is admin-owned under
+    // `Program Files` — its only AppContainer ACE is Windows' own
+    // inherited one, never a grant of ours to revoke.
     for path in extra_dll_paths {
         if !paths.contains(path) {
             paths.push(path.clone());
@@ -651,7 +732,10 @@ fn revoke_sid_from_paths(paths: &[PathBuf], sid_bytes: &[u8]) -> io::Result<()> 
             && let Err(error) = apply_sid_access(path, sid_bytes, None)
             && first_error.is_none()
         {
-            first_error = Some(error);
+            first_error = Some(io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            ));
         }
     }
     match first_error {
@@ -1193,6 +1277,64 @@ mod tests {
         std::fs::write(grant_record_path(&data_dir), "S-1-5-21-1\n").unwrap();
         assert!(read_grant_record(&data_dir).is_err());
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Regression for beta.5 on the installed layout: enabling failed
+    /// with "Access is denied" because legacy cleanup tried to rewrite
+    /// the DACL of `C:\Program Files\Ferrow\ferrow_winsearch.dll`,
+    /// which carries only Windows' inherited `ALL APPLICATION
+    /// PACKAGES` ACE. Revoking a SID with no explicit ACE must be a
+    /// no-op success, decided by reading the DACL only.
+    #[test]
+    fn revoking_ungranted_or_inherited_only_sid_is_a_no_op() {
+        let bogus = sid_string_to_bytes("S-1-15-2-987654321-123456789").unwrap();
+
+        // A system file this SID has no ACE on at all: an unelevated
+        // revoke must not attempt the DACL write Windows would deny.
+        let windows = windows_directory().expect("OS reports its Windows directory");
+        let target = windows.join("System32").join("kernel32.dll");
+        assert!(target.is_file(), "missing {}", target.display());
+        assert!(!has_explicit_sid_ace(&target, &bogus).unwrap());
+        apply_sid_access(&target, &bogus, None).expect("absent-SID revoke is a no-op");
+
+        // An inherited-only ACE (the installed-DLL shape): grant
+        // inheritable access on a folder, then create the file so its
+        // ACE arrives by inheritance. Revoking on the file is a no-op
+        // and leaves the folder's explicit grant untouched.
+        let dir =
+            std::env::temp_dir().join(format!("ferrow-winsearch-inherit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID).unwrap();
+        apply_sid_access(&dir, &legacy, Some(AccessKind::Modify)).unwrap();
+        assert!(has_explicit_sid_ace(&dir, &legacy).unwrap());
+        let child = dir.join("child.txt");
+        std::fs::write(&child, b"x").unwrap();
+        assert!(
+            !has_explicit_sid_ace(&child, &legacy).unwrap(),
+            "child ACE must be inherited-only"
+        );
+        apply_sid_access(&child, &legacy, None).expect("inherited-only revoke is a no-op");
+        assert!(has_explicit_sid_ace(&dir, &legacy).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grant_and_revoke_round_trip_on_temp_file() {
+        let file =
+            std::env::temp_dir().join(format!("ferrow-winsearch-acl-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, b"x").unwrap();
+        let sid = sid_string_to_bytes("S-1-15-2-987654321-123456789").unwrap();
+
+        assert!(!has_explicit_sid_ace(&file, &sid).unwrap());
+        apply_sid_access(&file, &sid, Some(AccessKind::Modify)).unwrap();
+        assert!(has_explicit_sid_ace(&file, &sid).unwrap());
+        apply_sid_access(&file, &sid, None).unwrap();
+        assert!(!has_explicit_sid_ace(&file, &sid).unwrap());
+        // A second revoke is an idempotent no-op success.
+        apply_sid_access(&file, &sid, None).unwrap();
+        let _ = std::fs::remove_file(&file);
     }
 
     /// When a verified SearchHost runs here, its token must yield a

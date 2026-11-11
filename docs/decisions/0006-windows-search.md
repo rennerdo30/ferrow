@@ -129,6 +129,10 @@ security-relevant code. Deliberate properties:
   deleted only after every revocation succeeds and failures surface in
   Settings. Legacy all-packages grants from earlier builds are revoked
   unconditionally on enable, even when `SearchHost.exe` is not running.
+  Revocation only rewrites a DACL that actually carries an explicit ACE
+  for the trustee — decided by reading it — so inherited operating
+  system ACEs and paths an unelevated GUI cannot rewrite (for example
+  the installed DLL under `Program Files`) never block enabling.
   Uninstall without disabling first still leaves the per-user grants
   behind (user data is kept by design); follow-up (1).
 - **Bridge files are transient.** Request files hold one query string;
