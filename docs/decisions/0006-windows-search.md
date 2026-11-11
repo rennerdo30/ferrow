@@ -42,12 +42,16 @@ Crate `ferrow-winsearch` (cdylib `ferrow_winsearch.dll` + rlib used by
 `ferrow-gui`):
 
 - `sql`: extracts projection columns, `TOP` limit (clamped 1..=100) and
-  search terms from `CONTAINS`/`LIKE` predicates on `SystemIndex`.
-  Anything else returns "unsupported" and the native provider runs —
-  including any `NOT`, and `OR` between different term sets, because
-  Ferrow ANDs terms and either would change the result set. The
-  observed same-terms-across-columns `OR` shape is kept.
-  Folder-only `System.Kind` predicates map to `folder:`.
+  search terms from `CONTAINS`/`LIKE` predicates on `SystemIndex`. The
+  whole predicate is parsed as a boolean expression (grouping and
+  precedence included) and accepted only when it reduces exactly to a
+  conjunction of filename term sets — an `OR` survives only when every
+  branch is the same conjunction, which covers the observed
+  same-terms-across-columns shape. Anything else returns "unsupported"
+  and the native provider runs, because Ferrow ANDs terms and a dropped
+  or widened predicate would change the result set. The exact
+  folder-only `System.Kind` restriction maps to `folder:`; other kinds
+  (for example the Documents tab's `document`) fall back to native.
 - `hook`: pins its own module, verifies the `ICommandText::Execute`
   vtable slot (slot 4 on `CLSID_CollatorDataSource`) belongs to
   `tquery.dll`, then swaps it with `VirtualProtect` + atomic store. The
@@ -110,12 +114,21 @@ security-relevant code. Deliberate properties:
   data folder, read on `index.bin` and the staged DLL, modify on the
   `winsearch` bridge folder. Other AppContainer apps get nothing;
   full-trust processes of the same user already had equivalent access.
-  Identity is verified from the opened process handle (image name +
-  session), closing the pid-reuse race. Grants are recorded
-  (`granted-sid`) and revoked on disable, which also removes the staged
-  DLL copy; legacy all-packages grants from earlier builds are revoked
-  on enable. Uninstall without disabling first still leaves the
-  per-user grants behind (user data is kept by design); follow-up (1).
+  Identity is verified from the opened process handle against the full
+  trusted image path (`%SystemRoot%\SystemApps\
+  MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe`, with
+  `%SystemRoot%` from `GetWindowsDirectoryW`) plus the session, closing
+  both the pid-reuse race and same-name decoy processes; the grant or
+  injection never happens for anything else. Grants are recorded with
+  every granted DLL path in `winsearch-granted-sid` in the app data
+  folder — outside the Modify-granted bridge, so the AppContainer
+  cannot delete or rewrite its own revocation record — and revoked on
+  disable, which also removes the staged DLL copy. The record is
+  deleted only after every revocation succeeds and failures surface in
+  Settings. Legacy all-packages grants from earlier builds are revoked
+  unconditionally on enable, even when `SearchHost.exe` is not running.
+  Uninstall without disabling first still leaves the per-user grants
+  behind (user data is kept by design); follow-up (1).
 - **Bridge files are transient.** Request files hold one query string;
   they are deleted when handled or on timeout, and leftovers are swept
   after 10 s. No query text is logged. Responses carry the same paths

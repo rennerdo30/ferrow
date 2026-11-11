@@ -65,49 +65,15 @@ pub fn parse_windows_search_sql(sql: &str) -> Option<ParsedSql> {
     let (_before_from, after_from) = split_from_system_index(sql)?;
     let predicate = extract_where_predicate(after_from)?;
 
-    // Boolean meaning must survive translation. Ferrow terms are ANDed,
-    // so NOT anywhere (at SQL level or inside a CONTAINS condition) and
-    // OR between *different* term sets are unsupported: native answers.
-    // The one observed OR shape — the same terms repeated across
-    // columns (`CONTAINS(name, ...) OR CONTAINS(*, ...)`) — is kept.
-    if contains_word_outside_single_quotes(predicate, "NOT") {
-        return None;
-    }
-
-    let mut terms: Vec<String> = Vec::new();
-    match extract_contains_term_sets(predicate) {
-        None => return None,
-        Some(sets) if !sets.is_empty() => {
-            let mut distinct: Vec<Vec<String>> = Vec::new();
-            for set in &sets {
-                let mut normalized: Vec<String> =
-                    set.iter().map(|t| t.to_ascii_lowercase()).collect();
-                normalized.sort();
-                if !distinct.contains(&normalized) {
-                    distinct.push(normalized);
-                }
-            }
-            if distinct.len() > 1 && contains_word_outside_single_quotes(predicate, "OR") {
-                return None;
-            }
-            for set in sets {
-                for term in set {
-                    push_unique_term(&mut terms, term);
-                }
-            }
-        }
-        Some(_) => {
-            terms = extract_like_terms(predicate);
-            if terms.len() > 1 && contains_word_outside_single_quotes(predicate, "OR") {
-                return None;
-            }
-        }
-    }
+    // Boolean meaning must survive translation. The whole predicate is
+    // parsed as a boolean expression and accepted only when it reduces
+    // to a conjunction of filename term sets (plus an optional folder
+    // restriction). Every other leaf or operator falls back to native.
+    let (terms, only_folders) = parse_predicate_expression(predicate)?;
     if terms.is_empty() {
         return None;
     }
 
-    let only_folders = is_folder_only_kind(predicate);
     let query = format_ferrow_query(&terms, only_folders)?;
     Query::parse(&query).ok()?;
 
@@ -165,69 +131,360 @@ fn find_clause_end_outside_quotes(s: &str) -> usize {
     s.len()
 }
 
-/// Whole word `word` present in `s` outside single-quoted SQL
-/// literals (`''` is an escaped quote). Word characters are
-/// alphanumerics and `_`, so e.g. `CANNOT` does not match `NOT`.
-fn contains_word_outside_single_quotes(s: &str, word: &str) -> bool {
-    let bytes = s.as_bytes();
-    let needle = word.as_bytes();
-    let mut in_single = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if in_single && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PredicateComponent {
+    Terms(usize),
+    FolderOnly,
+}
+
+#[derive(Clone, Debug)]
+enum PredicateExpr {
+    Leaf(PredicateComponent),
+    And(Vec<PredicateExpr>),
+    Or(Vec<PredicateExpr>),
+}
+
+/// Reduce an expression to a conjunction only by sound identities:
+/// nested ANDs flatten, and an OR survives only when every branch is
+/// the same conjunction. Anything else has no exact Ferrow AND form.
+fn predicate_conjunction(
+    expr: &PredicateExpr,
+) -> Option<std::collections::BTreeSet<PredicateComponent>> {
+    match expr {
+        PredicateExpr::Leaf(component) => Some([*component].into_iter().collect()),
+        PredicateExpr::And(parts) => {
+            let mut combined = std::collections::BTreeSet::new();
+            for part in parts {
+                combined.extend(predicate_conjunction(part)?);
             }
-            in_single = !in_single;
-            i += 1;
-            continue;
+            Some(combined)
         }
-        if !in_single
-            && i + needle.len() <= bytes.len()
-            && bytes[i..i + needle.len()].eq_ignore_ascii_case(needle)
-        {
-            let before_ok =
-                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-            let after = i + needle.len();
-            let after_ok = after == bytes.len()
-                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_');
-            if before_ok && after_ok {
-                return true;
+        PredicateExpr::Or(parts) => {
+            let mut branches = parts.iter();
+            let first = predicate_conjunction(branches.next()?)?;
+            branches
+                .all(|part| predicate_conjunction(part).as_ref() == Some(&first))
+                .then_some(first)
+        }
+    }
+}
+
+fn parse_predicate_expression(predicate: &str) -> Option<(Vec<String>, bool)> {
+    let mut parser = PredicateParser {
+        predicate,
+        bytes: predicate.as_bytes(),
+        pos: 0,
+        distinct_term_sets: Vec::new(),
+        representatives: Vec::new(),
+    };
+    let expr = parser.parse_or()?;
+    parser.skip_ws();
+    if parser.pos != parser.bytes.len() {
+        return None;
+    }
+    let components = predicate_conjunction(&expr)?;
+    let mut terms = Vec::new();
+    let mut only_folders = false;
+    for component in components {
+        match component {
+            PredicateComponent::Terms(index) => {
+                for term in &parser.representatives[index] {
+                    push_unique_term(&mut terms, term.clone());
+                }
             }
+            PredicateComponent::FolderOnly => only_folders = true,
+        }
+    }
+    Some((terms, only_folders))
+}
+
+struct PredicateParser<'a> {
+    predicate: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+    distinct_term_sets: Vec<Vec<String>>,
+    representatives: Vec<Vec<String>>,
+}
+
+impl PredicateParser<'_> {
+    fn skip_ws(&mut self) {
+        while self
+            .bytes
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn consume_word(&mut self, word: &str) -> bool {
+        self.skip_ws();
+        let needle = word.as_bytes();
+        let end = self.pos + needle.len();
+        if end <= self.bytes.len()
+            && self.bytes[self.pos..end].eq_ignore_ascii_case(needle)
+            && self
+                .bytes
+                .get(end)
+                .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+        {
+            self.pos = end;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_byte(&mut self, byte: u8) -> bool {
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_or(&mut self) -> Option<PredicateExpr> {
+        let mut parts = vec![self.parse_and()?];
+        while self.consume_word("OR") {
+            parts.push(self.parse_and()?);
+        }
+        Some(if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            PredicateExpr::Or(parts)
+        })
+    }
+
+    fn parse_and(&mut self) -> Option<PredicateExpr> {
+        let mut parts = vec![self.parse_unary()?];
+        while self.consume_word("AND") {
+            parts.push(self.parse_unary()?);
+        }
+        Some(if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            PredicateExpr::And(parts)
+        })
+    }
+
+    fn parse_unary(&mut self) -> Option<PredicateExpr> {
+        if self.consume_byte(b'(') {
+            let expr = self.parse_or()?;
+            self.consume_byte(b')').then_some(expr)
+        } else {
+            self.parse_leaf().map(PredicateExpr::Leaf)
+        }
+    }
+}
+
+impl PredicateParser<'_> {
+    fn register_terms(&mut self, terms: Vec<String>) -> Option<PredicateComponent> {
+        let mut normalized: Vec<String> =
+            terms.iter().map(|term| term.to_ascii_lowercase()).collect();
+        normalized.sort();
+        normalized.dedup();
+        if normalized.is_empty() {
+            return None;
+        }
+        if let Some(index) = self
+            .distinct_term_sets
+            .iter()
+            .position(|existing| existing == &normalized)
+        {
+            return Some(PredicateComponent::Terms(index));
+        }
+        let index = self.distinct_term_sets.len();
+        self.distinct_term_sets.push(normalized);
+        self.representatives.push(terms);
+        Some(PredicateComponent::Terms(index))
+    }
+
+    fn parse_leaf(&mut self) -> Option<PredicateComponent> {
+        self.skip_ws();
+        if self.consume_word("CONTAINS") {
+            self.skip_ws();
+            if self.bytes.get(self.pos) != Some(&b'(') {
+                return None;
+            }
+            let open = self.pos;
+            let call_end = find_matching_paren(self.bytes, open)?;
+            let args = &self.predicate[open + 1..call_end - 1];
+            let (prop_prefix, literal, _) = parse_contains_call(args)?;
+            self.pos = call_end;
+            let terms = parse_contains_condition(&literal)?;
+            let property = normalize_property(prop_prefix);
+            if property == "system.kind" {
+                let folder_only = terms.len() == 1 && terms[0].eq_ignore_ascii_case("folder");
+                return folder_only.then_some(PredicateComponent::FolderOnly);
+            }
+            if !is_name_property_list(&property) {
+                return None;
+            }
+            return self.register_terms(terms);
+        }
+
+        let property = self.read_property()?;
+        if property == "system.kind" {
+            // Only the exact folder restriction has a Ferrow form
+            // (`folder:`); every other kind value or operator falls
+            // back to the native provider.
+            if !self.consume_byte(b'=') {
+                return None;
+            }
+            self.skip_ws();
+            let value = self.parse_sql_literal()?;
+            return value
+                .eq_ignore_ascii_case("folder")
+                .then_some(PredicateComponent::FolderOnly);
+        }
+        if !self.consume_word("LIKE") {
+            return None;
+        }
+        self.skip_ws();
+        let pattern = self.parse_sql_literal()?;
+        if !is_name_property(&property) {
+            return None;
+        }
+        let inner = pattern.strip_prefix('%')?.strip_suffix('%')?;
+        if inner.is_empty() || inner.contains(['%', '_', '*', '?']) {
+            return None;
+        }
+        self.register_terms(vec![clean_search_token(inner)?])
+    }
+
+    fn read_property(&mut self) -> Option<String> {
+        self.skip_ws();
+        let start = self.pos;
+        match self.bytes.get(self.pos) {
+            Some(b'"') => {
+                self.pos += 1;
+                let inner_start = self.pos;
+                while self.bytes.get(self.pos).is_some_and(|b| *b != b'"') {
+                    self.pos += 1;
+                }
+                if self.bytes.get(self.pos) != Some(&b'"') {
+                    return None;
+                }
+                let property = self.predicate[inner_start..self.pos].to_owned();
+                self.pos += 1;
+                Some(normalize_property(&property))
+            }
+            Some(b'[') => {
+                self.pos += 1;
+                let inner_start = self.pos;
+                while self.bytes.get(self.pos).is_some_and(|b| *b != b']') {
+                    self.pos += 1;
+                }
+                if self.bytes.get(self.pos) != Some(&b']') {
+                    return None;
+                }
+                let property = self.predicate[inner_start..self.pos].to_owned();
+                self.pos += 1;
+                Some(normalize_property(&property))
+            }
+            _ => {
+                while self
+                    .bytes
+                    .get(self.pos)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'*'))
+                {
+                    self.pos += 1;
+                }
+                (self.pos > start).then(|| normalize_property(&self.predicate[start..self.pos]))
+            }
+        }
+    }
+
+    fn parse_sql_literal(&mut self) -> Option<String> {
+        if self.bytes.get(self.pos) != Some(&b'\'') {
+            return None;
+        }
+        self.pos += 1;
+        let mut literal = String::new();
+        let rest = &self.predicate[self.pos..];
+        let mut chars = rest.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '\'' {
+                if let Some(&(_, '\'')) = chars.peek() {
+                    chars.next();
+                    literal.push('\'');
+                } else {
+                    self.pos += idx + 1;
+                    return Some(literal);
+                }
+            } else {
+                literal.push(ch);
+            }
+        }
+        None
+    }
+}
+
+fn normalize_property(property: &str) -> String {
+    property
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '[' | ']'))
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_name_property(property: &str) -> bool {
+    matches!(
+        property,
+        "*" | "filename"
+            | "system.filename"
+            | "itemname"
+            | "system.itemname"
+            | "itemnamedisplay"
+            | "system.itemnamedisplay"
+    )
+}
+
+/// A CONTAINS property may be one name property or a parenthesized
+/// list of name properties (the same terms against each column).
+fn is_name_property_list(property: &str) -> bool {
+    if property.is_empty() {
+        return true; // CONTAINS('<literal>') searches the default columns.
+    }
+    let inner = property
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(property);
+    inner
+        .split(',')
+        .all(|part| is_name_property(&normalize_property(part)))
+}
+
+fn find_matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                if in_single && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single = !in_single;
+            }
+            b'(' if !in_single => depth += 1,
+            b')' if !in_single => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
         }
         i += 1;
     }
-    false
-}
-
-/// One term set per accepted `CONTAINS` call (kind/itemtype calls are
-/// skipped: they filter kinds, handled separately). `None` when any
-/// condition itself uses unsupported boolean structure.
-fn extract_contains_term_sets(predicate: &str) -> Option<Vec<Vec<String>>> {
-    let mut sets = Vec::new();
-    let upper = predicate.to_ascii_uppercase();
-    let mut search_from = 0;
-
-    while let Some(rel) = upper[search_from..].find("CONTAINS(") {
-        let start = search_from + rel;
-        let args_start = start + "CONTAINS(".len();
-        let Some((prop_prefix, literal, next_pos)) = parse_contains_call(&predicate[args_start..])
-        else {
-            search_from = args_start;
-            continue;
-        };
-        search_from = args_start + next_pos;
-
-        let prop_lower = prop_prefix.to_ascii_lowercase();
-        if prop_lower.contains("kind") || prop_lower.contains("itemtype") {
-            continue;
-        }
-
-        sets.push(parse_contains_condition(&literal)?);
-    }
-
-    Some(sets)
+    None
 }
 
 /// Parses `<prop>, '<literal>' ...)` or `'<literal>' ...)` starting right after `CONTAINS(`.
@@ -309,37 +566,6 @@ fn parse_contains_condition(condition: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn extract_like_terms(predicate: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let upper = predicate.to_ascii_uppercase();
-    let mut search_from = 0;
-
-    while let Some(rel) = upper[search_from..].find(" LIKE '") {
-        let lit_start = search_from + rel + " LIKE '".len();
-        let rest = &predicate[lit_start..];
-        let Some(end_quote) = rest.find('\'') else {
-            break;
-        };
-        let pattern = &rest[..end_quote];
-        search_from = lit_start + end_quote + 1;
-
-        // Ignore patterns with single-character SQL wildcards (`_`) or inner `%`.
-        let inner = pattern.trim_matches('%');
-        if inner.is_empty()
-            || inner.contains('%')
-            || inner.contains('_')
-            || rest[end_quote + 1..].contains("--")
-        {
-            continue;
-        }
-        if let Some(cleaned) = clean_search_token(inner) {
-            push_unique_term(&mut terms, cleaned);
-        }
-    }
-
-    terms
-}
-
 fn clean_search_token(raw: &str) -> Option<String> {
     let trimmed = raw
         .trim()
@@ -358,19 +584,6 @@ fn push_unique_term(terms: &mut Vec<String>, candidate: String) {
     {
         terms.push(candidate);
     }
-}
-
-fn is_folder_only_kind(predicate: &str) -> bool {
-    let lower = predicate.to_ascii_lowercase();
-    if !lower.contains("system.kind") {
-        return false;
-    }
-    lower.contains("'folder'")
-        && !lower.contains("'document'")
-        && !lower.contains("'picture'")
-        && !lower.contains("'music'")
-        && !lower.contains("'video'")
-        && !lower.contains("'program'")
 }
 
 fn format_ferrow_query(terms: &[String], only_folders: bool) -> Option<String> {
@@ -424,12 +637,73 @@ mod tests {
     #[test]
     fn parses_start_menu_documents_tab_19_columns_and_multi_term_contains() {
         let sql = format!(
-            "SELECT TOP 30 {DOCS_TAB_PROJECTION} FROM \"SystemIndex\" WHERE (CONTAINS(\"System.ItemNameDisplay\", '\"budget*\" AND \"2026*\"', 2057) OR CONTAINS(*, '\"budget*\" AND \"2026*\"', 2057)) AND CONTAINS(\"System.Kind\", '\"document\"') ORDER BY \"System.Search.Rank\" DESC"
+            "SELECT TOP 30 {DOCS_TAB_PROJECTION} FROM \"SystemIndex\" WHERE (CONTAINS(\"System.ItemNameDisplay\", '\"budget*\" AND \"2026*\"', 2057) OR CONTAINS(*, '\"budget*\" AND \"2026*\"', 2057)) ORDER BY \"System.Search.Rank\" DESC"
         );
         let parsed = parse_windows_search_sql(&sql).expect("valid Documents tab query");
         assert_eq!(parsed.columns.len(), 19);
         assert_eq!(parsed.limit, 30);
         assert_eq!(parsed.query, "budget 2026");
+
+        // The real Documents tab also restricts `System.Kind` to
+        // documents. Ferrow has no exact form for that kind, so the
+        // whole predicate falls back to native instead of silently
+        // dropping the restriction and returning non-documents.
+        let with_kind = format!(
+            "SELECT TOP 30 {DOCS_TAB_PROJECTION} FROM \"SystemIndex\" WHERE (CONTAINS(\"System.ItemNameDisplay\", '\"budget*\" AND \"2026*\"', 2057) OR CONTAINS(*, '\"budget*\" AND \"2026*\"', 2057)) AND CONTAINS(\"System.Kind\", '\"document\"') ORDER BY \"System.Search.Rank\" DESC"
+        );
+        assert!(parse_windows_search_sql(&with_kind).is_none());
+    }
+
+    #[test]
+    fn handles_mixed_grouped_and_kind_predicates() {
+        // Mixed CONTAINS + LIKE under AND: both term sets survive.
+        let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.FileName LIKE '%beta%'";
+        let parsed = parse_windows_search_sql(sql).expect("mixed AND parses");
+        assert_eq!(parsed.query, "alpha beta");
+
+        // Grouped OR of identical term sets ANDed with another term.
+        let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE (CONTAINS(System.FileName, '\"alpha*\"') OR System.FileName LIKE '%alpha%') AND CONTAINS(System.FileName, '\"beta*\"')";
+        let parsed = parse_windows_search_sql(sql).expect("identical OR branches parse");
+        assert_eq!(parsed.query, "alpha beta");
+
+        // Precedence: AND binds tighter than OR; identical conjunctions
+        // on both sides still reduce to one conjunction.
+        let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND CONTAINS(System.FileName, '\"beta*\"') OR CONTAINS(System.FileName, '\"beta*\"') AND CONTAINS(System.FileName, '\"alpha*\"')";
+        let parsed = parse_windows_search_sql(sql).expect("equal conjunctions parse");
+        assert_eq!(parsed.query, "alpha beta");
+
+        // The exact folder restriction, in both shell spellings.
+        for sql in [
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND CONTAINS(\"System.Kind\", '\"folder\"')",
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.Kind = 'folder'",
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE \"System.Kind\" = 'FOLDER' AND CONTAINS(System.FileName, '\"alpha*\"')",
+        ] {
+            let parsed = parse_windows_search_sql(sql)
+                .unwrap_or_else(|| panic!("folder restriction parses: {sql}"));
+            assert_eq!(parsed.query, "folder: alpha", "for: {sql}");
+        }
+
+        for unsupported in [
+            // Grouped OR of different terms cannot become an AND.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE (CONTAINS(System.FileName, '\"alpha*\"') OR CONTAINS(System.FileName, '\"beta*\"')) AND CONTAINS(System.FileName, '\"gamma*\"')",
+            // Precedence makes this alpha OR (beta AND gamma).
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') OR CONTAINS(System.FileName, '\"beta*\"') AND CONTAINS(System.FileName, '\"gamma*\"')",
+            // Kind values Ferrow cannot express exactly.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.Kind = 'document'",
+            // Folder as an OR branch is a union, not a restriction.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') OR CONTAINS(\"System.Kind\", '\"folder\"')",
+            // Unknown CONTAINS property.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.Title, '\"alpha*\"')",
+            // Unhandled comparison leaf beside a handled one.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.Size > 100",
+            // Grouped NOT.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND NOT (CONTAINS(System.FileName, '\"beta*\"'))",
+        ] {
+            assert!(
+                parse_windows_search_sql(unsupported).is_none(),
+                "expected None (native fallback) for: {unsupported}"
+            );
+        }
     }
 
     #[test]

@@ -6,10 +6,10 @@
 //! search host, so the integration survives shell restarts for as long as
 //! `ferrow-gui` runs. Attachment state is exposed via [`attach_status`].
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::io;
 use std::mem::size_of;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -42,7 +42,7 @@ use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
+use windows::Win32::System::SystemInformation::{GetWindowsDirectoryW, IMAGE_FILE_MACHINE};
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetCurrentProcessId, GetExitCodeThread, IsWow64Process2, OpenProcess,
     OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_FORMAT, QueryFullProcessImageNameW,
@@ -53,8 +53,10 @@ use windows::core::{PCWSTR, PWSTR, s, w};
 use crate::ipc;
 
 const DLL_NAME: &str = "ferrow_winsearch.dll";
+const SEARCHHOST_PACKAGE_DIR: &str = "MicrosoftWindows.Client.CBS_cw5n1h2txyewy";
 /// `PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE`
 const ATTACH_ACCESS: u32 = 0x10043A | 0x0010;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
 static LAST_ATTACHED_PID: AtomicU32 = AtomicU32::new(0);
 static WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -92,7 +94,8 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
             std::fs::remove_file(&marker)
                 .map_err(|e| format!("Could not disable Windows Search integration: {e}"))?;
         }
-        revoke_searchhost_access(data_dir);
+        revoke_searchhost_access(data_dir)
+            .map_err(|e| format!("Could not revoke SearchHost bridge access: {e}"))?;
         record_attach_error(None);
         return Ok(());
     }
@@ -100,6 +103,12 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
     let ws_dir = ipc::winsearch_dir(data_dir);
     std::fs::create_dir_all(&ws_dir)
         .map_err(|e| format!("Could not create Windows Search state folder: {e}"))?;
+
+    // Remove the broad grant made by older builds before anything can
+    // route queries again. This must happen even when SearchHost is
+    // not currently running and no replacement grant can be made yet.
+    revoke_legacy_all_packages_access(data_dir)
+        .map_err(|e| format!("Could not remove the legacy all-AppContainer bridge access: {e}"))?;
 
     // Bridge access goes to the SearchHost package alone, never to all
     // AppContainer apps. If SearchHost is not running yet, attachment
@@ -201,9 +210,10 @@ pub fn attach_searchhost_now(data_dir: &Path) -> Result<bool, String> {
     result
 }
 
-/// File in the winsearch folder recording which AppContainer SID was
-/// granted bridge access, so disable can revoke exactly that grant.
-const GRANTED_SID_FILE: &str = "granted-sid";
+/// File in the app data folder recording which AppContainer SID and DLL
+/// paths were granted bridge access. It deliberately lives outside the
+/// Modify-granted bridge folder so the AppContainer cannot alter it.
+const GRANTED_SID_FILE: &str = "winsearch-granted-sid";
 /// Legacy pre-review grant trustee. Revoked opportunistically so folders
 /// enabled by older builds do not stay open to every AppContainer app.
 const LEGACY_ALL_PACKAGES_SID: &str = "S-1-15-2-1";
@@ -330,21 +340,51 @@ fn sid_string_to_bytes(text: &str) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Verify an opened process handle really is this session's
-/// `SearchHost.exe`. Checking identity from the handle (not the earlier
-/// pid snapshot) closes the pid-reuse race between enumeration and use.
-fn verify_searchhost_identity(proc_handle: HANDLE, pid: u32) -> io::Result<()> {
-    let mut my_session = 0u32;
-    let mut proc_session = 0u32;
-    unsafe {
-        ProcessIdToSessionId(GetCurrentProcessId(), &mut my_session).map_err(io::Error::from)?;
-        ProcessIdToSessionId(pid, &mut proc_session).map_err(io::Error::from)?;
+fn windows_directory() -> PathBuf {
+    // Ask the OS instead of trusting the process environment: this
+    // directory anchors the trusted SearchHost image path.
+    let mut buffer = [0u16; 260];
+    // SAFETY: the fixed buffer follows the GetWindowsDirectoryW contract.
+    let len = unsafe { GetWindowsDirectoryW(Some(&mut buffer)) };
+    if len > 0 && (len as usize) < buffer.len() {
+        return PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize]));
     }
-    if proc_session != my_session {
-        return Err(io::Error::other(
-            "SearchHost candidate is in another session",
-        ));
+    std::env::var_os("SystemRoot")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+fn normalize_windows_path(path: &Path) -> String {
+    let mut normalized = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    for prefix in [r"\\?\unc\", r"\\?\", r"\??\"] {
+        if let Some(stripped) = normalized.strip_prefix(prefix) {
+            normalized = if prefix == r"\\?\unc\" {
+                format!(r"\\{stripped}")
+            } else {
+                stripped.to_owned()
+            };
+            break;
+        }
     }
+    while normalized.ends_with('\\') && !normalized.ends_with(":\\") {
+        normalized.pop();
+    }
+    normalized
+}
+
+/// Only the inbox CBS package image below the protected `SystemApps`
+/// directory is trusted. A same-session process elsewhere that merely
+/// calls itself `SearchHost.exe` is rejected before any grant/injection.
+fn is_trusted_searchhost_image(image: &Path, windows_dir: &Path) -> bool {
+    let expected = windows_dir
+        .join("SystemApps")
+        .join(SEARCHHOST_PACKAGE_DIR)
+        .join("SearchHost.exe");
+    normalize_windows_path(image) == normalize_windows_path(&expected)
+}
+
+fn process_image_path(proc_handle: HANDLE) -> io::Result<PathBuf> {
     let mut buffer = [0u16; 1024];
     let mut len = buffer.len() as u32;
     // SAFETY: buffer/len follow the QueryFullProcessImageNameW contract.
@@ -357,11 +397,32 @@ fn verify_searchhost_identity(proc_handle: HANDLE, pid: u32) -> io::Result<()> {
         )
         .map_err(io::Error::from)?;
     }
-    let image = String::from_utf16_lossy(&buffer[..len as usize]);
-    let file_name = image.rsplit(['\\', '/']).next().unwrap_or("");
-    if !file_name.eq_ignore_ascii_case("SearchHost.exe") {
+    Ok(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..len as usize],
+    )))
+}
+
+/// Verify an opened process handle really is this session's trusted
+/// system `SearchHost.exe`. Checking the full image from the handle
+/// (not the earlier pid snapshot or basename) closes both the pid-reuse
+/// race and same-name decoy processes.
+fn verify_searchhost_identity(proc_handle: HANDLE, pid: u32) -> io::Result<()> {
+    let mut my_session = 0u32;
+    let mut proc_session = 0u32;
+    unsafe {
+        ProcessIdToSessionId(GetCurrentProcessId(), &mut my_session).map_err(io::Error::from)?;
+        ProcessIdToSessionId(pid, &mut proc_session).map_err(io::Error::from)?;
+    }
+    if proc_session != my_session {
+        return Err(io::Error::other(
+            "SearchHost candidate is in another session",
+        ));
+    }
+    let image = process_image_path(proc_handle)?;
+    if !is_trusted_searchhost_image(&image, &windows_directory()) {
         return Err(io::Error::other(format!(
-            "pid {pid} is {file_name}, not SearchHost.exe"
+            "pid {pid} image {} is not the trusted system SearchHost.exe",
+            image.display()
         )));
     }
     Ok(())
@@ -410,7 +471,6 @@ fn appcontainer_sid_of_process(proc_handle: HANDLE) -> io::Result<(Vec<u8>, Stri
 /// Resolve the running SearchHost's AppContainer SID by opening and
 /// verifying its process handle. `NotFound` while it is not running.
 fn resolve_searchhost_sid() -> io::Result<(Vec<u8>, String)> {
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     for pid in find_searchhost_pids()? {
         let handle = unsafe {
             OpenProcess(
@@ -445,58 +505,252 @@ fn bridge_paths(data_dir: &Path) -> Vec<(PathBuf, AccessKind)> {
     ]
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct GrantRecord {
+    sid_text: String,
+    sid_bytes: Vec<u8>,
+    dll_paths: Vec<PathBuf>,
+}
+
+fn grant_record_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(GRANTED_SID_FILE)
+}
+
+fn encode_path_for_record(path: &Path) -> String {
+    path.as_os_str()
+        .encode_wide()
+        .map(|unit| format!("{unit:04x}"))
+        .collect()
+}
+
+fn decode_path_from_record(text: &str) -> io::Result<PathBuf> {
+    if !text.len().is_multiple_of(4) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid encoded DLL path in grant record",
+        ));
+    }
+    let mut units = Vec::with_capacity(text.len() / 4);
+    for chunk in text.as_bytes().as_chunks::<4>().0 {
+        let digits = std::str::from_utf8(chunk).map_err(io::Error::other)?;
+        units.push(u16::from_str_radix(digits, 16).map_err(io::Error::other)?);
+    }
+    Ok(PathBuf::from(OsString::from_wide(&units)))
+}
+
+fn write_grant_record(data_dir: &Path, record: &GrantRecord) -> io::Result<()> {
+    let mut text = format!("{}\n", record.sid_text);
+    for path in &record.dll_paths {
+        text.push_str("dll=");
+        text.push_str(&encode_path_for_record(path));
+        text.push('\n');
+    }
+    std::fs::write(grant_record_path(data_dir), text)
+}
+
+fn read_grant_record(data_dir: &Path) -> io::Result<Option<GrantRecord>> {
+    let path = grant_record_path(data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut lines = text.lines();
+    let sid_text = lines.next().unwrap_or_default().trim().to_owned();
+    if !sid_text.starts_with("S-1-15-2-") || sid_text == LEGACY_ALL_PACKAGES_SID {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "grant record does not contain a package SID",
+        ));
+    }
+    let sid_bytes = sid_string_to_bytes(&sid_text)?;
+    let mut dll_paths = Vec::new();
+    for line in lines {
+        let Some(encoded) = line.strip_prefix("dll=") else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown line in grant record",
+            ));
+        };
+        let path = decode_path_from_record(encoded.trim())?;
+        if !dll_paths.contains(&path) {
+            dll_paths.push(path);
+        }
+    }
+    Ok(Some(GrantRecord {
+        sid_text,
+        sid_bytes,
+        dll_paths,
+    }))
+}
+
+fn record_granted_dll_path(
+    data_dir: &Path,
+    sid_text: &str,
+    sid_bytes: &[u8],
+    dll_path: &Path,
+) -> io::Result<()> {
+    let mut record = match read_grant_record(data_dir)? {
+        Some(record) if record.sid_text == sid_text => record,
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "grant record belongs to a different SearchHost SID",
+            ));
+        }
+        None => GrantRecord {
+            sid_text: sid_text.to_owned(),
+            sid_bytes: sid_bytes.to_vec(),
+            dll_paths: Vec::new(),
+        },
+    };
+    if !record.dll_paths.iter().any(|path| path == dll_path) {
+        record.dll_paths.push(dll_path.to_path_buf());
+    }
+    write_grant_record(data_dir, &record)
+}
+
+fn access_paths(data_dir: &Path, extra_dll_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = bridge_paths(data_dir)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    let staged = ipc::winsearch_dir(data_dir).join(DLL_NAME);
+    if !paths.contains(&staged) {
+        paths.push(staged);
+    }
+    if let Some(source) = find_source_dll()
+        && !paths.contains(&source)
+    {
+        paths.push(source);
+    }
+    for path in extra_dll_paths {
+        if !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+fn revoke_sid_from_paths(paths: &[PathBuf], sid_bytes: &[u8]) -> io::Result<()> {
+    let mut first_error = None;
+    for path in paths {
+        if path.exists()
+            && let Err(error) = apply_sid_access(path, sid_bytes, None)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Remove grants made to every AppContainer by builds before the
+/// package-scoped grant existed. This is independent of whether a
+/// SearchHost process can currently be resolved.
+fn revoke_legacy_all_packages_access(data_dir: &Path) -> io::Result<()> {
+    let legacy = sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID)?;
+    revoke_sid_from_paths(&access_paths(data_dir, &[]), &legacy)
+}
+
 /// Grant the SearchHost package (and only it) the bridge access, record
 /// its SID for later revocation, and drop any legacy all-packages grant.
+/// The record is written first so a partially applied grant can still
+/// be cleaned up on disable.
 fn grant_searchhost_access(data_dir: &Path, sid: &[u8], sid_text: &str) -> io::Result<()> {
+    if !sid_text.starts_with("S-1-15-2-") || sid_text == LEGACY_ALL_PACKAGES_SID {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to grant bridge access to a non-package SID",
+        ));
+    }
+    let mut preserved_dll_paths = Vec::new();
+    if let Some(previous) = read_grant_record(data_dir)? {
+        if previous.sid_text == sid_text {
+            preserved_dll_paths = previous.dll_paths;
+        } else {
+            revoke_sid_from_paths(
+                &access_paths(data_dir, &previous.dll_paths),
+                &previous.sid_bytes,
+            )?;
+        }
+    }
+    write_grant_record(
+        data_dir,
+        &GrantRecord {
+            sid_text: sid_text.to_owned(),
+            sid_bytes: sid.to_vec(),
+            dll_paths: preserved_dll_paths,
+        },
+    )?;
+
     for (path, kind) in bridge_paths(data_dir) {
         if path.exists() {
             apply_sid_access(&path, sid, Some(kind))?;
         }
     }
-    let ws_dir = ipc::winsearch_dir(data_dir);
-    let _ = std::fs::write(ws_dir.join(GRANTED_SID_FILE), sid_text);
-    if let Ok(legacy) = sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID) {
-        for (path, _) in bridge_paths(data_dir) {
-            if path.exists() {
-                let _ = apply_sid_access(&path, &legacy, None);
-            }
-        }
-        let staged = ws_dir.join(DLL_NAME);
-        if staged.exists() {
-            let _ = apply_sid_access(&staged, &legacy, None);
-        }
-    }
-    Ok(())
+    // The first package-scoped build kept its record inside the
+    // AppContainer-writable bridge folder; it is not authoritative.
+    let _ = std::fs::remove_file(ipc::winsearch_dir(data_dir).join("granted-sid"));
+    revoke_legacy_all_packages_access(data_dir)
 }
 
-/// Best-effort undo of [`grant_searchhost_access`] on disable: revoke
-/// the recorded package grant (and the legacy one) and remove the
-/// staged DLL copy. The loaded copy inside SearchHost stays inert
-/// behind the removed marker until the shell restarts it.
-fn revoke_searchhost_access(data_dir: &Path) {
-    let ws_dir = ipc::winsearch_dir(data_dir);
+/// Undo [`grant_searchhost_access`] on disable. Every recorded path is
+/// attempted; the grant record is removed only after every revocation
+/// succeeds, so a failed cleanup remains retryable and visible. The
+/// loaded copy inside SearchHost stays inert behind the removed
+/// marker until the shell restarts it.
+fn revoke_searchhost_access(data_dir: &Path) -> io::Result<()> {
+    // A damaged record must not stop revocation of the grants that can
+    // still be identified (running SearchHost, legacy trustee); the
+    // damage is reported after every known path was attempted.
+    let (record, record_error) = match read_grant_record(data_dir) {
+        Ok(record) => (record, None),
+        Err(error) => (None, Some(error)),
+    };
+    let recorded_dll_paths = record
+        .as_ref()
+        .map(|record| record.dll_paths.clone())
+        .unwrap_or_default();
+    let paths = access_paths(data_dir, &recorded_dll_paths);
+
     let mut sids: Vec<Vec<u8>> = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(ws_dir.join(GRANTED_SID_FILE))
-        && let Ok(bytes) = sid_string_to_bytes(text.trim())
+    if let Some(record) = &record {
+        sids.push(record.sid_bytes.clone());
+    }
+    // If the record is missing for any reason, the verified running
+    // SearchHost still identifies the package whose grants must go.
+    if let Ok((current, _)) = resolve_searchhost_sid()
+        && !sids.contains(&current)
     {
-        sids.push(bytes);
+        sids.push(current);
     }
-    if let Ok(legacy) = sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID) {
-        sids.push(legacy);
-    }
-    let staged = ws_dir.join(DLL_NAME);
+    sids.push(sid_string_to_bytes(LEGACY_ALL_PACKAGES_SID)?);
+
+    let mut first_error = record_error;
     for sid in &sids {
-        for (path, _) in bridge_paths(data_dir) {
-            if path.exists() {
-                let _ = apply_sid_access(&path, sid, None);
-            }
-        }
-        if staged.exists() {
-            let _ = apply_sid_access(&staged, sid, None);
+        if let Err(error) = revoke_sid_from_paths(&paths, sid)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
     }
-    let _ = std::fs::remove_file(ws_dir.join(GRANTED_SID_FILE));
-    let _ = std::fs::remove_file(&staged);
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    if record.is_some() {
+        std::fs::remove_file(grant_record_path(data_dir))?;
+    }
+    // Remove the short-lived bridge-folder record written by the first
+    // package-scoped build; it is no longer authoritative.
+    let _ = std::fs::remove_file(ipc::winsearch_dir(data_dir).join("granted-sid"));
+    let staged = ipc::winsearch_dir(data_dir).join(DLL_NAME);
+    let _ = std::fs::remove_file(staged);
+    Ok(())
 }
 
 fn find_source_dll() -> Option<PathBuf> {
@@ -581,7 +835,27 @@ fn find_searchhost_pids() -> io::Result<Vec<u32>> {
         }
         let _ = CloseHandle(snap);
     }
-    Ok(pids)
+
+    // The snapshot only supplies candidates. Keep only processes whose
+    // opened handle verifies as the trusted CBS SearchHost image.
+    let mut trusted = Vec::new();
+    for pid in pids {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_LIMITED_INFORMATION),
+                false,
+                pid,
+            )
+        };
+        let Ok(handle) = handle else { continue };
+        if verify_searchhost_identity(handle, pid).is_ok() {
+            trusted.push(pid);
+        }
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+    }
+    Ok(trusted)
 }
 
 fn list_remote_modules(pid: u32) -> io::Result<Vec<(String, usize, usize)>> {
@@ -619,9 +893,9 @@ fn attach_to_searchhost(dll_path: &Path, data_dir: &Path) -> io::Result<bool> {
         ));
     }
     let pids = find_searchhost_pids()?;
-    let Some(&pid) = pids.first() else {
+    if pids.is_empty() {
         return Ok(false);
-    };
+    }
 
     let dll_name_lower = dll_path
         .file_name()
@@ -629,24 +903,40 @@ fn attach_to_searchhost(dll_path: &Path, data_dir: &Path) -> io::Result<bool> {
         .unwrap_or(DLL_NAME)
         .to_ascii_lowercase();
 
-    let remote_mods = list_remote_modules(pid)?;
-    let already_loaded = remote_mods.iter().any(|(n, _, _)| *n == dll_name_lower);
-    if already_loaded && LAST_ATTACHED_PID.load(Ordering::Acquire) == pid {
-        return Ok(true);
-    }
+    let mut last_error = None;
+    for pid in pids {
+        let result = (|| -> io::Result<bool> {
+            let remote_mods = list_remote_modules(pid)?;
+            let already_loaded = remote_mods.iter().any(|(n, _, _)| *n == dll_name_lower);
+            if already_loaded && LAST_ATTACHED_PID.load(Ordering::Acquire) == pid {
+                return Ok(true);
+            }
 
-    let proc_handle = unsafe { OpenProcess(PROCESS_ACCESS_RIGHTS(ATTACH_ACCESS), false, pid) }
-        .map_err(io::Error::from)?;
-
-    let res =
-        unsafe { attach_to_process_handle(proc_handle, pid, dll_path, &dll_name_lower, data_dir) };
-    unsafe {
-        let _ = CloseHandle(proc_handle);
+            let proc_handle = unsafe {
+                OpenProcess(PROCESS_ACCESS_RIGHTS(ATTACH_ACCESS), false, pid)
+                    .map_err(io::Error::from)?
+            };
+            let result = unsafe {
+                attach_to_process_handle(proc_handle, pid, dll_path, &dll_name_lower, data_dir)
+            };
+            unsafe {
+                let _ = CloseHandle(proc_handle);
+            }
+            result
+        })();
+        match result {
+            Ok(true) => {
+                LAST_ATTACHED_PID.store(pid, Ordering::Release);
+                return Ok(true);
+            }
+            Ok(false) => {}
+            Err(error) => last_error = Some(error),
+        }
     }
-    if res.is_ok() {
-        LAST_ATTACHED_PID.store(pid, Ordering::Release);
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(false),
     }
-    res
 }
 
 unsafe fn attach_to_process_handle(
@@ -662,6 +952,7 @@ unsafe fn attach_to_process_handle(
     verify_searchhost_identity(proc_handle, pid)?;
     let (sid, sid_text) = appcontainer_sid_of_process(proc_handle)?;
     grant_searchhost_access(data_dir, &sid, &sid_text)?;
+    record_granted_dll_path(data_dir, &sid_text, &sid, dll_path)?;
     apply_sid_access(dll_path, &sid, Some(AccessKind::ReadExecute))?;
 
     let mut proc_machine = IMAGE_FILE_MACHINE(0);
@@ -828,22 +1119,70 @@ unsafe fn run_remote_thread(
 mod tests {
     use super::*;
 
-    /// When SearchHost runs here, its token must yield a package SID —
-    /// the narrow bridge grant depends on it. Hosts without a shell
-    /// search process (CI runners) skip like the catalog test does.
+    #[test]
+    fn trusts_only_the_cbs_systemapps_searchhost_image() {
+        let windows = Path::new(r"C:\Windows");
+        let trusted = Path::new(
+            r"\\?\C:\WINDOWS\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe",
+        );
+        assert!(is_trusted_searchhost_image(trusted, windows));
+
+        for decoy in [
+            r"C:\Program Files\WindowsApps\Contoso.Search\SearchHost.exe",
+            r"C:\Users\someone\AppData\Local\Temp\SearchHost.exe",
+            r"C:\Windows\SystemApps\Some.Other_package\SearchHost.exe",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\NotSearchHost.exe",
+        ] {
+            assert!(
+                !is_trusted_searchhost_image(Path::new(decoy), windows),
+                "decoy must be rejected: {decoy}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_record_lives_outside_bridge_and_round_trips_paths() {
+        let data_dir =
+            std::env::temp_dir().join(format!("ferrow-winsearch-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let sid_text = "S-1-15-2-123-456";
+        let sid_bytes = sid_string_to_bytes(sid_text).unwrap();
+        let dll = Path::new(r"C:\Program Files\Ferrow\ferrow_winsearch.dll").to_path_buf();
+        let record = GrantRecord {
+            sid_text: sid_text.to_owned(),
+            sid_bytes,
+            dll_paths: vec![dll],
+        };
+        write_grant_record(&data_dir, &record).unwrap();
+
+        assert!(grant_record_path(&data_dir).starts_with(&data_dir));
+        assert!(!grant_record_path(&data_dir).starts_with(ipc::winsearch_dir(&data_dir)));
+        assert_eq!(read_grant_record(&data_dir).unwrap(), Some(record));
+
+        // A replaced or corrupted record is an error, never silently
+        // treated as authority to revoke an arbitrary SID.
+        std::fs::write(grant_record_path(&data_dir), "S-1-5-21-1\n").unwrap();
+        assert!(read_grant_record(&data_dir).is_err());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// When a verified SearchHost runs here, its token must yield a
+    /// package SID — the narrow bridge grant depends on it. Skip only
+    /// when there is no trusted candidate at all (for example CI).
     #[test]
     fn resolves_searchhost_package_sid_when_running() {
-        match resolve_searchhost_sid() {
-            Ok((bytes, text)) => {
-                assert!(!bytes.is_empty());
-                assert!(text.starts_with("S-1-15-2-"), "unexpected SID: {text}");
-                assert_ne!(text, LEGACY_ALL_PACKAGES_SID);
-                let round_trip = sid_string_to_bytes(&text).expect("SID round-trips");
-                assert_eq!(round_trip, bytes);
-            }
-            Err(error) => {
-                eprintln!("skipping: SearchHost AppContainer SID unavailable here: {error}");
-            }
+        let candidates = find_searchhost_pids().expect("candidate scan cannot fail the test");
+        if candidates.is_empty() {
+            eprintln!("skipping: no verified SearchHost process on this host");
+            return;
         }
+        let (bytes, text) = resolve_searchhost_sid()
+            .expect("verified SearchHost candidate exists, so SID resolution must succeed");
+        assert!(!bytes.is_empty());
+        assert!(text.starts_with("S-1-15-2-"), "unexpected SID: {text}");
+        assert_ne!(text, LEGACY_ALL_PACKAGES_SID);
+        let round_trip = sid_string_to_bytes(&text).expect("SID round-trips");
+        assert_eq!(round_trip, bytes);
     }
 }
