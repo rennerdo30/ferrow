@@ -63,7 +63,8 @@ is needed in either direction.
 - Uninstalling Ferrow removes the installed DLL with the rest of the
   program. As with all Ferrow data, `%LOCALAPPDATA%\ferrow` is kept;
   delete that folder to also remove the staged DLL copy and markers
-  under `%LOCALAPPDATA%\ferrow\winsearch`.
+  under `%LOCALAPPDATA%\ferrow\winsearch` and
+  `%LOCALAPPDATA%\ferrow\winsearch-bin`.
 
 ## Troubleshooting
 

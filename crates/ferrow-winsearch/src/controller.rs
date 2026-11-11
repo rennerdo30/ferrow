@@ -102,6 +102,9 @@ pub fn sync_state(data_dir: &Path, enabled: bool) -> Result<(), String> {
     let ws_dir = ipc::winsearch_dir(data_dir);
     std::fs::create_dir_all(&ws_dir)
         .map_err(|e| format!("Could not create Windows Search state folder: {e}"))?;
+    let bin_dir = dll_staging_dir(data_dir);
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| format!("Could not create Windows Search DLL staging folder: {e}"))?;
 
     // Remove the broad grant made by older builds before anything can
     // route queries again. This must happen even when SearchHost is
@@ -196,8 +199,7 @@ pub fn attach_searchhost_now(data_dir: &Path) -> Result<bool, String> {
         Err(poisoned) => poisoned.into_inner(),
     };
     let result = (|| -> Result<bool, String> {
-        let ws_dir = ipc::winsearch_dir(data_dir);
-        let staged_dll = stage_attachment_dll(&ws_dir)
+        let staged_dll = stage_attachment_dll(data_dir)
             .map_err(|e| format!("Could not stage ferrow_winsearch.dll: {e}"))?;
         attach_to_searchhost(&staged_dll, data_dir)
             .map_err(|e| format!("Could not attach to SearchHost.exe: {e}"))
@@ -598,11 +600,22 @@ fn resolve_searchhost_sid() -> io::Result<(Vec<u8>, String)> {
     ))
 }
 
+/// Directory holding staged `ferrow_winsearch-<hash>.dll` copies. Kept
+/// separate from the `Modify`-granted [`ipc::winsearch_dir`] request folder
+/// so `SearchHost.exe`'s LowBox AppContainer gets only non-inheritable
+/// `Traverse` on the directory and explicit `ReadExecute` on the staged DLL
+/// — never write or delete access to its own mapped image.
+fn dll_staging_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("winsearch-bin")
+}
+
 /// The bridge paths the SearchHost package may touch, narrowest first:
-/// pass through the data folder, use the bridge folder, read the index.
+/// pass through `data_dir` and `winsearch-bin`, use the `winsearch`
+/// request folder, and read `index.bin`.
 fn bridge_paths(data_dir: &Path) -> Vec<(PathBuf, AccessKind)> {
     vec![
         (data_dir.to_path_buf(), AccessKind::Traverse),
+        (dll_staging_dir(data_dir), AccessKind::Traverse),
         (ipc::winsearch_dir(data_dir), AccessKind::Modify),
         (data_dir.join("index.bin"), AccessKind::ReadExecute),
     ]
@@ -723,8 +736,8 @@ fn is_staged_dll_filename(name: &str) -> bool {
         || (lower.starts_with("ferrow_winsearch-") && lower.ends_with(".dll"))
 }
 
-fn staged_dll_files(ws_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(ws_dir) else {
+fn staged_dll_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let src_norm = find_source_dll().map(|src| normalize_windows_path(&src));
@@ -754,18 +767,22 @@ fn access_paths(data_dir: &Path, extra_dll_paths: &[PathBuf]) -> Vec<PathBuf> {
         .map(|(path, _)| path)
         .collect();
     let ws_dir = ipc::winsearch_dir(data_dir);
+    let bin_dir = dll_staging_dir(data_dir);
     let src_norm = find_source_dll().map(|src| normalize_windows_path(&src));
-    let staged = ws_dir.join(DLL_NAME);
-    if src_norm
-        .as_deref()
-        .is_none_or(|src| src != normalize_windows_path(&staged))
-        && !paths.contains(&staged)
-    {
-        paths.push(staged);
+    for candidate in [bin_dir.join(DLL_NAME), ws_dir.join(DLL_NAME)] {
+        if src_norm
+            .as_deref()
+            .is_none_or(|src| src != normalize_windows_path(&candidate))
+            && !paths.contains(&candidate)
+        {
+            paths.push(candidate);
+        }
     }
-    for path in staged_dll_files(&ws_dir) {
-        if !paths.contains(&path) {
-            paths.push(path);
+    for dir in [&bin_dir, &ws_dir] {
+        for path in staged_dll_files(dir) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
         }
     }
     // Deliberately no `find_source_dll()`: granted DLL paths are
@@ -825,6 +842,7 @@ fn grant_searchhost_access(data_dir: &Path, sid: &[u8], sid_text: &str) -> io::R
             "refusing to grant bridge access to a non-package SID",
         ));
     }
+    std::fs::create_dir_all(dll_staging_dir(data_dir))?;
     let mut preserved_dll_paths = Vec::new();
     if let Some(previous) = read_grant_record(data_dir)? {
         if previous.sid_text == sid_text {
@@ -906,10 +924,14 @@ fn revoke_searchhost_access(data_dir: &Path) -> io::Result<()> {
     // Remove the short-lived bridge-folder record written by the first
     // package-scoped build; it is no longer authoritative.
     let ws_dir = ipc::winsearch_dir(data_dir);
+    let bin_dir = dll_staging_dir(data_dir);
     let _ = std::fs::remove_file(ws_dir.join("granted-sid"));
-    for staged in staged_dll_files(&ws_dir) {
-        let _ = std::fs::remove_file(staged);
+    for dir in [&bin_dir, &ws_dir] {
+        for staged in staged_dll_files(dir) {
+            let _ = std::fs::remove_file(staged);
+        }
     }
+    let _ = std::fs::remove_dir(&bin_dir);
     Ok(())
 }
 
@@ -936,23 +958,26 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 }
 
 /// Stage `src` under a content-addressed filename (`ferrow_winsearch-<hash>.dll`)
-/// inside `ws_dir` and opportunistically sweep older unmapped staged copies.
+/// inside `<data_dir>/winsearch-bin` (outside the `Modify`-granted `winsearch`
+/// folder) and opportunistically sweep older unmapped staged copies in both
+/// `winsearch-bin` and legacy `winsearch`.
 ///
 /// Using a distinct module filename per DLL build avoids Windows' PEB module-name
 /// collision when `SearchHost.exe` still has an older `ferrow_winsearch*.dll`
 /// mapped from before an in-place Ferrow upgrade.
-fn stage_dll_from_source(src: &Path, ws_dir: &Path) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(ws_dir)?;
+fn stage_dll_from_source(src: &Path, data_dir: &Path) -> io::Result<PathBuf> {
+    let bin_dir = dll_staging_dir(data_dir);
+    std::fs::create_dir_all(&bin_dir)?;
     let bytes = std::fs::read(src)?;
     let staged_name = format!("ferrow_winsearch-{:016x}.dll", fnv1a_64(&bytes));
-    let staged = ws_dir.join(&staged_name);
+    let staged = bin_dir.join(&staged_name);
 
     if normalize_windows_path(src) != normalize_windows_path(&staged) {
         let already_matches = std::fs::read(&staged)
             .map(|existing| existing == bytes)
             .unwrap_or(false);
         if !already_matches {
-            let tmp = ws_dir.join(format!(".{staged_name}.tmp.{}", std::process::id()));
+            let tmp = bin_dir.join(format!(".{staged_name}.tmp.{}", std::process::id()));
             std::fs::write(&tmp, &bytes)?;
             if let Err(rename_err) = std::fs::rename(&tmp, &staged) {
                 let _ = std::fs::remove_file(&tmp);
@@ -967,20 +992,22 @@ fn stage_dll_from_source(src: &Path, ws_dir: &Path) -> io::Result<PathBuf> {
     }
 
     let keep_norm = normalize_windows_path(&staged);
-    for old in staged_dll_files(ws_dir) {
-        if normalize_windows_path(&old) != keep_norm {
-            let _ = std::fs::remove_file(old);
+    for dir in [&bin_dir, &ipc::winsearch_dir(data_dir)] {
+        for old in staged_dll_files(dir) {
+            if normalize_windows_path(&old) != keep_norm {
+                let _ = std::fs::remove_file(old);
+            }
         }
     }
 
     Ok(staged)
 }
 
-fn stage_attachment_dll(ws_dir: &Path) -> io::Result<PathBuf> {
+fn stage_attachment_dll(data_dir: &Path) -> io::Result<PathBuf> {
     if let Some(src) = find_source_dll() {
-        return stage_dll_from_source(&src, ws_dir);
+        return stage_dll_from_source(&src, data_dir);
     }
-    let fallback = ws_dir.join(DLL_NAME);
+    let fallback = dll_staging_dir(data_dir).join(DLL_NAME);
     if fallback.is_file() {
         Ok(fallback)
     } else {
@@ -1747,6 +1774,7 @@ mod tests {
         let src_dir = base.join("src");
         let data_dir = base.join("data");
         let ws_dir = ipc::winsearch_dir(&data_dir);
+        let bin_dir = dll_staging_dir(&data_dir);
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::create_dir_all(&ws_dir).unwrap();
 
@@ -1757,7 +1785,9 @@ mod tests {
         std::fs::write(&legacy_old, b"beta5").unwrap();
 
         std::fs::write(&src_dll, b"build-v1-payload").unwrap();
-        let staged_v1 = stage_dll_from_source(&src_dll, &ws_dir).unwrap();
+        let staged_v1 = stage_dll_from_source(&src_dll, &data_dir).unwrap();
+        assert!(staged_v1.starts_with(&bin_dir));
+        assert!(!staged_v1.starts_with(&ws_dir));
         assert!(staged_v1.is_file());
         assert_eq!(std::fs::read(&staged_v1).unwrap(), b"build-v1-payload");
         assert!(!legacy_dll.exists(), "unlocked legacy DLL should be swept");
@@ -1771,13 +1801,14 @@ mod tests {
         record_granted_dll_path(&data_dir, sid_text, &sid_bytes, &staged_v1).unwrap();
 
         // Idempotent re-stage of identical bytes keeps the exact same filename.
-        let staged_v1_again = stage_dll_from_source(&src_dll, &ws_dir).unwrap();
+        let staged_v1_again = stage_dll_from_source(&src_dll, &data_dir).unwrap();
         assert_eq!(staged_v1_again, staged_v1);
 
         // New build payload stages under a distinct filename and sweeps unmapped v1.
         std::fs::write(&src_dll, b"build-v2-payload-updated").unwrap();
-        let staged_v2 = stage_dll_from_source(&src_dll, &ws_dir).unwrap();
+        let staged_v2 = stage_dll_from_source(&src_dll, &data_dir).unwrap();
         assert_ne!(staged_v2, staged_v1);
+        assert!(staged_v2.starts_with(&bin_dir));
         assert!(staged_v2.is_file());
         assert!(!staged_v1.exists(), "unmapped v1 DLL should be swept");
         assert_eq!(
@@ -1980,6 +2011,7 @@ mod tests {
             let sid_text = sid_bytes_to_string(&sid_bytes).unwrap();
             let data_dir = root_dir.join("Ferrow");
             let ws_dir = ipc::winsearch_dir(&data_dir);
+            let bin_dir = dll_staging_dir(&data_dir);
             let src_dir = root_dir.join("install");
             std::fs::create_dir_all(&ws_dir).unwrap();
             std::fs::create_dir_all(&src_dir).unwrap();
@@ -2053,12 +2085,13 @@ mod tests {
 
             // 2. Apply the real bridge grant + DLL staging and verify upgrade + least privilege.
             grant_searchhost_access(&data_dir, &sid_bytes, &sid_text).unwrap();
-            let staged_dll = stage_dll_from_source(&src_dll, &ws_dir).unwrap();
+            let staged_dll = stage_dll_from_source(&src_dll, &data_dir).unwrap();
             record_granted_dll_path(&data_dir, &sid_text, &sid_bytes, &staged_dll).unwrap();
             apply_sid_access(&staged_dll, &sid_bytes, Some(AccessKind::ReadExecute)).unwrap();
 
             let dd = data_dir.clone();
             let ws = ws_dir.clone();
+            let bin = bin_dir.clone();
             let settings = settings_path.clone();
             let grant_rec = grant_record_path(&data_dir);
             let idx = index_path.clone();
@@ -2087,6 +2120,26 @@ mod tests {
                     "LowBox token must not write index.bin"
                 );
                 assert_eq!(std::fs::read(&dll).unwrap(), b"MZ-fake-dll");
+                assert!(
+                    std::fs::write(&dll, b"tamper").is_err(),
+                    "LowBox token must not overwrite the staged DLL"
+                );
+                assert!(
+                    std::fs::OpenOptions::new().append(true).open(&dll).is_err(),
+                    "LowBox token must not append to the staged DLL"
+                );
+                assert!(
+                    std::fs::remove_file(&dll).is_err(),
+                    "LowBox token must not delete the staged DLL"
+                );
+                assert!(
+                    std::fs::read_dir(&bin).is_err(),
+                    "LowBox token must not list winsearch-bin"
+                );
+                assert!(
+                    std::fs::write(bin.join("probe.dll"), b"x").is_err(),
+                    "LowBox token must not create files in winsearch-bin"
+                );
 
                 let req_tmp = ws.join("req-1.tmp");
                 let req_final = ws.join("req-1.q");
@@ -2100,6 +2153,7 @@ mod tests {
             revoke_searchhost_access(&data_dir).unwrap();
             assert!(!grant_record_path(&data_dir).exists());
             assert!(!staged_dll.exists());
+            assert!(!bin_dir.exists());
 
             let dd_after = data_dir.clone();
             let ws_after = ws_dir.clone();
