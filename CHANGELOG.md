@@ -2,7 +2,7 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.5
 
 - **Windows Start menu search (experimental, Windows 11):** the new opt-in **Power Windows Search with Ferrow** toggle (Settings → Windows, off by default) answers file and folder searches in the Start menu from Ferrow's index — the live service index when the service is installed. Anything Ferrow cannot answer falls back to Windows Search unchanged. See `docs/windows-search.md`.
 
