@@ -2,6 +2,11 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## 0.1.0-beta.7
+
+- **Fixed:** turning on **Power Windows Search with Ferrow** could fail with `Could not attach to SearchHost.exe: FerrowAttach returned non-zero status: 0x80070057`. The narrow folder permission granted to `SearchHost.exe` was missing `SYNCHRONIZE`, which prevented the AppContainer from verifying the Ferrow data folder at attach time.
+- **Fixed:** upgrading Ferrow while `SearchHost.exe` still held an older Windows Search DLL loaded could reuse the old module instead of attaching the updated one. Each build now stages a read-only, content-addressed DLL copy outside the writable request folder and detaches any older loaded copy cleanly before attaching.
+
 ## 0.1.0-beta.6
 
 - **Fixed:** turning on **Power Windows Search with Ferrow** failed on installed copies with "Could not remove the legacy all-AppContainer bridge access: Access is denied". Cleanup no longer tries to rewrite permissions it never granted (for example Windows' own inherited access on the installed program files), so the toggle now enables as intended.
