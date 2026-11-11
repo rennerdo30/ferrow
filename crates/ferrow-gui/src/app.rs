@@ -132,7 +132,7 @@ impl FerrowApp {
             closer.send_viewport_cmd(egui::ViewportCommand::Close);
             closer.request_repaint();
         });
-        Ok(FerrowApp {
+        let mut app = FerrowApp {
             engine,
             state: State::Loading,
             index: None,
@@ -170,7 +170,24 @@ impl FerrowApp {
             updater: crate::update::Updater::new(),
             service_entries: None,
             refreshing: false,
-        })
+        };
+        if app.settings.windows.windows_search {
+            app.sync_windows_search();
+        }
+        Ok(app)
+    }
+
+    pub(super) fn sync_windows_search(&mut self) {
+        let Some(index_path) = crate::engine::default_index_path() else {
+            return;
+        };
+        let Some(data_dir) = index_path.parent().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let enabled = self.settings.windows.windows_search;
+        if let Err(err) = ferrow_winsearch::sync_state(&data_dir, enabled) {
+            self.settings_error = Some(err);
+        }
     }
 
     fn drain_events(&mut self) {
@@ -183,6 +200,13 @@ impl FerrowApp {
                 } => {
                     let present = index.columns_present();
                     self.columns_need_rebuild = !present.contains(self.settings.index_columns());
+                    let data_dir = crate::engine::default_index_path()
+                        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+                    ferrow_winsearch::on_index_loaded(
+                        data_dir.as_deref(),
+                        index.clone(),
+                        self.settings.windows.windows_search,
+                    );
                     self.index = Some(index);
                     self.scan_status = None;
                     self.load_time = elapsed;
@@ -196,6 +220,12 @@ impl FerrowApp {
                     self.service_entries = Some(entries);
                     self.index_source = format!("Ferrow service: {report}");
                     if first {
+                        let data_dir = crate::engine::default_index_path()
+                            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+                        ferrow_winsearch::on_service_connected(
+                            data_dir.as_deref(),
+                            self.settings.windows.windows_search,
+                        );
                         // The service's index covers every drive and stays
                         // current: no local index or rebuilds needed.
                         self.index = Some(Arc::new(ferrow_index::IndexBuilder::new().freeze()));

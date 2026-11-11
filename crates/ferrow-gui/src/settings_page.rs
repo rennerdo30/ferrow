@@ -282,6 +282,7 @@ impl FerrowApp {
             });
         }
 
+        let mut winsearch_changed = false;
         if cfg!(windows) {
             ui.add_space(SECTION_GAP);
             section_title(ui, &p, "Windows");
@@ -296,6 +297,42 @@ impl FerrowApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if toggle(ui, &p, &mut self.settings.windows.all_fixed_drives).changed() {
                             changed = true;
+                        }
+                    });
+                });
+            });
+            ui.add_space(CARD_GAP);
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
+                    let detail = if self.settings.windows.windows_search {
+                        let status = ferrow_winsearch::status();
+                        if let Some(error) = status.last_error {
+                            format!("On, but not active: {error}")
+                        } else if status.attached_pid.is_some() {
+                            match status.source {
+                                Some(ferrow_winsearch::ipc::IndexSource::Service) => {
+                                    "On: Start menu searches use the Ferrow service index."
+                                        .to_owned()
+                                }
+                                Some(ferrow_winsearch::ipc::IndexSource::Local) => {
+                                    "On: Start menu searches use this app's index.".to_owned()
+                                }
+                                None => {
+                                    "On: Start menu searches use Ferrow's index.".to_owned()
+                                }
+                            }
+                        } else {
+                            "On: waiting to connect to Windows Search…".to_owned()
+                        }
+                    } else {
+                        "Use Ferrow's index to answer file and folder searches in the Windows Start menu."
+                            .to_owned()
+                    };
+                    row_text(ui, &p, "Power Windows Search with Ferrow", &detail);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if toggle(ui, &p, &mut self.settings.windows.windows_search).changed() {
+                            changed = true;
+                            winsearch_changed = true;
                         }
                     });
                 });
@@ -325,6 +362,9 @@ impl FerrowApp {
 
         if changed {
             self.save_settings();
+        }
+        if winsearch_changed {
+            self.sync_windows_search();
         }
         if let Some(err) = &self.settings_error {
             ui.add_space(6.0);

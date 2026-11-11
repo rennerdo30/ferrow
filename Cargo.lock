@@ -1106,6 +1106,7 @@ dependencies = [
  "ferrow-query",
  "ferrow-update",
  "ferrow-walk",
+ "ferrow-winsearch",
  "png",
  "raw-window-handle",
  "rfd",
@@ -1164,6 +1165,17 @@ dependencies = [
  "ferrow-index",
  "rayon",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ferrow-winsearch"
+version = "0.1.0-beta.4"
+dependencies = [
+ "ferrow-index",
+ "ferrow-ipc",
+ "ferrow-query",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

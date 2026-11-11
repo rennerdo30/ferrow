@@ -571,6 +571,7 @@ Function un.RemovePayload
   ${Loop}
   FileClose $ManifestHandle
   Delete /REBOOTOK "$INSTDIR\ferrow-update.exe.old"
+  Delete /REBOOTOK "$INSTDIR\ferrow_winsearch.dll.old"
   ClearErrors
   Delete "$INSTDIR\install-manifest.txt"
   ${If} ${Errors}
@@ -594,6 +595,7 @@ Section "Ferrow"
   SetOutPath "$INSTDIR"
   ; An in-app update runs this setup from ferrow-update.exe: move it aside.
   !insertmacro MoveAsideRunning "ferrow-update.exe"
+  !insertmacro MoveAsideRunning "ferrow_winsearch.dll"
   SetRebootFlag false
   StrCpy $FilesReplaced 1
   ClearErrors

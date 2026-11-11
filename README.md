@@ -133,6 +133,16 @@ System install (`ferrow service install`, admin/root once),
 per-platform details and the current privacy limits are in
 [`docs/service.md`](docs/service.md).
 
+## Windows Search (Start menu, experimental)
+
+On Windows 11, an opt-in toggle (**Settings → Windows → Power Windows
+Search with Ferrow**, off by default) lets Ferrow answer file and folder
+searches typed into the Start menu, from the same live index the app
+uses. Any failure falls back to plain Windows Search. How to use it, its
+limits and its unofficial mechanism are described in
+[`docs/windows-search.md`](docs/windows-search.md) and
+[ADR 0006](docs/decisions/0006-windows-search.md).
+
 ## Building
 
 ```sh

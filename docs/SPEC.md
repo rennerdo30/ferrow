@@ -127,6 +127,7 @@ launchers ────┘     (daemon)       └─ backend-macos   (FSEvents)
 - 2026-11-07: **never freeze.** Freezes in existing tools are why Ferrow exists. No code path may block the UI, a search or the service on indexing, disk I/O, a slow or unreachable volume, a lock or a large result set. Work is bounded and cancellable, and freeze resistance is tested (for example with mocked slow stages).
 - 2026-11-07: **perfect performance in remote desktop sessions** (RDP, VNC, TeamViewer and similar). The UI repaints only what changed and only when something changed: no animations, no blinking caret, no idle redraws. The renderer must work without a GPU, for example over RDP.
 - 2026-11-07: **benchmark regressions fail CI on PRs.** Compare current `main` and head on the same runner/job using medians; allow about 10% regression, with an absolute tolerance for sub-millisecond timings. Gate load total, every fixture query's full count and first page, and bytes per entry (§7). The §3 targets remain goals until reached, then become hard limits in a follow-up.
+- 2026-11-10: **Windows Start menu integration un-parked** as an opt-in, off-by-default experimental feature using the unofficial `SearchHost.exe` query interception (no supported API exists, see the 2026-11-06 note). Design, security analysis and fallback rules: [`decisions/0006-windows-search.md`](decisions/0006-windows-search.md); user guide: [`windows-search.md`](windows-search.md). Needs its independent security review before merge.
 
 ## 10. Open decisions for the owner
 

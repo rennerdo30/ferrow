@@ -22,6 +22,14 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# The winsearch DLL runs inside SearchHost.exe: build it with this
+# profile so its catch_unwind guard keeps a panic in Ferrow code from
+# aborting the shell. `panic` cannot be set per package, so the DLL
+# gets its own profile; scripts/package.ps1 builds it separately.
+[profile.winsearch]
+inherits = "release"
+panic = "unwind"
+
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"

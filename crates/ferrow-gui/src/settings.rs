@@ -212,6 +212,8 @@ impl SortChoice {
 pub struct WindowsSettings {
     /// Index every fixed (internal) drive, including drives added later.
     pub all_fixed_drives: bool,
+    /// Answer file and folder searches in the Windows Start menu using Ferrow's index.
+    pub windows_search: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
