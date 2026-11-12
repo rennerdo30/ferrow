@@ -436,6 +436,8 @@ impl<W: Fn()> Worker<W> {
             client,
             current: None,
         });
+        // Searches go to the service now; free the local index.
+        self.index = None;
         self.send(Event::Remote { entries, report });
         if let (Some(commands), Ok(mut watcher)) = (self.commands.clone(), connect()) {
             let _ = std::thread::Builder::new()
