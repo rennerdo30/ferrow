@@ -67,6 +67,90 @@ pub fn route_counts() -> (u32, u32) {
     )
 }
 
+/// Largest `diag.log` the DLL appends to; later lines are dropped.
+const DIAG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Opt-in DLL diagnostics: while `<data_dir>/winsearch/diag` exists, append
+/// one line per event to `<data_dir>/winsearch/diag.log`. Search text is
+/// never written; SQL is logged with every quoted literal blanked.
+fn diag(data_dir: Option<&std::path::Path>, line: impl FnOnce() -> String) {
+    let Some(data_dir) = data_dir else { return };
+    let ws_dir = ipc::winsearch_dir(data_dir);
+    if !ws_dir.join("diag").is_file() {
+        return;
+    }
+    let path = ws_dir.join("diag.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > DIAG_MAX_BYTES) {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let _ = writeln!(
+            file,
+            "{ms} pid={} module={:p} {}",
+            std::process::id(),
+            detour as *const c_void,
+            line()
+        );
+    }
+}
+
+/// True while the opt-in DLL diagnostics marker exists.
+pub(crate) fn diag_enabled() -> bool {
+    current_data_dir().is_some_and(|dir| ipc::winsearch_dir(&dir).join("diag").is_file())
+}
+
+/// [`diag`] for the data folder this DLL is attached to.
+pub(crate) fn diag_attached(line: impl FnOnce() -> String) {
+    diag(current_data_dir().as_deref(), line);
+}
+
+/// `sql` with every word inside `'...'` literals replaced by `x`s, except
+/// the full-text operators `AND`, `OR`, `NOT` and `NEAR`, so the query
+/// shape can be logged without the user's search text.
+pub(crate) fn redact_sql(sql: &str) -> String {
+    fn flush(word: &mut String, out: &mut String) {
+        if ["AND", "OR", "NOT", "NEAR"]
+            .iter()
+            .any(|op| word.eq_ignore_ascii_case(op))
+        {
+            out.push_str(word);
+        } else {
+            out.extend(word.chars().map(|_| 'x'));
+        }
+        word.clear();
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut word = String::new();
+    let mut in_literal = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_literal && c.is_alphanumeric() {
+            word.push(c);
+            continue;
+        }
+        flush(&mut word, &mut out);
+        if c == '\'' {
+            if in_literal && chars.peek() == Some(&'\'') {
+                chars.next(); // escaped quote inside the literal
+                out.push_str("''");
+                continue;
+            }
+            in_literal = !in_literal;
+        }
+        out.push(c);
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 unsafe extern "system" fn detour(
     this: *mut c_void,
     outer: *mut c_void,
@@ -76,18 +160,35 @@ unsafe extern "system" fn detour(
     output: *mut *mut c_void,
 ) -> HRESULT {
     let attempt = std::panic::catch_unwind(|| -> Result<bool> {
+        let data_dir = current_data_dir();
         if !outer.is_null()
             || iid.is_null()
             || output.is_null()
             || !params.is_null()
             || unsafe { *iid != IRowset::IID && *iid != IUnknown::IID }
         {
+            diag(data_dir.as_deref(), || {
+                let iid = if iid.is_null() {
+                    "null".to_owned()
+                } else {
+                    format!("{:?}", unsafe { *iid })
+                };
+                format!(
+                    "native: unsupported call outer={} iid={iid} params={} output={}",
+                    !outer.is_null(),
+                    !params.is_null(),
+                    !output.is_null()
+                )
+            });
             return Ok(false);
         }
-        let Some(data_dir) = current_data_dir() else {
+        let Some(data_dir) = data_dir else {
             return Ok(false);
         };
         if !ipc::is_enabled(&data_dir) {
+            diag(Some(&data_dir), || {
+                "native: integration disabled".to_owned()
+            });
             return Ok(false);
         }
 
@@ -99,6 +200,7 @@ unsafe extern "system" fn detour(
             command.GetCommandText(None, &mut raw_sql)?;
         }
         if raw_sql.is_null() {
+            diag(Some(&data_dir), || "native: no command text".to_owned());
             return Ok(false);
         }
         let sql_res = unsafe { raw_sql.to_string() };
@@ -108,18 +210,37 @@ unsafe extern "system" fn detour(
         let sql_str = sql_res?;
 
         let Some(parsed) = sql::parse_windows_search_sql(&sql_str) else {
+            diag(Some(&data_dir), || {
+                format!("native: SQL not understood: {}", redact_sql(&sql_str))
+            });
             return Ok(false);
         };
         let Some(hits) = ipc::query_hits(&data_dir, &parsed.query, parsed.limit) else {
+            diag(Some(&data_dir), || {
+                format!(
+                    "native: no answer from Ferrow (limit={}): {}",
+                    parsed.limit,
+                    redact_sql(&sql_str)
+                )
+            });
             return Ok(false);
         };
         if hits.is_empty() {
             // Fall back to Windows Search when Ferrow has zero matches so
             // non-indexed locations and non-file items still appear.
+            diag(Some(&data_dir), || {
+                format!("native: Ferrow found 0 hits: {}", redact_sql(&sql_str))
+            });
             return Ok(false);
         }
+        let hit_count = hits.len();
 
-        let rows = rowset::build_for_hits(&parsed.columns, hits)?;
+        let rows = rowset::build_for_hits(&parsed.columns, hits).inspect_err(|e| {
+            diag(Some(&data_dir), || format!("native: rowset failed: {e}"));
+        })?;
+        diag(Some(&data_dir), || {
+            format!("ferrow: answered {hit_count} hits")
+        });
         unsafe {
             output.write(rows.into_raw());
             if !affected.is_null() {
@@ -295,7 +416,16 @@ pub unsafe extern "system" fn FerrowAttach(data_dir: *const u16) -> u32 {
             return Err(E_POINTER.into());
         }
         let path_str = unsafe { PCWSTR(data_dir).to_string()? };
-        attach_in_process(PathBuf::from(path_str))
+        let data_dir = PathBuf::from(path_str);
+        let result = attach_in_process(data_dir.clone());
+        diag(Some(&data_dir), || {
+            format!(
+                "attach: {result:?} slot={:p} original={:p}",
+                SLOT_PTR.load(Ordering::Acquire),
+                ORIGINAL.load(Ordering::Acquire)
+            )
+        });
+        result
     }) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => e.code().0 as u32,
@@ -309,9 +439,29 @@ pub unsafe extern "system" fn FerrowAttach(data_dir: *const u16) -> u32 {
 /// Must only be called within a process where `ferrow_winsearch.dll` is loaded.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn FerrowDetach(_reserved: *mut c_void) -> u32 {
-    match std::panic::catch_unwind(detach_in_process) {
+    match std::panic::catch_unwind(|| {
+        let result = detach_in_process();
+        diag(current_data_dir().as_deref(), || {
+            format!("detach: {result:?}")
+        });
+        result
+    }) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => e.code().0 as u32,
         Err(_) => E_FAIL.0 as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_sql;
+
+    #[test]
+    fn redact_sql_blanks_every_literal() {
+        let sql = "SELECT TOP 30 path FROM SystemIndex WHERE CONTAINS(System.FileName, '\"budget*\" AND \"it''s*\"', 2057) AND System.Kind = 'folder'";
+        assert_eq!(
+            redact_sql(sql),
+            "SELECT TOP 30 path FROM SystemIndex WHERE CONTAINS(System.FileName, '\"xxxxxx*\" AND \"xx''x*\"', 2057) AND System.Kind = 'xxxxxx'"
+        );
     }
 }

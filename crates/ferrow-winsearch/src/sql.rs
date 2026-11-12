@@ -75,12 +75,13 @@ pub fn parse_windows_search_sql(sql: &str) -> Option<ParsedSql> {
     let (columns, limit) = parse_projection(sql)?;
     let (_before_from, after_from) = split_from_system_index(sql)?;
     let predicate = extract_where_predicate(after_from)?;
+    let (aliases, predicate) = split_column_group_aliases(predicate)?;
 
     // Boolean meaning must survive translation. The whole predicate is
     // parsed as a boolean expression and accepted only when it reduces
     // to a conjunction of filename term sets (plus an optional folder
     // restriction). Every other leaf or operator falls back to native.
-    let (terms, only_folders) = parse_predicate_expression(predicate)?;
+    let (terms, only_folders) = parse_predicate_expression(predicate, aliases)?;
     if terms.is_empty() {
         return None;
     }
@@ -116,6 +117,47 @@ fn extract_where_predicate(after_from: &str) -> Option<&str> {
     (!pred.is_empty()).then_some(pred)
 }
 
+/// Column group aliases: `#name` (lowercase) to its parenthesized column list.
+type ColumnGroupAliases = Vec<(String, String)>;
+
+/// Split leading `WITH (<columns>) AS #<name>` column group definitions
+/// (newer Windows 11 Start queries) off the predicate. `None` when a
+/// `WITH` clause is malformed.
+fn split_column_group_aliases(mut predicate: &str) -> Option<(ColumnGroupAliases, &str)> {
+    let mut aliases = Vec::new();
+    loop {
+        let trimmed = predicate.trim_start();
+        let Some(rest) = strip_keyword(trimmed, "WITH") else {
+            return Some((aliases, trimmed));
+        };
+        let rest = rest.trim_start();
+        let close = find_matching_paren(rest.as_bytes(), 0)?;
+        let columns = &rest[..close];
+        let rest = strip_keyword(rest[close..].trim_start(), "AS")?.trim_start();
+        let name_len = rest
+            .strip_prefix('#')?
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len() - 1);
+        if name_len == 0 {
+            return None;
+        }
+        aliases.push((rest[..=name_len].to_ascii_lowercase(), columns.to_owned()));
+        predicate = &rest[name_len + 1..];
+    }
+}
+
+/// `s` after a leading case-insensitive `word` that ends at a non-word byte.
+fn strip_keyword<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    let head = s.get(..word.len())?;
+    let rest = &s[word.len()..];
+    (head.eq_ignore_ascii_case(word)
+        && rest
+            .bytes()
+            .next()
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || b == b'_')))
+    .then_some(rest)
+}
+
 fn find_clause_end_outside_quotes(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut in_single = false;
@@ -146,6 +188,10 @@ fn find_clause_end_outside_quotes(s: &str) -> usize {
 enum PredicateComponent {
     Terms(usize),
     FolderOnly,
+    /// `ReuseWhere(<id>)`: the shell's location scope from an earlier
+    /// query. Ferrow answers from every location it indexes, so it adds
+    /// no restriction.
+    Scope,
 }
 
 #[derive(Clone, Debug)]
@@ -155,32 +201,82 @@ enum PredicateExpr {
     Or(Vec<PredicateExpr>),
 }
 
+/// A conjunction of filename terms (each a case-insensitive substring of
+/// the name), plus the folder restriction and the location scope.
+#[derive(Clone, Debug, Default)]
+struct Conjunction {
+    terms: Vec<String>,
+    only_folders: bool,
+    scope: bool,
+}
+
+impl Conjunction {
+    fn and(mut self, other: Conjunction) -> Self {
+        for term in other.terms {
+            push_unique_term(&mut self.terms, term);
+        }
+        self.only_folders |= other.only_folders;
+        self.scope |= other.scope;
+        self
+    }
+
+    /// True when every name matching `self` also matches `weaker`: each
+    /// of its terms is contained in one of ours, and it restricts to
+    /// folders or the scope only when we do too.
+    fn implies(&self, weaker: &Conjunction) -> bool {
+        (!weaker.only_folders || self.only_folders)
+            && (!weaker.scope || self.scope)
+            && weaker.terms.iter().all(|w| {
+                let w = w.to_lowercase();
+                self.terms.iter().any(|t| t.to_lowercase().contains(&w))
+            })
+    }
+}
+
 /// Reduce an expression to a conjunction only by sound identities:
-/// nested ANDs flatten, and an OR survives only when every branch is
-/// the same conjunction. Anything else has no exact Ferrow AND form.
-fn predicate_conjunction(
-    expr: &PredicateExpr,
-) -> Option<std::collections::BTreeSet<PredicateComponent>> {
+/// nested ANDs flatten, and an OR reduces to the branch that every other
+/// branch implies (for example `"a.txt" OR ("a" AND "txt")` is `a txt`).
+/// Anything else has no exact Ferrow AND form.
+fn predicate_conjunction(expr: &PredicateExpr, term_sets: &[Vec<String>]) -> Option<Conjunction> {
     match expr {
-        PredicateExpr::Leaf(component) => Some([*component].into_iter().collect()),
+        PredicateExpr::Leaf(component) => Some(match component {
+            PredicateComponent::Terms(index) => Conjunction {
+                terms: term_sets.get(*index)?.clone(),
+                ..Default::default()
+            },
+            PredicateComponent::FolderOnly => Conjunction {
+                only_folders: true,
+                ..Default::default()
+            },
+            PredicateComponent::Scope => Conjunction {
+                scope: true,
+                ..Default::default()
+            },
+        }),
         PredicateExpr::And(parts) => {
-            let mut combined = std::collections::BTreeSet::new();
+            let mut combined = Conjunction::default();
             for part in parts {
-                combined.extend(predicate_conjunction(part)?);
+                combined = combined.and(predicate_conjunction(part, term_sets)?);
             }
             Some(combined)
         }
         PredicateExpr::Or(parts) => {
-            let mut branches = parts.iter();
-            let first = predicate_conjunction(branches.next()?)?;
+            let branches = parts
+                .iter()
+                .map(|part| predicate_conjunction(part, term_sets))
+                .collect::<Option<Vec<_>>>()?;
             branches
-                .all(|part| predicate_conjunction(part).as_ref() == Some(&first))
-                .then_some(first)
+                .iter()
+                .find(|weakest| branches.iter().all(|b| b.implies(weakest)))
+                .cloned()
         }
     }
 }
 
-fn parse_predicate_expression(predicate: &str) -> Option<(Vec<String>, bool)> {
+fn parse_predicate_expression(
+    predicate: &str,
+    aliases: ColumnGroupAliases,
+) -> Option<(Vec<String>, bool)> {
     let mut parser = PredicateParser {
         predicate,
         bytes: predicate.as_bytes(),
@@ -188,26 +284,15 @@ fn parse_predicate_expression(predicate: &str) -> Option<(Vec<String>, bool)> {
         depth: 0,
         distinct_term_sets: Vec::new(),
         representatives: Vec::new(),
+        aliases,
     };
     let expr = parser.parse_or()?;
     parser.skip_ws();
     if parser.pos != parser.bytes.len() {
         return None;
     }
-    let components = predicate_conjunction(&expr)?;
-    let mut terms = Vec::new();
-    let mut only_folders = false;
-    for component in components {
-        match component {
-            PredicateComponent::Terms(index) => {
-                for term in &parser.representatives[index] {
-                    push_unique_term(&mut terms, term.clone());
-                }
-            }
-            PredicateComponent::FolderOnly => only_folders = true,
-        }
-    }
-    Some((terms, only_folders))
+    let conjunction = predicate_conjunction(&expr, &parser.representatives)?;
+    Some((conjunction.terms, conjunction.only_folders))
 }
 
 struct PredicateParser<'a> {
@@ -217,6 +302,7 @@ struct PredicateParser<'a> {
     depth: usize,
     distinct_term_sets: Vec<Vec<String>>,
     representatives: Vec<Vec<String>>,
+    aliases: ColumnGroupAliases,
 }
 
 impl PredicateParser<'_> {
@@ -293,10 +379,40 @@ impl PredicateParser<'_> {
             let expr = self.parse_or();
             self.depth -= 1;
             let expr = expr?;
-            self.consume_byte(b')').then_some(expr)
+            if !self.consume_byte(b')') {
+                return None;
+            }
+            self.skip_rank_clause()?;
+            Some(expr)
         } else {
-            self.parse_leaf().map(PredicateExpr::Leaf)
+            let leaf = self.parse_leaf()?;
+            self.skip_rank_clause()?;
+            Some(PredicateExpr::Leaf(leaf))
         }
+    }
+
+    /// Skip an optional `RANK BY <function>(<args>)`: it only orders
+    /// native results and never changes which items match.
+    fn skip_rank_clause(&mut self) -> Option<()> {
+        let saved = self.pos;
+        if !self.consume_word("RANK") {
+            return Some(());
+        }
+        if !self.consume_word("BY") {
+            self.pos = saved;
+            return Some(());
+        }
+        self.skip_ws();
+        while self
+            .bytes
+            .get(self.pos)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            self.pos += 1;
+        }
+        self.skip_ws();
+        self.pos = find_matching_paren(self.bytes, self.pos)?;
+        Some(())
     }
 }
 
@@ -335,7 +451,14 @@ impl PredicateParser<'_> {
             let (prop_prefix, literal, _) = parse_contains_call(args)?;
             self.pos = call_end;
             let terms = parse_contains_condition(&literal)?;
-            let property = normalize_property(prop_prefix);
+            let mut property = normalize_property(prop_prefix);
+            if property.starts_with('#') {
+                property = self
+                    .aliases
+                    .iter()
+                    .find(|(alias, _)| *alias == property)
+                    .map(|(_, columns)| normalize_property(columns))?;
+            }
             if property == "system.kind" {
                 let folder_only = terms.len() == 1 && terms[0].eq_ignore_ascii_case("folder");
                 return folder_only.then_some(PredicateComponent::FolderOnly);
@@ -344,6 +467,17 @@ impl PredicateParser<'_> {
                 return None;
             }
             return self.register_terms(terms);
+        }
+
+        if self.consume_word("ReuseWhere") {
+            self.skip_ws();
+            let end = find_matching_paren(self.bytes, self.pos)?;
+            let id = self.predicate[self.pos + 1..end - 1].trim();
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            self.pos = end;
+            return Some(PredicateComponent::Scope);
         }
 
         let property = self.read_property()?;
@@ -673,6 +807,44 @@ mod tests {
             "SELECT TOP 30 {DOCS_TAB_PROJECTION} FROM \"SystemIndex\" WHERE (CONTAINS(\"System.ItemNameDisplay\", '\"budget*\" AND \"2026*\"', 2057) OR CONTAINS(*, '\"budget*\" AND \"2026*\"', 2057)) AND CONTAINS(\"System.Kind\", '\"document\"') ORDER BY \"System.Search.Rank\" DESC"
         );
         assert!(parse_windows_search_sql(&with_kind).is_none());
+    }
+
+    /// Windows 11 (2026) Start query: a `WITH ... AS #alias` column group,
+    /// ranked CONTAINS branches and the location scope as `ReuseWhere`.
+    #[test]
+    fn parses_column_group_rank_and_reuse_where() {
+        let sql = format!(
+            "SELECT TOP 30 {ALL_TAB_PROJECTION} FROM SystemIndex WHERE WITH (System.ItemNameDisplay) AS #MRProps ((CONTAINS(#MRProps, '\"ferrowd\"', 1041) RANK BY COERCION(ABSOLUTE, 990)) OR (CONTAINS(#MRProps, '\"ferrowd*\"', 1041) RANK BY COERCION(ABSOLUTE, 980))) AND ReuseWhere(147)  ORDER BY \"System.Search.Rank\" DESC, \"System.DateModified\" DESC"
+        );
+        let parsed = parse_windows_search_sql(&sql).expect("Windows 11 Start query parses");
+        assert_eq!(parsed.columns.len(), 15);
+        assert_eq!(parsed.limit, 30);
+        assert_eq!(parsed.query, "ferrowd");
+
+        // A dotted query adds word-split branches; every branch implies
+        // the weakest (`default` AND `rdp`), so the OR is exactly that.
+        let sql = format!(
+            "SELECT TOP 30 {ALL_TAB_PROJECTION} FROM SystemIndex WHERE WITH (System.ItemNameDisplay) AS #MRProps ((CONTAINS(#MRProps, '\"default.rdp\"', 1041) RANK BY COERCION(ABSOLUTE, 990)) OR (CONTAINS(#MRProps, '\"default.rdp*\"', 1041) RANK BY COERCION(ABSOLUTE, 980)) OR (CONTAINS(#MRProps, '\"default\" AND \"rdp\"', 1041) RANK BY COERCION(ABSOLUTE, 600)) OR (CONTAINS(#MRProps, '\"default*\" AND \"rdp*\"', 1041) RANK BY COERCION(ABSOLUTE, 550))) AND ReuseWhere(177)  ORDER BY \"System.Search.Rank\" DESC, \"System.DateModified\" DESC"
+        );
+        let parsed = parse_windows_search_sql(&sql).expect("dotted Start query parses");
+        assert_eq!(parsed.query, "default rdp");
+
+        for unsupported in [
+            // An alias over a column Ferrow cannot search.
+            "SELECT TOP 30 path FROM SystemIndex WHERE WITH (System.Title) AS #P CONTAINS(#P, '\"a*\"')",
+            // An alias that was never defined.
+            "SELECT TOP 30 path FROM SystemIndex WHERE CONTAINS(#P, '\"a*\"')",
+            // The scope alone has no search terms.
+            "SELECT TOP 30 path FROM SystemIndex WHERE ReuseWhere(147)",
+            // Scope as an OR branch is a union, not a restriction.
+            "SELECT TOP 30 path FROM SystemIndex WHERE CONTAINS(System.FileName, '\"a*\"') OR ReuseWhere(147)",
+            "SELECT TOP 30 path FROM SystemIndex WHERE CONTAINS(System.FileName, '\"a*\"') AND ReuseWhere(x)",
+        ] {
+            assert!(
+                parse_windows_search_sql(unsupported).is_none(),
+                "should fall back: {unsupported}"
+            );
+        }
     }
 
     #[test]

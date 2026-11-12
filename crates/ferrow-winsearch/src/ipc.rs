@@ -33,7 +33,7 @@ use ferrow_query::{CancelToken, Query, SearchOptions, search};
 const MAX_INPROC_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum time `SearchHost.exe` waits for an IPC reply from `ferrow-gui`.
-const IPC_TIMEOUT: Duration = Duration::from_millis(250);
+const IPC_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Budget for (re)connecting the responder to the `ferrowd` service. Runs
 /// on the responder thread only; `SearchHost.exe` has already fallen back
@@ -41,7 +41,9 @@ const IPC_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_CONNECT_BUDGET: Duration = Duration::from_millis(800);
 /// Budget for one service page query on an established connection, kept
 /// inside [`IPC_TIMEOUT`] so the reply can still reach `SearchHost.exe`.
-const SERVICE_QUERY_BUDGET: Duration = Duration::from_millis(200);
+/// A rare term scans the whole service index (about 150 ms for 35 million
+/// names), so this must stay well above that.
+const SERVICE_QUERY_BUDGET: Duration = Duration::from_millis(450);
 /// Budget for one search over the preloaded on-disk index inside
 /// `SearchHost.exe`. Loading never happens on the query path (see
 /// [`preload_disk_index`]); this caps the search itself.
@@ -49,10 +51,12 @@ const DISK_SEARCH_BUDGET: Duration = Duration::from_millis(200);
 /// After a bridge timeout the DLL skips IPC for this long instead of
 /// deleting the responder marker: a slow first service connect must
 /// not disable the bridge until the next app sync.
-const IPC_COOLDOWN: Duration = Duration::from_secs(5);
+/// Kept short: Start sends one query per keystroke, and the query for the
+/// finished word must not land inside the cooldown of an earlier one.
+const IPC_COOLDOWN: Duration = Duration::from_secs(1);
 /// After a failed service connect or query, wait this long before the
 /// responder tries the service again (native fallback meanwhile).
-const SERVICE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const SERVICE_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 type CachedIndex = (PathBuf, SystemTime, Arc<Index>);
 
@@ -605,13 +609,14 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
         return;
     };
     let now = SystemTime::now();
+    let mut requests: Vec<(String, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if let Some(req_id) = name.strip_prefix("req-").and_then(|s| s.strip_suffix(".q")) {
-            handle_one_request(ws_dir, &path, req_id, link);
+            requests.push((req_id.to_owned(), path.clone()));
         } else if (name.ends_with(".tmp") || name.ends_with(".r"))
             && let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
@@ -620,6 +625,50 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    // Start sends one query per keystroke. Only the newest query of each
+    // shell process is worth a search; older ones get an empty reply at
+    // once (native results for that keystroke), so a slow search never
+    // queues the finished word behind queries nobody looks at anymore.
+    let newest = newest_request_per_process(&requests);
+    for (req_id, path) in &requests {
+        if newest.contains(req_id) {
+            handle_one_request(ws_dir, path, req_id, link);
+        } else {
+            reply_superseded(ws_dir, path, req_id);
+        }
+    }
+}
+
+/// Request ids `<pid>-<seq>`: the highest `seq` per `pid`. Ids that do not
+/// parse are always answered.
+fn newest_request_per_process(requests: &[(String, PathBuf)]) -> Vec<String> {
+    let mut newest: std::collections::HashMap<&str, (u64, &str)> = Default::default();
+    let mut unparsed = Vec::new();
+    for (req_id, _) in requests {
+        match req_id
+            .rsplit_once('-')
+            .and_then(|(pid, seq)| Some((pid, seq.parse::<u64>().ok()?)))
+        {
+            Some((pid, seq)) => {
+                let slot = newest.entry(pid).or_insert((seq, req_id));
+                if seq > slot.0 {
+                    *slot = (seq, req_id);
+                }
+            }
+            None => unparsed.push(req_id.clone()),
+        }
+    }
+    unparsed.extend(newest.into_values().map(|(_, id)| id.to_owned()));
+    unparsed
+}
+
+fn reply_superseded(ws_dir: &Path, req_path: &Path, req_id: &str) {
+    if std::fs::remove_file(req_path).is_err() {
+        return; // the shell already gave up on it
+    }
+    diag_line(format!("resp id={req_id} superseded"));
+    write_reply(ws_dir, req_id, &serialize_rows(&[]));
 }
 
 fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut ServiceLink) {
@@ -656,7 +705,10 @@ fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut S
         rows.len()
     ));
 
-    let serialized = serialize_rows(&rows);
+    write_reply(ws_dir, req_id, &serialize_rows(&rows));
+}
+
+fn write_reply(ws_dir: &Path, req_id: &str, serialized: &str) {
     let tmp_resp = ws_dir.join(format!("resp-{req_id}.tmp"));
     let final_resp = ws_dir.join(format!("resp-{req_id}.r"));
     if let Ok(mut f) = std::fs::File::create(&tmp_resp) {
@@ -735,6 +787,17 @@ pub fn deserialize_rows(text: &str) -> Vec<SearchHitRow> {
 mod tests {
     use super::*;
     use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder};
+
+    #[test]
+    fn only_the_newest_request_per_process_is_searched() {
+        let requests: Vec<(String, PathBuf)> = ["10-2", "10-10", "10-9", "7-1", "odd"]
+            .iter()
+            .map(|id| (id.to_string(), PathBuf::new()))
+            .collect();
+        let mut newest = newest_request_per_process(&requests);
+        newest.sort();
+        assert_eq!(newest, ["10-10", "7-1", "odd"]);
+    }
 
     #[test]
     fn round_trips_serialized_rows() {

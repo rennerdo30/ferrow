@@ -86,3 +86,14 @@ is needed in either direction.
   `FERROW_WINSEARCH_DIAG` set to a file path. The responder then logs
   one line per Start request (request id, hit count, answering source;
   never your search text). Attach that file to the report.
+- **To see what happens inside the Start search process:** create an
+  empty file named `diag` in `%LOCALAPPDATA%\ferrow\winsearch`. While it
+  exists, the DLL appends to `diag.log` in the same folder (up to 1 MiB):
+  attach and detach results, why each Start query fell back to Windows
+  (with the query's shape, every letter and digit of the search text
+  replaced by `x`), and how Start read the rows Ferrow answered. Delete
+  `diag` to stop.
+- To compare with Windows' own answers, run
+  `cargo run -p ferrow-winsearch --example native_props -- <term>`: it
+  prints the properties native Windows Search returns for a Start-shaped
+  query.
