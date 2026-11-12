@@ -43,7 +43,9 @@ use windows::core::{
     BSTR, Error, GUID, HRESULT, IUnknown, Interface, PCWSTR, PWSTR, Ref, Result, implement, w,
 };
 
+use crate::hook::diag_attached as diag;
 use crate::ipc::SearchHitRow;
+use crate::kinds;
 
 /// Difference between Windows `FILETIME` epoch (`1601-01-01`) and Unix epoch
 /// (`1970-01-01`) in 100ns ticks.
@@ -183,6 +185,18 @@ struct MemoryRowset {
     state: Mutex<State>,
 }
 
+impl Drop for MemoryRowset {
+    fn drop(&mut self) {
+        diag(|| {
+            let cursor = self.state.get_mut().map_or(0, |s| s.cursor);
+            format!(
+                "rowset: released after reading {cursor} of {} rows",
+                self.items.len()
+            )
+        });
+    }
+}
+
 fn information(code: HRESULT) -> Result<()> {
     Err(Error::from_hresult(code))
 }
@@ -200,13 +214,18 @@ fn unix_ticks_to_ole_date(ticks: Option<i64>) -> f64 {
         .unwrap_or(46000.0)
 }
 
+/// `System.SFGAOFlags` native Windows Search reports for a plain file and a
+/// folder (file system, can copy/move/rename/delete, property sheet, ...).
+const SFGAO_NATIVE_FILE: u32 = 0x4040_0177;
+const SFGAO_NATIVE_FOLDER: u32 = 0x7080_017F;
+
 fn classify_file_kind(file_name: &str, is_dir: bool) -> (String, String, Vec<&'static str>, u32) {
     if is_dir {
         return (
             String::new(),
             "Folder".to_owned(),
             vec!["folder"],
-            0x6000_0000,
+            SFGAO_NATIVE_FOLDER,
         );
     }
     let ext = match file_name.rfind('.') {
@@ -214,27 +233,24 @@ fn classify_file_kind(file_name: &str, is_dir: bool) -> (String, String, Vec<&'s
         _ => String::new(),
     };
     let ext_lower = ext.trim_start_matches('.').to_ascii_lowercase();
-    let (kinds, type_text): (Vec<&'static str>, String) = match ext_lower.as_str() {
-        "exe" | "msi" | "bat" | "cmd" | "com" => (vec!["program"], "Application".to_owned()),
-        "lnk" => (vec!["link"], "Shortcut".to_owned()),
-        "txt" | "md" | "log" | "rst" | "ini" | "cfg" | "conf" | "toml" | "yaml" | "yml"
-        | "json" | "xml" | "csv" | "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "cs" | "go"
-        | "java" | "html" | "css" | "ps1" | "sh" => {
-            (vec!["document", "text"], "Text Document".to_owned())
-        }
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
-        | "rtf" => (vec!["document"], "Document".to_owned()),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff" => {
-            (vec!["picture"], "Image".to_owned())
-        }
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "wma" => {
-            (vec!["music"], "Audio".to_owned())
-        }
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" => (vec!["video"], "Video".to_owned()),
-        "" => (vec!["item"], "File".to_owned()),
-        other => (vec!["item"], format!("{} File", other.to_ascii_uppercase())),
+    // Windows' own kinds (Explorer's KindMap), the same ones Ferrow answers
+    // Start's group queries with: every row lands in the group (Documents,
+    // Photos, ...) Windows would put it in, and a file Windows gives no
+    // kind (for example `.md`) gets none either.
+    let kinds: Vec<&'static str> = if ext_lower.is_empty() {
+        Vec::new()
+    } else {
+        kinds::kinds_of_extension(&ext_lower)
+            .iter()
+            .map(String::as_str)
+            .collect()
     };
-    (ext, type_text, kinds, 0x4000_0000)
+    let type_text = if ext_lower.is_empty() {
+        "File".to_owned()
+    } else {
+        format!("{} File", ext_lower.to_ascii_uppercase())
+    };
+    (ext, type_text, kinds, SFGAO_NATIVE_FILE)
 }
 
 unsafe fn alloc_pwstr(s: &str) -> PWSTR {
@@ -327,6 +343,18 @@ unsafe fn propvar_lpwstr_vec(items: &[&str]) -> PROPVARIANT {
     pv
 }
 
+/// `System.Search.QueryPropertyHits` as native Windows Search reports it for
+/// a Start menu name match (Windows 11, 2026), so Ferrow rows look like
+/// Windows' own to the Start UI.
+const QUERY_PROPERTY_HITS: [&str; 6] = [
+    "{41CF5AE0-F75A-4806-BD87-59C7D9248EB9},100",
+    "{49691C90-7E17-101A-A91C-08002B2ECDA9},9",
+    "{B725F130-47EF-101A-A5F1-02608C9EEBAC},10",
+    "{E3E0584C-B788-4A5A-BB20-7F5A44C9ACDD},7",
+    "{28636AA6-953D-11D2-B5D6-00C04FD918D0},24",
+    "{9E5E05AC-1936-4A75-94F7-4704B8B01923},0",
+];
+
 unsafe fn build_row_property_store(
     row: &RowInfo,
     row_id: i32,
@@ -338,7 +366,14 @@ unsafe fn build_row_property_store(
         let store = IPropertyStore::from_raw(raw_store);
 
         let mut props: Vec<(&str, PROPVARIANT)> = vec![
-            ("System.Kind", propvar_lpwstr_vec(&row.kinds)),
+            (
+                "System.Kind",
+                if row.kinds.is_empty() {
+                    propvar_null()
+                } else {
+                    propvar_lpwstr_vec(&row.kinds)
+                },
+            ),
             ("System.Search.Rank", propvar_i4(row.rank)),
             ("System.ParsingPath", propvar_lpwstr(&row.file_url)),
             ("System.ItemUrl", propvar_lpwstr(&row.file_url)),
@@ -346,12 +381,29 @@ unsafe fn build_row_property_store(
             ("System.DateCreated", propvar_filetime(row.created_ft)),
             ("System.DateModified", propvar_filetime(row.modified_ft)),
             ("System.DateAccessed", propvar_filetime(row.accessed_ft)),
-            ("System.Search.QueryPropertyHits", propvar_null()),
+            (
+                "System.Search.QueryPropertyHits",
+                propvar_lpwstr_vec(&QUERY_PROPERTY_HITS),
+            ),
             ("System.ItemNameDisplay", propvar_lpwstr(&row.hit.file_name)),
             ("System.ItemName", propvar_lpwstr(&row.hit.file_name)),
             ("System.FileName", propvar_lpwstr(&row.hit.file_name)),
-            ("System.FileExtension", propvar_lpwstr(&row.ext)),
-            ("System.ItemType", propvar_lpwstr(&row.ext)),
+            (
+                "System.FileExtension",
+                if row.hit.is_dir {
+                    propvar_null()
+                } else {
+                    propvar_lpwstr(&row.ext)
+                },
+            ),
+            (
+                "System.ItemType",
+                propvar_lpwstr(if row.hit.is_dir {
+                    "Directory"
+                } else {
+                    &row.ext
+                }),
+            ),
             ("System.ItemTypeText", propvar_lpwstr(&row.item_type_text)),
             ("System.Title", propvar_null()),
             ("System.Music.AlbumTitle", propvar_null()),
@@ -376,9 +428,89 @@ unsafe fn build_row_property_store(
             let _ = PropVariantClear(&mut pv_path);
         }
 
+        let store: IPropertyStore = if crate::hook::diag_enabled() {
+            LoggingPropertyStore {
+                inner: store,
+                row: row_id,
+            }
+            .into()
+        } else {
+            store
+        };
         let mut out = ptr::null_mut();
         store.query(riid, &mut out).ok()?;
         Ok(IUnknown::from_raw(out))
+    }
+}
+
+/// Diagnostics only: forwards to the row's property store and logs which
+/// properties `SearchHost.exe` reads (names only, never values).
+#[implement(IPropertyStore)]
+struct LoggingPropertyStore {
+    inner: IPropertyStore,
+    row: i32,
+}
+
+fn property_key_name(key: *const PROPERTYKEY) -> String {
+    if key.is_null() {
+        return "null".to_owned();
+    }
+    unsafe {
+        match windows::Win32::UI::Shell::PropertiesSystem::PSGetNameFromPropertyKey(key) {
+            Ok(name) => {
+                let text = name.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(name.0.cast()));
+                text
+            }
+            Err(_) => format!("{{{:?}}}/{}", (*key).fmtid, (*key).pid),
+        }
+    }
+}
+
+impl windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore_Impl
+    for LoggingPropertyStore_Impl
+{
+    fn GetCount(&self) -> Result<u32> {
+        let result = unsafe { self.inner.GetCount() };
+        diag(|| format!("store row={}: GetCount -> {result:?}", self.row));
+        result
+    }
+
+    fn GetAt(&self, index: u32, key: *mut PROPERTYKEY) -> Result<()> {
+        let result = unsafe { self.inner.GetAt(index, key) };
+        diag(|| format!("store row={}: GetAt {index} -> {result:?}", self.row));
+        result
+    }
+
+    fn GetValue(&self, key: *const PROPERTYKEY) -> Result<PROPVARIANT> {
+        let result = unsafe { self.inner.GetValue(key) };
+        diag(|| {
+            let vt = result
+                .as_ref()
+                .map(|pv| unsafe { pv.Anonymous.Anonymous.vt.0 });
+            format!(
+                "store row={}: GetValue {} -> vt {vt:?}",
+                self.row,
+                property_key_name(key)
+            )
+        });
+        result
+    }
+
+    fn SetValue(&self, key: *const PROPERTYKEY, value: *const PROPVARIANT) -> Result<()> {
+        diag(|| {
+            format!(
+                "store row={}: SetValue {}",
+                self.row,
+                property_key_name(key)
+            )
+        });
+        unsafe { self.inner.SetValue(key, value) }
+    }
+
+    fn Commit(&self) -> Result<()> {
+        diag(|| format!("store row={}: Commit", self.row));
+        unsafe { self.inner.Commit() }
     }
 }
 
@@ -401,10 +533,19 @@ impl IGetRow_Impl for MemoryRowset_Impl {
         }
         let row = self.items[hrow - 1].clone();
         drop(state);
-        unsafe { build_row_property_store(&row, hrow as i32, riid) }
+        let result = unsafe { build_row_property_store(&row, hrow as i32, riid) };
+        diag(|| {
+            format!(
+                "rowset: GetRowFromHROW row={hrow} iid={:?} -> {:?}",
+                unsafe { *riid },
+                result.as_ref().map(|_| ())
+            )
+        });
+        result
     }
 
     fn GetURLFromHROW(&self, hrow: usize) -> Result<PWSTR> {
+        diag(|| format!("rowset: GetURLFromHROW row={hrow}"));
         let state = self.state.lock().map_err(|_| Error::from_hresult(E_FAIL))?;
         if !state.rows.contains_key(&hrow) || hrow == 0 || hrow > self.items.len() {
             return Err(DB_E_BADROWHANDLE.into());
@@ -464,7 +605,9 @@ fn value_for_column(
     let cre_date = unix_ticks_to_ole_date(hit.created_ticks.or(hit.modified_ticks));
     let acc_date = unix_ticks_to_ole_date(hit.accessed_ticks.or(hit.modified_ticks));
     match col_name.to_ascii_lowercase().as_str() {
-        "system.kind" => ColVal::Str((*kinds.first().unwrap_or(&"item")).to_owned()),
+        "system.kind" => kinds
+            .first()
+            .map_or(ColVal::Empty, |kind| ColVal::Str((*kind).to_owned())),
         "system.search.rank" => ColVal::I4(rank),
         "path" | "system.itemurl" | "system.itempathdisplay" => ColVal::Str(hit.full_path.clone()),
         "system.datecreated" => ColVal::Date(cre_date),
@@ -552,6 +695,12 @@ impl IRowset_Impl for MemoryRowset_Impl {
                 .min(self.items.len())
         };
         let take = (count as usize).min(self.items.len().saturating_sub(start));
+        diag(|| {
+            format!(
+                "rowset: GetNextRows chapter={chapter} offset={offset} count={count} start={start} -> {take} of {}",
+                self.items.len()
+            )
+        });
         if take == 0 {
             return information(DB_S_ENDOFROWSET);
         }
@@ -578,6 +727,7 @@ impl IRowset_Impl for MemoryRowset_Impl {
     }
 
     fn GetData(&self, row: usize, accessor: HACCESSOR, data: *mut c_void) -> Result<()> {
+        diag(|| format!("rowset: GetData row={row} accessor={}", accessor.0));
         if data.is_null() {
             return Err(E_POINTER.into());
         }
@@ -748,6 +898,7 @@ impl IRowset_Impl for MemoryRowset_Impl {
     }
 
     fn RestartPosition(&self, _chapter: usize) -> Result<()> {
+        diag(|| "rowset: RestartPosition".to_owned());
         self.state
             .lock()
             .map_err(|_| Error::from_hresult(E_FAIL))?
@@ -884,6 +1035,16 @@ impl IAccessor_Impl for MemoryRowset_Impl {
                 }
             }
         }
+        diag(|| {
+            let parts: Vec<String> = cols
+                .iter()
+                .map(|b| format!("{}:{}:{:#x}", b.ordinal, b.w_type, b.dw_part))
+                .collect();
+            format!(
+                "rowset: CreateAccessor flags={flags:#x} row_size={row_size} invalid={any_invalid} bindings=[{}]",
+                parts.join(" ")
+            )
+        });
         if any_invalid {
             return Err(E_INVALIDARG.into());
         }
@@ -971,6 +1132,7 @@ impl IColumnsInfo_Impl for MemoryRowset_Impl {
         info: *mut *mut DBCOLUMNINFO,
         strings: *mut *mut u16,
     ) -> Result<()> {
+        diag(|| "rowset: GetColumnInfo".to_owned());
         if count.is_null() || info.is_null() || strings.is_null() {
             return Err(E_INVALIDARG.into());
         }
@@ -1051,6 +1213,7 @@ impl IColumnsInfo_Impl for MemoryRowset_Impl {
                 columns.add(n).write(found);
             }
         }
+        diag(|| format!("rowset: MapColumnIDs count={count} invalid={any_invalid}"));
         if any_invalid {
             if any_valid {
                 information(DB_S_ERRORSOCCURRED)

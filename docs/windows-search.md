@@ -30,8 +30,15 @@ is needed in either direction.
 - If Ferrow finds nothing for a query, or cannot answer in time,
   Windows answers exactly as before. A slow, missing or stopped Ferrow
   never blocks or empties the Start menu.
-- Results are the first matches in name order (the app's richer sorting
-  and ranking stay in the app for now).
+- Results are ranked like Windows ranks them: the whole name first, then
+  names starting with what you typed, then a word in the name starting
+  with it, then the rest; files outside cache, AppData and temp folders
+  before files in them; newest first. Files in other accounts' profile
+  folders and in folders whose name starts with a dot (`.git`, `.cache`)
+  are left out (Start does not show the latter anyway).
+- The Documents, Photos, Music and Videos groups and tabs are answered by
+  Ferrow too, using the same file kinds Windows uses (Explorer's
+  `KindMap`), so a file shows in the group Windows would put it in.
 - All queries stay on this PC. Nothing is uploaded, and no search text
   is logged.
 - No administrator rights are used. The integration runs as your user,
@@ -86,3 +93,14 @@ is needed in either direction.
   `FERROW_WINSEARCH_DIAG` set to a file path. The responder then logs
   one line per Start request (request id, hit count, answering source;
   never your search text). Attach that file to the report.
+- **To see what happens inside the Start search process:** create an
+  empty file named `diag` in `%LOCALAPPDATA%\ferrow\winsearch`. While it
+  exists, the DLL appends to `diag.log` in the same folder (up to 1 MiB):
+  attach and detach results, why each Start query fell back to Windows
+  (with the query's shape, every letter and digit of the search text
+  replaced by `x`), and how Start read the rows Ferrow answered. Delete
+  `diag` to stop.
+- To compare with Windows' own answers, run
+  `cargo run -p ferrow-winsearch --example native_props -- <term>`: it
+  prints the properties native Windows Search returns for a Start-shaped
+  query.

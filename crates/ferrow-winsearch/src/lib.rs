@@ -14,6 +14,7 @@
 //!   `SearchHost.exe` remote attachment.
 
 pub mod ipc;
+pub mod kinds;
 pub mod sql;
 
 #[cfg(windows)]

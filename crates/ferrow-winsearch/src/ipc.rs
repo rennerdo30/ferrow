@@ -33,7 +33,7 @@ use ferrow_query::{CancelToken, Query, SearchOptions, search};
 const MAX_INPROC_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum time `SearchHost.exe` waits for an IPC reply from `ferrow-gui`.
-const IPC_TIMEOUT: Duration = Duration::from_millis(250);
+const IPC_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Budget for (re)connecting the responder to the `ferrowd` service. Runs
 /// on the responder thread only; `SearchHost.exe` has already fallen back
@@ -41,7 +41,9 @@ const IPC_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_CONNECT_BUDGET: Duration = Duration::from_millis(800);
 /// Budget for one service page query on an established connection, kept
 /// inside [`IPC_TIMEOUT`] so the reply can still reach `SearchHost.exe`.
-const SERVICE_QUERY_BUDGET: Duration = Duration::from_millis(200);
+/// A rare term scans the whole service index (about 150 ms for 35 million
+/// names), so this must stay well above that.
+const SERVICE_QUERY_BUDGET: Duration = Duration::from_millis(450);
 /// Budget for one search over the preloaded on-disk index inside
 /// `SearchHost.exe`. Loading never happens on the query path (see
 /// [`preload_disk_index`]); this caps the search itself.
@@ -49,10 +51,12 @@ const DISK_SEARCH_BUDGET: Duration = Duration::from_millis(200);
 /// After a bridge timeout the DLL skips IPC for this long instead of
 /// deleting the responder marker: a slow first service connect must
 /// not disable the bridge until the next app sync.
-const IPC_COOLDOWN: Duration = Duration::from_secs(5);
+/// Kept short: Start sends one query per keystroke, and the query for the
+/// finished word must not land inside the cooldown of an earlier one.
+const IPC_COOLDOWN: Duration = Duration::from_secs(1);
 /// After a failed service connect or query, wait this long before the
 /// responder tries the service again (native fallback meanwhile).
-const SERVICE_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const SERVICE_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 type CachedIndex = (PathBuf, SystemTime, Arc<Index>);
 
@@ -302,7 +306,15 @@ impl ServiceLink {
         }
         let client = self.client.as_mut()?;
         let _ = client.set_deadline(Instant::now() + SERVICE_QUERY_BUDGET);
-        let page = client.page(query_str, 0, limit as u32, Sort::Name, false);
+        // Newest first: when there are more matches than fit, Start gets
+        // the files the user most likely means. An index without dates
+        // (for example during its first scan) answers in name order.
+        let page = match client.page(query_str, 0, limit as u32, Sort::Modified, true) {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                client.page(query_str, 0, limit as u32, Sort::Name, false)
+            }
+            other => other,
+        };
         match page {
             Ok((rows, _, _)) => {
                 client.clear_deadline();
@@ -317,13 +329,156 @@ impl ServiceLink {
     }
 }
 
-/// Query Ferrow for `query_str` using:
+/// One Start search, as the shell asked for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartQuery {
+    /// Every match: the Ferrow query for the shell's predicate.
+    pub query: String,
+    /// The best matches first: names starting with the first term.
+    pub prefix_query: Option<String>,
+    /// The first term, for ranking.
+    pub rank_term: Option<String>,
+    pub limit: usize,
+}
+
+impl StartQuery {
+    pub fn from_sql(parsed: &crate::sql::ParsedSql) -> Self {
+        StartQuery {
+            query: parsed.query.clone(),
+            prefix_query: parsed.prefix_query.clone(),
+            rank_term: parsed.rank_term.clone(),
+            limit: parsed.limit,
+        }
+    }
+}
+
+/// Matches gathered per Start query before ranking keeps the best `limit`.
+const START_POOL: usize = 100;
+/// Skip the second (all-matches) search when the prefix search already
+/// took this long, so the reply still beats [`IPC_TIMEOUT`].
+const SECOND_SEARCH_CUTOFF: Duration = Duration::from_millis(150);
+
+/// Answer `start` with up to `limit` rows ranked like Windows Search:
+/// names that start with the first term are asked for first, the rest of
+/// the matches fill up, and [`rank_rows`] orders the pool. `fetch(query,
+/// n)` runs one Ferrow search; `None` from the all-matches search is a
+/// failure (native fallback).
+fn ranked_hits(
+    start: &StartQuery,
+    mut fetch: impl FnMut(&str, usize) -> Option<Vec<SearchHitRow>>,
+) -> Option<Vec<SearchHitRow>> {
+    let started = Instant::now();
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let mut pool: Vec<SearchHitRow> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |rows: Vec<SearchHitRow>, pool: &mut Vec<SearchHitRow>| {
+        for row in rows {
+            if !is_other_users_profile(&row.full_path, home.as_deref())
+                && seen.insert(row.full_path.to_lowercase())
+            {
+                pool.push(row);
+            }
+        }
+    };
+    let mut prefix_ok = false;
+    if let Some(prefix) = &start.prefix_query
+        && let Some(rows) = fetch(prefix, START_POOL)
+    {
+        prefix_ok = true;
+        add(rows, &mut pool);
+    }
+    if pool.len() < start.limit && !(prefix_ok && started.elapsed() > SECOND_SEARCH_CUTOFF) {
+        match fetch(&start.query, START_POOL) {
+            Some(rows) => add(rows, &mut pool),
+            None if !prefix_ok => return None,
+            None => {}
+        }
+    }
+    rank_rows(&mut pool, start.rank_term.as_deref());
+    pool.truncate(start.limit);
+    Some(pool)
+}
+
+/// True for a path inside another account's profile folder (for example
+/// `C:\Users\other\...` when this user's profile is `C:\Users\me`).
+fn is_other_users_profile(path: &str, home: Option<&Path>) -> bool {
+    let Some(home) = home else { return false };
+    let home = home.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    let Some((profiles, _)) = home.rsplit_once('\\') else {
+        return false;
+    };
+    let lower = path.to_lowercase();
+    let profiles = format!("{profiles}\\");
+    let home = format!("{home}\\");
+    let Some(rest) = lower.strip_prefix(&profiles) else {
+        return false;
+    };
+    !(lower.starts_with(&home) || rest.starts_with("public\\") || !rest.contains('\\'))
+}
+
+/// How well a file name matches like Windows ranks it: 3 whole name (with
+/// or without extension), 2 name starts with the term, 1 a word in the
+/// name starts with it, 0 elsewhere in the name.
+fn name_tier(file_name: &str, term: &str) -> u8 {
+    let name = file_name.to_lowercase();
+    let term = term.to_lowercase();
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name.as_str(), |(stem, _)| stem);
+    if name == term || stem == term {
+        3
+    } else if name.starts_with(&term) {
+        2
+    } else if name.match_indices(&term).any(|(at, _)| {
+        name[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_alphanumeric())
+    }) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Folders whose files are rarely what a Start search is for.
+fn is_noise_path(path: &str) -> bool {
+    const NOISE: [&str; 11] = [
+        "\\appdata\\",
+        "\\node_modules\\",
+        "\\.git\\",
+        "\\.cache\\",
+        "\\_cache\\",
+        "\\cache\\",
+        "\\temp\\",
+        "\\tmp\\",
+        "\\_trash\\",
+        "\\$recycle.bin\\",
+        "\\windows\\winsxs\\",
+    ];
+    let lower = path.to_lowercase();
+    NOISE.iter().any(|n| lower.contains(n))
+}
+
+/// Order like Windows Search ranks Start results: better name match first,
+/// then outside noise folders, then most recently modified.
+fn rank_rows(rows: &mut [SearchHitRow], term: Option<&str>) {
+    rows.sort_by_key(|row| {
+        (
+            std::cmp::Reverse(term.map_or(0, |t| name_tier(&row.file_name, t))),
+            is_noise_path(&row.full_path),
+            std::cmp::Reverse(row.modified_ticks.unwrap_or(i64::MIN)),
+        )
+    });
+}
+
+/// Query Ferrow for `start` using:
 /// 1. In-process `ACTIVE_INDEX` if present in this process,
 /// 2. The `ferrow-gui` responder over `<data_dir>/winsearch` if active
 ///    (which itself answers from the local index or the `ferrowd` service),
 /// 3. The preloaded `<data_dir>/index.bin` cache if ready (loading
 ///    happens off the query path in [`preload_disk_index`]).
-pub fn query_hits(data_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
+pub fn query_hits(data_dir: &Path, start: &StartQuery) -> Option<Vec<SearchHitRow>> {
     if !is_enabled(data_dir) {
         return None;
     }
@@ -331,20 +486,20 @@ pub fn query_hits(data_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<
     if let Ok(guard) = active_index_slot().lock()
         && let Some(index) = guard.clone()
     {
-        return hits_from_index(&index, query_str, limit);
+        return ranked_hits(start, |q, n| hits_from_index(&index, q, n));
     }
 
     let ws_dir = winsearch_dir(data_dir);
     if ws_dir.join("server.pid").is_file()
-        && let Some(rows) = query_via_ipc(&ws_dir, query_str, limit)
+        && let Some(rows) = query_via_ipc(&ws_dir, start)
     {
         return Some(rows);
     }
 
-    query_via_disk_index(data_dir, query_str, limit)
+    query_via_disk_index(data_dir, start)
 }
 
-fn query_via_ipc(ws_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<SearchHitRow>> {
+fn query_via_ipc(ws_dir: &Path, start: &StartQuery) -> Option<Vec<SearchHitRow>> {
     if millis_now() < IPC_COOLDOWN_UNTIL_MS.load(Ordering::Acquire) {
         return None;
     }
@@ -355,7 +510,13 @@ fn query_via_ipc(ws_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<Sea
     let req_path = ws_dir.join(format!("req-{req_id}.q"));
     let resp_path = ws_dir.join(format!("resp-{req_id}.r"));
 
-    let payload = format!("{limit}\n{query_str}\n");
+    let payload = format!(
+        "{}\n{}\n{}\n{}\n",
+        start.limit,
+        start.query,
+        start.prefix_query.as_deref().unwrap_or(""),
+        start.rank_term.as_deref().unwrap_or("")
+    );
     {
         let mut f = std::fs::File::create(&tmp_path).ok()?;
         f.write_all(payload.as_bytes()).ok()?;
@@ -394,11 +555,7 @@ fn query_via_ipc(ws_dir: &Path, query_str: &str, limit: usize) -> Option<Vec<Sea
 /// it only ever searches an already-loaded cache (with a deadline) and
 /// kicks off background loading otherwise, returning `None` so this
 /// query falls back to native results instead of blocking on disk I/O.
-fn query_via_disk_index(
-    data_dir: &Path,
-    query_str: &str,
-    limit: usize,
-) -> Option<Vec<SearchHitRow>> {
+fn query_via_disk_index(data_dir: &Path, start: &StartQuery) -> Option<Vec<SearchHitRow>> {
     // In service mode the local index.bin is stale by definition (the
     // service owns the live index): prefer native Windows Search.
     if source_from_marker(data_dir) == Some(IndexSource::Service) {
@@ -433,7 +590,12 @@ fn query_via_disk_index(
     if !fresh {
         ensure_disk_index_loading(data_dir);
     }
-    hits_from_index_deadline(&index, query_str, limit, DISK_SEARCH_BUDGET)
+    // One budget for the whole ranked answer, split over its searches.
+    let deadline = Instant::now() + DISK_SEARCH_BUDGET;
+    ranked_hits(start, |q, n| {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        hits_from_index_deadline(&index, q, n, left)
+    })
 }
 
 /// Load `<data_dir>/index.bin` into the process cache. Blocking; run
@@ -605,13 +767,19 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
         return;
     };
     let now = SystemTime::now();
+    let mut requests: Vec<(String, PathBuf)> = Vec::new();
+    let mut groups: Vec<(String, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if let Some(req_id) = name.strip_prefix("req-").and_then(|s| s.strip_suffix(".q")) {
-            handle_one_request(ws_dir, &path, req_id, link);
+            let group = std::fs::read_to_string(&path)
+                .map(|text| query_group(&text))
+                .unwrap_or_default();
+            requests.push((req_id.to_owned(), path.clone()));
+            groups.push((req_id.to_owned(), group));
         } else if (name.ends_with(".tmp") || name.ends_with(".r"))
             && let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
@@ -620,6 +788,63 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    // Start sends one query per keystroke for each result group (all
+    // files, documents, pictures, ...). Only the newest query of each
+    // group and shell process is worth a search; older ones get an empty
+    // reply at once (native results for that keystroke), so a slow search
+    // never queues the finished word behind queries nobody looks at.
+    let newest = newest_request_per_group(&groups);
+    for (req_id, path) in &requests {
+        if newest.contains(req_id) {
+            handle_one_request(ws_dir, path, req_id, link);
+        } else {
+            reply_superseded(ws_dir, path, req_id);
+        }
+    }
+}
+
+/// The result group of a request: its query's leading kind filter
+/// (`folder:`, `ext:...`), or empty for the all-files query.
+fn query_group(request: &str) -> String {
+    let query = request.lines().nth(1).unwrap_or("");
+    query
+        .split_whitespace()
+        .next()
+        .filter(|first| first.starts_with("ext:") || first.ends_with(':'))
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// `(id, group)` pairs with ids `<pid>-<seq>`: the highest `seq` per `pid`
+/// and group. Ids that do not parse are always answered.
+fn newest_request_per_group(requests: &[(String, String)]) -> Vec<String> {
+    let mut newest: std::collections::HashMap<(&str, &str), (u64, &str)> = Default::default();
+    let mut unparsed = Vec::new();
+    for (req_id, group) in requests {
+        match req_id
+            .rsplit_once('-')
+            .and_then(|(pid, seq)| Some((pid, seq.parse::<u64>().ok()?)))
+        {
+            Some((pid, seq)) => {
+                let slot = newest.entry((pid, group.as_str())).or_insert((seq, req_id));
+                if seq > slot.0 {
+                    *slot = (seq, req_id);
+                }
+            }
+            None => unparsed.push(req_id.clone()),
+        }
+    }
+    unparsed.extend(newest.into_values().map(|(_, id)| id.to_owned()));
+    unparsed
+}
+
+fn reply_superseded(ws_dir: &Path, req_path: &Path, req_id: &str) {
+    if std::fs::remove_file(req_path).is_err() {
+        return; // the shell already gave up on it
+    }
+    diag_line(format!("resp id={req_id} superseded"));
+    write_reply(ws_dir, req_id, &serialize_rows(&[]));
 }
 
 fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut ServiceLink) {
@@ -636,6 +861,19 @@ fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut S
     let Some(query_str) = lines.next() else {
         return;
     };
+    let mut optional = || {
+        lines
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let start = StartQuery {
+        query: query_str.to_owned(),
+        prefix_query: optional(),
+        rank_term: optional(),
+        limit,
+    };
 
     // Answer from the app's own source: its in-memory index when one is
     // loaded, otherwise the ferrowd service. An empty reply makes the DLL
@@ -643,10 +881,10 @@ fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut S
     let index_opt = active_index_slot().lock().ok().and_then(|g| g.clone());
     let (rows, answered_by) = match index_opt {
         Some(index) => (
-            hits_from_index(&index, query_str, limit).unwrap_or_default(),
+            ranked_hits(&start, |q, n| hits_from_index(&index, q, n)).unwrap_or_default(),
             "local",
         ),
-        None => match link.query(query_str, limit) {
+        None => match ranked_hits(&start, |q, n| link.query(q, n)) {
             Some(rows) => (rows, "service"),
             None => (Vec::new(), "service-error"),
         },
@@ -656,7 +894,10 @@ fn handle_one_request(ws_dir: &Path, req_path: &Path, req_id: &str, link: &mut S
         rows.len()
     ));
 
-    let serialized = serialize_rows(&rows);
+    write_reply(ws_dir, req_id, &serialize_rows(&rows));
+}
+
+fn write_reply(ws_dir: &Path, req_id: &str, serialized: &str) {
     let tmp_resp = ws_dir.join(format!("resp-{req_id}.tmp"));
     let final_resp = ws_dir.join(format!("resp-{req_id}.r"));
     if let Ok(mut f) = std::fs::File::create(&tmp_resp) {
@@ -735,6 +976,108 @@ pub fn deserialize_rows(text: &str) -> Vec<SearchHitRow> {
 mod tests {
     use super::*;
     use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder};
+
+    fn plain(query: &str, limit: usize) -> StartQuery {
+        StartQuery {
+            query: query.to_owned(),
+            limit,
+            ..Default::default()
+        }
+    }
+
+    fn row(path: &str, modified: i64) -> SearchHitRow {
+        SearchHitRow {
+            file_name: path.rsplit('\\').next().unwrap().to_owned(),
+            full_path: path.to_owned(),
+            is_dir: false,
+            modified_ticks: Some(modified),
+            created_ticks: None,
+            accessed_ticks: None,
+        }
+    }
+
+    #[test]
+    fn start_hits_rank_like_windows_search() {
+        assert_eq!(name_tier("README.md", "readme"), 3);
+        assert_eq!(name_tier("readme-old.md", "readme"), 2);
+        assert_eq!(name_tier("00-README.md", "readme"), 1);
+        assert_eq!(name_tier("ThreadMessage.ts", "readme"), 0);
+
+        let mut rows = vec![
+            row(r"E:\src\069_ThreadMessageSearch.ts", 9),
+            row(r"E:\docs\00-README.md", 1),
+            row(r"C:\Users\me\AppData\Local\x\README.md", 8),
+            row(r"E:\docs\README.md", 2),
+            row(r"E:\docs\readme-old.md", 7),
+        ];
+        rank_rows(&mut rows, Some("readme"));
+        let order: Vec<&str> = rows.iter().map(|r| r.full_path.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                r"E:\docs\README.md",
+                r"C:\Users\me\AppData\Local\x\README.md",
+                r"E:\docs\readme-old.md",
+                r"E:\docs\00-README.md",
+                r"E:\src\069_ThreadMessageSearch.ts",
+            ]
+        );
+    }
+
+    #[test]
+    fn start_hits_skip_other_profiles_and_fill_up_from_all_matches() {
+        let home = Path::new(r"C:\Users\me");
+        assert!(is_other_users_profile(r"C:\Users\other\a.txt", Some(home)));
+        assert!(!is_other_users_profile(r"C:\Users\me\a.txt", Some(home)));
+        assert!(!is_other_users_profile(
+            r"C:\Users\Public\a.txt",
+            Some(home)
+        ));
+        assert!(!is_other_users_profile(r"E:\a.txt", Some(home)));
+
+        let start = StartQuery {
+            query: "readme".into(),
+            prefix_query: Some("readme*".into()),
+            rank_term: Some("readme".into()),
+            limit: 3,
+        };
+        let mut asked = Vec::new();
+        let rows = ranked_hits(&start, |q, _| {
+            asked.push(q.to_owned());
+            Some(match q {
+                "readme*" => vec![row(r"E:\a\README.md", 1)],
+                _ => vec![row(r"E:\a\README.md", 1), row(r"E:\b\00-readme.txt", 5)],
+            })
+        })
+        .unwrap();
+        assert_eq!(asked, ["readme*", "readme"]);
+        assert_eq!(rows.len(), 2, "duplicates merged");
+        assert_eq!(rows[0].full_path, r"E:\a\README.md");
+    }
+
+    #[test]
+    fn only_the_newest_request_per_process_and_group_is_searched() {
+        let requests: Vec<(String, String)> = [
+            ("10-2", ""),
+            ("10-10", ""),
+            ("10-9", ""),
+            ("10-3", "ext:txt"),
+            ("10-4", "ext:txt"),
+            ("10-5", "ext:png"),
+            ("7-1", ""),
+            ("odd", ""),
+        ]
+        .iter()
+        .map(|(id, group)| (id.to_string(), group.to_string()))
+        .collect();
+        let mut newest = newest_request_per_group(&requests);
+        newest.sort();
+        assert_eq!(newest, ["10-10", "10-4", "10-5", "7-1", "odd"]);
+
+        assert_eq!(query_group("30\next:txt;md readme\n"), "ext:txt;md");
+        assert_eq!(query_group("30\nfolder: alpha\n"), "folder:");
+        assert_eq!(query_group("30\nreadme\nreadme*\n"), "");
+    }
 
     #[test]
     fn round_trips_serialized_rows() {
@@ -832,14 +1175,15 @@ mod tests {
 
         // Service mode: the stale local file must not be served.
         set_source(&temp_dir, IndexSource::Service);
-        assert!(query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).is_none());
+        assert!(query_via_disk_index(&temp_dir, &plain("ferrow-service-mode-guard", 30)).is_none());
 
         // Local mode: a cold cache never loads synchronously on the
         // query path; after the off-path preload, the file answers.
         set_source(&temp_dir, IndexSource::Local);
-        assert!(query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).is_none());
+        assert!(query_via_disk_index(&temp_dir, &plain("ferrow-service-mode-guard", 30)).is_none());
         assert!(load_disk_index_blocking(&temp_dir));
-        let hits = query_via_disk_index(&temp_dir, "ferrow-service-mode-guard", 30).unwrap();
+        let hits =
+            query_via_disk_index(&temp_dir, &plain("ferrow-service-mode-guard", 30)).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].file_name, "ferrow-service-mode-guard.txt");
 
@@ -860,7 +1204,7 @@ mod tests {
         // responder owns survives, and a retry after the cooldown
         // works once a responder reply path exists again (here: the
         // cooldown is the only state that changed).
-        assert!(query_via_ipc(&ws_dir, "anything", 5).is_none());
+        assert!(query_via_ipc(&ws_dir, &plain("anything", 5)).is_none());
         assert!(
             ws_dir.join("server.pid").is_file(),
             "shell side must never delete the responder marker"
