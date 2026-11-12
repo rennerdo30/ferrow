@@ -20,6 +20,8 @@ const FIRST_PAGE: usize = 200;
 const REMOTE_PAGE: usize = 500;
 /// Loaded service rows kept per query; scrolling far away drops the rest.
 const REMOTE_KEEP: usize = 20_000;
+/// How often the app checks for a Ferrow service it is not connected to.
+const SERVICE_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// The current result set.
 #[derive(Clone)]
@@ -144,6 +146,9 @@ enum Command {
         elapsed: Duration,
         source: String,
     },
+    /// The Ferrow service answers now (it started after the app or came
+    /// back after a restart): switch to it.
+    ServiceUp,
 }
 
 /// Handle owned by the UI.
@@ -256,6 +261,7 @@ impl<W: Fn()> Worker<W> {
     fn run(mut self, commands: Receiver<Command>) {
         if !self.connect_service() {
             self.load_default();
+            self.probe_service();
         }
         while let Ok(mut command) = commands.recv() {
             // Only the newest search matters; skip superseded ones.
@@ -295,9 +301,45 @@ impl<W: Fn()> Worker<W> {
                 index,
                 elapsed,
                 source,
-            } => self.set_index(*index, elapsed, source),
+            } => {
+                // A local rebuild that finishes after the switch to the
+                // service is stale.
+                if self.remote.is_none() {
+                    self.set_index(*index, elapsed, source);
+                }
+            }
             Command::Forward(event) => self.send(event),
+            Command::ServiceUp => {
+                if self.remote.is_none() && !self.connect_service() {
+                    self.probe_service();
+                }
+            }
         }
+    }
+
+    /// Watch in the background for the Ferrow service to answer, for
+    /// example while it still loads its index after boot or an update,
+    /// and then switch to it (`Command::ServiceUp`).
+    fn probe_service(&self) {
+        let Some(commands) = self.commands.clone() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("ferrow-service-probe".into())
+            .spawn(move || {
+                let endpoint = ferrow_ipc::Endpoint::default_service();
+                loop {
+                    std::thread::sleep(SERVICE_PROBE_INTERVAL);
+                    let deadline = Instant::now() + Duration::from_millis(800);
+                    let answers = ferrow_ipc::Client::connect_deadline(&endpoint, deadline)
+                        .and_then(|mut client| client.status())
+                        .is_ok();
+                    if answers {
+                        let _ = commands.send(Command::ServiceUp);
+                        return;
+                    }
+                }
+            });
     }
 
     fn load_default(&mut self) {
@@ -428,6 +470,7 @@ impl<W: Fn()> Worker<W> {
             "The Ferrow service stopped answering ({error}); using this app's own index."
         )));
         self.load_default();
+        self.probe_service();
     }
 
     fn remote_search(&mut self, generation: u64, text: &str, sort: SortKey, descending: bool) {
