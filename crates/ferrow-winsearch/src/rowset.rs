@@ -45,6 +45,7 @@ use windows::core::{
 
 use crate::hook::diag_attached as diag;
 use crate::ipc::SearchHitRow;
+use crate::kinds;
 
 /// Difference between Windows `FILETIME` epoch (`1601-01-01`) and Unix epoch
 /// (`1970-01-01`) in 100ns ticks.
@@ -213,13 +214,18 @@ fn unix_ticks_to_ole_date(ticks: Option<i64>) -> f64 {
         .unwrap_or(46000.0)
 }
 
+/// `System.SFGAOFlags` native Windows Search reports for a plain file and a
+/// folder (file system, can copy/move/rename/delete, property sheet, ...).
+const SFGAO_NATIVE_FILE: u32 = 0x4040_0177;
+const SFGAO_NATIVE_FOLDER: u32 = 0x7080_017F;
+
 fn classify_file_kind(file_name: &str, is_dir: bool) -> (String, String, Vec<&'static str>, u32) {
     if is_dir {
         return (
             String::new(),
             "Folder".to_owned(),
             vec!["folder"],
-            0x6000_0000,
+            SFGAO_NATIVE_FOLDER,
         );
     }
     let ext = match file_name.rfind('.') {
@@ -227,27 +233,24 @@ fn classify_file_kind(file_name: &str, is_dir: bool) -> (String, String, Vec<&'s
         _ => String::new(),
     };
     let ext_lower = ext.trim_start_matches('.').to_ascii_lowercase();
-    let (kinds, type_text): (Vec<&'static str>, String) = match ext_lower.as_str() {
-        "exe" | "msi" | "bat" | "cmd" | "com" => (vec!["program"], "Application".to_owned()),
-        "lnk" => (vec!["link"], "Shortcut".to_owned()),
-        "txt" | "md" | "log" | "rst" | "ini" | "cfg" | "conf" | "toml" | "yaml" | "yml"
-        | "json" | "xml" | "csv" | "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "cs" | "go"
-        | "java" | "html" | "css" | "ps1" | "sh" => {
-            (vec!["document", "text"], "Text Document".to_owned())
-        }
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
-        | "rtf" => (vec!["document"], "Document".to_owned()),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff" => {
-            (vec!["picture"], "Image".to_owned())
-        }
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "wma" => {
-            (vec!["music"], "Audio".to_owned())
-        }
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" => (vec!["video"], "Video".to_owned()),
-        "" => (vec!["item"], "File".to_owned()),
-        other => (vec!["item"], format!("{} File", other.to_ascii_uppercase())),
+    // Windows' own kinds (Explorer's KindMap), the same ones Ferrow answers
+    // Start's group queries with: every row lands in the group (Documents,
+    // Photos, ...) Windows would put it in, and a file Windows gives no
+    // kind (for example `.md`) gets none either.
+    let kinds: Vec<&'static str> = if ext_lower.is_empty() {
+        Vec::new()
+    } else {
+        kinds::kinds_of_extension(&ext_lower)
+            .iter()
+            .map(String::as_str)
+            .collect()
     };
-    (ext, type_text, kinds, 0x4000_0000)
+    let type_text = if ext_lower.is_empty() {
+        "File".to_owned()
+    } else {
+        format!("{} File", ext_lower.to_ascii_uppercase())
+    };
+    (ext, type_text, kinds, SFGAO_NATIVE_FILE)
 }
 
 unsafe fn alloc_pwstr(s: &str) -> PWSTR {
@@ -363,7 +366,14 @@ unsafe fn build_row_property_store(
         let store = IPropertyStore::from_raw(raw_store);
 
         let mut props: Vec<(&str, PROPVARIANT)> = vec![
-            ("System.Kind", propvar_lpwstr_vec(&row.kinds)),
+            (
+                "System.Kind",
+                if row.kinds.is_empty() {
+                    propvar_null()
+                } else {
+                    propvar_lpwstr_vec(&row.kinds)
+                },
+            ),
             ("System.Search.Rank", propvar_i4(row.rank)),
             ("System.ParsingPath", propvar_lpwstr(&row.file_url)),
             ("System.ItemUrl", propvar_lpwstr(&row.file_url)),
@@ -595,7 +605,9 @@ fn value_for_column(
     let cre_date = unix_ticks_to_ole_date(hit.created_ticks.or(hit.modified_ticks));
     let acc_date = unix_ticks_to_ole_date(hit.accessed_ticks.or(hit.modified_ticks));
     match col_name.to_ascii_lowercase().as_str() {
-        "system.kind" => ColVal::Str((*kinds.first().unwrap_or(&"item")).to_owned()),
+        "system.kind" => kinds
+            .first()
+            .map_or(ColVal::Empty, |kind| ColVal::Str((*kind).to_owned())),
         "system.search.rank" => ColVal::I4(rank),
         "path" | "system.itemurl" | "system.itempathdisplay" => ColVal::Str(hit.full_path.clone()),
         "system.datecreated" => ColVal::Date(cre_date),

@@ -768,13 +768,18 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
     };
     let now = SystemTime::now();
     let mut requests: Vec<(String, PathBuf)> = Vec::new();
+    let mut groups: Vec<(String, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if let Some(req_id) = name.strip_prefix("req-").and_then(|s| s.strip_suffix(".q")) {
+            let group = std::fs::read_to_string(&path)
+                .map(|text| query_group(&text))
+                .unwrap_or_default();
             requests.push((req_id.to_owned(), path.clone()));
+            groups.push((req_id.to_owned(), group));
         } else if (name.ends_with(".tmp") || name.ends_with(".r"))
             && let Ok(meta) = entry.metadata()
             && let Ok(modified) = meta.modified()
@@ -784,11 +789,12 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
         }
     }
 
-    // Start sends one query per keystroke. Only the newest query of each
-    // shell process is worth a search; older ones get an empty reply at
-    // once (native results for that keystroke), so a slow search never
-    // queues the finished word behind queries nobody looks at anymore.
-    let newest = newest_request_per_process(&requests);
+    // Start sends one query per keystroke for each result group (all
+    // files, documents, pictures, ...). Only the newest query of each
+    // group and shell process is worth a search; older ones get an empty
+    // reply at once (native results for that keystroke), so a slow search
+    // never queues the finished word behind queries nobody looks at.
+    let newest = newest_request_per_group(&groups);
     for (req_id, path) in &requests {
         if newest.contains(req_id) {
             handle_one_request(ws_dir, path, req_id, link);
@@ -798,18 +804,30 @@ pub fn process_pending_requests(ws_dir: &Path, link: &mut ServiceLink) {
     }
 }
 
-/// Request ids `<pid>-<seq>`: the highest `seq` per `pid`. Ids that do not
-/// parse are always answered.
-fn newest_request_per_process(requests: &[(String, PathBuf)]) -> Vec<String> {
-    let mut newest: std::collections::HashMap<&str, (u64, &str)> = Default::default();
+/// The result group of a request: its query's leading kind filter
+/// (`folder:`, `ext:...`), or empty for the all-files query.
+fn query_group(request: &str) -> String {
+    let query = request.lines().nth(1).unwrap_or("");
+    query
+        .split_whitespace()
+        .next()
+        .filter(|first| first.starts_with("ext:") || first.ends_with(':'))
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// `(id, group)` pairs with ids `<pid>-<seq>`: the highest `seq` per `pid`
+/// and group. Ids that do not parse are always answered.
+fn newest_request_per_group(requests: &[(String, String)]) -> Vec<String> {
+    let mut newest: std::collections::HashMap<(&str, &str), (u64, &str)> = Default::default();
     let mut unparsed = Vec::new();
-    for (req_id, _) in requests {
+    for (req_id, group) in requests {
         match req_id
             .rsplit_once('-')
             .and_then(|(pid, seq)| Some((pid, seq.parse::<u64>().ok()?)))
         {
             Some((pid, seq)) => {
-                let slot = newest.entry(pid).or_insert((seq, req_id));
+                let slot = newest.entry((pid, group.as_str())).or_insert((seq, req_id));
                 if seq > slot.0 {
                     *slot = (seq, req_id);
                 }
@@ -1038,14 +1056,27 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_request_per_process_is_searched() {
-        let requests: Vec<(String, PathBuf)> = ["10-2", "10-10", "10-9", "7-1", "odd"]
-            .iter()
-            .map(|id| (id.to_string(), PathBuf::new()))
-            .collect();
-        let mut newest = newest_request_per_process(&requests);
+    fn only_the_newest_request_per_process_and_group_is_searched() {
+        let requests: Vec<(String, String)> = [
+            ("10-2", ""),
+            ("10-10", ""),
+            ("10-9", ""),
+            ("10-3", "ext:txt"),
+            ("10-4", "ext:txt"),
+            ("10-5", "ext:png"),
+            ("7-1", ""),
+            ("odd", ""),
+        ]
+        .iter()
+        .map(|(id, group)| (id.to_string(), group.to_string()))
+        .collect();
+        let mut newest = newest_request_per_group(&requests);
         newest.sort();
-        assert_eq!(newest, ["10-10", "7-1", "odd"]);
+        assert_eq!(newest, ["10-10", "10-4", "10-5", "7-1", "odd"]);
+
+        assert_eq!(query_group("30\next:txt;md readme\n"), "ext:txt;md");
+        assert_eq!(query_group("30\nfolder: alpha\n"), "folder:");
+        assert_eq!(query_group("30\nreadme\nreadme*\n"), "");
     }
 
     #[test]

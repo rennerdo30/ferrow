@@ -37,6 +37,11 @@ pub struct ParsedSql {
     pub prefix_query: Option<String>,
 }
 
+/// Leaves out everything inside a folder whose name starts with a dot
+/// (`.git`, `.cache`, `.claude`, ...): Start silently drops those rows, so
+/// they would only take places from files it shows.
+const SKIP_DOT_FOLDERS: &str = "!path:\\.";
+
 /// A term that can stand in a bare `term*` wildcard.
 fn is_wildcard_safe(term: &str) -> bool {
     !term.is_empty()
@@ -96,24 +101,25 @@ pub fn parse_windows_search_sql(sql: &str) -> Option<ParsedSql> {
     // parsed as a boolean expression and accepted only when it reduces
     // to a conjunction of filename term sets (plus an optional folder
     // restriction). Every other leaf or operator falls back to native.
-    let (terms, only_folders) = parse_predicate_expression(predicate, aliases)?;
+    let (terms, kind) = parse_predicate_expression(predicate, aliases)?;
     if terms.is_empty() {
         return None;
     }
 
-    let query = format_ferrow_query(&terms, only_folders)?;
+    let query = format!("{} {SKIP_DOT_FOLDERS}", format_ferrow_query(&terms, kind)?);
     Query::parse(&query).ok()?;
 
     let rank_term = terms.first().filter(|t| is_wildcard_safe(t)).cloned();
     let prefix_query = rank_term.as_ref().and_then(|first| {
         let mut parts = Vec::new();
-        if only_folders {
-            parts.push("folder:".to_owned());
+        if let Some(kind) = kind {
+            parts.push(kind.filter()?);
         }
         parts.push(format!("{first}*"));
         if terms.len() > 1 {
-            parts.push(format_ferrow_query(&terms[1..], false)?);
+            parts.push(format_ferrow_query(&terms[1..], None)?);
         }
+        parts.push(SKIP_DOT_FOLDERS.to_owned());
         let prefix = parts.join(" ");
         Query::parse(&prefix).is_ok().then_some(prefix)
     });
@@ -215,10 +221,71 @@ fn find_clause_end_outside_quotes(s: &str) -> usize {
     s.len()
 }
 
+/// A `System.Kind` value Ferrow can answer: folders, or files by extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ItemKind {
+    Folder,
+    Document,
+    Picture,
+    Music,
+    Video,
+}
+
+impl ItemKind {
+    /// The kind for a `System.Kind` value the Start menu filters on.
+    pub fn from_kind_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "folder" => Some(ItemKind::Folder),
+            "document" => Some(ItemKind::Document),
+            "picture" => Some(ItemKind::Picture),
+            "music" => Some(ItemKind::Music),
+            "video" => Some(ItemKind::Video),
+            _ => None,
+        }
+    }
+
+    /// The `System.Kind` value Windows reports for this kind.
+    pub fn kind_value(self) -> &'static str {
+        match self {
+            ItemKind::Folder => "folder",
+            ItemKind::Document => "document",
+            ItemKind::Picture => "picture",
+            ItemKind::Music => "music",
+            ItemKind::Video => "video",
+        }
+    }
+
+    /// The extensions Windows files under this kind (none for folders).
+    pub fn extensions(self) -> Vec<&'static str> {
+        match self {
+            ItemKind::Folder => Vec::new(),
+            kind => crate::kinds::extensions_of_kind(kind.kind_value())
+                .into_iter()
+                .filter(|ext| {
+                    ext.chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                })
+                .collect(),
+        }
+    }
+
+    /// The Ferrow filter for this kind (`folder:` or `ext:a;b;...`).
+    /// `None` when no extension has this kind.
+    fn filter(self) -> Option<String> {
+        match self {
+            ItemKind::Folder => Some("folder:".to_owned()),
+            kind => {
+                let extensions = kind.extensions();
+                (!extensions.is_empty()).then(|| format!("ext:{}", extensions.join(";")))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PredicateComponent {
     Terms(usize),
-    FolderOnly,
+    Kind(ItemKind),
     /// `ReuseWhere(<id>)`: the shell's location scope from an earlier
     /// query. Ferrow answers from every location it indexes, so it adds
     /// no restriction.
@@ -233,29 +300,34 @@ enum PredicateExpr {
 }
 
 /// A conjunction of filename terms (each a case-insensitive substring of
-/// the name), plus the folder restriction and the location scope.
+/// the name), plus the kind restriction and the location scope.
 #[derive(Clone, Debug, Default)]
 struct Conjunction {
     terms: Vec<String>,
-    only_folders: bool,
+    kind: Option<ItemKind>,
     scope: bool,
 }
 
 impl Conjunction {
-    fn and(mut self, other: Conjunction) -> Self {
+    /// `None` when the two restrict to different kinds (no item is both).
+    fn and(mut self, other: Conjunction) -> Option<Self> {
         for term in other.terms {
             push_unique_term(&mut self.terms, term);
         }
-        self.only_folders |= other.only_folders;
+        match (self.kind, other.kind) {
+            (Some(a), Some(b)) if a != b => return None,
+            (None, kind) => self.kind = kind,
+            _ => {}
+        }
         self.scope |= other.scope;
-        self
+        Some(self)
     }
 
     /// True when every name matching `self` also matches `weaker`: each
-    /// of its terms is contained in one of ours, and it restricts to
-    /// folders or the scope only when we do too.
+    /// of its terms is contained in one of ours, and it restricts the
+    /// kind or the scope only when we do too.
     fn implies(&self, weaker: &Conjunction) -> bool {
-        (!weaker.only_folders || self.only_folders)
+        (weaker.kind.is_none() || self.kind == weaker.kind)
             && (!weaker.scope || self.scope)
             && weaker.terms.iter().all(|w| {
                 let w = w.to_lowercase();
@@ -275,8 +347,8 @@ fn predicate_conjunction(expr: &PredicateExpr, term_sets: &[Vec<String>]) -> Opt
                 terms: term_sets.get(*index)?.clone(),
                 ..Default::default()
             },
-            PredicateComponent::FolderOnly => Conjunction {
-                only_folders: true,
+            PredicateComponent::Kind(kind) => Conjunction {
+                kind: Some(*kind),
                 ..Default::default()
             },
             PredicateComponent::Scope => Conjunction {
@@ -287,7 +359,7 @@ fn predicate_conjunction(expr: &PredicateExpr, term_sets: &[Vec<String>]) -> Opt
         PredicateExpr::And(parts) => {
             let mut combined = Conjunction::default();
             for part in parts {
-                combined = combined.and(predicate_conjunction(part, term_sets)?);
+                combined = combined.and(predicate_conjunction(part, term_sets)?)?;
             }
             Some(combined)
         }
@@ -307,7 +379,7 @@ fn predicate_conjunction(expr: &PredicateExpr, term_sets: &[Vec<String>]) -> Opt
 fn parse_predicate_expression(
     predicate: &str,
     aliases: ColumnGroupAliases,
-) -> Option<(Vec<String>, bool)> {
+) -> Option<(Vec<String>, Option<ItemKind>)> {
     let mut parser = PredicateParser {
         predicate,
         bytes: predicate.as_bytes(),
@@ -323,7 +395,7 @@ fn parse_predicate_expression(
         return None;
     }
     let conjunction = predicate_conjunction(&expr, &parser.representatives)?;
-    Some((conjunction.terms, conjunction.only_folders))
+    Some((conjunction.terms, conjunction.kind))
 }
 
 struct PredicateParser<'a> {
@@ -491,8 +563,10 @@ impl PredicateParser<'_> {
                     .map(|(_, columns)| normalize_property(columns))?;
             }
             if property == "system.kind" {
-                let folder_only = terms.len() == 1 && terms[0].eq_ignore_ascii_case("folder");
-                return folder_only.then_some(PredicateComponent::FolderOnly);
+                if terms.len() != 1 {
+                    return None;
+                }
+                return ItemKind::from_kind_value(&terms[0]).map(PredicateComponent::Kind);
             }
             if !is_name_property_list(&property) {
                 return None;
@@ -513,17 +587,14 @@ impl PredicateParser<'_> {
 
         let property = self.read_property()?;
         if property == "system.kind" {
-            // Only the exact folder restriction has a Ferrow form
-            // (`folder:`); every other kind value or operator falls
-            // back to the native provider.
+            // Kinds with a Ferrow form (`folder:` or an extension list);
+            // every other kind value or operator falls back to native.
             if !self.consume_byte(b'=') {
                 return None;
             }
             self.skip_ws();
             let value = self.parse_sql_literal()?;
-            return value
-                .eq_ignore_ascii_case("folder")
-                .then_some(PredicateComponent::FolderOnly);
+            return ItemKind::from_kind_value(&value).map(PredicateComponent::Kind);
         }
         if !self.consume_word("LIKE") {
             return None;
@@ -772,10 +843,10 @@ fn push_unique_term(terms: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn format_ferrow_query(terms: &[String], only_folders: bool) -> Option<String> {
-    let mut parts = Vec::with_capacity(terms.len() + usize::from(only_folders));
-    if only_folders {
-        parts.push("folder:".to_owned());
+fn format_ferrow_query(terms: &[String], kind: Option<ItemKind>) -> Option<String> {
+    let mut parts = Vec::with_capacity(terms.len() + 1);
+    if let Some(kind) = kind {
+        parts.push(kind.filter()?);
     }
     for term in terms {
         let sanitized: String = term.chars().filter(|&c| c != '"').collect();
@@ -792,7 +863,7 @@ fn format_ferrow_query(terms: &[String], only_folders: bool) -> Option<String> {
             parts.push(sanitized.to_owned());
         }
     }
-    if parts.is_empty() || (only_folders && parts.len() == 1) {
+    if parts.is_empty() || (kind.is_some() && parts.len() == 1) {
         None
     } else {
         Some(parts.join(" "))
@@ -802,6 +873,13 @@ fn format_ferrow_query(terms: &[String], only_folders: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Start query without the dot-folder exclusion every query ends with.
+    fn plain(query: &str) -> &str {
+        query
+            .strip_suffix(&format!(" {SKIP_DOT_FOLDERS}"))
+            .expect("dot folders skipped")
+    }
 
     const ALL_TAB_PROJECTION: &str = "\"System.Kind\",\"System.Search.Rank\",path,\"System.DateCreated\",\"System.DateModified\",\"System.Search.QueryPropertyHits\",\"System.ItemNameDisplay\",\"System.FileExtension\",\"System.ItemType\",\"System.Title\",\"System.Music.AlbumTitle\",\"System.Music.DisplayArtist\",\"System.DateAccessed\",\"System.Link.TargetParsingPath\",\"System.SFGAOFlags\"";
 
@@ -817,7 +895,7 @@ mod tests {
         assert_eq!(parsed.columns[0], "System.Kind");
         assert_eq!(parsed.columns[2], "path");
         assert_eq!(parsed.limit, 30);
-        assert_eq!(parsed.query, "ferrow-native-query-proof");
+        assert_eq!(plain(&parsed.query), "ferrow-native-query-proof");
     }
 
     #[test]
@@ -828,16 +906,24 @@ mod tests {
         let parsed = parse_windows_search_sql(&sql).expect("valid Documents tab query");
         assert_eq!(parsed.columns.len(), 19);
         assert_eq!(parsed.limit, 30);
-        assert_eq!(parsed.query, "budget 2026");
+        assert_eq!(plain(&parsed.query), "budget 2026");
 
         // The real Documents tab also restricts `System.Kind` to
-        // documents. Ferrow has no exact form for that kind, so the
-        // whole predicate falls back to native instead of silently
-        // dropping the restriction and returning non-documents.
+        // documents: Ferrow answers it with the document extensions.
         let with_kind = format!(
             "SELECT TOP 30 {DOCS_TAB_PROJECTION} FROM \"SystemIndex\" WHERE (CONTAINS(\"System.ItemNameDisplay\", '\"budget*\" AND \"2026*\"', 2057) OR CONTAINS(*, '\"budget*\" AND \"2026*\"', 2057)) AND CONTAINS(\"System.Kind\", '\"document\"') ORDER BY \"System.Search.Rank\" DESC"
         );
-        assert!(parse_windows_search_sql(&with_kind).is_none());
+        let parsed = parse_windows_search_sql(&with_kind).expect("Documents tab query parses");
+        assert!(
+            parsed.query.starts_with("ext:") && parsed.query.contains(";pdf;"),
+            "{}",
+            parsed.query
+        );
+        assert!(
+            plain(&parsed.query).ends_with(" budget 2026"),
+            "{}",
+            parsed.query
+        );
     }
 
     /// Windows 11 (2026) Start query: a `WITH ... AS #alias` column group,
@@ -850,9 +936,9 @@ mod tests {
         let parsed = parse_windows_search_sql(&sql).expect("Windows 11 Start query parses");
         assert_eq!(parsed.columns.len(), 15);
         assert_eq!(parsed.limit, 30);
-        assert_eq!(parsed.query, "ferrowd");
+        assert_eq!(plain(&parsed.query), "ferrowd");
         assert_eq!(parsed.rank_term.as_deref(), Some("ferrowd"));
-        assert_eq!(parsed.prefix_query.as_deref(), Some("ferrowd*"));
+        assert_eq!(parsed.prefix_query.as_deref().map(plain), Some("ferrowd*"));
 
         // A dotted query adds word-split branches; every branch implies
         // the weakest (`default` AND `rdp`), so the OR is exactly that.
@@ -860,8 +946,34 @@ mod tests {
             "SELECT TOP 30 {ALL_TAB_PROJECTION} FROM SystemIndex WHERE WITH (System.ItemNameDisplay) AS #MRProps ((CONTAINS(#MRProps, '\"default.rdp\"', 1041) RANK BY COERCION(ABSOLUTE, 990)) OR (CONTAINS(#MRProps, '\"default.rdp*\"', 1041) RANK BY COERCION(ABSOLUTE, 980)) OR (CONTAINS(#MRProps, '\"default\" AND \"rdp\"', 1041) RANK BY COERCION(ABSOLUTE, 600)) OR (CONTAINS(#MRProps, '\"default*\" AND \"rdp*\"', 1041) RANK BY COERCION(ABSOLUTE, 550))) AND ReuseWhere(177)  ORDER BY \"System.Search.Rank\" DESC, \"System.DateModified\" DESC"
         );
         let parsed = parse_windows_search_sql(&sql).expect("dotted Start query parses");
-        assert_eq!(parsed.query, "default rdp");
-        assert_eq!(parsed.prefix_query.as_deref(), Some("default* rdp"));
+        assert_eq!(plain(&parsed.query), "default rdp");
+        assert_eq!(
+            parsed.prefix_query.as_deref().map(plain),
+            Some("default* rdp")
+        );
+
+        // The All tab's Documents and Photos groups: one query per kind.
+        for (kind, ext) in [("document", ";pdf;"), ("picture", ";png;")] {
+            let sql = format!(
+                "SELECT TOP 30 {ALL_TAB_PROJECTION} FROM SystemIndex WHERE WITH (System.ItemNameDisplay) AS #MRProps ((CONTAINS(#MRProps, '\"readme\"', 1041) RANK BY COERCION(ABSOLUTE, 990)) OR (CONTAINS(#MRProps, '\"readme*\"', 1041) RANK BY COERCION(ABSOLUTE, 980))) AND \"System.Kind\" = '{kind}' AND ReuseWhere(280)  ORDER BY \"System.Search.Rank\" DESC, \"System.DateModified\" DESC"
+            );
+            let parsed = parse_windows_search_sql(&sql).expect("kind group query parses");
+            assert!(
+                parsed.query.starts_with("ext:") && parsed.query.contains(ext),
+                "{}",
+                parsed.query
+            );
+            assert!(
+                plain(&parsed.query).ends_with(" readme"),
+                "{}",
+                parsed.query
+            );
+            let prefix = parsed.prefix_query.expect("prefix query");
+            assert!(
+                prefix.contains(ext) && plain(&prefix).ends_with(" readme*"),
+                "{prefix}"
+            );
+        }
 
         for unsupported in [
             // An alias over a column Ferrow cannot search.
@@ -886,18 +998,18 @@ mod tests {
         // Mixed CONTAINS + LIKE under AND: both term sets survive.
         let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.FileName LIKE '%beta%'";
         let parsed = parse_windows_search_sql(sql).expect("mixed AND parses");
-        assert_eq!(parsed.query, "alpha beta");
+        assert_eq!(plain(&parsed.query), "alpha beta");
 
         // Grouped OR of identical term sets ANDed with another term.
         let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE (CONTAINS(System.FileName, '\"alpha*\"') OR System.FileName LIKE '%alpha%') AND CONTAINS(System.FileName, '\"beta*\"')";
         let parsed = parse_windows_search_sql(sql).expect("identical OR branches parse");
-        assert_eq!(parsed.query, "alpha beta");
+        assert_eq!(plain(&parsed.query), "alpha beta");
 
         // Precedence: AND binds tighter than OR; identical conjunctions
         // on both sides still reduce to one conjunction.
         let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND CONTAINS(System.FileName, '\"beta*\"') OR CONTAINS(System.FileName, '\"beta*\"') AND CONTAINS(System.FileName, '\"alpha*\"')";
         let parsed = parse_windows_search_sql(sql).expect("equal conjunctions parse");
-        assert_eq!(parsed.query, "alpha beta");
+        assert_eq!(plain(&parsed.query), "alpha beta");
 
         // The exact folder restriction, in both shell spellings.
         for sql in [
@@ -907,7 +1019,7 @@ mod tests {
         ] {
             let parsed = parse_windows_search_sql(sql)
                 .unwrap_or_else(|| panic!("folder restriction parses: {sql}"));
-            assert_eq!(parsed.query, "folder: alpha", "for: {sql}");
+            assert_eq!(plain(&parsed.query), "folder: alpha", "for: {sql}");
         }
 
         for unsupported in [
@@ -916,7 +1028,9 @@ mod tests {
             // Precedence makes this alpha OR (beta AND gamma).
             "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') OR CONTAINS(System.FileName, '\"beta*\"') AND CONTAINS(System.FileName, '\"gamma*\"')",
             // Kind values Ferrow cannot express exactly.
-            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.Kind = 'document'",
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.Kind = 'email'",
+            // Two different kinds: no item is both.
+            "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') AND System.Kind = 'picture' AND System.Kind = 'document'",
             // Folder as an OR branch is a union, not a restriction.
             "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"alpha*\"') OR CONTAINS(\"System.Kind\", '\"folder\"')",
             // Unknown CONTAINS property.
@@ -947,7 +1061,7 @@ mod tests {
         let shallow = format!("{}{leaf}{}", "(".repeat(8), ")".repeat(8));
         let sql = format!("SELECT TOP 30 System.ItemName FROM SystemIndex WHERE {shallow}");
         let parsed = parse_windows_search_sql(&sql).expect("shallow nesting parses");
-        assert_eq!(parsed.query, "alpha");
+        assert_eq!(plain(&parsed.query), "alpha");
 
         // Oversized input is rejected before any parsing work.
         let sql = format!(
@@ -982,7 +1096,7 @@ mod tests {
         // A search *term* containing the letters is not an operator.
         let sql = "SELECT TOP 30 System.ItemName FROM SystemIndex WHERE CONTAINS(System.FileName, '\"cannot*\" AND \"notes*\"')";
         let parsed = parse_windows_search_sql(sql).expect("terms resembling operators still parse");
-        assert_eq!(parsed.query, "cannot notes");
+        assert_eq!(plain(&parsed.query), "cannot notes");
     }
 
     #[test]
@@ -991,7 +1105,7 @@ mod tests {
         let parsed = parse_windows_search_sql(sql).expect("valid LIKE query");
         assert_eq!(parsed.columns, vec!["System.ItemName"]);
         assert_eq!(parsed.limit, 12);
-        assert_eq!(parsed.query, "report-2026");
+        assert_eq!(plain(&parsed.query), "report-2026");
 
         for unsupported in [
             "SELECT * FROM SystemIndex",
