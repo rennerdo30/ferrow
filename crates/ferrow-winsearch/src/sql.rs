@@ -28,6 +28,21 @@ pub struct ParsedSql {
     pub limit: usize,
     /// Extracted query string validated with `ferrow_query::Query::parse`.
     pub query: String,
+    /// The first search term, used to rank hits the way Windows does
+    /// (whole name, then name start, then word start). `None` when the
+    /// term has characters a wildcard cannot carry.
+    pub rank_term: Option<String>,
+    /// `query` with the first term as a name-prefix wildcard (`term*`):
+    /// the best Start matches, asked for first.
+    pub prefix_query: Option<String>,
+}
+
+/// A term that can stand in a bare `term*` wildcard.
+fn is_wildcard_safe(term: &str) -> bool {
+    !term.is_empty()
+        && term
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Extract projection columns and `TOP <N>` limit from a `SystemIndex` SQL query.
@@ -89,10 +104,26 @@ pub fn parse_windows_search_sql(sql: &str) -> Option<ParsedSql> {
     let query = format_ferrow_query(&terms, only_folders)?;
     Query::parse(&query).ok()?;
 
+    let rank_term = terms.first().filter(|t| is_wildcard_safe(t)).cloned();
+    let prefix_query = rank_term.as_ref().and_then(|first| {
+        let mut parts = Vec::new();
+        if only_folders {
+            parts.push("folder:".to_owned());
+        }
+        parts.push(format!("{first}*"));
+        if terms.len() > 1 {
+            parts.push(format_ferrow_query(&terms[1..], false)?);
+        }
+        let prefix = parts.join(" ");
+        Query::parse(&prefix).is_ok().then_some(prefix)
+    });
+
     Some(ParsedSql {
         columns,
         limit,
         query,
+        rank_term,
+        prefix_query,
     })
 }
 
@@ -820,6 +851,8 @@ mod tests {
         assert_eq!(parsed.columns.len(), 15);
         assert_eq!(parsed.limit, 30);
         assert_eq!(parsed.query, "ferrowd");
+        assert_eq!(parsed.rank_term.as_deref(), Some("ferrowd"));
+        assert_eq!(parsed.prefix_query.as_deref(), Some("ferrowd*"));
 
         // A dotted query adds word-split branches; every branch implies
         // the weakest (`default` AND `rdp`), so the OR is exactly that.
@@ -828,6 +861,7 @@ mod tests {
         );
         let parsed = parse_windows_search_sql(&sql).expect("dotted Start query parses");
         assert_eq!(parsed.query, "default rdp");
+        assert_eq!(parsed.prefix_query.as_deref(), Some("default* rdp"));
 
         for unsupported in [
             // An alias over a column Ferrow cannot search.

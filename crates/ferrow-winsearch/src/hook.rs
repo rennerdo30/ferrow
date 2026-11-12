@@ -215,7 +215,8 @@ unsafe extern "system" fn detour(
             });
             return Ok(false);
         };
-        let Some(hits) = ipc::query_hits(&data_dir, &parsed.query, parsed.limit) else {
+        let start = ipc::StartQuery::from_sql(&parsed);
+        let Some(hits) = ipc::query_hits(&data_dir, &start) else {
             diag(Some(&data_dir), || {
                 format!(
                     "native: no answer from Ferrow (limit={}): {}",
