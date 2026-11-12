@@ -2,6 +2,14 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## 0.1.0-beta.9
+
+- **Fixed:** **Power Windows Search with Ferrow** showed "On" but Start never used Ferrow on current Windows 11 builds: Start sends its searches in a newer format that Ferrow did not understand, so every search went to Windows. Ferrow now answers them, including names with dots or dashes.
+- **Start results ranked like Windows:** the whole name first, then names starting with what you typed, then words starting with it; newest first; cache, AppData and temp folders last. Other accounts' profile folders and dot folders (`.git`, `.cache`) are left out. Before, Start got the first 30 matches in name order, so "Best match" could be a file that only contained the word somewhere in the middle.
+- **Documents, Photos, Music and Videos in Start** now come from Ferrow too, using Windows' own file kinds, so these groups and tabs list files outside the Windows index.
+- **Faster typing in Start:** only the newest search per keystroke is run; slow searches no longer hold up the finished word.
+- **Diagnostics:** an empty `diag` file in `%LOCALAPPDATA%\ferrow\winsearch` makes the Start integration log what Start asked and why a search went to Windows (search text masked). See `docs/windows-search.md`.
+
 ## 0.1.0-beta.8
 
 - **Fixed:** after installing or updating Ferrow, the app could miss the Ferrow service because the service was still loading its index, then keep using its own slower index and show **Fast NTFS index and live updates** as off until restarted. The app now keeps checking in the background and switches to the service as soon as it answers, also after the service restarts.
