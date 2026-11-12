@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## 0.1.0-beta.8
+
+- **Fixed:** after installing or updating Ferrow, the app could miss the Ferrow service because the service was still loading its index, then keep using its own slower index and show **Fast NTFS index and live updates** as off until restarted. The app now keeps checking in the background and switches to the service as soon as it answers, also after the service restarts.
+
 ## 0.1.0-beta.7
 
 - **Fixed:** turning on **Power Windows Search with Ferrow** could fail with `Could not attach to SearchHost.exe: FerrowAttach returned non-zero status: 0x80070057`. The narrow folder permission granted to `SearchHost.exe` was missing `SYNCHRONIZE`, which prevented the AppContainer from verifying the Ferrow data folder at attach time.
