@@ -89,10 +89,16 @@ impl Prepared {
             finder,
             pieces,
             extensions: match &term.pattern {
-                Pattern::Filter(Filter::Extension(exts)) => exts
-                    .iter()
-                    .map(|v| folded(v.as_bytes(), term.case_sensitive))
-                    .collect(),
+                Pattern::Filter(Filter::Extension(exts)) => {
+                    // Sorted for a binary search: type macros carry ~35.
+                    let mut exts: Vec<_> = exts
+                        .iter()
+                        .map(|v| folded(v.as_bytes(), term.case_sensitive))
+                        .collect();
+                    exts.sort_unstable();
+                    exts.dedup();
+                    exts
+                }
                 _ => Vec::new(),
             },
         }
@@ -518,7 +524,9 @@ impl GeneralMatcher {
                 };
                 dot != 0
                     && dot + 1 < name.len()
-                    && p.extensions.iter().any(|ext| name[dot + 1..] == *ext)
+                    && p.extensions
+                        .binary_search_by(|ext| ext.as_slice().cmp(&name[dot + 1..]))
+                        .is_ok()
             }
             Pattern::Filter(Filter::Parent(_)) => {
                 let id = index.parent(id);

@@ -103,6 +103,11 @@ such as `regex:"report|draft"`. `ext:txt;md` filters extensions,
 counts parent edges from an indexed root (depth zero). Paths use the native
 separator.
 
+File type filters match common extensions: `audio:`, `video:`, `pic:`,
+`doc:`, `archive:` (or `zip:`) and `exe:`. Alone they list every file of that
+type; with a term they narrow it, for example `audio:beatles` or
+`!pic: holiday`.
+
 Metadata filters read the index's metadata columns:
 
 - `size:>10mb`, `size:<=1kb`, `size:1mb..5mb` (binary units b, kb, mb, gb, tb; files only);

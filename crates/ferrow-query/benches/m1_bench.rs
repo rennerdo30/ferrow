@@ -32,6 +32,7 @@ const QUERIES: &[&str] = &[
     "path:docs report",
     "ext:txt;md",
     "<a|re> !tmp",
+    "doc:",
 ];
 
 fn entries() -> usize {

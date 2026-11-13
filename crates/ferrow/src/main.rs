@@ -56,7 +56,8 @@ Modifiers stack: case:, path:, wholeword:, file:, folder:, regex:.
 Filters: ext:txt;md, parent:\"/folder\", depth:2 (root depth is zero),
 size:>10mb, size:1mb..5mb, dm:today, dm:last10minutes,
 dm:2026-01-01..2026-01-31 (dc: created, da: accessed), attrib:H.
-Size, date and attribute filters are reserved for a later milestone.
+File types: audio:, video:, pic:, doc:, archive: (or zip:), exe:;
+alone or with a term, for example audio:beatles.
 Quote the query for your shell, for example:
   ferrow search \"*.log\"
   ferrow search \"<report*|draft> !tmp\"

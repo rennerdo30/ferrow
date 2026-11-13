@@ -70,12 +70,12 @@ class GateTests(unittest.TestCase):
     def rows(self):
         return gate.compare(self.base, self.head, 16)
 
-    def test_metric_inventory_includes_twenty_required_language_observations(self):
+    def test_metric_inventory_includes_twenty_four_required_language_observations(self):
         self.assertEqual(gate.PAIRED_METRICS, 26)
-        self.assertEqual(gate.EXPECTED_METRICS, 46)
+        self.assertEqual(gate.EXPECTED_METRICS, 50)
         rows = self.rows()
         self.assertEqual(sum(row[1] is not None for row in rows), 26)
-        self.assertEqual(sum(row[1] is None for row in rows), 20)
+        self.assertEqual(sum(row[1] is None for row in rows), 24)
         # Refuse each missing scalar, query operation, count or entire query,
         # in either arm. A shared omission cannot shrink the paired inventory.
         for language in (False, True):
@@ -89,7 +89,7 @@ class GateTests(unittest.TestCase):
 
     def test_legacy_baseline_accepts_only_explicit_legacy_queries(self):
         base = gate.parse(fixture(language=False), require_new=False)
-        self.assertEqual(len(gate.compare(base, self.head, 16)), 46)
+        self.assertEqual(len(gate.compare(base, self.head, 16)), 50)
         with self.assertRaises(ValueError):
             gate.parse(fixture(), require_new=False)
 
@@ -125,8 +125,8 @@ class GateTests(unittest.TestCase):
     def test_metadata_observation_inventory_keeps_paired_gate(self):
         rows, report = gate.metadata_observations(metadata_fixture(), self.head, 16)
         self.assertEqual(gate.PAIRED_METRICS, 26)
-        self.assertEqual(gate.EXPECTED_METRICS, 46)
-        self.assertEqual(gate.EXPECTED_TOTAL_METRICS, 82)
+        self.assertEqual(gate.EXPECTED_METRICS, 50)
+        self.assertEqual(gate.EXPECTED_TOTAL_METRICS, 86)
         self.assertEqual(len(rows), 36)
         self.assertEqual(len(self.rows()) + len(rows), gate.EXPECTED_TOTAL_METRICS)
         self.assertIn("head-only", report)
@@ -283,7 +283,7 @@ class GateTests(unittest.TestCase):
                 gate.interleaved(measure, "IPC", "a", "first_page_ms")
             self.assertEqual(calls, 3)
 
-    def test_initial_interleaved_measurement_produces_all_46_metrics(self):
+    def test_initial_interleaved_measurement_produces_all_50_metrics(self):
         with tempfile.TemporaryDirectory() as folder:
             args = SimpleNamespace(base=Path(folder)/"base.txt", head=Path(folder)/"head.txt",
                                    base_index=Path(folder)/"fixture", head_index=Path(folder)/"fixture", entries=16)
@@ -293,10 +293,10 @@ class GateTests(unittest.TestCase):
                 return 1, 16 if kind == "load" else 2, 42, 800, 16
             gate.measure_pair(args, measure, trace)
             rows = gate.compare(gate.parse(args.base.read_text(encoding="utf-8"), require_new=False), gate.parse(args.head.read_text(encoding="utf-8")), 16)
-            self.assertEqual(len(rows), 46)
+            self.assertEqual(len(rows), 50)
             self.assertFalse(any(row[-1] for row in rows))
             self.assertEqual(len(trace), 25)
-            self.assertEqual(len(calls), 8 + 24*12 + 20*6)
+            self.assertEqual(len(calls), 8 + 24*12 + 24*6)
             self.assertTrue(all(arm == "head" or kind == "load" or query in gate.QUERIES
                                 for arm, kind, query, _ in calls))
             for query in gate.NEW_QUERIES:

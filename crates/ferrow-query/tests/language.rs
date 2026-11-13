@@ -223,6 +223,10 @@ fn every_language_feature_equals_reference_on_100k() {
         "zzzz-no-hit-zzzz",
         "report zzzz",
         "!tmp zzzz",
+        "doc:",
+        "doc:report",
+        "!doc: report*",
+        "<audio:|pic:> !tmp",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -561,6 +565,52 @@ fn wildcard_boolean_modifiers_and_filters() {
         ("\"a*b\"", vec!["a*b"]),
     ] {
         assert_eq!(names(&index, text), expected, "{text}");
+    }
+}
+
+#[test]
+fn type_macros() {
+    let b = IndexBuilder::new();
+    let root = b.add_root(b"root", flags::DIR);
+    let music = b.add(root, b"Music.mp3", flags::DIR);
+    for name in [
+        "Song.MP3",
+        "song.flac",
+        "song.txt",
+        "photo.JPG",
+        "clip.mkv",
+        "setup.exe",
+        "backup.tar",
+        ".mp3",
+        "mp3",
+    ] {
+        b.add(music, name.as_bytes(), 0);
+    }
+    let index = b.freeze();
+    for (text, expected) in [
+        ("audio:", vec!["Song.MP3", "song.flac"]),
+        ("audio:song", vec!["Song.MP3", "song.flac"]),
+        ("audio:flac", vec!["song.flac"]),
+        ("!audio: song", vec!["song.txt"]),
+        ("!audio:flac song", vec!["Song.MP3", "song.txt"]),
+        ("pic:", vec!["photo.JPG"]),
+        ("video:", vec!["clip.mkv"]),
+        ("exe:", vec!["setup.exe"]),
+        ("archive:", vec!["backup.tar"]),
+        ("zip:", vec!["backup.tar"]),
+        ("doc:", vec!["song.txt"]),
+        ("file:audio:", vec!["Song.MP3", "song.flac"]),
+        ("<pic:|video:>", vec!["photo.JPG", "clip.mkv"]),
+        ("audio:\"song.\"", vec!["Song.MP3", "song.flac"]),
+        ("audio:*.mp3", vec!["Song.MP3"]),
+    ] {
+        let (mut got, mut expected) = (names(&index, text), expected);
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "{text}");
+    }
+    for text in ["audio:video:", "folder:audio:", "audio:folder:"] {
+        assert!(Query::parse(text).is_err(), "{text}");
     }
 }
 

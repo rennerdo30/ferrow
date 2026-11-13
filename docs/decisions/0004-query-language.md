@@ -51,6 +51,15 @@ edges from an indexed root (root depth zero). Modifiers may qualify these
 predicates where meaningful (`case:parent:...`, `file:depth:2`); `regex:`,
 `path:` and `wholeword:` apply only to text patterns.
 
+File type macros (added 2026-11-14): `audio:`, `video:`, `pic:`, `doc:`,
+`archive:` and its alias `zip:`, `exe:` are prefixes like the modifiers. The
+parser expands one into an `ext:` predicate with a fixed extension list
+(`parser::TYPE_MACROS`). Alone it is that predicate; with a value it is
+`AND(ext-predicate, value term)`, the extension test first, so `!audio:x`
+negates both together. Two macros on one term, or a macro with `folder:`,
+are errors. The matcher keeps extension lists sorted and binary-searches
+them, so a macro costs about six short comparisons per candidate.
+
 ## Public API and Part 2
 
 The AST has term leaves, AND, OR and NOT. Each term carries its source byte
@@ -134,9 +143,9 @@ paired measurements are the performance evidence, never local benchmarks.
 
 Retain all 26 existing paired metrics and their count-equivalence and
 regression checks. The main IPC arm explicitly uses the six legacy queries.
-Require all 20 additional head-only measurements: first page and count, both
+Require all 24 additional head-only measurements: first page and count, both
 in-process and IPC, for `*.log`, `report*2024*`, `path:docs report`,
-`ext:txt;md` and `<a|re> !tmp`. Report 46 metrics total, identifying new
+`ext:txt;md`, `<a|re> !tmp` and `doc:` (added 2026-11-14). Report 50 metrics total, identifying new
 language observations without a fabricated baseline. Common wildcard queries
 (`*.log`, `report*2024*` when at least 100 hits exist) must return their first
 page within 16 ms in both modes. Missing/partial observations fail closed.
