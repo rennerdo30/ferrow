@@ -427,11 +427,12 @@ const PREFILTER_MIN_ENTRIES: usize = 1 << 16;
 const PREFILTER_SAMPLE_RUNS: usize = 8;
 const PREFILTER_SAMPLE_RUN: usize = 1_024;
 
-/// For a query with metadata-only conjuncts that few entries pass, mark the
-/// passing ids in one id-order pass first.
+/// For a query with cheap conjuncts (name, flags and metadata columns; see
+/// `EntryMatcher::prefilter`) that few entries pass, mark the passing ids in
+/// one id-order pass first.
 ///
-/// The ordered scan walks name (or metadata) order, so each metadata read
-/// is a random access into id-ordered columns. With a rare filter the scan
+/// The ordered scan walks name (or metadata) order, so each name or
+/// metadata read is a random access into id-ordered storage. With a rare filter the scan
 /// visits nearly every entry that way before the page fills; a sequential
 /// pass plus one bit test per visited entry is several times cheaper. A
 /// broad filter fills the page within a few blocks and keeps the plain scan.
@@ -447,20 +448,33 @@ fn prefilter_bits<M: EntryMatcher>(
     if !matcher.has_prefilter() || candidates < PREFILTER_MIN_ENTRIES {
         return None;
     }
-    // Evenly spaced runs of consecutive ids: sequential reads.
+    // Evenly spaced runs of consecutive ids: sequential reads. `passed`
+    // counts the cheap conjuncts (what the bits would keep), `hits` the
+    // whole query (how soon the page fills); the full matcher runs only
+    // where the cheap part passed.
     let stride = n / PREFILTER_SAMPLE_RUNS;
-    let (mut sampled, mut passed) = (0usize, 0usize);
+    let (mut sampled, mut passed, mut hits) = (0usize, 0usize, 0usize);
+    let mut scratch = Scratch::default();
     for run in 0..PREFILTER_SAMPLE_RUNS {
         let start = run * stride;
         for id in start..(start + PREFILTER_SAMPLE_RUN).min(n) {
             sampled += 1;
-            passed += usize::from(matcher.prefilter(index, id as u32));
+            if matcher.prefilter(index, id as u32, &mut scratch, cancel) {
+                passed += 1;
+                if limit.is_some() {
+                    hits += usize::from(matcher.matches(index, id as u32, &mut scratch, cancel));
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return None;
         }
         // A broad query keeps the plain scan; stop sampling as soon as that
-        // is clear, so it pays for one run, not eight: most entries pass,
-        // or the page is expected to fill within a small part of the index.
-        let fills_early = limit
-            .is_some_and(|limit| passed > 0 && limit.saturating_mul(sampled) / passed <= n / 64);
+        // is clear, so it pays for one run, not eight: the cheap part keeps
+        // most entries (bits would skip little), or the page is expected to
+        // fill within a small part of the index.
+        let fills_early =
+            limit.is_some_and(|limit| hits > 0 && limit.saturating_mul(sampled) / hits <= n / 64);
         if passed * 2 > sampled || fills_early {
             return None;
         }
@@ -468,12 +482,10 @@ fn prefilter_bits<M: EntryMatcher>(
     let build = match limit {
         // Every candidate is visited; skip only when most pass anyway.
         None => passed * 2 < sampled,
-        // Expected visits to fill the page: limit / pass rate.
-        Some(limit) => {
-            passed == 0 || (limit.saturating_mul(sampled) / passed).min(candidates) > n / 8
-        }
+        // Expected visits to fill the page: limit / hit rate.
+        Some(limit) => hits == 0 || (limit.saturating_mul(sampled) / hits).min(candidates) > n / 8,
     };
-    if !build || cancel.is_cancelled() {
+    if !build {
         return None;
     }
     let mut bits = vec![0u64; n.div_ceil(64)];
@@ -481,6 +493,7 @@ fn prefilter_bits<M: EntryMatcher>(
         .enumerate()
         .for_each(|(chunk, words)| {
             let start = chunk * BLOCK_SIZE;
+            let mut scratch = Scratch::default();
             for (w, word) in words.iter_mut().enumerate() {
                 if w % (CANCEL_INTERVAL / 64) == 0 && cancel.is_cancelled() {
                     return;
@@ -488,7 +501,8 @@ fn prefilter_bits<M: EntryMatcher>(
                 let base = start + w * 64;
                 let mut value = 0u64;
                 for bit in 0..64.min(n - base) {
-                    value |= u64::from(matcher.prefilter(index, (base + bit) as u32)) << bit;
+                    let id = (base + bit) as u32;
+                    value |= u64::from(matcher.prefilter(index, id, &mut scratch, cancel)) << bit;
                 }
                 *word = value;
             }
