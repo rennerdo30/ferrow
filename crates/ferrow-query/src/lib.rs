@@ -494,39 +494,65 @@ fn prefilter_bits<M: EntryMatcher>(
         }
         None
     };
+    // Expected walk position where the page fills. Hits spread over most
+    // runs: the overall rate is the better estimate (one run without hits
+    // says little). Hits in few runs (clustered in the walk, like names
+    // that sort last): accumulate region by region.
+    let estimate = |rates: &[(usize, usize)], limit: usize| -> Option<usize> {
+        let hits: usize = rates.iter().map(|r| r.0).sum();
+        let size: usize = rates.iter().map(|r| r.1).sum();
+        let with_hits = rates.iter().filter(|r| r.0 > 0).count();
+        if hits == 0 {
+            None
+        } else if with_hits * 2 >= rates.len() {
+            Some(limit.saturating_mul(size) / hits)
+        } else {
+            fill_at(rates, limit)
+        }
+    };
+    // Run 0 (the front of the walk) goes in small steps: a broad query
+    // settles after a few dozen reads.
+    const STEP: usize = 128;
     for run in 0..PREFILTER_SAMPLE_RUNS {
         let start = run * stride;
         let end = (start + PREFILTER_SAMPLE_RUN).min(walk_len);
         let mut run_hits = 0;
-        for p in start..end {
-            let id = walk_at(p);
-            sampled += 1;
-            if matcher.prefilter(index, id, &mut scratch, cancel) {
-                passed += 1;
-                if limit.is_some() {
-                    run_hits += usize::from(matcher.matches(index, id, &mut scratch, cancel));
+        let mut at = start;
+        while at < end {
+            let step_end = if run == 0 { (at + STEP).min(end) } else { end };
+            for p in at..step_end {
+                let id = walk_at(p);
+                sampled += 1;
+                if matcher.prefilter(index, id, &mut scratch, cancel) {
+                    passed += 1;
+                    if limit.is_some() {
+                        run_hits += usize::from(matcher.matches(index, id, &mut scratch, cancel));
+                    }
                 }
+            }
+            at = step_end;
+            if cancel.is_cancelled() {
+                return None;
+            }
+            // A broad query keeps the plain scan; stop sampling as soon as
+            // that is clear: the cheap part keeps most entries (bits would
+            // skip little), or the page is expected to fill within a small
+            // part of the walk.
+            let mut so_far = rates.clone();
+            so_far.push((run_hits, at - start));
+            let fills_early =
+                limit.is_some_and(|limit| estimate(&so_far, limit).is_some_and(|at| at <= n / 64));
+            if passed * 2 > sampled || fills_early {
+                return None;
             }
         }
         rates.push((run_hits, end - start));
-        if cancel.is_cancelled() {
-            return None;
-        }
-        // A broad query keeps the plain scan; stop sampling as soon as that
-        // is clear, so it pays for one run, not eight: the cheap part keeps
-        // most entries (bits would skip little), or the page is expected to
-        // fill within a small part of the walk.
-        let fills_early =
-            limit.is_some_and(|limit| fill_at(&rates, limit).is_some_and(|at| at <= n / 64));
-        if passed * 2 > sampled || fills_early {
-            return None;
-        }
     }
     let build = match limit {
         // Every candidate is visited; skip only when most pass anyway.
         None => passed * 2 < sampled,
         // Build when the walk would visit a large part of the index.
-        Some(limit) => fill_at(&rates, limit).is_none_or(|at| at > n / 8),
+        Some(limit) => estimate(&rates, limit).is_none_or(|at| at > n / 8),
     };
     if !build {
         return None;
