@@ -128,7 +128,11 @@ impl FerrowApp {
         let engine = Engine::start(move || wake.request_repaint());
         // Setup asks running copies to close before it replaces files.
         let closer = ctx.clone();
+        platform::sync_start_at_sign_in(settings.windows.start_at_sign_in);
         platform::listen_for_setup_exit(move || {
+            // An update restarts the app: if it is in the tray now, the
+            // updated copy starts there too.
+            platform::remember_tray_for_update();
             // The window may be hidden in the tray, where it would not
             // process a close request: quit directly there.
             platform::quit_from_tray();

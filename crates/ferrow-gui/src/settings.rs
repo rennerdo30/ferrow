@@ -207,13 +207,26 @@ impl SortChoice {
 }
 
 /// Windows-only options.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowsSettings {
     /// Index every fixed (internal) drive, including drives added later.
     pub all_fixed_drives: bool,
     /// Answer file and folder searches in the Windows Start menu using Ferrow's index.
     pub windows_search: bool,
+    /// Start Ferrow hidden in the tray when the user signs in, so search
+    /// and the Start menu integration are ready right away.
+    pub start_at_sign_in: bool,
+}
+
+impl Default for WindowsSettings {
+    fn default() -> Self {
+        WindowsSettings {
+            all_fixed_drives: false,
+            windows_search: false,
+            start_at_sign_in: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

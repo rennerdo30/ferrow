@@ -304,6 +304,25 @@ impl FerrowApp {
             ui.add_space(CARD_GAP);
             card(ui, &p, |ui| {
                 ui.horizontal(|ui| {
+                    row_text(
+                        ui,
+                        &p,
+                        "Start Ferrow when you sign in",
+                        "Starts in the notification area, so search and the Start menu integration are ready right away. Closing the window keeps Ferrow running there.",
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if toggle(ui, &p, &mut self.settings.windows.start_at_sign_in).changed() {
+                            changed = true;
+                            platform::sync_start_at_sign_in(
+                                self.settings.windows.start_at_sign_in,
+                            );
+                        }
+                    });
+                });
+            });
+            ui.add_space(CARD_GAP);
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
                     let detail = if self.settings.windows.windows_search {
                         let status = ferrow_winsearch::status();
                         if let Some(error) = status.last_error {

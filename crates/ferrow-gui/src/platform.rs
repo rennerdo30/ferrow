@@ -138,6 +138,55 @@ pub fn hide_to_tray() -> bool {
     false
 }
 
+/// Command-line flag: start hidden in the tray (sign-in autostart).
+pub const TRAY_FLAG: &str = "--tray";
+
+/// File left by a copy that was hidden in the tray when setup closed it
+/// for an update: the restarted copy goes back to the tray too.
+fn tray_marker() -> Option<PathBuf> {
+    crate::engine::default_index_path()?
+        .parent()
+        .map(|dir| dir.join("start-in-tray"))
+}
+
+/// Whether this start should stay hidden in the tray: started with
+/// [`TRAY_FLAG`] (at sign-in), or restarted by an update while the
+/// previous copy was in the tray. Windows only.
+pub fn start_hidden() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let after_update = tray_marker().is_some_and(|marker| std::fs::remove_file(marker).is_ok());
+    after_update || std::env::args().skip(1).any(|arg| arg == TRAY_FLAG)
+}
+
+/// Keep the window hidden in the tray until the user opens it.
+pub fn keep_hidden_until_opened() {
+    #[cfg(windows)]
+    crate::tray::start_hidden();
+}
+
+/// Setup is about to close the app for an update: remember a hidden
+/// window so the updated copy starts in the tray too.
+pub fn remember_tray_for_update() {
+    #[cfg(windows)]
+    if crate::tray::is_hidden()
+        && let Some(marker) = tray_marker()
+    {
+        let _ = std::fs::write(marker, b"1");
+    }
+}
+
+/// Start Ferrow (hidden in the tray) when the user signs in, or stop doing
+/// so. Only an installed copy registers itself; a development build never
+/// does. Windows only.
+pub fn sync_start_at_sign_in(enabled: bool) {
+    #[cfg(windows)]
+    win::sync_start_at_sign_in(enabled);
+    #[cfg(not(windows))]
+    let _ = enabled;
+}
+
 /// Bring the window back from the tray (or to the front).
 pub fn show_from_tray() {
     #[cfg(windows)]
@@ -301,6 +350,47 @@ pub fn apply_backdrop(window: &impl raw_window_handle::HasWindowHandle, dark: bo
 
 #[cfg(windows)]
 mod win {
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const RUN_VALUE: &str = "Ferrow";
+
+    /// The installed app sits next to its uninstaller; development builds
+    /// do not, and must never register themselves for sign-in.
+    fn installed_exe() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        exe.with_file_name("uninstall.exe").is_file().then_some(exe)
+    }
+
+    pub fn sync_start_at_sign_in(enabled: bool) {
+        use std::ffi::OsStr;
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
+        };
+        let Some(exe) = installed_exe() else { return };
+        let key = wide(OsStr::new(RUN_KEY));
+        let name = wide(OsStr::new(RUN_VALUE));
+        if enabled {
+            let command = wide(OsStr::new(&format!(
+                "\"{}\" {}",
+                exe.display(),
+                super::TRAY_FLAG
+            )));
+            // SAFETY: terminated strings; the size covers the value and its NUL.
+            unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    key.as_ptr(),
+                    name.as_ptr(),
+                    REG_SZ,
+                    command.as_ptr().cast(),
+                    (command.len() * 2) as u32,
+                );
+            }
+        } else {
+            // SAFETY: terminated strings.
+            unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+        }
+    }
+
     /// Auto-reset event the running copy waits on; `Local\` keeps it to
     /// this session.
     const ACTIVATE_EVENT: &str = "Local\\Ferrow.Activate";

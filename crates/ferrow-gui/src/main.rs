@@ -34,6 +34,12 @@ fn main() -> eframe::Result {
         .with_min_inner_size([560.0, 360.0])
         .with_transparent(cfg!(target_os = "macos"))
         .with_icon(logo::window_icon());
+    // At sign-in, or after an update while it was in the tray, Ferrow
+    // starts hidden in the tray; the tray icon or starting it again shows
+    // the window.
+    if platform::start_hidden() {
+        platform::keep_hidden_until_opened();
+    }
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,

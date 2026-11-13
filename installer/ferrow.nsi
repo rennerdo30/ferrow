@@ -687,5 +687,9 @@ Section "Uninstall"
   ${AndIf} $0 != 2
     !insertmacro FAIL "Could not remove Ferrow from Installed apps (Windows error $0)." "un."
   ${EndIf}
+  ; The app registers itself to start at sign-in (Settings -> Windows).
+  ; Best effort: only the signed-in account's own entry is reachable here.
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Ferrow"
+  ClearErrors
   SetErrorLevel 0
 SectionEnd
