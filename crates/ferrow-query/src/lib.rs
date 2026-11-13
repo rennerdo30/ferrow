@@ -252,8 +252,25 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
             "allowed set must cover every id"
         );
     }
+    // Id at a position of the walk below (same order the scan uses).
+    let walk_at = |p: usize| -> u32 {
+        if let Some(order) = &metadata_order {
+            order.range(p, p + 1).next().unwrap_or(0)
+        } else if reverse {
+            sorted[sorted.len() - 1 - p]
+        } else {
+            sorted[p]
+        }
+    };
     let bits: Option<std::borrow::Cow<'_, [u64]>> = match (
-        prefilter_bits(index, matcher, sorted.len(), options.limit, &options.cancel),
+        prefilter_bits(
+            index,
+            matcher,
+            sorted.len(),
+            &walk_at,
+            options.limit,
+            &options.cancel,
+        ),
         options.allowed.as_deref(),
     ) {
         (Some(mut pre), Some(allowed)) => {
@@ -440,41 +457,67 @@ const PREFILTER_SAMPLE_RUN: usize = 1_024;
 fn prefilter_bits<M: EntryMatcher>(
     index: &Index,
     matcher: &M,
-    candidates: usize,
+    walk_len: usize,
+    walk_at: &dyn Fn(usize) -> u32,
     limit: Option<usize>,
     cancel: &CancelToken,
 ) -> Option<Vec<u64>> {
     let n = index.len();
-    if !matcher.has_prefilter() || candidates < PREFILTER_MIN_ENTRIES {
+    if !matcher.has_prefilter() || walk_len < PREFILTER_MIN_ENTRIES {
         return None;
     }
-    // Evenly spaced runs of consecutive ids: sequential reads. `passed`
-    // counts the cheap conjuncts (what the bits would keep), `hits` the
-    // whole query (how soon the page fills); the full matcher runs only
-    // where the cheap part passed.
-    let stride = n / PREFILTER_SAMPLE_RUNS;
-    let (mut sampled, mut passed, mut hits) = (0usize, 0usize, 0usize);
+    // Runs at evenly spaced positions of the walk itself (name or metadata
+    // order), so the estimate sees where hits sit in that order: names that
+    // sort last (CJK, `~` prefixes) fill the page only at the end even when
+    // they are not rare. Run 0 is the front of the walk, which the scan
+    // reads first anyway. `passed` counts the cheap conjuncts (what the bits
+    // would keep), `hits` the whole query per run; the full matcher runs
+    // only where the cheap part passed.
+    let stride = walk_len / PREFILTER_SAMPLE_RUNS;
+    let (mut sampled, mut passed) = (0usize, 0usize);
+    let mut rates: Vec<(usize, usize)> = Vec::with_capacity(PREFILTER_SAMPLE_RUNS);
     let mut scratch = Scratch::default();
+    // Walk position at which the page is expected to fill, from the runs
+    // sampled so far (each run's rate stands for its whole region).
+    let fill_at = |rates: &[(usize, usize)], limit: usize| -> Option<usize> {
+        let mut expected = 0.0f64;
+        for (k, &(hits, size)) in rates.iter().enumerate() {
+            if hits == 0 {
+                continue;
+            }
+            let rate = hits as f64 / size as f64;
+            let need = limit as f64 - expected;
+            if need <= rate * stride as f64 {
+                return Some(k * stride + (need / rate) as usize);
+            }
+            expected += rate * stride as f64;
+        }
+        None
+    };
     for run in 0..PREFILTER_SAMPLE_RUNS {
         let start = run * stride;
-        for id in start..(start + PREFILTER_SAMPLE_RUN).min(n) {
+        let end = (start + PREFILTER_SAMPLE_RUN).min(walk_len);
+        let mut run_hits = 0;
+        for p in start..end {
+            let id = walk_at(p);
             sampled += 1;
-            if matcher.prefilter(index, id as u32, &mut scratch, cancel) {
+            if matcher.prefilter(index, id, &mut scratch, cancel) {
                 passed += 1;
                 if limit.is_some() {
-                    hits += usize::from(matcher.matches(index, id as u32, &mut scratch, cancel));
+                    run_hits += usize::from(matcher.matches(index, id, &mut scratch, cancel));
                 }
             }
         }
+        rates.push((run_hits, end - start));
         if cancel.is_cancelled() {
             return None;
         }
         // A broad query keeps the plain scan; stop sampling as soon as that
         // is clear, so it pays for one run, not eight: the cheap part keeps
         // most entries (bits would skip little), or the page is expected to
-        // fill within a small part of the index.
+        // fill within a small part of the walk.
         let fills_early =
-            limit.is_some_and(|limit| hits > 0 && limit.saturating_mul(sampled) / hits <= n / 64);
+            limit.is_some_and(|limit| fill_at(&rates, limit).is_some_and(|at| at <= n / 64));
         if passed * 2 > sampled || fills_early {
             return None;
         }
@@ -482,8 +525,8 @@ fn prefilter_bits<M: EntryMatcher>(
     let build = match limit {
         // Every candidate is visited; skip only when most pass anyway.
         None => passed * 2 < sampled,
-        // Expected visits to fill the page: limit / hit rate.
-        Some(limit) => hits == 0 || (limit.saturating_mul(sampled) / hits).min(candidates) > n / 8,
+        // Build when the walk would visit a large part of the index.
+        Some(limit) => fill_at(&rates, limit).is_none_or(|at| at > n / 8),
     };
     if !build {
         return None;
