@@ -773,13 +773,35 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
     chunk_ranges(n.saturating_sub(1))
         .into_par_iter()
         .try_for_each(|(start, end)| -> Result<(), LoadError> {
-            let mut previous = key(sorted[start]);
-            for &id in &sorted[start + 1..=end] {
-                let next = key(id);
-                if previous >= next {
-                    return Err(LoadError::Corrupt("sort order is not sorted"));
+            // Sorted order visits names at random arena positions, and
+            // each step's load chain (id → offset → name bytes) would stall
+            // on the previous one. Per batch, first gather the offsets, then
+            // touch every name's first byte (independent loads the CPU can
+            // overlap), then compare with the data already in cache.
+            const BATCH: usize = 64;
+            let ids = &sorted[start..=end];
+            let mut spans = [(0u32, 0u16); BATCH];
+            let mut previous = key(ids[0]);
+            for batch in ids[1..].chunks(BATCH) {
+                for (span, &id) in spans.iter_mut().zip(batch) {
+                    *span = (name_off[id as usize], name_len[id as usize]);
                 }
-                previous = next;
+                let mut touch = 0u8;
+                for &(off, len) in &spans[..batch.len()] {
+                    if len > 0 {
+                        touch ^= folded_arena[off as usize];
+                    }
+                }
+                std::hint::black_box(touch);
+                for (&(off, len), &id) in spans.iter().zip(batch) {
+                    let off = off as usize;
+                    let end = off + len as usize;
+                    let next = (&folded_arena[off..end], &arena[off..end], id);
+                    if previous >= next {
+                        return Err(LoadError::Corrupt("sort order is not sorted"));
+                    }
+                    previous = next;
+                }
             }
             Ok(())
         })?;
@@ -1122,6 +1144,39 @@ mod tests {
         std::fs::write(&path, &bad).unwrap();
         assert!(matches!(Index::load(&path), Err(LoadError::Corrupt(_))));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batched sort check finds a swapped pair anywhere: inside a
+    /// batch, across a batch boundary and at a chunk's last entry.
+    #[test]
+    fn rejects_swapped_sort_ids_in_and_across_batches() {
+        let dir = test_dir("sort-batches");
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        for i in 0..5000 {
+            b.add(root, format!("name-{i:05}").as_bytes(), 0);
+        }
+        b.freeze().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(from_bytes(&bytes).is_ok());
+        let n = 5001;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let sorted_at = HEADER_LEN + n * 12 + 2 * arena_len;
+        // Sorted positions p and p + 1; the batches start at position 1.
+        for p in [1usize, 30, 64, 65, 128, 4000, n - 2] {
+            let mut bad = bytes.clone();
+            let (a, b) = (sorted_at + p * 4, sorted_at + (p + 1) * 4);
+            let first: [u8; 4] = bad[a..a + 4].try_into().unwrap();
+            bad.copy_within(b..b + 4, a);
+            bad[b..b + 4].copy_from_slice(&first);
+            fix_checksum(&mut bad);
+            assert!(
+                matches!(from_bytes(&bad), Err(LoadError::Corrupt(_))),
+                "swap at sorted position {p}"
+            );
+        }
     }
 
     fn tiny_index(name: &[u8]) -> Index {
