@@ -45,7 +45,7 @@ use windows::Win32::System::SystemInformation::{GetWindowsDirectoryW, IMAGE_FILE
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetCurrentProcessId, GetExitCodeThread, IsWow64Process2, OpenProcess,
     OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_FORMAT, QueryFullProcessImageNameW,
-    WaitForSingleObject,
+    TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR, s, w};
 
@@ -53,8 +53,8 @@ use crate::ipc;
 
 const DLL_NAME: &str = "ferrow_winsearch.dll";
 const SEARCHHOST_PACKAGE_DIR: &str = "MicrosoftWindows.Client.CBS_cw5n1h2txyewy";
-/// `PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE`
-const ATTACH_ACCESS: u32 = 0x10043A | 0x0010;
+/// `PROCESS_TERMINATE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE`
+const ATTACH_ACCESS: u32 = 0x10043A | 0x0010 | 0x0001;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
 static LAST_ATTACHED_PID: AtomicU32 = AtomicU32::new(0);
@@ -1193,22 +1193,18 @@ unsafe fn attach_to_process_handle(
 
     let remote_mods = list_remote_modules(pid)?;
 
-    // Detach any older `ferrow_winsearch*.dll` still mapped from a prior
-    // build so `tquery.dll`'s vtable slot returns to `tquery.dll` before
-    // the newly staged DLL installs its hook.
-    for (mod_name, old_base, old_size) in &remote_mods {
-        if mod_name != dll_name_lower && is_ferrow_winsearch_module(mod_name) {
-            let detach_rva = remote_export_rva(proc_handle, *old_base, *old_size, b"FerrowDetach")?;
-            let detach_addr = old_base
-                .checked_add(detach_rva)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "detach RVA overflow"))?;
-            let detach_code = unsafe { run_remote_thread(proc_handle, detach_addr, None, 10_000)? };
-            if detach_code != 0 {
-                return Err(io::Error::other(format!(
-                    "FerrowDetach on prior {mod_name} returned non-zero status: {detach_code:#x}"
-                )));
-            }
-        }
+    // An older `ferrow_winsearch*.dll` from a previous Ferrow build is still
+    // mapped: it pins itself (a late hook call must never run unloaded
+    // code), so every update would add one more copy for the life of the
+    // process. End this `SearchHost.exe` instead; Windows starts a fresh
+    // one when Start is next used, and the watcher attaches to it with
+    // only the current DLL.
+    if remote_mods
+        .iter()
+        .any(|(name, _, _)| name != dll_name_lower && is_ferrow_winsearch_module(name))
+    {
+        unsafe { TerminateProcess(proc_handle, 0).map_err(io::Error::from)? };
+        return Ok(false);
     }
 
     if !remote_mods.iter().any(|(n, _, _)| n == dll_name_lower) {

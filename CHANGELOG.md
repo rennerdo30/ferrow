@@ -2,6 +2,11 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## 0.1.0-beta.12
+
+- **Fixed:** the app could crash about 10 seconds after an update (or whenever the Ferrow service came up after the app). It had started on its own index while the service was restarting, and the switch to the service left the result list pointing into the index it just dropped. While it was down, Start searches fell back to Windows. The result list is now cleared on every index switch, and rows from a replaced index are never read.
+- **Fixed:** every Ferrow update left one more copy of its Start-search DLL loaded in `SearchHost.exe` until you signed out. When an older copy is loaded, Ferrow now restarts `SearchHost.exe` once (Start search reloads; Windows starts it again by itself), so only the current copy stays.
+
 ## 0.1.0-beta.11
 
 - **Tray icon (Windows):** closing the window now keeps Ferrow running in the notification area, so the live index and the Start menu integration keep working. Click the icon to bring the window back (the search box is ready to type); right-click it for **Open Ferrow** and **Quit Ferrow**. Starting Ferrow again while it runs shows the running window instead of a second copy.
