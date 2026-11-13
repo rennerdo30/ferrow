@@ -219,6 +219,10 @@ fn every_language_feature_equals_reference_on_100k() {
         "!<*.log|tmp> report",
         "<folder:|file:ext:txt> !case:TMP",
         "\"*\"",
+        // Rare plain literals take the id-order prefilter path.
+        "zzzz-no-hit-zzzz",
+        "report zzzz",
+        "!tmp zzzz",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -231,6 +235,10 @@ fn every_language_feature_equals_reference_on_100k() {
         if chars.len() >= 3 {
             queries.push(format!("{}*{}", chars[0], chars.last().unwrap()));
             queries.push(format!("?{}*", chars[1]));
+            // A whole name as a plain literal: a handful of hits.
+            if !name.contains(['*', '?', '"', '|', '!', '<', '>', ' ']) {
+                queries.push(name.into_owned());
+            }
         }
     }
     for text in queries {
