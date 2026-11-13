@@ -649,39 +649,73 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
     // content validation, so shared/overlapping ranges cannot make
     // folding and sort-key work grow with the sum of referenced name
     // lengths instead of the stored arena size.
+    // Parallel in chunks: each chunk's length sum (u64: at most n * 65535,
+    // no overflow), a serial prefix over the few chunks, then each chunk
+    // checks its offsets from its own start. A packed layout ending at
+    // the arena length also keeps every name inside the arena.
+    const STRUCT_CHUNK: usize = 1 << 16;
+    let sums: Vec<u64> = name_len
+        .par_chunks(STRUCT_CHUNK)
+        .map(|lens| lens.iter().map(|&l| l as u64).sum())
+        .collect();
+    let mut starts = Vec::with_capacity(sums.len());
     let mut running: u64 = 0;
-    for i in 0..n {
-        if name_off[i] as u64 != running {
-            return Err(LoadError::Corrupt("name layout is not packed"));
-        }
-        running = running
-            .checked_add(name_len[i] as u64)
-            .ok_or(LoadError::Corrupt("size overflow"))?;
+    for sum in &sums {
+        starts.push(running);
+        running += sum;
     }
     if running != arena_len as u64 {
         return Err(LoadError::Corrupt("name layout is not packed"));
     }
+    let packed = name_off
+        .par_chunks(STRUCT_CHUNK)
+        .zip(name_len.par_chunks(STRUCT_CHUNK))
+        .zip(starts.par_iter())
+        .all(|((offs, lens), &start)| {
+            let mut at = start;
+            let mut ok = true;
+            for (&off, &len) in offs.iter().zip(lens) {
+                ok &= off as u64 == at;
+                at += len as u64;
+            }
+            ok
+        });
+    if !packed {
+        return Err(LoadError::Corrupt("name layout is not packed"));
+    }
 
     // Validate so later lookups can never panic on a crafted file.
-    for i in 0..n {
-        if parent[i] != ROOT_PARENT && parent[i] as usize >= n {
-            return Err(LoadError::Corrupt("parent id out of range"));
-        }
-        // u64 math: overflow-free even on 32-bit targets.
-        let end = name_off[i] as u64 + name_len[i] as u64;
-        if end > arena_len as u64 {
-            return Err(LoadError::Corrupt("name offset out of range"));
-        }
-        if sorted[i] as usize >= n {
-            return Err(LoadError::Corrupt("sort order id out of range"));
-        }
+    let n32 = n as u64;
+    if !parent
+        .par_chunks(STRUCT_CHUNK)
+        .all(|c| c.iter().all(|&p| p == ROOT_PARENT || (p as u64) < n32))
+    {
+        return Err(LoadError::Corrupt("parent id out of range"));
+    }
+    if !sorted
+        .par_chunks(STRUCT_CHUNK)
+        .all(|c| c.iter().all(|&id| (id as u64) < n32))
+    {
+        return Err(LoadError::Corrupt("sort order id out of range"));
     }
     // Reject parent cycles, which would loop forever in path rebuild:
-    // every chain must reach a root within n steps. O(n * depth) worst
-    // case is too slow for big files, so walk with a visiting mark.
-    let mut state = vec![0u8; n]; // 0 = unseen, 1 = on current walk, 2 = done
+    // every chain must reach a root within n steps. The writer gives
+    // every parent a smaller id than its children, and then no cycle is
+    // possible; that is one parallel pass. Any other layout gets the full
+    // walk with a visiting mark (O(n * depth) would be too slow).
+    let parents_first = parent
+        .par_chunks(STRUCT_CHUNK)
+        .enumerate()
+        .all(|(c, chunk)| {
+            let base = c * STRUCT_CHUNK;
+            chunk
+                .iter()
+                .enumerate()
+                .all(|(i, &p)| p == ROOT_PARENT || (p as usize) < base + i)
+        });
+    let mut state = vec![0u8; if parents_first { 0 } else { n }]; // 0 = unseen, 1 = on current walk, 2 = done
     let mut walk: Vec<usize> = Vec::new(); // reused: no per-entry allocation
-    for start in 0..n {
+    for start in 0..if parents_first { 0 } else { n } {
         if state[start] != 0 {
             continue;
         }
@@ -706,15 +740,21 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
         }
     }
 
-    // Sort-order uniqueness is structural and stays serial (a single
-    // pass over a bool per entry); the packed/range/cycle checks above
-    // plus this one make up the structure span.
-    let mut seen = vec![false; n];
-    for &id in &sorted {
-        if seen[id as usize] {
-            return Err(LoadError::Corrupt("duplicate id in sort order"));
-        }
-        seen[id as usize] = true;
+    // Sort-order uniqueness: one bit per id, set in parallel; an id whose
+    // bit was already set is a duplicate. With n in-range ids and no
+    // duplicate, the order is a permutation.
+    let seen: Vec<std::sync::atomic::AtomicU64> = (0..n.div_ceil(64))
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+    let unique = sorted.par_chunks(STRUCT_CHUNK).all(|c| {
+        c.iter().all(|&id| {
+            let bit = 1u64 << (id % 64);
+            seen[id as usize / 64].fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+        })
+    });
+    drop(seen);
+    if !unique {
+        return Err(LoadError::Corrupt("duplicate id in sort order"));
     }
     timings.structure += structure_started.elapsed();
 
@@ -1070,6 +1110,34 @@ mod tests {
         let sum = crc32(&bytes[CHECKSUM_START..]);
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
         assert!(matches!(from_bytes(&bytes), Err(LoadError::Corrupt(_))));
+    }
+
+    /// A parent with a larger id than its child is not what the writer
+    /// produces but is valid: the full walk accepts it. A two-entry cycle
+    /// in the same layout is rejected.
+    #[test]
+    fn later_parent_ids_load_and_longer_cycles_are_rejected() {
+        let dir = test_dir("later-parent");
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        b.add(root, b"a", 0);
+        b.add(root, b"b", flags::DIR);
+        b.freeze().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let set_parent = |bytes: &mut Vec<u8>, id: usize, parent: u32| {
+            let at = HEADER_LEN + id * 4;
+            bytes[at..at + 4].copy_from_slice(&parent.to_le_bytes());
+            fix_checksum(bytes);
+        };
+        let mut later = bytes.clone();
+        set_parent(&mut later, 1, 2); // a's parent is b (id 2 > 1)
+        let index = from_bytes(&later).expect("valid non-writer layout loads");
+        assert_eq!(index.parent(1), 2);
+        let mut cycle = later.clone();
+        set_parent(&mut cycle, 2, 1); // b's parent is a: 1 -> 2 -> 1
+        assert!(matches!(from_bytes(&cycle), Err(LoadError::Corrupt(_))));
     }
 
     fn test_dir(tag: &str) -> std::path::PathBuf {
