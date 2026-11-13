@@ -39,8 +39,10 @@ pub struct ParsedSql {
 
 /// Leaves out everything inside a folder whose name starts with a dot
 /// (`.git`, `.cache`, `.claude`, ...): Start silently drops those rows, so
-/// they would only take places from files it shows.
-const SKIP_DOT_FOLDERS: &str = "!path:\\.";
+/// they would only take places from files it shows. Also leaves out
+/// Windows' prefetch traces (`C:\Windows\Prefetch\NAME.EXE-1234.pf`): one
+/// per program run, they match every program name and nobody opens them.
+const SKIP_DOT_FOLDERS: &str = "!path:\\. !path:\\windows\\prefetch\\";
 
 /// A term that can stand in a bare `term*` wildcard.
 fn is_wildcard_safe(term: &str) -> bool {

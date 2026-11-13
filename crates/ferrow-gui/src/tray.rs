@@ -15,14 +15,17 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIcon, CreatePopupMenu, DestroyMenu, HICON, IsIconic, MF_SEPARATOR,
-    MF_STRING, PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SetForegroundWindow, SetMenuDefaultItem, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL,
+    AppendMenuW, CreateIcon, CreatePopupMenu, DestroyMenu, HICON, IsIconic, IsWindowVisible,
+    MF_SEPARATOR, MF_STRING, PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SWP_SHOWWINDOW, SetForegroundWindow, SetMenuDefaultItem, ShowWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOWPOS, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_SHOWWINDOW, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
 };
 
 /// Callback message the icon sends to the main window.
 const TRAY_MESSAGE: u32 = WM_APP + 0x46;
+/// Posted to hide the window again while Ferrow starts in the tray.
+const HIDE_MESSAGE: u32 = WM_APP + 0x47;
 const ICON_ID: u32 = 1;
 /// `NIN_SELECT` / `NIN_KEYSELECT`: the icon was clicked or chosen with the
 /// keyboard (`NOTIFYICON_VERSION_4`).
@@ -36,6 +39,14 @@ static WINDOW: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut(
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static FOCUS_SEARCH: AtomicBool = AtomicBool::new(false);
+/// Set when Ferrow starts in the tray: the window must not appear until
+/// the user opens it (eframe shows its window after the first frame).
+static KEEP_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Start hidden in the tray: block the window from showing until [`show`].
+pub fn start_hidden() {
+    KEEP_HIDDEN.store(true, Ordering::Release);
+}
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -125,6 +136,7 @@ pub fn show() {
         return;
     }
     FOCUS_SEARCH.store(true, Ordering::Release);
+    KEEP_HIDDEN.store(false, Ordering::Release);
     // SAFETY: hwnd is our live window; both calls are safe from any thread.
     unsafe {
         ShowWindow(
@@ -150,6 +162,13 @@ pub fn hide_to_tray() -> bool {
     // SAFETY: hwnd is our live window.
     unsafe { ShowWindow(hwnd, SW_HIDE) };
     true
+}
+
+/// True while the window is hidden in the tray.
+pub fn is_hidden() -> bool {
+    let hwnd = WINDOW.load(Ordering::Acquire);
+    // SAFETY: hwnd is our live window.
+    !hwnd.is_null() && INSTALLED.load(Ordering::Acquire) && unsafe { IsWindowVisible(hwnd) } == 0
 }
 
 /// True once after [`show`]: the UI should focus the search box.
@@ -217,6 +236,31 @@ pub fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
         }
         // The ✕ button, Alt+F4 and the taskbar's Close window: keep running.
         WM_CLOSE if hide_to_tray() => Some(0),
+        // Started in the tray: drop any attempt to show the window until
+        // the user opens it.
+        WM_WINDOWPOSCHANGING if KEEP_HIDDEN.load(Ordering::Acquire) => {
+            // SAFETY: for this message lparam points to the caller's WINDOWPOS.
+            unsafe { (*(lparam as *mut WINDOWPOS)).flags &= !SWP_SHOWWINDOW };
+            None
+        }
+        // Some show paths (ShowWindow) make the window visible regardless;
+        // hide it again before it paints.
+        WM_SHOWWINDOW | WM_WINDOWPOSCHANGED if KEEP_HIDDEN.load(Ordering::Acquire) => {
+            // SAFETY: hwnd is our live window, on its own thread.
+            unsafe {
+                if IsWindowVisible(hwnd) != 0 {
+                    PostMessageW(hwnd, HIDE_MESSAGE, 0, 0);
+                }
+            }
+            None
+        }
+        HIDE_MESSAGE => {
+            if KEEP_HIDDEN.load(Ordering::Acquire) {
+                // SAFETY: hwnd is our live window.
+                unsafe { ShowWindow(hwnd, SW_HIDE) };
+            }
+            Some(0)
+        }
         WM_DESTROY => {
             remove_icon();
             None
