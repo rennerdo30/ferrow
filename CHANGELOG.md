@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Keyboard shortcut (Windows):** press **Ctrl+Alt+F** anywhere to bring up Ferrow with the search box ready; press it again to put Ferrow back in the tray. Change it or turn it off in Settings → Windows → Keyboard shortcut (Ctrl+Alt+Space and Alt+Space are offered too). If another app already uses the shortcut, Settings says so.
+
 ## 0.1.0-beta.13
 
 - **Starts with Windows, in the tray:** new setting **Start Ferrow when you sign in** (Settings → Windows, on by default). Ferrow starts hidden in the notification area, so search and the Start menu integration are ready right after you sign in. Opening Ferrow yourself still shows the window.
