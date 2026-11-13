@@ -2,9 +2,11 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.15
 
 - **Drag results out (Windows):** drag a result into Explorer, onto the desktop, into a mail, chat or editor window to copy, move or link the file, as from Explorer.
+- **Faster searches for names that sort last:** searches whose matches all sort near the end (Japanese, Chinese and other non-Latin names, for example `文書`) show their first page about three times sooner (5 million entries: 280 ms → 79 ms).
+- **Faster start:** checking the saved index while loading is quicker (about 45 ms less at 5 million entries).
 
 ## 0.1.0-beta.14
 
