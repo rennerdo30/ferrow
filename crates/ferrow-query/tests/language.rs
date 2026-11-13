@@ -568,6 +568,52 @@ fn wildcard_boolean_modifiers_and_filters() {
     }
 }
 
+/// Hits common enough that the sample keeps the plain walk, but all sorting
+/// last: the walk switches to the id-order bits after the front eighth.
+/// The page must equal the unlimited result's prefix, for plain and
+/// general matchers and descending order.
+#[test]
+fn late_hits_switch_to_bits_without_changing_results() {
+    let b = IndexBuilder::new();
+    let root = b.add_root(b"root", flags::DIR);
+    for i in 0..200_000u32 {
+        let name = if i % 10 == 0 {
+            format!("~late-{i:06}.txt")
+        } else {
+            format!("early-{i:06}.log")
+        };
+        b.add(root, name.as_bytes(), 0);
+    }
+    let index = b.freeze();
+    for text in ["late", "late file:", "late !zzz", "*late*"] {
+        let query = Query::parse(text).unwrap();
+        for descending in [false, true] {
+            let all = search(
+                &index,
+                &query,
+                &SearchOptions {
+                    descending,
+                    ..SearchOptions::default()
+                },
+            );
+            assert_eq!(all.hits.len(), 20_000, "{text}");
+            for limit in [1, 100, 5_000] {
+                let page = search(
+                    &index,
+                    &query,
+                    &SearchOptions {
+                        limit: Some(limit),
+                        descending,
+                        ..SearchOptions::default()
+                    },
+                );
+                assert_eq!(page.hits, all.hits[..limit], "{text} {descending} {limit}");
+                assert!(!page.cancelled);
+            }
+        }
+    }
+}
+
 #[test]
 fn type_macros() {
     let b = IndexBuilder::new();

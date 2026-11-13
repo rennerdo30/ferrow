@@ -252,20 +252,32 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
             "allowed set must cover every id"
         );
     }
-    let bits: Option<std::borrow::Cow<'_, [u64]>> = match (
-        prefilter_bits(index, matcher, sorted.len(), options.limit, &options.cancel),
-        options.allowed.as_deref(),
-    ) {
-        (Some(mut pre), Some(allowed)) => {
-            for (word, allow) in pre.iter_mut().zip(allowed) {
-                *word &= allow;
+    let combine = |pre: Option<Vec<u64>>| -> Option<std::borrow::Cow<'_, [u64]>> {
+        match (pre, options.allowed.as_deref()) {
+            (Some(mut pre), Some(allowed)) => {
+                for (word, allow) in pre.iter_mut().zip(allowed) {
+                    *word &= allow;
+                }
+                Some(std::borrow::Cow::Owned(pre))
             }
-            Some(std::borrow::Cow::Owned(pre))
+            (Some(pre), None) => Some(std::borrow::Cow::Owned(pre)),
+            (None, Some(allowed)) => Some(std::borrow::Cow::Borrowed(allowed.as_slice())),
+            (None, None) => None,
         }
-        (Some(pre), None) => Some(std::borrow::Cow::Owned(pre)),
-        (None, Some(allowed)) => Some(std::borrow::Cow::Borrowed(allowed.as_slice())),
-        (None, None) => None,
     };
+    let pre = prefilter_bits(index, matcher, sorted.len(), options.limit, &options.cancel);
+    // When the sample kept the plain walk but guessed wrong (hits that sit
+    // late in the walk, such as CJK names, which sort last), the walk would
+    // visit most of the index in random order. So the walk first covers
+    // only the front eighth of the index; a page that is still not full
+    // then switches to the id-order bits for the rest. Queries that fill
+    // their page early never reach the switch and pay nothing.
+    let switch_chunk = (pre.is_none()
+        && matcher.has_prefilter()
+        && options.limit.is_some_and(|limit| limit > 0)
+        && sorted.len() >= PREFILTER_MIN_ENTRIES)
+        .then(|| (index.len() / SWITCH_FRACTION).div_ceil(BLOCK_SIZE));
+    let mut bits = combine(pre);
     let width = rayon::current_num_threads();
     // Only a window of `width` chunks can be admitted ahead of the
     // completed prefix. A slow early chunk cannot accumulate unbounded
@@ -292,96 +304,108 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
         timings.prepare = t.elapsed();
     }
     let scan_started = TIMED.then(std::time::Instant::now);
-    (0..width).into_par_iter().for_each(|_| {
-        let mut scratch = Scratch::default();
-        loop {
-            let chunk = {
-                let mut state = ordered.lock().expect("query progress poisoned");
-                loop {
-                    if state.stop
-                        || options.cancel.is_cancelled()
-                        || state.next == state.chunks.len()
-                    {
-                        return;
+    // Admit chunks up to `end_chunk`; a second call continues from there.
+    let scan = |end_chunk: usize, bits: Option<&[u64]>| {
+        (0..width).into_par_iter().for_each(|_| {
+            let mut scratch = Scratch::default();
+            loop {
+                let chunk = {
+                    let mut state = ordered.lock().expect("query progress poisoned");
+                    loop {
+                        if state.stop || options.cancel.is_cancelled() || state.next >= end_chunk {
+                            return;
+                        }
+                        if state.next < state.prefix + width {
+                            let next = state.next;
+                            state.next += 1;
+                            break next;
+                        }
+                        // An admitted chunk always owns the missing prefix. Its
+                        // completion (including cancellation) wakes every waiter.
+                        state = ready.wait(state).expect("query progress poisoned");
                     }
-                    if state.next < state.prefix + width {
-                        let next = state.next;
-                        state.next += 1;
-                        break next;
-                    }
-                    // An admitted chunk always owns the missing prefix. Its
-                    // completion (including cancellation) wakes every waiter.
-                    state = ready.wait(state).expect("query progress poisoned");
-                }
-            };
-            let start = chunk * BLOCK_SIZE;
-            let block = &sorted[start..(start + BLOCK_SIZE).min(sorted.len())];
-            let mut found = Vec::new();
-            let mut ordered_ids = Vec::new();
-            let mut examined = 0;
-            for offset in (0..block.len()).step_by(CANCEL_INTERVAL) {
-                if options.cancel.is_cancelled() {
-                    break;
-                }
-                let end = (offset + CANCEL_INTERVAL).min(block.len());
-                let ids = if let Some(order) = &metadata_order {
-                    ordered_ids.clear();
-                    ordered_ids.extend(order.range(start + offset, start + end));
-                    ordered_ids.as_slice()
-                } else if reverse {
-                    ordered_ids.clear();
-                    ordered_ids.extend(
-                        (start + offset..start + end).map(|p| sorted[sorted.len() - 1 - p]),
-                    );
-                    ordered_ids.as_slice()
-                } else {
-                    &sorted[start + offset..start + end]
                 };
-                for &id in ids {
-                    if bits
-                        .as_ref()
-                        .is_some_and(|b| b[id as usize / 64] >> (id % 64) & 1 == 0)
-                    {
-                        continue;
-                    }
-                    if matcher.matches(index, id, &mut scratch, &options.cancel)
-                        && options.limit.is_none_or(|limit| found.len() < limit)
-                    {
-                        found.push(id);
-                    }
-                }
-                if M::CANCELLABLE_TERM && options.cancel.is_cancelled() {
-                    break;
-                }
-                examined += end - offset;
-            }
-            visited.fetch_add(examined, Ordering::Relaxed);
-            #[cfg(feature = "test-hooks")]
-            if examined == block.len()
-                && let Some(hook) = &options.on_block
-            {
-                hook(chunk);
-            }
-            let mut state = ordered.lock().expect("query progress poisoned");
-            if examined == block.len() {
-                state.chunks[chunk] = Some(found);
-                while state.prefix < state.chunks.len() {
-                    let Some(hits) = &state.chunks[state.prefix] else {
+                let start = chunk * BLOCK_SIZE;
+                let block = &sorted[start..(start + BLOCK_SIZE).min(sorted.len())];
+                let mut found = Vec::new();
+                let mut ordered_ids = Vec::new();
+                let mut examined = 0;
+                for offset in (0..block.len()).step_by(CANCEL_INTERVAL) {
+                    if options.cancel.is_cancelled() {
                         break;
+                    }
+                    let end = (offset + CANCEL_INTERVAL).min(block.len());
+                    let ids = if let Some(order) = &metadata_order {
+                        ordered_ids.clear();
+                        ordered_ids.extend(order.range(start + offset, start + end));
+                        ordered_ids.as_slice()
+                    } else if reverse {
+                        ordered_ids.clear();
+                        ordered_ids.extend(
+                            (start + offset..start + end).map(|p| sorted[sorted.len() - 1 - p]),
+                        );
+                        ordered_ids.as_slice()
+                    } else {
+                        &sorted[start + offset..start + end]
                     };
-                    state.hits += hits.len();
-                    state.prefix += 1;
+                    for &id in ids {
+                        if bits.is_some_and(|b| b[id as usize / 64] >> (id % 64) & 1 == 0) {
+                            continue;
+                        }
+                        if matcher.matches(index, id, &mut scratch, &options.cancel)
+                            && options.limit.is_none_or(|limit| found.len() < limit)
+                        {
+                            found.push(id);
+                        }
+                    }
+                    if M::CANCELLABLE_TERM && options.cancel.is_cancelled() {
+                        break;
+                    }
+                    examined += end - offset;
                 }
-                if options.limit.is_some_and(|limit| state.hits >= limit) {
+                visited.fetch_add(examined, Ordering::Relaxed);
+                #[cfg(feature = "test-hooks")]
+                if examined == block.len()
+                    && let Some(hook) = &options.on_block
+                {
+                    hook(chunk);
+                }
+                let mut state = ordered.lock().expect("query progress poisoned");
+                if examined == block.len() {
+                    state.chunks[chunk] = Some(found);
+                    while state.prefix < state.chunks.len() {
+                        let Some(hits) = &state.chunks[state.prefix] else {
+                            break;
+                        };
+                        state.hits += hits.len();
+                        state.prefix += 1;
+                    }
+                    if options.limit.is_some_and(|limit| state.hits >= limit) {
+                        state.stop = true;
+                    }
+                }
+                if options.cancel.is_cancelled() {
                     state.stop = true;
                 }
+                ready.notify_all();
             }
-            if options.cancel.is_cancelled() {
-                state.stop = true;
+        });
+    };
+    let total_chunks = sorted.len().div_ceil(BLOCK_SIZE);
+    match switch_chunk {
+        Some(boundary) if boundary < total_chunks => {
+            scan(boundary, bits.as_deref());
+            let unfilled = {
+                let state = ordered.lock().expect("query progress poisoned");
+                !state.stop && state.prefix == boundary
+            };
+            if unfilled && !options.cancel.is_cancelled() {
+                bits = combine(Some(build_prefilter_bits(index, matcher, &options.cancel)));
+                scan(total_chunks, bits.as_deref());
             }
-            ready.notify_all();
         }
-    });
+        _ => scan(total_chunks, bits.as_deref()),
+    }
     if let Some(t) = scan_started {
         timings.scan = t.elapsed();
     }
@@ -419,6 +443,9 @@ fn search_prepared<const TIMED: bool, M: EntryMatcher>(
     (result, timings)
 }
 
+/// A first page still empty after this fraction of the walk switches to
+/// the id-order prefilter bits for the rest.
+const SWITCH_FRACTION: usize = 8;
 /// Indexes smaller than this always use the plain ordered scan.
 const PREFILTER_MIN_ENTRIES: usize = 1 << 16;
 /// Selectivity sample: this many runs of `PREFILTER_SAMPLE_RUN` consecutive
@@ -488,6 +515,17 @@ fn prefilter_bits<M: EntryMatcher>(
     if !build {
         return None;
     }
+    Some(build_prefilter_bits(index, matcher, cancel))
+}
+
+/// One parallel id-order pass marking the entries that pass the matcher's
+/// cheap conjuncts.
+fn build_prefilter_bits<M: EntryMatcher>(
+    index: &Index,
+    matcher: &M,
+    cancel: &CancelToken,
+) -> Vec<u64> {
+    let n = index.len();
     let mut bits = vec![0u64; n.div_ceil(64)];
     bits.par_chunks_mut(BLOCK_SIZE / 64)
         .enumerate()
@@ -509,7 +547,7 @@ fn prefilter_bits<M: EntryMatcher>(
         });
     // A cancelled build is incomplete; the scan sees the cancellation and
     // returns an empty exact prefix.
-    Some(bits)
+    bits
 }
 
 /// Count all hits without storing them. Returns the count found and
