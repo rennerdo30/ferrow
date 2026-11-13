@@ -1500,6 +1500,10 @@ const SYNTAX_HELP: &[(&str, &str)] = &[
     ),
     ("report*2024*", "Starts with report, contains 2024"),
     ("ext:log;txt", "File extensions"),
+    (
+        "audio:beatles",
+        "File types: audio: video: pic: doc: archive: exe:",
+    ),
     ("path:docs", "Match the full path, not just the name"),
     ("file:  folder:", "Only files, or only folders"),
     ("case:Readme", "Case-sensitive"),

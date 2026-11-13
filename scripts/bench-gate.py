@@ -10,7 +10,7 @@ import subprocess
 import statistics
 
 QUERIES = {"a", "re", "report 2024", "!tmp log", "zzzz-no-hit-zzzz", "文書"}
-NEW_QUERIES = {"*.log", "report*2024*", "path:docs report", "ext:txt;md", "<a|re> !tmp"}
+NEW_QUERIES = {"*.log", "report*2024*", "path:docs report", "ext:txt;md", "<a|re> !tmp", "doc:"}
 COMMON_WILDCARDS = {"*.log", "report*2024*"}
 # size:/dm: filters over the metadata fixture (examples/metadata_bench.rs).
 FILTER_QUERIES = {"size:>1gb", "size:<1mb", "dm:2024-03-01..2024-03-31",
@@ -111,7 +111,7 @@ def render(rows):
     lines = ["## Paired benchmark regression gate", "",
              "Same runner/job; median of 3 loads and 5 queries per arm. "
              "Limit: base + max(10%, 0.1 ms); memory: base + 10%. "
-             "All 20 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms. "
+             "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms. "
              "Section 3 absolute targets remain reported goals.", "",
              "| Metric | Base | Head | Limit | Result |", "|---|---:|---:|---:|---|"]
     def cell(value):

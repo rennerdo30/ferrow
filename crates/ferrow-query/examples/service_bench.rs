@@ -126,6 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "path:docs report",
         "ext:txt;md",
         "<a|re> !tmp",
+        "doc:",
     ];
     let queries = if legacy || modified {
         &queries[..6]

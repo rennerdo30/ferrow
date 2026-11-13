@@ -62,6 +62,86 @@ pub enum Pattern {
     EntryType,
 }
 
+/// File type macros: `audio:` alone matches files with one of these
+/// extensions; `audio:beatles` also needs the text term. Lists are
+/// lowercase and sorted, so the matcher can binary-search them.
+pub const TYPE_MACROS: &[(&str, &[&str])] = &[
+    (
+        "archive:",
+        &[
+            "7z", "ace", "arj", "bz2", "cab", "gz", "gzip", "iso", "jar", "lz", "lz4", "lzh",
+            "lzma", "rar", "tar", "taz", "tbz", "tbz2", "tgz", "txz", "tz", "xz", "z", "zip",
+            "zipx", "zst",
+        ],
+    ),
+    (
+        "audio:",
+        &[
+            "aac", "ac3", "aif", "aifc", "aiff", "alac", "amr", "ape", "au", "cda", "dts", "fla",
+            "flac", "m4a", "m4b", "m4p", "mid", "midi", "mka", "mod", "mp2", "mp3", "mpa", "oga",
+            "ogg", "opus", "ra", "rmi", "snd", "voc", "wav", "weba", "wma", "wv",
+        ],
+    ),
+    (
+        "doc:",
+        &[
+            "csv", "doc", "docm", "docx", "dot", "dotm", "dotx", "epub", "md", "odp", "ods", "odt",
+            "oxps", "pdf", "pot", "potm", "potx", "pps", "ppsm", "ppsx", "ppt", "pptm", "pptx",
+            "rtf", "tex", "txt", "wpd", "wps", "xls", "xlsb", "xlsm", "xlsx", "xlt", "xltm",
+            "xltx", "xps",
+        ],
+    ),
+    (
+        "exe:",
+        &[
+            "appimage",
+            "appx",
+            "appxbundle",
+            "bat",
+            "cmd",
+            "com",
+            "exe",
+            "msi",
+            "msix",
+            "msixbundle",
+            "ps1",
+            "run",
+            "scr",
+            "sh",
+            "vbs",
+        ],
+    ),
+    (
+        "pic:",
+        &[
+            "ani", "arw", "avif", "bmp", "cr2", "cr3", "cur", "dng", "gif", "heic", "heif", "ico",
+            "jfif", "jpe", "jpeg", "jpg", "jxl", "nef", "orf", "pcx", "png", "psd", "raf", "raw",
+            "rw2", "svg", "tga", "tif", "tiff", "webp", "wmf",
+        ],
+    ),
+    (
+        "video:",
+        &[
+            "3g2", "3gp", "3gp2", "3gpp", "amv", "asf", "avi", "bik", "divx", "dvr-ms", "f4v",
+            "flv", "m1v", "m2t", "m2ts", "m2v", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg", "mpg",
+            "mts", "ogm", "ogv", "qt", "rm", "rmvb", "ts", "vob", "webm", "wm", "wmv",
+        ],
+    ),
+    // Everything's name for archives.
+    ("zip:", &[]),
+];
+
+fn type_macro(rest: &str) -> Option<(&'static str, &'static [&'static str])> {
+    let (name, exts) = TYPE_MACROS
+        .iter()
+        .find(|(name, _)| rest.starts_with(name))?;
+    if exts.is_empty() {
+        // An alias: `zip:` is `archive:`.
+        return Some((name, TYPE_MACROS[0].1));
+    }
+    Some((name, exts))
+}
+
 /// User regexes may nest groups this deep.
 const REGEX_NEST_LIMIT: u32 = 32;
 /// Bound for the normalised wholeword form: its HIR display adds
@@ -299,8 +379,17 @@ impl Parser<'_> {
         let start = self.at;
         let (mut case, mut path, mut word, mut regex, mut directory) =
             (false, false, false, false, None);
+        let mut kind: Option<(&'static str, &'static [&'static str])> = None;
         loop {
             let rest = &self.input[self.at..];
+            if let Some((name, exts)) = type_macro(rest) {
+                if kind.is_some() {
+                    return Err(self.error(start, self.at + name.len(), "conflicting file types"));
+                }
+                kind = Some((name, exts));
+                self.at += name.len();
+                continue;
+            }
             let (prefix, kind) = [
                 ("case:", 0),
                 ("path:", 1),
@@ -331,6 +420,9 @@ impl Parser<'_> {
                 _ => break,
             }
             self.at += prefix.len();
+        }
+        if kind.is_some() && directory == Some(true) {
+            return Err(self.error(start, self.at, "conflicting entry types"));
         }
         let mut filter = None;
         if !regex {
@@ -375,6 +467,26 @@ impl Parser<'_> {
         let text = self.input[value_start..self.at].to_string();
         if quoted {
             self.at += 1;
+        }
+        let kind_term = kind.map(|(name, exts)| Term {
+            text: name.trim_end_matches(':').to_string(),
+            negated: false,
+            case_sensitive: false,
+            path: false,
+            wholeword: false,
+            directory: None,
+            pattern: Pattern::Filter(Filter::Extension(
+                exts.iter().map(|e| e.to_string()).collect(),
+            )),
+            span: start..self.at,
+        });
+        let bare = !quoted && filter.is_none() && !regex && !path && !word;
+        if let Some(kind_term) = &kind_term
+            && text.is_empty()
+            && bare
+        {
+            // `audio:` or `file:audio:` alone.
+            return self.push(kind_term.clone());
         }
         let pattern = if text.is_empty() {
             if directory.is_some() && !quoted && filter.is_none() && !regex && !path && !word {
@@ -442,11 +554,7 @@ impl Parser<'_> {
         } else {
             Pattern::Literal
         };
-        if self.terms.len() == 256 {
-            return Err(self.error(start, self.at, "query exceeds 256 terms"));
-        }
-        let i = self.terms.len();
-        self.terms.push(Term {
+        let term = Term {
             text,
             negated: false,
             case_sensitive: case,
@@ -455,7 +563,18 @@ impl Parser<'_> {
             directory,
             pattern,
             span: start..self.at,
-        });
-        Ok(Expr::Term(i))
+        };
+        match kind_term {
+            // `audio:beatles`: the cheap extension test first.
+            Some(kind_term) => Ok(Expr::And(vec![self.push(kind_term)?, self.push(term)?])),
+            None => self.push(term),
+        }
+    }
+    fn push(&mut self, term: Term) -> Result<Expr, ParseError> {
+        if self.terms.len() == 256 {
+            return Err(self.error(term.span.start, term.span.end, "query exceeds 256 terms"));
+        }
+        self.terms.push(term);
+        Ok(Expr::Term(self.terms.len() - 1))
     }
 }
