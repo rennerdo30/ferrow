@@ -35,4 +35,6 @@ serde_json = "1"
 window-vibrancy = "0.8.1"
 
 [target.'cfg(windows)'.dependencies]
+# COM for the Explorer context menu (already in the tree via ferrow-winsearch).
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_NetworkManagement_WNet", "Win32_Storage_FileSystem", "Win32_System_DataExchange", "Win32_System_Threading", "Win32_Security", "Win32_Security_Authorization", "Win32_System_RemoteDesktop", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_WindowsProgramming", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

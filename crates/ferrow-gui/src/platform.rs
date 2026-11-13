@@ -38,6 +38,22 @@ pub fn reveal(path: &Path) {
     }
 }
 
+/// Show the system file manager's context menu for `path` at the mouse
+/// (with Ferrow's own items on top). False where there is none; the
+/// caller shows its own menu. `extended` adds the Shift+right-click verbs.
+pub fn show_shell_menu(path: &Path, extended: bool) -> bool {
+    #[cfg(windows)]
+    {
+        crate::shell_menu::show(path.to_path_buf(), extended);
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, extended);
+        false
+    }
+}
+
 /// Start a helper process without waiting for it. The child is not
 /// tracked: the file manager or viewer outlives Ferrow on purpose.
 #[allow(dead_code, reason = "unused on platforms with a native open call")]

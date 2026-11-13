@@ -14,6 +14,8 @@ mod frame;
 mod logo;
 mod platform;
 mod settings;
+#[cfg(windows)]
+mod shell_menu;
 mod theme;
 #[cfg(windows)]
 mod tray;

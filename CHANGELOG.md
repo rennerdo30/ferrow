@@ -5,6 +5,7 @@ Release notes for each version. The release workflow copies a version's section 
 ## Unreleased
 
 - **Keyboard shortcut (Windows):** press **Ctrl+Alt+F** anywhere to bring up Ferrow with the search box ready; press it again to put Ferrow back in the tray. Change it or turn it off in Settings → Windows → Keyboard shortcut (Ctrl+Alt+Space and Alt+Space are offered too). If another app already uses the shortcut, Settings says so.
+- **Explorer right-click menu (Windows):** right-clicking a result shows the same menu as in Explorer (Open with, Send to, Properties, your cloud and archive tools), with Ferrow's **Open file location**, **Copy full path** and **Copy name** on top. Hold Shift for the extended menu. The menu runs separately from the window, so a slow shell extension or an unreachable network drive can't freeze Ferrow.
 
 ## 0.1.0-beta.13
 
