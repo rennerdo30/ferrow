@@ -19,8 +19,10 @@
 //! | folded_arena | `u8` × arena_len | |
 //! | sorted | `u32` × n | |
 //!
-//! Loading reads the file in one sequential read, checks magic, version
-//! and checksum, validates every offset, and never panics on bad input.
+//! Loading reads the header, checks the file length against it, then
+//! reads each section sequentially straight into its column (v3; v1 files
+//! go through one buffer), checks the checksum, validates every offset and
+//! never panics on bad input.
 
 use std::fmt;
 use std::io::Write;
@@ -378,6 +380,12 @@ fn load_from<R: std::io::Read>(
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
     let total = usize::try_from(expected).map_err(|_| LoadError::Corrupt("size overflow"))?;
+    if header.header_len == HEADER_LEN && head_len == HEADER_LEN {
+        // v3: read every section straight into its final column.
+        let index = stream_sections(reader, &data, &header, &mut timings)?;
+        timings.total = started.elapsed();
+        return Ok((index, timings));
+    }
     let t = Instant::now();
     data.try_reserve_exact(total - data.len())
         .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
@@ -394,6 +402,162 @@ fn load_from<R: std::io::Read>(
     timings.cleanup += t.elapsed();
     timings.total = started.elapsed();
     Ok((index, timings))
+}
+
+/// Bytes per streamed read: big enough for few syscalls, small enough
+/// that the CRC and the little-endian decode see each chunk in cache.
+const STREAM_CHUNK: usize = 1 << 20;
+
+/// Sequential section reader for [`stream_sections`]: every byte goes
+/// through the CRC exactly once, straight after it is read.
+struct Stream<'a, R> {
+    reader: &'a mut R,
+    crc: crc32fast::Hasher,
+    chunk: Vec<u8>,
+    timings: &'a mut LoadTimings,
+}
+
+impl<R: std::io::Read> Stream<'_, R> {
+    /// Read exactly `len` (at most one chunk) bytes into `self.chunk`.
+    fn fill(&mut self, len: usize) -> Result<(), LoadError> {
+        self.chunk.resize(len, 0);
+        let t = Instant::now();
+        self.reader
+            .read_exact(&mut self.chunk)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => LoadError::Truncated,
+                _ => LoadError::Io(e),
+            })?;
+        self.timings.read += t.elapsed();
+        let t = Instant::now();
+        self.crc.update(&self.chunk);
+        self.timings.checksum += t.elapsed();
+        Ok(())
+    }
+
+    fn reserve<T>(&mut self, n: usize) -> Result<Vec<T>, LoadError> {
+        let t = Instant::now();
+        let mut out = Vec::new();
+        out.try_reserve_exact(n)
+            .map_err(|_| LoadError::Corrupt("index too large to allocate"))?;
+        self.timings.buffer += t.elapsed();
+        Ok(out)
+    }
+
+    /// `n` little-endian values of `W` bytes each, decoded by `decode`.
+    fn values<T, const W: usize>(
+        &mut self,
+        n: usize,
+        decode: fn([u8; W]) -> T,
+    ) -> Result<Vec<T>, LoadError> {
+        let mut out = self.reserve(n)?;
+        let mut left = n
+            .checked_mul(W)
+            .ok_or(LoadError::Corrupt("size overflow"))?;
+        while left > 0 {
+            // STREAM_CHUNK is a multiple of every width.
+            let len = left.min(STREAM_CHUNK);
+            self.fill(len)?;
+            let t = Instant::now();
+            out.extend(self.chunk.as_chunks::<W>().0.iter().map(|c| decode(*c)));
+            self.timings.decode += t.elapsed();
+            left -= len;
+        }
+        Ok(out)
+    }
+
+    /// `len` raw bytes, read directly into the returned vector.
+    fn bytes(&mut self, len: usize) -> Result<Vec<u8>, LoadError> {
+        use std::io::Read;
+        let mut out: Vec<u8> = self.reserve(len)?;
+        while out.len() < len {
+            let start = out.len();
+            let want = (len - start).min(STREAM_CHUNK);
+            let t = Instant::now();
+            let got = (&mut *self.reader)
+                .take(want as u64)
+                .read_to_end(&mut out)
+                .map_err(LoadError::Io)?;
+            self.timings.read += t.elapsed();
+            if got != want {
+                return Err(LoadError::Truncated);
+            }
+            let t = Instant::now();
+            self.crc.update(&out[start..]);
+            self.timings.checksum += t.elapsed();
+        }
+        Ok(out)
+    }
+}
+
+/// Load a v3 index whose 32-byte header is already in `head`: each
+/// section is read directly into the column that keeps it, with no
+/// whole-file staging buffer (which would cost a second page-fault and
+/// zeroing pass over the file size, a copy per column and a large free).
+/// The checksum is verified before any structural validation, as in
+/// [`from_bytes`]; validation is shared with it.
+fn stream_sections<R: std::io::Read>(
+    reader: &mut R,
+    head: &[u8],
+    header: &Header,
+    timings: &mut LoadTimings,
+) -> Result<Index, LoadError> {
+    let n = header.entry_count as usize;
+    let arena_len = header.arena_len as usize;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&head[CHECKSUM_START..HEADER_LEN]);
+    let mut s = Stream {
+        reader,
+        crc,
+        chunk: Vec::with_capacity(STREAM_CHUNK),
+        timings,
+    };
+    let parent = s.values(n, u32::from_le_bytes)?;
+    let name_off = s.values(n, u32::from_le_bytes)?;
+    let name_len = s.values(n, u16::from_le_bytes)?;
+    let flags = s.values(n, u16::from_le_bytes)?;
+    let arena = s.bytes(arena_len)?;
+    let folded_arena = s.bytes(arena_len)?;
+    let sorted = s.values(n, u32::from_le_bytes)?;
+    let metadata_bytes = s.bytes(header.metadata_len as usize)?;
+    let sum = s.crc.finalize();
+    drop(s.chunk);
+    if sum != header.checksum {
+        return Err(LoadError::ChecksumMismatch);
+    }
+    let t = Instant::now();
+    let mut at = 0;
+    let metadata = MetadataColumns::read(&metadata_bytes, &mut at, n, header.columns)?;
+    if at != metadata_bytes.len() {
+        return Err(LoadError::Corrupt("unexpected metadata bytes"));
+    }
+    drop(metadata_bytes);
+    timings.decode += t.elapsed();
+    validate(
+        Parts {
+            parent,
+            name_off,
+            name_len,
+            flags,
+            arena,
+            folded_arena,
+            sorted,
+            metadata,
+        },
+        timings,
+    )
+}
+
+/// Decoded sections, not yet validated.
+struct Parts {
+    parent: Vec<u32>,
+    name_off: Vec<u32>,
+    name_len: Vec<u16>,
+    flags: Vec<u16>,
+    arena: Vec<u8>,
+    folded_arena: Vec<u8>,
+    sorted: Vec<u32>,
+    metadata: MetadataColumns,
 }
 
 /// Parse an index from bytes (also used by tests and fuzz-style checks).
@@ -438,6 +602,44 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         return Err(LoadError::Corrupt("unexpected metadata bytes"));
     }
     timings.decode += t.elapsed();
+    validate(
+        Parts {
+            parent,
+            name_off,
+            name_len,
+            flags: ent_flags,
+            arena,
+            folded_arena,
+            sorted,
+            metadata,
+        },
+        timings,
+    )
+}
+
+/// Structural and derived-data validation shared by both load paths;
+/// builds the index only from parts that pass every check.
+fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError> {
+    let Parts {
+        parent,
+        name_off,
+        name_len,
+        flags: ent_flags,
+        arena,
+        folded_arena,
+        sorted,
+        metadata,
+    } = parts;
+    let n = parent.len();
+    let arena_len = arena.len();
+    if name_off.len() != n
+        || name_len.len() != n
+        || ent_flags.len() != n
+        || sorted.len() != n
+        || folded_arena.len() != arena_len
+    {
+        return Err(LoadError::Corrupt("section lengths disagree"));
+    }
     let structure_started = Instant::now();
 
     // Require the canonical packed name layout the writer produces
@@ -857,6 +1059,69 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The streamed file load (several chunks per section) equals the
+    /// in-memory parse, and rejects any flipped byte and any
+    /// checksum-valid structural corruption, like `from_bytes`.
+    #[test]
+    fn streamed_load_matches_from_bytes_and_rejects_corruption() {
+        let dir = test_dir("stream");
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        for i in 0..300_000u32 {
+            b.add(
+                root,
+                format!("file-{:06}.Txt", i * 7919 % 300_000).as_bytes(),
+                0,
+            );
+        }
+        b.freeze().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() > 4 * STREAM_CHUNK,
+            "sections span several chunks"
+        );
+        let streamed = Index::load(&path).unwrap();
+        let parsed = from_bytes(&bytes).unwrap();
+        assert_eq!(streamed.len(), parsed.len());
+        assert_eq!(streamed.sorted(), parsed.sorted());
+        for id in [0u32, 1, 150_000, 300_000] {
+            assert_eq!(streamed.name(id), parsed.name(id));
+            assert_eq!(streamed.folded_name(id), parsed.folded_name(id));
+            assert_eq!(streamed.parent(id), parsed.parent(id));
+        }
+        // A flipped byte in each section (parent, name_len, arena, folded
+        // arena, sorted, last byte) fails the streamed checksum.
+        let n = 300_001;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        for at in [
+            HEADER_LEN + 5,
+            HEADER_LEN + n * 8 + 3,
+            HEADER_LEN + n * 12 + arena_len / 2,
+            HEADER_LEN + n * 12 + arena_len + arena_len / 2,
+            HEADER_LEN + n * 12 + 2 * arena_len + 4 * (n / 2),
+            bytes.len() - 1,
+        ] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0x40;
+            std::fs::write(&path, &bad).unwrap();
+            assert!(
+                matches!(Index::load(&path), Err(LoadError::ChecksumMismatch)),
+                "flip at {at}"
+            );
+        }
+        // Checksum-valid corruption still fails validation when streamed.
+        let mut bad = three_entry_bytes();
+        let at = bad.len() - 12;
+        for (i, id) in [2u32, 0, 1].iter().enumerate() {
+            bad[at + i * 4..at + i * 4 + 4].copy_from_slice(&id.to_le_bytes());
+        }
+        fix_checksum(&mut bad);
+        std::fs::write(&path, &bad).unwrap();
+        assert!(matches!(Index::load(&path), Err(LoadError::Corrupt(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tiny_index(name: &[u8]) -> Index {
