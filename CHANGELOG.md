@@ -6,6 +6,7 @@ Release notes for each version. The release workflow copies a version's section 
 
 - **Fixed:** programs (`.exe`, `.msi`, `.bat`, ...) that Ferrow found never showed in Start, because Start hides file results of the kind "program". Ferrow now reports them as plain files, so for example `animasky.exe` lists every copy Ferrow knows.
 - Windows' prefetch files (`C:\Windows\Prefetch\*.pf`) now rank last in Start instead of taking places from the files you look for.
+- **Fixed:** buttons in Settings did not react to the mouse. They now light up on hover and darken while pressed, like Windows buttons.
 
 ## 0.1.0-beta.9
 

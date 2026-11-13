@@ -149,7 +149,10 @@ pub struct Palette {
     pub card_stroke: Color32,
     pub control: Color32,
     pub control_hover: Color32,
+    pub control_pressed: Color32,
     pub control_stroke: Color32,
+    pub accent_hover: Color32,
+    pub accent_pressed: Color32,
     pub row_hover: Color32,
     pub row_selected: Color32,
     pub divider: Color32,
@@ -186,8 +189,11 @@ impl Palette {
                 card: Color32::from_rgba_unmultiplied(0x3A, 0x3A, 0x3A, 0x4C),
                 card_stroke: Color32::from_rgba_unmultiplied(0, 0, 0, 0x30),
                 control: Color32::from_rgba_unmultiplied(255, 255, 255, 0x0F),
-                control_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 0x15),
+                control_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 0x1F),
+                control_pressed: Color32::from_rgba_unmultiplied(255, 255, 255, 0x08),
                 control_stroke: Color32::from_rgba_unmultiplied(255, 255, 255, 0x12),
+                accent_hover: mix(base, Color32::WHITE, 0.12),
+                accent_pressed: mix(base, Color32::BLACK, 0.15),
                 row_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 0x0F),
                 row_selected: Color32::from_rgba_unmultiplied(255, 255, 255, 0x15),
                 divider: Color32::from_rgba_unmultiplied(255, 255, 255, 0x15),
@@ -207,8 +213,11 @@ impl Palette {
                 card: Color32::from_rgba_unmultiplied(255, 255, 255, 0xB3),
                 card_stroke: Color32::from_rgba_unmultiplied(0, 0, 0, 0x0F),
                 control: Color32::from_rgba_unmultiplied(255, 255, 255, 0xB3),
-                control_hover: Color32::from_rgba_unmultiplied(0xF9, 0xF9, 0xF9, 0x80),
+                control_hover: Color32::from_rgba_unmultiplied(0xF0, 0xF0, 0xF0, 0xE6),
+                control_pressed: Color32::from_rgba_unmultiplied(0xF9, 0xF9, 0xF9, 0x4D),
                 control_stroke: Color32::from_rgba_unmultiplied(0, 0, 0, 0x13),
+                accent_hover: mix(base, Color32::WHITE, 0.12),
+                accent_pressed: mix(base, Color32::WHITE, 0.25),
                 row_hover: Color32::from_rgba_unmultiplied(0, 0, 0, 0x09),
                 row_selected: Color32::from_rgba_unmultiplied(0, 0, 0, 0x0F),
                 divider: Color32::from_rgba_unmultiplied(0, 0, 0, 0x0F),
@@ -265,6 +274,54 @@ impl Palette {
         v.widgets.active.bg_fill = self.row_selected;
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.divider);
         v
+    }
+}
+
+/// A framed button whose fill follows the pointer: rest, hover and pressed
+/// each get their own colour. (`egui::Button::fill` pins one colour for
+/// every state, so buttons styled with it never react to the mouse.)
+pub struct FilledButton<'a> {
+    button: egui::Button<'a>,
+    fills: [Color32; 3],
+    stroke: Stroke,
+}
+
+impl<'a> FilledButton<'a> {
+    /// A standard (secondary) button.
+    pub fn standard(p: &Palette, button: egui::Button<'a>) -> Self {
+        FilledButton {
+            button,
+            fills: [p.control, p.control_hover, p.control_pressed],
+            stroke: Stroke::new(1.0, p.control_stroke),
+        }
+    }
+
+    /// An accent (primary) button.
+    pub fn accent(p: &Palette, button: egui::Button<'a>) -> Self {
+        FilledButton {
+            button,
+            fills: [p.accent, p.accent_hover, p.accent_pressed],
+            stroke: Stroke::NONE,
+        }
+    }
+}
+
+impl egui::Widget for FilledButton<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        ui.scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            for (state, fill) in [
+                (&mut widgets.inactive, self.fills[0]),
+                (&mut widgets.hovered, self.fills[1]),
+                (&mut widgets.active, self.fills[2]),
+            ] {
+                state.weak_bg_fill = fill;
+                state.bg_fill = fill;
+                state.bg_stroke = self.stroke;
+            }
+            ui.add(self.button.frame(true))
+        })
+        .inner
     }
 }
 

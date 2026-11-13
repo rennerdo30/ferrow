@@ -478,10 +478,12 @@ impl FerrowApp {
                         } else {
                             p.text
                         });
-                        let b = egui::Button::new(text)
-                            .fill(if selected { p.accent } else { p.control })
-                            .stroke(Stroke::new(1.0, p.control_stroke))
-                            .min_size(vec2(76.0, 30.0));
+                        let b = egui::Button::new(text).min_size(vec2(76.0, 30.0));
+                        let b = if selected {
+                            theme::FilledButton::accent(&p, b)
+                        } else {
+                            theme::FilledButton::standard(&p, b)
+                        };
                         if ui.add(b).clicked() {
                             choice = value;
                         }
@@ -652,12 +654,10 @@ impl FerrowApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add(
-                                egui::Button::new("Open")
-                                    .fill(p.control)
-                                    .stroke(Stroke::new(1.0, p.control_stroke))
-                                    .min_size(vec2(80.0, 30.0)),
-                            )
+                            .add(theme::FilledButton::standard(
+                                &p,
+                                egui::Button::new("Open").min_size(vec2(80.0, 30.0)),
+                            ))
                             .clicked()
                             && let Some(dir) = path.parent()
                         {
@@ -851,11 +851,11 @@ fn toggle(ui: &mut egui::Ui, p: &theme::Palette, on: &mut bool) -> egui::Respons
     resp
 }
 
-fn std_button(p: &theme::Palette, text: &str, width: f32) -> egui::Button<'static> {
-    egui::Button::new(text.to_owned())
-        .fill(p.control)
-        .stroke(Stroke::new(1.0, p.control_stroke))
-        .min_size(vec2(width, 32.0))
+fn std_button(p: &theme::Palette, text: &str, width: f32) -> theme::FilledButton<'static> {
+    theme::FilledButton::standard(
+        p,
+        egui::Button::new(text.to_owned()).min_size(vec2(width, 32.0)),
+    )
 }
 
 fn accent_button(
@@ -863,14 +863,16 @@ fn accent_button(
     text: &str,
     width: f32,
     enabled: bool,
-) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_owned()).color(if enabled {
-        Color32::WHITE
-    } else {
-        p.text_tertiary
-    }))
-    .fill(if enabled { p.accent } else { p.control })
-    .min_size(vec2(width, 32.0))
+) -> theme::FilledButton<'static> {
+    if !enabled {
+        let label = RichText::new(text.to_owned()).color(p.text_tertiary);
+        return theme::FilledButton::standard(
+            p,
+            egui::Button::new(label).min_size(vec2(width, 32.0)),
+        );
+    }
+    let label = RichText::new(text.to_owned()).color(Color32::WHITE);
+    theme::FilledButton::accent(p, egui::Button::new(label).min_size(vec2(width, 32.0)))
 }
 
 /// One list row with a kind icon, the main text and a secondary label.
