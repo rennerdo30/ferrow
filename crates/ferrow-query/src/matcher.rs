@@ -65,7 +65,47 @@ struct Prepared {
     needle: Vec<u8>,
     finder: memmem::Finder<'static>,
     pieces: Vec<memmem::Finder<'static>>,
-    extensions: Vec<Vec<u8>>,
+    extensions: Extensions,
+}
+
+/// An extension list prepared for one lookup per entry. Extensions of up
+/// to 8 bytes (nearly all) are packed into a sorted `u64` list, so the test
+/// is a few integer comparisons without touching other memory; longer ones
+/// are compared as bytes. Names never contain NUL, so zero padding is
+/// unambiguous.
+#[derive(Default)]
+struct Extensions {
+    short: Vec<u64>,
+    long: Vec<Vec<u8>>,
+}
+impl Extensions {
+    fn new(exts: impl Iterator<Item = Vec<u8>>) -> Self {
+        let mut set = Self::default();
+        for ext in exts {
+            match pack(&ext) {
+                Some(packed) => set.short.push(packed),
+                None => set.long.push(ext),
+            }
+        }
+        set.short.sort_unstable();
+        set.short.dedup();
+        set
+    }
+    #[inline]
+    fn contains(&self, ext: &[u8]) -> bool {
+        match pack(ext) {
+            Some(packed) => self.short.binary_search(&packed).is_ok(),
+            None => self.long.iter().any(|e| e == ext),
+        }
+    }
+}
+#[inline]
+fn pack(ext: &[u8]) -> Option<u64> {
+    (ext.len() <= 8).then(|| {
+        let mut bytes = [0u8; 8];
+        bytes[..ext.len()].copy_from_slice(ext);
+        u64::from_le_bytes(bytes)
+    })
 }
 impl Prepared {
     fn new(term: &Term) -> Self {
@@ -89,17 +129,11 @@ impl Prepared {
             finder,
             pieces,
             extensions: match &term.pattern {
-                Pattern::Filter(Filter::Extension(exts)) => {
-                    // Sorted for a binary search: type macros carry ~35.
-                    let mut exts: Vec<_> = exts
-                        .iter()
-                        .map(|v| folded(v.as_bytes(), term.case_sensitive))
-                        .collect();
-                    exts.sort_unstable();
-                    exts.dedup();
-                    exts
-                }
-                _ => Vec::new(),
+                Pattern::Filter(Filter::Extension(exts)) => Extensions::new(
+                    exts.iter()
+                        .map(|v| folded(v.as_bytes(), term.case_sensitive)),
+                ),
+                _ => Extensions::default(),
             },
         }
     }
@@ -522,11 +556,7 @@ impl GeneralMatcher {
                 let Some(dot) = memchr::memrchr(b'.', name) else {
                     return false;
                 };
-                dot != 0
-                    && dot + 1 < name.len()
-                    && p.extensions
-                        .binary_search_by(|ext| ext.as_slice().cmp(&name[dot + 1..]))
-                        .is_ok()
+                dot != 0 && dot + 1 < name.len() && p.extensions.contains(&name[dot + 1..])
             }
             Pattern::Filter(Filter::Parent(_)) => {
                 let id = index.parent(id);
