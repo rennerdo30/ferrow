@@ -8,6 +8,8 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
+#[cfg(windows)]
+mod drag;
 mod engine;
 #[cfg(windows)]
 mod frame;

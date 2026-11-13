@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Drag results out (Windows):** drag a result into Explorer, onto the desktop, into a mail, chat or editor window to copy, move or link the file, as from Explorer.
+
 ## 0.1.0-beta.14
 
 - **Keyboard shortcut (Windows):** press **Ctrl+Alt+F** anywhere to bring up Ferrow with the search box ready; press it again to put Ferrow back in the tray. Change it or turn it off in Settings → Windows → Keyboard shortcut (Ctrl+Alt+Space and Alt+Space are offered too). If another app already uses the shortcut, Settings says so.

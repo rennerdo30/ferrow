@@ -740,7 +740,7 @@ impl FerrowApp {
         // Scrolling, in rows (f64 so millions of rows stay precise).
         let visible = (list.height() / ROW_HEIGHT).max(1.0);
         let max_scroll = (rows as f64 - visible as f64).max(0.0);
-        let list_resp = ui.interact(list, egui::Id::unique("list"), Sense::click());
+        let list_resp = ui.interact(list, egui::Id::unique("list"), Sense::click_and_drag());
         if ui.rect_contains_pointer(list) {
             // Scroll animation is off (theme.rs), so this is the raw wheel
             // delta: one repaint per notch, no animated frames.
@@ -971,6 +971,22 @@ impl FerrowApp {
         }
         if list_resp.double_clicked() && clicked_row.is_some() {
             self.open_selected(false);
+        }
+        // Dragging a row out of the list hands the file to the drop target
+        // (Explorer, the desktop, another app). The row is the one under
+        // the press, not under the pointer now.
+        if list_resp.drag_started()
+            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+            && origin.y >= list.top()
+            && origin.x < track.left()
+        {
+            let row = first + ((origin.y - list.top() + offset) / ROW_HEIGHT) as usize;
+            if row < rows
+                && let Some(path) = self.path_of_row(row)
+            {
+                self.selected = Some(row);
+                platform::drag_out(&path);
+            }
         }
         // Windows: the Explorer menu (on its own thread, so slow shell
         // extensions never stall the window).
