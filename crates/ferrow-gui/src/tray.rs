@@ -105,6 +105,12 @@ fn toggle(hwnd: HWND) {
     }
 }
 
+/// The app's main window, once installed.
+pub fn window() -> Option<HWND> {
+    let hwnd = WINDOW.load(Ordering::Acquire);
+    (!hwnd.is_null()).then_some(hwnd)
+}
+
 /// Start hidden in the tray: block the window from showing until [`show`].
 pub fn start_hidden() {
     KEEP_HIDDEN.store(true, Ordering::Release);

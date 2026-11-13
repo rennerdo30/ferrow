@@ -54,6 +54,22 @@ pub fn show_shell_menu(path: &Path, extended: bool) -> bool {
     }
 }
 
+/// Drag `path` out of the app (to Explorer, the desktop, other apps) while
+/// the left button is held. Returns when it is dropped. False where this
+/// is not supported or the drag could not start.
+pub fn drag_out(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::tray::window()
+            .is_some_and(|hwnd| crate::drag::drag_out(windows::Win32::Foundation::HWND(hwnd), path))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Start a helper process without waiting for it. The child is not
 /// tracked: the file manager or viewer outlives Ferrow on purpose.
 #[allow(dead_code, reason = "unused on platforms with a native open call")]
