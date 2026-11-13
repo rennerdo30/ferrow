@@ -243,6 +243,10 @@ fn classify_file_kind(file_name: &str, is_dir: bool) -> (String, String, Vec<&'s
         kinds::kinds_of_extension(&ext_lower)
             .iter()
             .map(String::as_str)
+            // Start hides file rows of kind `program` (it lists programs
+            // in Apps itself), so a program file Ferrow finds would never
+            // show: report no kind, like Windows does for unknown types.
+            .filter(|kind| *kind != "program")
             .collect()
     };
     let type_text = if ext_lower.is_empty() {

@@ -2,6 +2,12 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## 0.1.0-beta.10
+
+- **Fixed:** programs (`.exe`, `.msi`, `.bat`, ...) that Ferrow found never showed in Start, because Start hides file results of the kind "program". Ferrow now reports them as plain files, so for example `animasky.exe` lists every copy Ferrow knows.
+- Windows' prefetch files (`C:\Windows\Prefetch\*.pf`) now rank last in Start instead of taking places from the files you look for.
+- **Fixed:** buttons in Settings did not react to the mouse. They now light up on hover and darken while pressed, like Windows buttons.
+
 ## 0.1.0-beta.9
 
 - **Fixed:** **Power Windows Search with Ferrow** showed "On" but Start never used Ferrow on current Windows 11 builds: Start sends its searches in a newer format that Ferrow did not understand, so every search went to Windows. Ferrow now answers them, including names with dots or dashes.
