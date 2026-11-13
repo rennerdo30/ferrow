@@ -19,7 +19,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, PostMessageW, RegisterWindowMessageW, SM_CXSMICON, SW_HIDE,
     SW_RESTORE, SW_SHOW, SWP_SHOWWINDOW, SetForegroundWindow, SetMenuDefaultItem, ShowWindow,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOWPOS, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_SHOWWINDOW, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_NULL, WM_SHOWWINDOW, WM_WINDOWPOSCHANGED,
+    WM_WINDOWPOSCHANGING,
 };
 
 /// Callback message the icon sends to the main window.
@@ -43,6 +44,67 @@ static FOCUS_SEARCH: AtomicBool = AtomicBool::new(false);
 /// the user opens it (eframe shows its window after the first frame).
 static KEEP_HIDDEN: AtomicBool = AtomicBool::new(false);
 
+const HOTKEY_ID: i32 = 1;
+/// Wanted global hotkey as `modifiers << 16 | virtual key`; 0 is none.
+static HOTKEY: AtomicU32 = AtomicU32::new(0);
+static HOTKEY_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Register (or with `None` remove) the global hotkey that shows the
+/// window from anywhere. False when another app already owns the
+/// combination. Call on the UI thread; before [`install`] the choice is
+/// kept and registered there.
+pub fn set_hotkey(hotkey: Option<(u32, u32)>) -> bool {
+    let packed = hotkey.map_or(0, |(modifiers, key)| (modifiers << 16) | (key & 0xFFFF));
+    HOTKEY.store(packed, Ordering::Release);
+    let hwnd = WINDOW.load(Ordering::Acquire);
+    hwnd.is_null() || register_hotkey(hwnd)
+}
+
+/// True when the chosen hotkey could not be registered.
+pub fn hotkey_unavailable() -> bool {
+    HOTKEY.load(Ordering::Acquire) != 0 && !HOTKEY_REGISTERED.load(Ordering::Acquire)
+}
+
+fn register_hotkey(hwnd: HWND) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+    };
+    // SAFETY: hwnd is our live window, owned by this (the UI) thread.
+    unsafe {
+        if HOTKEY_REGISTERED.swap(false, Ordering::AcqRel) {
+            UnregisterHotKey(hwnd, HOTKEY_ID);
+        }
+        let packed = HOTKEY.load(Ordering::Acquire);
+        if packed == 0 {
+            return true;
+        }
+        let ok = RegisterHotKey(
+            hwnd,
+            HOTKEY_ID,
+            (packed >> 16) | MOD_NOREPEAT,
+            packed & 0xFFFF,
+        ) != 0;
+        HOTKEY_REGISTERED.store(ok, Ordering::Release);
+        ok
+    }
+}
+
+/// The hotkey was pressed: bring Ferrow up, or put it away again when it
+/// is already the active window.
+fn toggle(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SW_MINIMIZE};
+    // SAFETY: hwnd is our live window.
+    let active = unsafe {
+        IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 && GetForegroundWindow() == hwnd
+    };
+    if !active {
+        show();
+    } else if !hide_to_tray() {
+        // SAFETY: as above.
+        unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+    }
+}
+
 /// Start hidden in the tray: block the window from showing until [`show`].
 pub fn start_hidden() {
     KEEP_HIDDEN.store(true, Ordering::Release);
@@ -59,6 +121,7 @@ pub fn install(hwnd: HWND) {
     let message = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
     TASKBAR_CREATED.store(message, Ordering::Relaxed);
     add_icon(hwnd);
+    register_hotkey(hwnd);
 }
 
 fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -232,6 +295,10 @@ pub fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
                 }
                 _ => {}
             }
+            Some(0)
+        }
+        WM_HOTKEY if wparam == HOTKEY_ID as usize => {
+            toggle(hwnd);
             Some(0)
         }
         // The ✕ button, Alt+F4 and the taskbar's Close window: keep running.

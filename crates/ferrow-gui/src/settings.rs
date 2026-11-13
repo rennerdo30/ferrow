@@ -217,6 +217,8 @@ pub struct WindowsSettings {
     /// Start Ferrow hidden in the tray when the user signs in, so search
     /// and the Start menu integration are ready right away.
     pub start_at_sign_in: bool,
+    /// Key combination that shows Ferrow from anywhere (and hides it again).
+    pub hotkey: Hotkey,
 }
 
 impl Default for WindowsSettings {
@@ -225,6 +227,37 @@ impl Default for WindowsSettings {
             all_fixed_drives: false,
             windows_search: false,
             start_at_sign_in: true,
+            hotkey: Hotkey::default(),
+        }
+    }
+}
+
+/// Global shortcut choices. Only combinations that common apps leave free
+/// are offered: a global hotkey takes the keys away from every other app.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hotkey {
+    Off,
+    #[default]
+    CtrlAltF,
+    CtrlAltSpace,
+    AltSpace,
+}
+
+impl Hotkey {
+    pub const ALL: [Hotkey; 4] = [
+        Hotkey::Off,
+        Hotkey::CtrlAltF,
+        Hotkey::CtrlAltSpace,
+        Hotkey::AltSpace,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Hotkey::Off => "Off",
+            Hotkey::CtrlAltF => "Ctrl+Alt+F",
+            Hotkey::CtrlAltSpace => "Ctrl+Alt+Space",
+            Hotkey::AltSpace => "Alt+Space",
         }
     }
 }
@@ -427,6 +460,23 @@ mod tests {
         assert!(partial.sources.is_empty());
         assert_eq!(partial.columns, default_columns());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkey_defaults_and_round_trips() {
+        // Settings written before the shortcut existed get the default.
+        let old: Settings =
+            serde_json::from_str(r#"{"windows":{"start_at_sign_in":false}}"#).unwrap();
+        assert_eq!(old.windows.hotkey, Hotkey::CtrlAltF);
+        assert!(!old.windows.start_at_sign_in);
+        for choice in Hotkey::ALL {
+            let mut s = Settings::default();
+            s.windows.hotkey = choice;
+            let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+            assert_eq!(back.windows.hotkey, choice);
+        }
+        let off: Settings = serde_json::from_str(r#"{"windows":{"hotkey":"off"}}"#).unwrap();
+        assert_eq!(off.windows.hotkey, Hotkey::Off);
     }
 
     #[test]

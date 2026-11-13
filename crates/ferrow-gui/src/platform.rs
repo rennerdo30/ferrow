@@ -187,6 +187,38 @@ pub fn sync_start_at_sign_in(enabled: bool) {
     let _ = enabled;
 }
 
+/// Register the global hotkey that shows Ferrow from anywhere. False when
+/// another app already uses the combination. Windows only.
+pub fn set_global_hotkey(hotkey: crate::settings::Hotkey) -> bool {
+    #[cfg(windows)]
+    {
+        use crate::settings::Hotkey;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            MOD_ALT, MOD_CONTROL, VK_F, VK_SPACE,
+        };
+        let keys = match hotkey {
+            Hotkey::Off => None,
+            Hotkey::CtrlAltF => Some((MOD_CONTROL | MOD_ALT, VK_F)),
+            Hotkey::CtrlAltSpace => Some((MOD_CONTROL | MOD_ALT, VK_SPACE)),
+            Hotkey::AltSpace => Some((MOD_ALT, VK_SPACE)),
+        };
+        crate::tray::set_hotkey(keys.map(|(modifiers, key)| (modifiers, u32::from(key))))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hotkey;
+        true
+    }
+}
+
+/// True when the chosen global hotkey is taken by another app.
+pub fn global_hotkey_unavailable() -> bool {
+    #[cfg(windows)]
+    return crate::tray::hotkey_unavailable();
+    #[cfg(not(windows))]
+    false
+}
+
 /// Bring the window back from the tray (or to the front).
 pub fn show_from_tray() {
     #[cfg(windows)]

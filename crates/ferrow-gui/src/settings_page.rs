@@ -323,6 +323,40 @@ impl FerrowApp {
             ui.add_space(CARD_GAP);
             card(ui, &p, |ui| {
                 ui.horizontal(|ui| {
+                    let current = self.settings.windows.hotkey;
+                    let detail = if platform::global_hotkey_unavailable() {
+                        format!(
+                            "{} is taken by another app. Choose another shortcut.",
+                            current.label()
+                        )
+                    } else {
+                        "Shows Ferrow from anywhere with the search box ready; press it again to put Ferrow away."
+                            .to_owned()
+                    };
+                    row_text(ui, &p, "Keyboard shortcut", &detail);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("global-hotkey")
+                            .selected_text(current.label())
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for choice in crate::settings::Hotkey::ALL {
+                                    if ui
+                                        .selectable_label(current == choice, choice.label())
+                                        .clicked()
+                                        && choice != current
+                                    {
+                                        self.settings.windows.hotkey = choice;
+                                        platform::set_global_hotkey(choice);
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    });
+                });
+            });
+            ui.add_space(CARD_GAP);
+            card(ui, &p, |ui| {
+                ui.horizontal(|ui| {
                     let detail = if self.settings.windows.windows_search {
                         let status = ferrow_winsearch::status();
                         if let Some(error) = status.last_error {
