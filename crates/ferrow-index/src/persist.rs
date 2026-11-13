@@ -781,22 +781,36 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
             .map(|c| (c * chunk, ((c + 1) * chunk).min(count)))
             .collect()
     }
+    // `fold_name` maps every ASCII byte to its lowercase in place, in every
+    // name (ASCII, UTF-8 and invalid UTF-8 alike). So one branchless pass
+    // over both whole arenas (the compiler vectorizes it) checks all ASCII
+    // positions, and only names with a non-ASCII byte need the full fold.
+    const ARENA_CHUNK: usize = 1 << 16;
+    arena
+        .par_chunks(ARENA_CHUNK)
+        .zip(folded_arena.par_chunks(ARENA_CHUNK))
+        .try_for_each(|(raw, folded)| -> Result<(), LoadError> {
+            let bad = raw.iter().zip(folded).fold(0u8, |acc, (&a, &b)| {
+                let lower = a | (u8::from(a.wrapping_sub(b'A') < 26) << 5);
+                let ascii = u8::from(a < 0x80).wrapping_neg();
+                acc | ((lower ^ b) & ascii)
+            });
+            if bad != 0 {
+                return Err(LoadError::Corrupt("folded arena inconsistent with names"));
+            }
+            Ok(())
+        })?;
     chunk_ranges(n)
         .into_par_iter()
         .try_for_each(|(start, end)| -> Result<(), LoadError> {
             let mut folded_buf: Vec<u8> = Vec::new();
             for i in start..end {
                 let raw = name_at(&arena, &name_off, &name_len, i);
-                let expected = name_at(&folded_arena, &name_off, &name_len, i);
-                let consistent = if raw.is_ascii() {
-                    raw.iter()
-                        .zip(expected)
-                        .all(|(&a, &b)| a.to_ascii_lowercase() == b)
-                } else {
-                    fold_name(raw, &mut folded_buf);
-                    folded_buf == expected
-                };
-                if !consistent {
+                if raw.is_ascii() {
+                    continue; // fully checked above
+                }
+                fold_name(raw, &mut folded_buf);
+                if folded_buf != name_at(&folded_arena, &name_off, &name_len, i) {
                     return Err(LoadError::Corrupt("folded arena inconsistent with names"));
                 }
             }
@@ -1244,6 +1258,44 @@ mod tests {
                 matches!(from_bytes(&bad), Err(LoadError::Corrupt(_))),
                 "swap at sorted position {p}"
             );
+        }
+    }
+
+    /// Every single-byte change of the folded arena is rejected, whether it
+    /// hits an ASCII byte (whole-arena pass), an ASCII byte inside a
+    /// non-ASCII name, a multi-byte character or invalid UTF-8.
+    #[test]
+    fn any_folded_byte_change_is_rejected() {
+        let dir = test_dir("fold-flip");
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"Root", flags::DIR);
+        for name in [
+            "plain.TXT".as_bytes(),
+            "Ärger-ΣΟΦΙΑ.Log".as_bytes(),
+            b"raw\xffAB\xfe.bin",
+            "Kelvin\u{212A}.k".as_bytes(),
+        ] {
+            b.add(root, name, 0);
+        }
+        b.freeze().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(from_bytes(&bytes).is_ok());
+        let n = 5;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let folded_at = HEADER_LEN + n * 12 + arena_len;
+        for at in folded_at..folded_at + arena_len {
+            for change in [0x01u8, 0x20, 0x80] {
+                let mut bad = bytes.clone();
+                bad[at] ^= change;
+                fix_checksum(&mut bad);
+                assert!(
+                    matches!(from_bytes(&bad), Err(LoadError::Corrupt(_))),
+                    "folded byte {} ^ {change:#x} accepted",
+                    at - folded_at
+                );
+            }
         }
     }
 
