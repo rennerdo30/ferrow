@@ -110,6 +110,55 @@ pub fn listen_for_setup_exit(on_exit: impl Fn() + Send + 'static) {
     let _ = on_exit;
 }
 
+/// If Ferrow already runs in this session (for example hidden in the
+/// tray), ask it to show its window and return true: this copy should
+/// exit. Windows only; elsewhere always false.
+pub fn activate_running_instance() -> bool {
+    #[cfg(windows)]
+    return win::activate_running_instance();
+    #[cfg(not(windows))]
+    false
+}
+
+/// Call `on_activate` (from a background thread) whenever Ferrow is
+/// started again while this copy runs. Windows only.
+pub fn listen_for_activation(on_activate: impl Fn() + Send + 'static) {
+    #[cfg(windows)]
+    win::listen_for_activation(on_activate);
+    #[cfg(not(windows))]
+    let _ = on_activate;
+}
+
+/// Hide the window to the tray instead of closing. False where there is
+/// no tray icon; the caller closes the window as usual.
+pub fn hide_to_tray() -> bool {
+    #[cfg(windows)]
+    return crate::tray::hide_to_tray();
+    #[cfg(not(windows))]
+    false
+}
+
+/// Bring the window back from the tray (or to the front).
+pub fn show_from_tray() {
+    #[cfg(windows)]
+    crate::tray::show();
+}
+
+/// True once after the window came back from the tray: focus the search box.
+pub fn take_tray_focus_request() -> bool {
+    #[cfg(windows)]
+    return crate::tray::take_focus_request();
+    #[cfg(not(windows))]
+    false
+}
+
+/// Quit right away, even while the window is hidden in the tray (setup
+/// asked the app to exit). Returns only where there is no tray.
+pub fn quit_from_tray() {
+    #[cfg(windows)]
+    crate::tray::quit();
+}
+
 /// True inside a Remote Desktop (RDP) session. Other remote tools
 /// (VNC, TeamViewer) mirror the console and cannot be detected; the UI
 /// is kept cheap to update everywhere for them.
@@ -252,6 +301,57 @@ pub fn apply_backdrop(window: &impl raw_window_handle::HasWindowHandle, dark: bo
 
 #[cfg(windows)]
 mod win {
+    /// Auto-reset event the running copy waits on; `Local\` keeps it to
+    /// this session.
+    const ACTIVATE_EVENT: &str = "Local\\Ferrow.Activate";
+
+    fn activate_event_name() -> Vec<u16> {
+        ACTIVATE_EVENT.encode_utf16().chain(Some(0)).collect()
+    }
+
+    pub fn activate_running_instance() -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+        let name = activate_event_name();
+        // SAFETY: a terminated name; the handle is closed below.
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        if event.is_null() {
+            return false;
+        }
+        // This copy was started by the user, so it may hand the right to
+        // come to the front to the running copy.
+        // SAFETY: plain calls on a live handle.
+        unsafe {
+            AllowSetForegroundWindow(ASFW_ANY);
+            SetEvent(event);
+            CloseHandle(event);
+        }
+        true
+    }
+
+    pub fn listen_for_activation(on_activate: impl Fn() + Send + 'static) {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        let name = activate_event_name();
+        // Auto reset: one signal, one activation. Default security: only
+        // this user's processes in this session can open it.
+        // SAFETY: a terminated name and default attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        if event.is_null() {
+            return;
+        }
+        let event = event as usize;
+        let _ = std::thread::Builder::new()
+            .name("ferrow-activate".into())
+            .spawn(move || {
+                // SAFETY: the event handle stays open for the process lifetime.
+                while unsafe { WaitForSingleObject(event as _, INFINITE) } == WAIT_OBJECT_0 {
+                    on_activate();
+                }
+            });
+    }
+
     pub fn listen_for_setup_exit(on_exit: impl Fn() + Send + 'static) {
         use windows_sys::Win32::Foundation::{LocalFree, WAIT_OBJECT_0};
         use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;

@@ -15,11 +15,18 @@ mod logo;
 mod platform;
 mod settings;
 mod theme;
+#[cfg(windows)]
+mod tray;
 mod update;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Ferrow keeps running in the tray: starting it again shows that
+    // window instead of opening a second copy.
+    if platform::activate_running_instance() {
+        return Ok(());
+    }
     let viewport = egui::ViewportBuilder::default()
         .with_title("Ferrow")
         .with_app_id("ferrow")

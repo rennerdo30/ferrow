@@ -48,6 +48,13 @@ pub fn window_icon() -> egui::IconData {
     }
 }
 
+/// The logo as straight RGBA at the smallest pre-rendered size of at least
+/// `pixels` (for the tray icon): `(width, height, rgba)`.
+#[cfg(windows)]
+pub fn rgba_at_least(pixels: u32) -> Option<(u32, u32, Vec<u8>)> {
+    decode(SIZES[pick(pixels as f32)].1)
+}
+
 /// Logo texture for the title row, sized for `logical` points at the
 /// current display scale. Cached per pixel size.
 pub struct TitleLogo {
