@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Tray icon (Windows):** closing the window now keeps Ferrow running in the notification area, so the live index and the Start menu integration keep working. Click the icon to bring the window back (the search box is ready to type); right-click it for **Open Ferrow** and **Quit Ferrow**. Starting Ferrow again while it runs shows the running window instead of a second copy.
+
 ## 0.1.0-beta.10
 
 - **Fixed:** programs (`.exe`, `.msi`, `.bat`, ...) that Ferrow found never showed in Start, because Start hides file results of the kind "program". Ferrow now reports them as plain files, so for example `animasky.exe` lists every copy Ferrow knows.

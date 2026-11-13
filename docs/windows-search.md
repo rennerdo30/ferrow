@@ -46,8 +46,10 @@ is needed in either direction.
 
 ## Limits to know
 
-- **The Ferrow app must be running** in service mode. If you close the
-  app completely, Start searches fall back to Windows until you start
+- **The Ferrow app must be running** in service mode. Closing the
+  window keeps Ferrow running in the notification area (tray), so Start
+  keeps using it; choose **Quit Ferrow** in the tray icon's menu to end
+  it. After quitting, Start searches fall back to Windows until you start
   Ferrow again. (With the app's own index — no service — small indexes
   keep answering even with the app closed.)
 - This uses an unofficial mechanism: Microsoft offers no supported way

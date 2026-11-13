@@ -129,9 +129,13 @@ impl FerrowApp {
         // Setup asks running copies to close before it replaces files.
         let closer = ctx.clone();
         platform::listen_for_setup_exit(move || {
+            // The window may be hidden in the tray, where it would not
+            // process a close request: quit directly there.
+            platform::quit_from_tray();
             closer.send_viewport_cmd(egui::ViewportCommand::Close);
             closer.request_repaint();
         });
+        platform::listen_for_activation(platform::show_from_tray);
         let mut app = FerrowApp {
             engine,
             state: State::Loading,
@@ -1152,7 +1156,10 @@ impl FerrowApp {
             if clicked {
                 match kind {
                     "min" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-                    "close" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    // Keeps running in the tray where there is one.
+                    "close" if !platform::hide_to_tray() => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                     _ => {}
                 }
             }
@@ -1235,6 +1242,9 @@ impl eframe::App for FerrowApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.sync_theme(&ctx, frame);
+        if platform::take_tray_focus_request() {
+            self.focus_search = true;
+        }
         self.drain_events();
         self.auto_rebuild(&ctx);
         self.updates_on_open(&ctx);

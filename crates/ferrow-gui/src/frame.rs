@@ -109,6 +109,7 @@ pub fn install(
     // only makes Windows recompute the frame.
     unsafe {
         SetWindowSubclass(hwnd, Some(subclass_proc), 1, 0);
+        crate::tray::install(hwnd);
         SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
@@ -122,7 +123,7 @@ pub fn install(
     true
 }
 
-fn repaint() {
+pub(crate) fn repaint() {
     if let Some(f) = REPAINT.get() {
         f();
     }
@@ -181,6 +182,9 @@ unsafe extern "system" fn subclass_proc(
     // arguments. For WM_NCCALCSIZE with wparam != 0, lparam points to a
     // NCCALCSIZE_PARAMS owned by the caller for the duration of the call.
     unsafe {
+        if let Some(result) = crate::tray::handle(hwnd, msg, wparam, lparam) {
+            return result;
+        }
         match msg {
             WM_NCCALCSIZE if wparam != 0 => {
                 let params = lparam as *mut NCCALCSIZE_PARAMS;
