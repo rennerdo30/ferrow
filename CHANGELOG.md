@@ -2,11 +2,13 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.14
 
 - **Keyboard shortcut (Windows):** press **Ctrl+Alt+F** anywhere to bring up Ferrow with the search box ready; press it again to put Ferrow back in the tray. Change it or turn it off in Settings → Windows → Keyboard shortcut (Ctrl+Alt+Space and Alt+Space are offered too). If another app already uses the shortcut, Settings says so.
 - **Explorer right-click menu (Windows):** right-clicking a result shows the same menu as in Explorer (Open with, Send to, Properties, your cloud and archive tools), with Ferrow's **Open file location**, **Copy full path** and **Copy name** on top. Hold Shift for the extended menu. The menu runs separately from the window, so a slow shell extension or an unreachable network drive can't freeze Ferrow.
 - **File type filters:** `audio:`, `video:`, `pic:`, `doc:`, `archive:` (or `zip:`) and `exe:` find files by kind. Alone they list every file of that kind; with a word they narrow it, for example `audio:beatles`, `pic: holiday` or `!exe: setup`.
+- **Faster start:** the saved index loads about a third faster (5 million entries: 464 ms → 314 ms on the test machine), and loading no longer needs a second copy of the index file in memory.
+- **Faster searches with few results:** a search that matches almost nothing shows its (empty or short) first page several times sooner (5 million entries: 194 ms → 34 ms), and `path:` searches combined with a word are about twice as fast. The new type filters count their results about twice as fast as at first (`doc:`: 145 ms → 77 ms).
 
 ## 0.1.0-beta.13
 
