@@ -34,13 +34,14 @@ fn hits(store: &SnapshotStore, text: &str) -> Vec<String> {
     out
 }
 
-fn wait_until(what: &str, mut ok: impl FnMut() -> bool) -> Duration {
+fn wait_until(what: &str, ok: impl FnMut() -> bool) -> Duration {
+    wait_within(what, Duration::from_secs(10), ok)
+}
+
+fn wait_within(what: &str, limit: Duration, mut ok: impl FnMut() -> bool) -> Duration {
     let started = Instant::now();
     while !ok() {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "timed out waiting for {what}"
-        );
+        assert!(started.elapsed() < limit, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
     }
     started.elapsed()
@@ -68,7 +69,13 @@ fn file_changes_appear_in_searches_within_a_second() {
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
-    wait_until("the initial scan", || store.get().mode == "live");
+    // The initial scan reads the runner's whole system volume; on a busy
+    // hosted runner that alone has taken over 10 s. The timed requirement
+    // (a change visible within 1 s) is asserted below.
+    let scan = wait_within("the initial scan", Duration::from_secs(90), || {
+        store.get().mode == "live"
+    });
+    eprintln!("initial scan took {scan:?}");
     assert_eq!(hits(&store, "existing-zq").len(), 1);
 
     std::fs::write(dir.join("created-zq.txt"), b"new").unwrap();
