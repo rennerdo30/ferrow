@@ -212,6 +212,9 @@ impl FerrowApp {
                         self.settings.windows.windows_search,
                     );
                     self.index = Some(index);
+                    // Result ids belong to the index they came from; the
+                    // re-run below fills the list again.
+                    self.hits = None;
                     self.scan_status = None;
                     self.load_time = elapsed;
                     self.index_source = source;
@@ -233,6 +236,10 @@ impl FerrowApp {
                         // The service's index covers every drive and stays
                         // current: no local index or rebuilds needed.
                         self.index = Some(Arc::new(ferrow_index::IndexBuilder::new().freeze()));
+                        // Results from the app's own index (when the service
+                        // came up after the app) point into the index just
+                        // dropped: reading them would go out of bounds.
+                        self.hits = None;
                         self.scan_status = None;
                         self.columns_need_rebuild = false;
                         self.state = State::Ready;

@@ -54,12 +54,16 @@ impl Hits {
         }
     }
 
+    /// The entry id shown at `row`, or `None` past the end. An id the
+    /// given index does not have (results from an index that was replaced
+    /// in the meantime) is `None` too, never an out-of-bounds read.
     pub fn get(&self, index: &Index, row: usize) -> Option<u32> {
-        match self {
+        let id = match self {
             Hits::All => index.sorted().get(row).copied(),
             Hits::Some(ids) => ids.get(row).copied(),
             Hits::Remote(view) => view.ids.get(&row).copied(),
-        }
+        }?;
+        ((id as usize) < index.len()).then_some(id)
     }
 
     /// The index the hit ids refer to, when it is not the app's own.
@@ -920,6 +924,26 @@ mod tests {
         let id = hits.get(&index, 4).unwrap();
         assert_eq!(index.name(id), b"a.txt");
         assert_eq!(index.metadata(id).size, Some(5));
+    }
+
+    /// Regression for beta.11: results from the app's own index, read after
+    /// the service came up and the app swapped in an empty placeholder
+    /// index, aborted the app with an out-of-bounds read.
+    #[test]
+    fn hits_from_a_replaced_index_are_ignored_not_read_out_of_bounds() {
+        let builder = IndexBuilder::new();
+        let root = builder.add_root(b"C:\\data", flags::DIR);
+        for n in 0..10 {
+            builder.add(root, format!("file{n}.txt").as_bytes(), 0);
+        }
+        let big = builder.freeze();
+        let hits = Hits::Some(Arc::new((0..big.len() as u32).collect()));
+        assert!(hits.get(&big, 5).is_some());
+
+        let placeholder = IndexBuilder::new().freeze();
+        for row in 0..hits.len(&big) {
+            assert_eq!(hits.get(&placeholder, row), None);
+        }
     }
 
     #[test]
