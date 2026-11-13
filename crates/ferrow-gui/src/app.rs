@@ -972,6 +972,16 @@ impl FerrowApp {
         if list_resp.double_clicked() && clicked_row.is_some() {
             self.open_selected(false);
         }
+        // Windows: the Explorer menu (on its own thread, so slow shell
+        // extensions never stall the window).
+        if list_resp.secondary_clicked()
+            && let Some(path) = clicked_row.and_then(|row| self.path_of_row(row))
+        {
+            let extended = ui.input(|i| i.modifiers.shift);
+            if platform::show_shell_menu(&path, extended) {
+                return;
+            }
+        }
         let has_sel = self.selected.is_some();
         list_resp.context_menu(|ui| {
             ui.set_min_width(220.0);
