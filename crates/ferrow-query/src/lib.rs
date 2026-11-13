@@ -456,6 +456,14 @@ fn prefilter_bits<M: EntryMatcher>(
             sampled += 1;
             passed += usize::from(matcher.prefilter(index, id as u32));
         }
+        // A broad query keeps the plain scan; stop sampling as soon as that
+        // is clear, so it pays for one run, not eight: most entries pass,
+        // or the page is expected to fill within a small part of the index.
+        let fills_early = limit
+            .is_some_and(|limit| passed > 0 && limit.saturating_mul(sampled) / passed <= n / 64);
+        if passed * 2 > sampled || fills_early {
+            return None;
+        }
     }
     let build = match limit {
         // Every candidate is visited; skip only when most pass anyway.

@@ -248,6 +248,24 @@ impl EntryMatcher for PlainMatcher {
     const CANCELLABLE_TERM: bool = false;
     #[inline]
     fn matches(&self, index: &Index, id: u32, _: &mut Scratch, _: &CancelToken) -> bool {
+        self.test(index, id)
+    }
+    /// A plain query reads only names. For a rare one (few hits), testing
+    /// it in id order, where names lie sequentially in the arena, and then
+    /// walking name order over the resulting bits is several times cheaper
+    /// than running memmem on every entry in name order (a random access
+    /// per entry). The sampling in `prefilter_bits` decides.
+    fn has_prefilter(&self) -> bool {
+        !self.finders.is_empty()
+    }
+    #[inline]
+    fn prefilter(&self, index: &Index, id: u32) -> bool {
+        self.test(index, id)
+    }
+}
+impl PlainMatcher {
+    #[inline]
+    fn test(&self, index: &Index, id: u32) -> bool {
         self.finders
             .iter()
             .all(|(finder, negated, case_sensitive)| {
