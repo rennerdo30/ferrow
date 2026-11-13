@@ -159,7 +159,7 @@ impl FerrowApp {
                 }
                 sort_changed = true;
             }
-            // Divider and resize grip on the right edge (not after the last).
+            // Divider on the right edge (not after the last column).
             if i + 1 < cols.len() {
                 painter.line_segment(
                     [
@@ -168,22 +168,37 @@ impl FerrowApp {
                     ],
                     Stroke::new(1.0, p.divider),
                 );
-                let grip = Rect::from_center_size(
-                    pos2(col.right, header.center().y),
-                    vec2(8.0, header.height()),
-                );
-                let g = ui
-                    .interact(grip, egui::Id::unique(("col-grip", i)), Sense::drag())
-                    .on_hover_cursor(CursorIcon::ResizeColumn);
-                if g.dragged()
-                    && col.id != ColumnId::Folder
-                    && let Some(cfg) = self.settings.columns.iter_mut().find(|c| c.id == col.id)
-                {
-                    cfg.width = (col.right - col.left + g.drag_delta().x).max(MIN_WIDTH);
+            }
+        }
+        // Resize grips, registered after every header cell so they lie on
+        // top: egui gives the pointer to the last-registered widget, and a
+        // cell registered later covered half of each grip.
+        for (i, pair) in cols.windows(2).enumerate() {
+            let (left_col, right_col) = (&pair[0], &pair[1]);
+            let grip = Rect::from_center_size(
+                pos2(left_col.right, header.center().y),
+                vec2(10.0, header.height()),
+            );
+            let g = ui
+                .interact(grip, egui::Id::unique(("col-grip", i)), Sense::drag())
+                .on_hover_cursor(CursorIcon::ResizeColumn);
+            if g.dragged() {
+                let delta = g.drag_delta().x;
+                // The flexible Folder column takes whatever space is left,
+                // so a divider next to it resizes the column on its other
+                // side: dragging right of Folder moves that column's left
+                // edge.
+                let (target, width) = if left_col.id != ColumnId::Folder {
+                    (left_col.id, left_col.right - left_col.left + delta)
+                } else {
+                    (right_col.id, right_col.right - right_col.left - delta)
+                };
+                if let Some(cfg) = self.settings.columns.iter_mut().find(|c| c.id == target) {
+                    cfg.width = width.max(MIN_WIDTH);
                 }
-                if g.drag_stopped() {
-                    resized = true;
-                }
+            }
+            if g.drag_stopped() {
+                resized = true;
             }
         }
         let mut columns_changed = false;

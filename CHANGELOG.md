@@ -6,6 +6,7 @@ Release notes for each version. The release workflow copies a version's section 
 
 - **Starts with Windows, in the tray:** new setting **Start Ferrow when you sign in** (Settings → Windows, on by default). Ferrow starts hidden in the notification area, so search and the Start menu integration are ready right after you sign in. Opening Ferrow yourself still shows the window.
 - **Updates keep Ferrow in the tray:** if Ferrow was in the tray when an update closed it, the updated copy starts there too instead of opening its window.
+- **Fixed:** result columns could not be resized. The resize grips lay under the header cells, so dragging a divider hit the header instead, and the divider right of Folder did nothing. All dividers now resize; next to Folder (which takes the remaining space) they resize the column on the other side.
 - **Better Start results:** Windows' prefetch traces (`C:\Windows\Prefetch\NAME.EXE-1234.pf`, one per program run) are no longer offered to Start, so searching a program name shows the program instead of its traces.
 
 ## 0.1.0-beta.12
