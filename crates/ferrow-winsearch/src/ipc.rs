@@ -443,7 +443,8 @@ fn name_tier(file_name: &str, term: &str) -> u8 {
 
 /// Folders whose files are rarely what a Start search is for.
 fn is_noise_path(path: &str) -> bool {
-    const NOISE: [&str; 11] = [
+    const NOISE: [&str; 12] = [
+        "\\windows\\prefetch\\",
         "\\appdata\\",
         "\\node_modules\\",
         "\\.git\\",
