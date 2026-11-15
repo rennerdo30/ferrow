@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 
-use crate::live::{Change, Live, RecordSource, RecordState};
+use crate::live::{Change, HARD_DELTA, Live, RecordSource, RecordState, RescanPolicy};
 use crate::{Snapshot, SnapshotStore};
 
 /// How long changes are collected after the first one of a batch.
@@ -69,13 +69,42 @@ pub fn start(store: SnapshotStore, options: WalkOptions) {
     }
 }
 
+/// Threads for background rescans: a few, never the whole machine. The
+/// global pool stays free for searches.
+fn background_pool() -> Option<rayon::ThreadPool> {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads((cores / 4).clamp(2, 8))
+        .thread_name(|i| format!("index-rescan-{i}"))
+        .start_handler(|_| ferrow_walk::priority::enter_background())
+        .build()
+        .ok()
+}
+
 fn maintain(store: SnapshotStore, options: WalkOptions) {
     let (tx, rx) = channel::<Message>();
     let mut readers: HashMap<String, ()> = HashMap::new();
     let mut reason = "startup".to_string();
+    let pool = background_pool();
+    // With a saved index loaded, even the startup scan is background work:
+    // that index answers searches meanwhile.
+    let mut background = !store.get().index.is_empty();
     loop {
         let started = Instant::now();
-        let (index, report, maps) = ferrow_walk::scan_with_maps(&options);
+        let scan = || ferrow_walk::scan_with_maps(&options);
+        let (index, report, maps) = match (&pool, background) {
+            (Some(pool), true) => {
+                // This thread runs the MFT reads; live batches after the
+                // scan run at normal priority again.
+                ferrow_walk::priority::enter_background();
+                let out = pool.install(scan);
+                ferrow_walk::priority::leave_background();
+                out
+            }
+            _ => scan(),
+        };
+        background = true;
+        let took = started.elapsed();
         if let Some(fatal) = &report.fatal_error {
             eprintln!("ferrowd: scan failed: {fatal}");
             return;
@@ -90,7 +119,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             } else {
                 "live"
             },
-            started.elapsed().as_secs_f64()
+            took.as_secs_f64()
         );
         eprintln!("ferrowd: {summary}");
         store.swap(Snapshot {
@@ -144,40 +173,67 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             .map(|(i, m)| (m.device.clone(), i))
             .collect();
         let mut live = Live::new(base.clone(), &maps);
+        // The record maps (16 bytes per entry) are only needed to build
+        // the overlay; do not keep them for the whole live session.
+        drop(maps);
         let mut applied_total = 0usize;
+        let mut rescan = RescanPolicy::after_scan(Instant::now(), took);
         reason = loop {
-            let Some(batch) = next_batch(&rx, &device_index) else {
+            let urgent = live.delta_len() > HARD_DELTA;
+            if let Some(why) = rescan.due(Instant::now(), urgent) {
+                break why;
+            }
+            let Some(batch) = next_batch(&rx, &device_index, rescan.wake_at()) else {
                 return;
             };
             let changes = match batch {
                 Ok(changes) => changes,
-                Err(reset) => break reset,
+                Err(reset) => {
+                    rescan.request(reset);
+                    continue;
+                }
             };
+            if changes.is_empty() {
+                continue; // woke for a pending rescan
+            }
             let outcome = live.apply(&changes, &volumes);
             if let Some(why) = outcome.rescan {
-                break why;
+                rescan.request(why);
             }
             if outcome.changed == 0 {
                 continue;
             }
             applied_total += outcome.changed;
+            let mut report = format!("{summary}; {applied_total} live changes");
+            if let Some(why) = rescan.pending() {
+                report.push_str(&format!("; rescan pending ({why})"));
+            }
             store.swap(Snapshot {
                 index: base.clone(),
                 live: Some(Arc::new(live.view())),
                 mode: "live".into(),
-                report: format!("{summary}; {applied_total} live changes"),
+                report,
             });
         };
     }
 }
 
-/// Wait for the next batch (blocking while idle). `None` when every
-/// reader is gone; `Err` when a volume must be rescanned.
+/// Wait for the next batch (blocking while idle, or until `wake_at`, then
+/// an empty batch). `None` when every reader is gone; `Err` when a volume
+/// must be rescanned.
 fn next_batch(
     rx: &Receiver<Message>,
     device_index: &HashMap<String, usize>,
+    wake_at: Option<Instant>,
 ) -> Option<Result<Vec<Change>, String>> {
-    let first = rx.recv().ok()?;
+    let first = match wake_at {
+        None => rx.recv().ok()?,
+        Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => return Some(Ok(Vec::new())),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        },
+    };
     let deadline = Instant::now() + BATCH;
     let mut changes: HashMap<(usize, u64), bool> = HashMap::new();
     let mut take = |message: Message| -> Result<(), String> {

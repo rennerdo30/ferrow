@@ -15,6 +15,7 @@ ferrow-index = { path = "../ferrow-index" }
 ferrow-ipc = { path = "../ferrow-ipc" }
 ferrow-query = { path = "../ferrow-query" }
 ferrow-walk = { path = "../ferrow-walk" }
+rayon = "1"
 
 [dev-dependencies]
 ferrow-query = { path = "../ferrow-query", features = ["test-hooks"] }

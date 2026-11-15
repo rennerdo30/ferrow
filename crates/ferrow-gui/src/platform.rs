@@ -251,6 +251,14 @@ pub fn global_hotkey_unavailable() -> bool {
     false
 }
 
+/// True while the window is hidden in the tray.
+pub fn is_hidden_in_tray() -> bool {
+    #[cfg(windows)]
+    return crate::tray::is_hidden();
+    #[cfg(not(windows))]
+    false
+}
+
 /// Bring the window back from the tray (or to the front).
 pub fn show_from_tray() {
     #[cfg(windows)]

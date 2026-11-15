@@ -22,6 +22,9 @@ const REMOTE_PAGE: usize = 500;
 const REMOTE_KEEP: usize = 20_000;
 /// How often the app checks for a Ferrow service it is not connected to.
 const SERVICE_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+/// Live changes are reported at most this often: a busy disk publishes
+/// up to five times a second, and each report re-runs the search.
+const LIVE_COALESCE: Duration = Duration::from_millis(500);
 
 /// The current result set.
 #[derive(Clone)]
@@ -463,6 +466,8 @@ impl<W: Fn()> Worker<W> {
                         {
                             return;
                         }
+                        // Later changes are picked up by the next watch.
+                        std::thread::sleep(LIVE_COALESCE);
                     }
                 });
         }

@@ -2,6 +2,17 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Fixed: the service kept rescanning and used gigabytes of memory.** On a busy disk, almost any folder moved into an indexed place, or a burst of changes, started a full rescan of every drive. While a rescan ran, two indexes were in memory and the search threads were busy with the scan, and afterwards the whole index file was written again. Now:
+  - A rescan waits until at least nine times its own duration has passed since the last one (between 1 and 30 minutes). Changes keep showing up live while it waits.
+  - Rescans run on a few low-priority threads with low disk priority, so searches and your own programs come first.
+  - The index file is saved at most every 30 minutes while the service runs, and always when it stops.
+  - About 16 bytes per entry that were only needed at startup are released (about 500 MB at 33 million entries).
+- **Fixed: a whole drive could lose live updates and take minutes to scan.** If the drive's change journal filled up while its file table was being read, Ferrow gave up and walked every folder instead (170 s for 19 million entries on the test PC), and that drive then got no live updates. Ferrow now continues from where the journal currently starts.
+- **Fixed: the app kept searching while hidden in the tray.** Every change on disk made it run the current search again through the service, up to five times a second, even with the window hidden. It now searches again at most twice a second, and only while the window is shown (it catches up as soon as you open it).
+- **Faster live updates for deleted or moved folders:** removing a folder no longer checks every pending change once per subfolder.
+
 ## 0.1.0-beta.15
 
 - **Drag results out (Windows):** drag a result into Explorer, onto the desktop, into a mail, chat or editor window to copy, move or link the file, as from Explorer.

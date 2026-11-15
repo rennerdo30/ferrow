@@ -13,6 +13,10 @@ pub fn scheduled_delay(dirty: bool) -> Option<Duration> {
     dirty.then_some(Duration::from_millis(250))
 }
 
+/// Least time between two index saves while running. An index save
+/// writes the whole file (gigabytes on large machines).
+pub const SAVE_GAP: Duration = Duration::from_secs(30 * 60);
+
 pub struct Persistence {
     store: SnapshotStore,
     stop: Arc<AtomicBool>,
@@ -41,25 +45,32 @@ impl Persistence {
         // Live updates publish often but keep the same frozen index; only
         // a new frozen index (a scan) is worth writing again.
         let mut last: Option<std::sync::Weak<ferrow_index::Index>> = None;
-        Self::start_with_saver(config, store, shutdown, move |config, snapshot| {
-            if last
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|saved| Arc::ptr_eq(&saved, &snapshot.index))
-            {
-                return Ok(());
-            }
-            let index = Arc::downgrade(&snapshot.index);
-            save(config, snapshot)?;
-            last = Some(index);
-            Ok(())
-        })
+        Self::start_with_saver(
+            config,
+            store,
+            shutdown,
+            SAVE_GAP,
+            move |config, snapshot| {
+                if last
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_some_and(|saved| Arc::ptr_eq(&saved, &snapshot.index))
+                {
+                    return Ok(());
+                }
+                let index = Arc::downgrade(&snapshot.index);
+                save(config, snapshot)?;
+                last = Some(index);
+                Ok(())
+            },
+        )
     }
 
     fn start_with_saver(
         config: &DaemonConfig,
         store: &SnapshotStore,
         shutdown: &Shutdown,
+        save_gap: Duration,
         mut saver: impl FnMut(&DaemonConfig, Arc<Snapshot>) -> io::Result<()> + Send + 'static,
     ) -> io::Result<Option<Self>> {
         if config.index_path.is_none() {
@@ -82,6 +93,7 @@ impl Persistence {
         let thread = std::thread::Builder::new()
             .name("index-persist".into())
             .spawn(move || {
+                let mut last_save: Option<Instant> = None;
                 let result: io::Result<()> = (|| {
                     loop {
                         // No timer is armed until a publication or controlled exit.
@@ -90,7 +102,14 @@ impl Persistence {
                             Some(delay) => events.recv_timeout(delay).map_err(io::Error::other)?,
                         }
                         if !s.load(Ordering::Acquire) {
-                            let deadline = Instant::now() + scheduled_delay(true).unwrap();
+                            // Coalesce publications; and save a whole index
+                            // at most once per gap (every service start
+                            // rescans anyway, so a slightly older file only
+                            // costs that rescan's diff, never correctness).
+                            let mut deadline = Instant::now() + scheduled_delay(true).unwrap();
+                            if let Some(at) = last_save {
+                                deadline = deadline.max(at + save_gap);
+                            }
                             while !s.load(Ordering::Acquire) {
                                 let Some(left) = deadline.checked_duration_since(Instant::now())
                                 else {
@@ -103,6 +122,7 @@ impl Persistence {
                         }
                         let mut saved_generation = current.generation.load(Ordering::Acquire);
                         saver(&config, current.get())?;
+                        last_save = Some(Instant::now());
                         if s.load(Ordering::Acquire) {
                             loop {
                                 let latest = current.generation.load(Ordering::Acquire);
@@ -188,17 +208,22 @@ mod tests {
         let observed = saved.clone();
         let (paused_tx, paused) = mpsc::channel();
         let (release, resumed) = mpsc::channel();
-        let worker =
-            Persistence::start_with_saver(&config, &store, &shutdown, move |_, snapshot| {
+        let worker = Persistence::start_with_saver(
+            &config,
+            &store,
+            &shutdown,
+            Duration::ZERO,
+            move |_, snapshot| {
                 if snapshot.report == "A" {
                     paused_tx.send(()).unwrap();
                     resumed.recv_timeout(Duration::from_secs(2)).unwrap();
                 }
                 observed.lock().unwrap().push(snapshot.report.clone());
                 Ok(())
-            })
-            .unwrap()
-            .unwrap();
+            },
+        )
+        .unwrap()
+        .unwrap();
         let mut a = Snapshot::empty();
         a.report = "A".into();
         store.swap(a);
@@ -218,6 +243,45 @@ mod tests {
             "controlled shutdown lost a pre-shutdown publication"
         );
     }
+    #[test]
+    fn saves_wait_for_the_gap_but_shutdown_saves_the_latest() {
+        let store = SnapshotStore::new(Snapshot::empty());
+        let config = DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-save-gap-unused"),
+            index_path: Some("unused-mocked-save".into()),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let shutdown = Shutdown::new();
+        let (saved_tx, saved) = mpsc::channel();
+        let worker = Persistence::start_with_saver(
+            &config,
+            &store,
+            &shutdown,
+            Duration::from_secs(60),
+            move |_, snapshot| {
+                saved_tx.send(snapshot.report.clone()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let mut a = Snapshot::empty();
+        a.report = "A".into();
+        store.swap(a);
+        assert_eq!(saved.recv_timeout(Duration::from_secs(5)).unwrap(), "A");
+        let mut b = Snapshot::empty();
+        b.report = "B".into();
+        store.swap(b);
+        assert!(
+            saved.recv_timeout(Duration::from_millis(600)).is_err(),
+            "a second save within the gap"
+        );
+        worker.finish().unwrap();
+        assert_eq!(saved.try_recv().unwrap(), "B", "shutdown saves the latest");
+    }
+
     #[test]
     fn clean_idle_host_arms_no_periodic_task() {
         assert_eq!(scheduled_delay(false), None);
