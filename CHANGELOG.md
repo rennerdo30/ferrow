@@ -2,7 +2,7 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.16
 
 - **Fixed: the service kept rescanning and used gigabytes of memory.** On a busy disk, almost any folder moved into an indexed place, or a burst of changes, started a full rescan of every drive. While a rescan ran, two indexes were in memory and the search threads were busy with the scan, and afterwards the whole index file was written again. Now:
   - A rescan waits until at least nine times its own duration has passed since the last one (between 1 and 30 minutes). Changes keep showing up live while it waits.
