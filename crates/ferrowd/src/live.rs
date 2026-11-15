@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, flags};
 use ferrow_walk::VolumeMap;
@@ -31,6 +32,63 @@ const MAX_DELTA: usize = 50_000;
 const MAX_REMOVED_DIVISOR: usize = 10;
 /// …or a single folder move would copy more than this many entries.
 const MAX_MOVE: usize = 100_000;
+
+/// A pending rescan waits until a full scan's worth of time has passed
+/// this many times over (rescans take at most 1/10 of the time)…
+const RESCAN_DUTY: u32 = 9;
+/// …but at least this long…
+const MIN_RESCAN_GAP: Duration = Duration::from_secs(60);
+/// …and at most this long.
+const MAX_RESCAN_GAP: Duration = Duration::from_secs(30 * 60);
+/// A pending rescan starts at once when the delta, removed entries
+/// included, grows past this (bounds its memory and per-batch view cost).
+pub const HARD_DELTA: usize = 8 * MAX_DELTA;
+
+/// When a requested rescan may start. A rescan is a full scan: on a busy
+/// disk the triggers (a folder moved in, a full delta, a journal reset)
+/// can arrive every few seconds, and rescanning on each kept the service
+/// scanning, and holding two indexes, nearly all the time. Changes keep
+/// being applied while a rescan waits.
+#[derive(Debug)]
+pub struct RescanPolicy {
+    pending: Option<String>,
+    earliest: Instant,
+}
+
+impl RescanPolicy {
+    /// After a scan that took `took` and finished at `now`.
+    pub fn after_scan(now: Instant, took: Duration) -> RescanPolicy {
+        let gap = (took * RESCAN_DUTY).clamp(MIN_RESCAN_GAP, MAX_RESCAN_GAP);
+        RescanPolicy {
+            pending: None,
+            earliest: now + gap,
+        }
+    }
+
+    /// Ask for a rescan; the first reason is kept.
+    pub fn request(&mut self, reason: String) {
+        self.pending.get_or_insert(reason);
+    }
+
+    pub fn pending(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
+    /// The reason to rescan now: one is pending and its gap has passed, or
+    /// `urgent` (the delta outgrew [`HARD_DELTA`]).
+    pub fn due(&mut self, now: Instant, urgent: bool) -> Option<String> {
+        if self.pending.is_some() && (urgent || now >= self.earliest) {
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    /// When the maintainer must wake to start a pending rescan.
+    pub fn wake_at(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|_| self.earliest)
+    }
+}
 
 /// Where an entry lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,6 +183,9 @@ pub struct Live {
     removed_count: usize,
     delta: Vec<DeltaEntry>,
     delta_alive: usize,
+    /// Delta entries by parent (alive or not; readers filter). Without it
+    /// every folder visited by a move or delete scanned the whole delta.
+    delta_children: HashMap<Loc, Vec<u32>>,
     overrides: HashMap<u32, EntryMetadata>,
     volumes: Vec<Volume>,
     /// Frozen id → `(volume << 48) | record`, `u64::MAX` when unmapped.
@@ -172,6 +233,7 @@ impl Live {
             removed_count: 0,
             delta: Vec::new(),
             delta_alive: 0,
+            delta_children: HashMap::new(),
             overrides: HashMap::new(),
             volumes,
             base_record,
@@ -281,9 +343,17 @@ impl Live {
     }
 
     fn add(&mut self, entry: DeltaEntry) -> Loc {
+        let d = self.delta.len() as u32;
+        self.delta_children.entry(entry.parent).or_default().push(d);
         self.delta.push(entry);
         self.delta_alive += 1;
-        Loc::Delta(self.delta.len() as u32 - 1)
+        Loc::Delta(d)
+    }
+
+    /// Delta entries ever added, removed ones included (they stay until
+    /// the next rescan): what the delta costs in memory and per view.
+    pub fn delta_len(&self) -> usize {
+        self.delta.len()
     }
 
     fn children(&self, loc: Loc) -> Vec<Loc> {
@@ -315,13 +385,9 @@ impl Live {
             let range = first[id as usize] as usize..first[id as usize + 1] as usize;
             out.extend(ids[range].iter().map(|&c| Loc::Base(c)));
         }
-        out.extend(
-            self.delta
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.alive && e.parent == loc)
-                .map(|(d, _)| Loc::Delta(d as u32)),
-        );
+        if let Some(ids) = self.delta_children.get(&loc) {
+            out.extend(ids.iter().map(|&d| Loc::Delta(d)));
+        }
         out.retain(|&l| self.is_alive(l));
         out
     }
@@ -722,6 +788,60 @@ mod tests {
             record,
             created,
         }
+    }
+
+    #[test]
+    fn rescans_wait_for_their_share_of_time() {
+        let t0 = Instant::now();
+        // A 3-minute scan (directory walk): the next waits 27 minutes.
+        let mut p = RescanPolicy::after_scan(t0, Duration::from_secs(180));
+        assert_eq!(p.wake_at(), None, "nothing pending arms no wake-up");
+        assert_eq!(p.due(t0 + Duration::from_secs(3600), false), None);
+        p.request("a folder moved into an indexed location".into());
+        p.request("50001 live changes".into());
+        assert_eq!(p.wake_at(), Some(t0 + Duration::from_secs(27 * 60)));
+        assert_eq!(p.due(t0 + Duration::from_secs(26 * 60), false), None);
+        assert_eq!(
+            p.due(t0 + Duration::from_secs(27 * 60), false).as_deref(),
+            Some("a folder moved into an indexed location")
+        );
+        assert_eq!(p.pending(), None);
+        // Fast MFT scans still wait a minute; slow ones at most 30.
+        let p = RescanPolicy::after_scan(t0, Duration::from_millis(500));
+        assert_eq!(p.earliest, t0 + MIN_RESCAN_GAP);
+        let p = RescanPolicy::after_scan(t0, Duration::from_secs(3600));
+        assert_eq!(p.earliest, t0 + MAX_RESCAN_GAP);
+        // An outgrown delta does not wait.
+        let mut p = RescanPolicy::after_scan(t0, Duration::from_secs(10));
+        p.request("x".into());
+        assert_eq!(p.due(t0, true).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn deleting_a_folder_visits_only_its_own_children() {
+        // Many unrelated delta entries must not make a subtree delete
+        // scan the whole delta per folder (it was quadratic).
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        let mut changes = Vec::new();
+        for i in 0..2000u64 {
+            let record = 1000 + i;
+            f.set(record, file_info(1), &[(20, &format!("n{i}.txt"))]);
+            changes.push(change(record, true));
+        }
+        live.apply(&changes, &f);
+        assert_eq!(live.delta_len(), 2000);
+        let docs = live.locations(0, 20)[0];
+        assert_eq!(live.children(docs).len(), 2001, "a.txt and the new files");
+        assert!(
+            live.children(Loc::Delta(0)).is_empty(),
+            "files have no children"
+        );
+        // Deleting the folder hides it and everything below it.
+        f.0.remove(&20);
+        live.apply(&[change(20, false)], &f);
+        assert_eq!(paths(&base, &live.view()), ["C:", "C:\\b.txt"]);
     }
 
     #[test]

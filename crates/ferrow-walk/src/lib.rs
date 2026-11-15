@@ -18,6 +18,7 @@ use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, metadat
 
 mod identity;
 pub mod ntfs;
+pub mod priority;
 
 use identity::{FileId, file_id};
 

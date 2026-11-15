@@ -571,6 +571,29 @@ mod platform {
     const NO_BUFFERING: u32 = 0x2000_0000;
     /// Unbuffered reads need sector-aligned memory; 4 KiB covers every disk.
     const ALIGN: usize = 4096;
+    /// `ERROR_JOURNAL_ENTRY_DELETED`: the requested USN was purged.
+    const ERROR_JOURNAL_ENTRY_DELETED: i32 = 1181;
+
+    /// Ask the disk stack to serve this handle's reads at low priority
+    /// (background rescans). Best effort: on failure reads stay normal.
+    fn low_io_priority(volume: &std::fs::File) {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_IO_PRIORITY_HINT_INFO, FileIoPriorityHintInfo, IoPriorityHintLow,
+            SetFileInformationByHandle,
+        };
+        let hint = FILE_IO_PRIORITY_HINT_INFO {
+            PriorityHint: IoPriorityHintLow,
+        };
+        // SAFETY: live handle; the input pointer and size describe `hint`.
+        unsafe {
+            SetFileInformationByHandle(
+                volume.as_raw_handle(),
+                FileIoPriorityHintInfo,
+                (&raw const hint).cast(),
+                size_of::<FILE_IO_PRIORITY_HINT_INFO>() as u32,
+            );
+        }
+    }
 
     /// A zeroed, 4 KiB-aligned byte buffer for unbuffered reads.
     struct Aligned {
@@ -729,6 +752,10 @@ mod platform {
             return Err("MFT record 0 is damaged".into());
         }
         let runs = mft_runs(&record0).ok_or("cannot decode the MFT's location")?;
+        let background = crate::priority::is_background();
+        if background {
+            low_io_priority(&volume);
+        }
         let journal_before = query_journal(&volume);
         let read_started = std::time::SystemTime::now();
         let records = valid / record_size as u64;
@@ -739,6 +766,9 @@ mod platform {
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Aligned)>(2);
             let volume = &volume;
             let reader = scope.spawn(move || -> Result<(), String> {
+                if background {
+                    crate::priority::enter_background();
+                }
                 let mut mft_offset = 0u64;
                 for (lcn, clusters) in runs {
                     let run_bytes = clusters * cluster;
@@ -933,7 +963,7 @@ mod platform {
         journal: u64,
         start: i64,
         mut each: impl FnMut(UsnRecord),
-    ) -> Result<i64, String> {
+    ) -> std::io::Result<i64> {
         use windows_sys::Win32::System::IO::DeviceIoControl;
         use windows_sys::Win32::System::Ioctl::{FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1};
         let mut next = start;
@@ -965,10 +995,7 @@ mod platform {
                 )
             };
             if ok == 0 {
-                return Err(format!(
-                    "read change journal: {}",
-                    std::io::Error::last_os_error()
-                ));
+                return Err(std::io::Error::last_os_error());
             }
             // SAFETY: the buffer holds `returned` initialized bytes.
             let bytes =
@@ -977,7 +1004,7 @@ mod platform {
                 .get(0..8)
                 .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
             else {
-                return Err("short change journal read".into());
+                return Err(std::io::Error::other("short change journal read"));
             };
             let records = parse_usn_records(&bytes[8..]);
             let empty = records.is_empty();
@@ -1045,11 +1072,32 @@ mod platform {
         let (id, first, before) = journal;
         let since = filetime_now(read_started) - 120 * 10_000_000;
         let mut changed = std::collections::BTreeSet::new();
-        let next = read_journal(volume, id, first.max(before - WINDOW_BYTES), |r| {
-            if r.timestamp >= since {
-                changed.insert(r.record);
+        let mut start = first.max(before - WINDOW_BYTES);
+        let mut purged = 0;
+        let next = loop {
+            match read_journal(volume, id, start, |r| {
+                if r.timestamp >= since {
+                    changed.insert(r.record);
+                }
+            }) {
+                Ok(next) => break next,
+                // A busy volume with a small journal purges its oldest
+                // records while the MFT is read. Continue from the
+                // journal's current start: the purged records are its
+                // oldest ones. Giving up here used to send the whole
+                // volume to the directory walk (minutes, no live updates).
+                Err(e) if e.raw_os_error() == Some(ERROR_JOURNAL_ENTRY_DELETED) && purged < 3 => {
+                    purged += 1;
+                    match query_journal(volume) {
+                        Some((now_id, now_first, _)) if now_id == id && now_first > start => {
+                            start = now_first;
+                        }
+                        _ => return Err(format!("read change journal: {e}")),
+                    }
+                }
+                Err(e) => return Err(format!("read change journal: {e}")),
             }
-        })?;
+        };
         if changed.is_empty() {
             return Ok(next);
         }

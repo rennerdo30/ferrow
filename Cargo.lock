@@ -1189,6 +1189,7 @@ dependencies = [
  "ferrow-query",
  "ferrow-walk",
  "libc",
+ "rayon",
  "signal-hook",
  "windows-service",
  "windows-sys 0.61.2",
