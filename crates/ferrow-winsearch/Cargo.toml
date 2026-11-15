@@ -41,4 +41,4 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
 ] }
-windows-core = "0.62.2"
+windows-core = "0.100.0"
