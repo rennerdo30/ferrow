@@ -109,6 +109,9 @@ pub struct FerrowApp {
     pub(crate) service_entries: Option<u64>,
     /// Re-run the query for a live change without jumping to the top.
     refreshing: bool,
+    /// The service changed while the window was hidden or minimized: search
+    /// again once it is shown (a hidden window never re-searches).
+    live_change_pending: bool,
 }
 
 impl FerrowApp {
@@ -179,6 +182,7 @@ impl FerrowApp {
             updater: crate::update::Updater::new(),
             service_entries: None,
             refreshing: false,
+            live_change_pending: false,
         };
         if app.settings.windows.windows_search {
             app.sync_windows_search();
@@ -254,8 +258,7 @@ impl FerrowApp {
                 Event::IndexChanged => {
                     // A live change: search again, keeping the view.
                     if self.service_entries.is_some() {
-                        self.refreshing = true;
-                        self.sent_query = None;
+                        self.live_change_pending = true;
                     }
                 }
                 Event::Failed(msg) => {
@@ -1288,6 +1291,12 @@ impl eframe::App for FerrowApp {
         self.updates_on_open(&ctx);
         self.updater.poll();
 
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if self.live_change_pending && !minimized && !platform::is_hidden_in_tray() {
+            self.live_change_pending = false;
+            self.refreshing = true;
+            self.sent_query = None;
+        }
         // Every keystroke starts a new (cancelling) search on the worker.
         if self.page == Page::Settings
             && self.sent_query.is_some()

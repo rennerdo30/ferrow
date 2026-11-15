@@ -10,6 +10,7 @@ Release notes for each version. The release workflow copies a version's section 
   - The index file is saved at most every 30 minutes while the service runs, and always when it stops.
   - About 16 bytes per entry that were only needed at startup are released (about 500 MB at 33 million entries).
 - **Fixed: a whole drive could lose live updates and take minutes to scan.** If the drive's change journal filled up while its file table was being read, Ferrow gave up and walked every folder instead (170 s for 19 million entries on the test PC), and that drive then got no live updates. Ferrow now continues from where the journal currently starts.
+- **Fixed: the app kept searching while hidden in the tray.** Every change on disk made it run the current search again through the service, up to five times a second, even with the window hidden. It now searches again at most twice a second, and only while the window is shown (it catches up as soon as you open it).
 - **Faster live updates for deleted or moved folders:** removing a folder no longer checks every pending change once per subfolder.
 
 ## 0.1.0-beta.15
