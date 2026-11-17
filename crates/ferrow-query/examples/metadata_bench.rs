@@ -62,10 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_path = path.with_extension("sort-prototype.bin");
     std::fs::write(&cache_path, sort_prototype::encode(&index))?;
     let mut samples: [Vec<f64>; 3] = Default::default();
+    let mut breakdowns: [Vec<ferrow_index::LoadTimings>; 2] = Default::default();
     println!("FERROW-LOAD-ORDER modes=core,lazy,persisted warm=ABC samples=ABC,BCA,CAB");
     for (warm, mode) in sort_prototype::load_order() {
         let started = Instant::now();
-        let loaded = Index::load(if mode == 0 { &core_path } else { path })?;
+        let (loaded, timings) =
+            Index::load_with_timings(if mode == 0 { &core_path } else { path })?;
         if mode == 2 {
             sort_prototype::validate(&loaded, &cache_path)?;
         }
@@ -79,6 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(loaded.metadata_order(SortKey::Modified, false).is_none());
         if !warm {
             samples[mode].push(elapsed);
+            if mode < 2 {
+                breakdowns[mode].push(timings);
+            }
         }
     }
     let [core_load, loads, persisted] = samples;
@@ -97,6 +102,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         heap - cold,
         freeze.total.as_secs_f64() * 1000.0
     );
+    // Additive per-stage load breakdown of the median-total sample of each
+    // arm (core file, default-column file). The `metadata_*` fields are
+    // subspans of read/checksum/decode when the load is serial; when it is
+    // overlapped they ran on the metadata thread, beside the core
+    // sections, and `metadata_wait_ms` is the join wait on the total.
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    for (arm, runs) in ["core", "default"].into_iter().zip(&mut breakdowns) {
+        runs.sort_by_key(|t| t.total);
+        let t = runs[runs.len() / 2];
+        // Which metadata load path ran; read the arm only after this line.
+        println!(
+            "FERROW-METADATA-LOAD-ACTIVE arm={arm} metadata_load={} core_read_mb_s={:.1}",
+            t.metadata_load.label(),
+            t.core_read_mb_s
+        );
+        println!(
+            "FERROW-LOAD-BREAKDOWN arm={arm} total_ms={:.6} read_ms={:.6} buffer_ms={:.6} checksum_ms={:.6} decode_ms={:.6} structure_ms={:.6} derived_ms={:.6} cleanup_ms={:.6} unattributed_ms={:.6} metadata_read_ms={:.6} metadata_checksum_ms={:.6} metadata_decode_ms={:.6} metadata_wait_ms={:.6}",
+            ms(t.total),
+            ms(t.read),
+            ms(t.buffer),
+            ms(t.checksum),
+            ms(t.decode),
+            ms(t.structure),
+            ms(t.derived),
+            ms(t.cleanup),
+            ms(t.unattributed()),
+            ms(t.metadata_read),
+            ms(t.metadata_checksum),
+            ms(t.metadata_decode),
+            ms(t.metadata_wait),
+        );
+    }
     for text in [
         "a",
         "re",
