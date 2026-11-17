@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Vec2, pos2, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
 use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder, flags};
 
 use super::*;
+use crate::access;
 use crate::engine::{self, Event};
 use crate::settings::{AutoRebuild, SortChoice, Source, SourceKind, ThemeChoice};
 use crate::update::UpdateState;
@@ -598,6 +598,21 @@ impl<'a> Session<'a> {
         self.frames(3);
     }
 
+    /// Click the state chip at the left of the status bar.
+    fn click_state_chip(&mut self) {
+        let pos = pos2(60.0, self.size.y - 16.0);
+        self.hover(pos);
+        for pressed in [true, false] {
+            self.harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        self.frames(8);
+    }
+
     /// Click the "?" next to the search box: the search syntax help.
     fn open_syntax_help(&mut self) {
         let w = self.size.x;
@@ -632,26 +647,26 @@ impl<'a> Session<'a> {
         self.frames(3);
     }
 
-    /// Scroll the Settings page so that the element labelled `label` is
-    /// near the top. Scrolling uses wheel events over the page.
-    fn scroll_to(&mut self, label: &str) {
-        let page_center = pos2(self.size.x / 2.0, self.size.y / 2.0);
-        let target = self.content_top() + 12.0;
-        self.hover(page_center);
-        // Back to the top first.
-        self.wheel(page_center, 100_000.0);
-        for _ in 0..60 {
-            let y = self
-                .harness
-                .query_all_by_label(label)
-                .map(|n| n.rect().min.y)
-                .fold(None::<f32>, |best, y| Some(best.map_or(y, |b| b.min(y))));
-            match y {
-                Some(y) if (y - target).abs() < 1.0 => return,
-                Some(y) => self.wheel(page_center, target - y),
-                None => self.wheel(page_center, -300.0),
-            }
-        }
+    /// Scroll Settings to a section the way a request from another page
+    /// (or a click in the section list) does.
+    fn goto(&mut self, target: &'static str) {
+        self.app().settings_scroll_to = Some(target);
+        self.frames(4);
+    }
+
+    /// Wheel scroll by `dy` points (negative: towards the bottom).
+    fn scroll_by(&mut self, dy: f32) {
+        let at = pos2(self.size.x / 2.0, self.size.y / 2.0);
+        self.hover(at);
+        self.wheel(at, dy);
+        // egui spreads a wheel step over several frames; let it finish so it
+        // cannot leak into the next picture.
+        self.frames(40);
+    }
+
+    /// Back to the top of the page (a big wheel step up).
+    fn scroll_top(&mut self) {
+        self.scroll_by(100_000.0);
     }
 
     /// Positive `dy` moves the content down (scrolls towards the top).
@@ -921,6 +936,13 @@ fn capture_all(out: &Path) {
         }
     }
 
+    // Settings, at both sizes (the section list only stands at the wide one).
+    for look in Look::BOTH {
+        for size in [WIDE, NARROW] {
+            settings_scenes(look, size, out, &index);
+        }
+    }
+
     // States that only make sense at the default size.
     for look in Look::BOTH {
         let new = |with_index| Session::new(look, WIDE, out, &index, with_index);
@@ -942,48 +964,255 @@ fn capture_all(out: &Path) {
         s.hover(hover);
         s.save(13, "row-hover");
 
-        // 16..21 Settings, one picture per section.
+        // 31 Clicking the state chip opens Settings at the Fast index
+        // section (checked here end to end: the click sets the target, the
+        // Settings page takes it and scrolls).
         let mut s = new(true);
         s.loaded();
-        s.settings_page();
-        s.scroll_to("Settings");
-        s.save(16, "settings-index");
-        s.scroll_to("Follow symbolic links");
-        s.save(17, "settings-index-more");
-        s.scroll_to("Windows");
-        s.save(18, "settings-windows");
-        s.scroll_to("Appearance");
-        s.save(19, "settings-appearance");
-        s.scroll_to("Updates");
-        s.save(20, "settings-updates");
-        s.scroll_to("About");
-        s.save(21, "settings-about");
+        s.query("report");
+        s.click_state_chip();
+        assert!(s.app().page == Page::Settings, "the chip opens Settings");
+        assert!(
+            s.app().settings_scroll_to.is_none(),
+            "the Settings page took the scroll target"
+        );
+        s.save(31, "chip-opens-service-access");
+    }
+}
 
-        // 22 Update available (the installed copy offers "Install update").
-        s.app().updater.state = UpdateState::Available(ferrow_update::Release {
-            version: ferrow_update::Version {
-                major: 0,
-                minor: 1,
-                patch: 0,
-                pre: vec!["beta".into(), "17".into()],
-            },
-            has_setup: true,
-        });
-        crate::update::test_can_install(true);
-        s.scroll_to("Updates");
-        s.save(22, "settings-update-available");
-        crate::update::test_can_install(false);
+/// Settings (16..39): the fast-index status in every state, who can use the
+/// service, the own-index group closed and open, and each section.
+fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::Index>) {
+    use ferrow_ipc::{AccessInfo, AccessMode, AccessUser};
+    let user = |id: &str, name: &str| AccessUser {
+        id: id.into(),
+        name: name.into(),
+    };
+    let info = |mode, allowed, users: Option<Vec<AccessUser>>| {
+        access::View::Info(AccessInfo {
+            mode,
+            you_allowed: allowed,
+            you: user(
+                "S-1-5-21-3623811015-3361044348-30300820-1013",
+                r"ALEX-PC\Alex",
+            ),
+            users,
+        })
+    };
+    access::test_can_elevate(true);
+    settings_page::test_set_now(NOW as u64);
 
-        // 23 Settings with the service answering.
-        let mut s = new(false);
-        s.send(Event::Remote {
-            entries: 18_422_907,
-            report: "NTFS journal, 3 volumes".into(),
+    // The service is not available: the app's own index, one reason each.
+    let mut s = Session::new(look, size, out, index, true);
+    s.loaded();
+    s.settings_page();
+    s.save(16, "settings-off-no-service");
+    s.goto("Own index");
+    s.save(17, "settings-own-index-open");
+    s.app()
+        .access
+        .show_for_test(access::View::TooOld, false, None);
+    s.goto("Fast index");
+    s.save(18, "settings-off-old-service");
+    let refused = info(AccessMode::Admins, false, None);
+    s.app().access.show_for_test(refused.clone(), false, None);
+    s.frames(2);
+    s.save(19, "settings-off-refused");
+    access::test_can_elevate(false);
+    s.frames(2);
+    s.save(20, "settings-off-refused-terminal");
+    access::test_can_elevate(true);
+    let declined = access::Notice::new(
+        access::Outcome::Declined,
+        "Administrator approval was declined; nothing was changed.",
+    );
+    s.app().access.show_for_test(refused, false, Some(declined));
+    s.frames(2);
+    s.save(21, "settings-access-declined");
+
+    // The service answers: on, and who can use it.
+    let mut s = Session::new(look, size, out, index, false);
+    s.send(Event::Remote {
+        entries: 18_422_907,
+        report: "NTFS journal, 3 volumes".into(),
+    });
+    s.frames(3);
+    s.settings_page();
+    let admins = info(AccessMode::Admins, true, Some(Vec::new()));
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.frames(2);
+    s.save(22, "settings-live-admins");
+    let listed = info(
+        AccessMode::Listed,
+        true,
+        Some(vec![
+            user(
+                "S-1-5-21-3623811015-3361044348-30300820-1014",
+                r"ALEX-PC\Sam",
+            ),
+            user(
+                "S-1-5-21-3623811015-3361044348-30300820-1015",
+                r"ALEX-PC\Kim",
+            ),
+        ]),
+    );
+    s.app().access.show_for_test(listed, false, None);
+    s.frames(2);
+    s.save(23, "settings-live-listed");
+    let everyone = info(AccessMode::Everyone, true, Some(Vec::new()));
+    s.app().access.show_for_test(everyone.clone(), false, None);
+    s.frames(2);
+    s.save(24, "settings-live-everyone");
+    s.app().access.show_for_test(admins.clone(), true, None);
+    s.frames(2);
+    s.save(25, "settings-access-busy");
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.app().access.confirm_everyone = true;
+    s.frames(2);
+    s.save(26, "settings-access-confirm");
+    s.app().access.confirm_everyone = false;
+    let done = access::Notice::new(
+        access::Outcome::Done,
+        "Done. The service applies it within a second.",
+    );
+    s.app().access.show_for_test(everyone, false, Some(done));
+    s.frames(2);
+    s.save(27, "settings-access-done");
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.frames(2);
+
+    // The "Add account" field: empty, looked up, and an unknown name.
+    let add = |s: &mut Session, text: &str, state: access::AddState, number, name| {
+        s.app().access.show_for_test(admins.clone(), false, None);
+        s.app().access.add = Some(access::AddAccount {
+            text: text.into(),
+            state,
+            focus: false,
         });
-        s.frames(3);
-        s.settings_page();
-        s.scroll_to("Follow symbolic links");
-        s.save(23, "settings-service-index");
+        s.goto("Fast index");
+        if size == NARROW {
+            s.scroll_top();
+            s.scroll_by(-230.0);
+        }
+        s.save(number, name);
+    };
+    add(
+        &mut s,
+        "",
+        access::AddState::Idle,
+        35,
+        "settings-add-account-empty",
+    );
+    let sam = access::Resolved {
+        id: "S-1-5-21-3623811015-3361044348-30300820-1014".into(),
+        name: r"ALEX-PC\Sam".into(),
+    };
+    add(
+        &mut s,
+        "sam",
+        access::AddState::Found(sam),
+        36,
+        "settings-add-account-found",
+    );
+    add(
+        &mut s,
+        "samm",
+        access::AddState::Failed(
+            "No account named \"samm\" was found on this PC or its domain.".into(),
+        ),
+        37,
+        "settings-add-account-unknown",
+    );
+    // Without the administrator button the command is shown: with a real
+    // domain SID it is long, so it wraps at the narrow size.
+    access::test_can_elevate(false);
+    let sam = access::Resolved {
+        id: "S-1-5-21-3623811015-3361044348-30300820-1014".into(),
+        name: r"ALEX-PC\Sam".into(),
+    };
+    add(
+        &mut s,
+        "sam",
+        access::AddState::Found(sam),
+        38,
+        "settings-add-account-command",
+    );
+    access::test_can_elevate(true);
+    // The change ran but this account cannot see the list.
+    s.app().access.add = None;
+    let unconfirmed = access::Notice::new(
+        access::Outcome::Unconfirmed,
+        "Added — the list isn't visible to this account, so Ferrow can't confirm it.",
+    );
+    s.app().access.show_for_test(
+        info(AccessMode::Listed, true, None),
+        false,
+        Some(unconfirmed),
+    );
+    s.goto("Fast index");
+    if size == NARROW {
+        s.scroll_top();
+        s.scroll_by(-120.0);
+    }
+    s.save(39, "settings-access-unconfirmed");
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.frames(2);
+
+    // The own-index group: closed while the service is live, then opened.
+    s.goto("Fast index");
+    s.scroll_top();
+    s.scroll_by(-240.0);
+    s.save(28, "settings-live-own-index-closed");
+    s.goto("Own index");
+    s.save(29, "settings-live-own-index-open");
+
+    // The other sections.
+    s.goto("Windows");
+    s.save(30, "settings-windows");
+    s.goto("Appearance");
+    s.save(31, "settings-appearance");
+    s.app().settings.last_update_check = Some(NOW as u64 - 3 * 3600);
+    s.app().updater.state = UpdateState::UpToDate;
+    s.goto("Updates");
+    s.save(32, "settings-updates");
+    s.app().updater.state = UpdateState::Available(ferrow_update::Release {
+        version: ferrow_update::Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+            pre: vec!["beta".into(), "17".into()],
+        },
+        has_setup: true,
+    });
+    crate::update::test_can_install(true);
+    s.goto("Updates");
+    s.save(33, "settings-update-available");
+    crate::update::test_can_install(false);
+    s.goto("About");
+    s.save(34, "settings-about");
+}
+
+/// A scroll request made on the very first frame of a freshly opened
+/// Settings page reaches its section (the room below the last section is not
+/// measured yet on that frame).
+#[test]
+#[ignore = "needs the wgpu adapter like the screenshot run"]
+fn a_scroll_request_on_the_first_frame_reaches_its_section() {
+    let index = fixture_index();
+    let out = std::env::temp_dir();
+    let mut sections = vec!["Own index", "Appearance", "Updates", "About"];
+    if cfg!(windows) {
+        sections.push("Windows");
+    }
+    for target in sections {
+        let mut s = Session::new(Look::Dark, WIDE, &out, &index, false);
+        s.app().page = Page::Settings;
+        s.app().focus_search = false;
+        s.app().settings_scroll_to = Some(target);
+        s.frames(6);
+        let top = s.content_top();
+        let seen = settings_page::section_label_in_view(&s.harness.ctx, top);
+        assert_eq!(seen, target, "request on the first frame");
     }
 }
 

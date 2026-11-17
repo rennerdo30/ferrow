@@ -53,6 +53,19 @@ Nothing touches the machine's state:
 - Right-click and double-click on a result row are never sent: on Windows they
   open the real Explorer menu or the file.
 
+## Settings pictures (16..37)
+
+Rendered at both sizes (the section list stands left only at 1040x680):
+the fast-index status with the service live and with the own index (not
+running, older or busy, refused with and without the administrator buttons),
+who can use the service (administrators, listed, everyone, waiting for the
+administrator prompt, confirming "everyone", done, declined, the add-account
+field empty, found and with an unknown name), the own-index
+group closed (service live) and open, and the Windows, Appearance, Updates and
+About sections. Test builds inject the service's answer with
+`Access::show_for_test` and scroll with the `settings_scroll_to` request the
+other pages use. The "now" shown in the update line is fixed.
+
 ## Adding a screen
 
 Add it to `capture_all` in `crates/ferrow-gui/src/screenshots.rs`: build a

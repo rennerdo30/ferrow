@@ -1202,20 +1202,27 @@ mod tests {
         assert!(app.scan_info.is_none());
     }
 
+    /// The Settings page decides what it accepts (`Section::from_target`):
+    /// every card this page opens must resolve there, "Service access" to the
+    /// fast index section, "Own index" to the own index section.
     #[test]
-    fn the_settings_cards_opened_from_here_are_names_the_settings_page_accepts() {
-        let accepted = [
-            "Fast index",
-            "Own index",
-            "Windows",
-            "Appearance",
-            "Updates",
-            "About",
-            "Service access",
-        ];
-        for card in [SERVICE_CARD, OWN_INDEX_CARD] {
-            assert!(accepted.contains(&card), "{card}");
-        }
+    fn the_settings_cards_opened_from_here_resolve_on_the_settings_page() {
+        use super::super::settings_page::Section;
+        assert_eq!(Section::from_target(SERVICE_CARD), Some(Section::FastIndex));
+        assert_eq!(
+            Section::from_target(OWN_INDEX_CARD),
+            Some(Section::OwnIndex)
+        );
+    }
+
+    /// Opening Settings from the chip sets the page and the target the
+    /// Settings page consumes.
+    #[test]
+    fn the_chip_click_asks_settings_for_the_service_card() {
+        let (mut app, _tx) = test_app();
+        app.open_settings_at(SERVICE_CARD);
+        assert!(app.page == Page::Settings);
+        assert_eq!(app.settings_scroll_to, Some("Service access"));
     }
 
     fn service_rows_event() -> Event {

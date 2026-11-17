@@ -149,9 +149,8 @@ pub struct FerrowApp {
     /// back on (yet): the last results stay on screen until the service is
     /// back or the user builds an index.
     no_own_index: bool,
-    /// Set by the results page to open Settings at a card (the page's title
-    /// text, e.g. "Service access"); the Settings page takes it when it
-    /// scrolls.
+    /// A page asks Settings to scroll to a section (for example "Service
+    /// access"); Settings takes it when it is drawn.
     pub(crate) settings_scroll_to: Option<&'static str>,
     /// Fitted folder and name texts of the visible rows.
     fit_cache: fit::FitCache,
