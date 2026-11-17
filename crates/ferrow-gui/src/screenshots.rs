@@ -874,7 +874,7 @@ fn capture_all(out: &Path) {
     }
 }
 
-/// Settings (16..37): the fast-index status in every state, who can use the
+/// Settings (16..39): the fast-index status in every state, who can use the
 /// service, the own-index group closed and open, and each section.
 fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::Index>) {
     use ferrow_ipc::{AccessInfo, AccessMode, AccessUser};
@@ -886,7 +886,10 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
         access::View::Info(AccessInfo {
             mode,
             you_allowed: allowed,
-            you: user("S-1-5-21-1-2-3-1001", r"ALEX-PC\Alex"),
+            you: user(
+                "S-1-5-21-3623811015-3361044348-30300820-1013",
+                r"ALEX-PC\Alex",
+            ),
             users,
         })
     };
@@ -913,7 +916,10 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
     s.frames(2);
     s.save(20, "settings-off-refused-terminal");
     access::test_can_elevate(true);
-    let declined = "Administrator approval was declined; nothing was changed.";
+    let declined = access::Notice::new(
+        access::Outcome::Declined,
+        "Administrator approval was declined; nothing was changed.",
+    );
     s.app().access.show_for_test(refused, false, Some(declined));
     s.frames(2);
     s.save(21, "settings-access-declined");
@@ -934,8 +940,14 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
         AccessMode::Listed,
         true,
         Some(vec![
-            user("S-1-5-21-1-2-3-1002", r"ALEX-PC\Sam"),
-            user("S-1-5-21-1-2-3-1003", r"ALEX-PC\Kim"),
+            user(
+                "S-1-5-21-3623811015-3361044348-30300820-1014",
+                r"ALEX-PC\Sam",
+            ),
+            user(
+                "S-1-5-21-3623811015-3361044348-30300820-1015",
+                r"ALEX-PC\Kim",
+            ),
         ]),
     );
     s.app().access.show_for_test(listed, false, None);
@@ -953,7 +965,10 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
     s.frames(2);
     s.save(26, "settings-access-confirm");
     s.app().access.confirm_everyone = false;
-    let done = "Done. The service applies it within a second.";
+    let done = access::Notice::new(
+        access::Outcome::Done,
+        "Done. The service applies it within a second.",
+    );
     s.app().access.show_for_test(everyone, false, Some(done));
     s.frames(2);
     s.save(27, "settings-access-done");
@@ -966,6 +981,7 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
         s.app().access.add = Some(access::AddAccount {
             text: text.into(),
             state,
+            focus: false,
         });
         s.goto("Fast index");
         if size == NARROW {
@@ -982,7 +998,7 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
         "settings-add-account-empty",
     );
     let sam = access::Resolved {
-        id: "S-1-5-21-1-2-3-1002".into(),
+        id: "S-1-5-21-3623811015-3361044348-30300820-1014".into(),
         name: r"ALEX-PC\Sam".into(),
     };
     add(
@@ -1001,7 +1017,38 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
         37,
         "settings-add-account-unknown",
     );
+    // Without the administrator button the command is shown: with a real
+    // domain SID it is long, so it wraps at the narrow size.
+    access::test_can_elevate(false);
+    let sam = access::Resolved {
+        id: "S-1-5-21-3623811015-3361044348-30300820-1014".into(),
+        name: r"ALEX-PC\Sam".into(),
+    };
+    add(
+        &mut s,
+        "sam",
+        access::AddState::Found(sam),
+        38,
+        "settings-add-account-command",
+    );
+    access::test_can_elevate(true);
+    // The change ran but this account cannot see the list.
     s.app().access.add = None;
+    let unconfirmed = access::Notice::new(
+        access::Outcome::Unconfirmed,
+        "Added — the list isn't visible to this account, so Ferrow can't confirm it.",
+    );
+    s.app().access.show_for_test(
+        info(AccessMode::Listed, true, None),
+        false,
+        Some(unconfirmed),
+    );
+    s.goto("Fast index");
+    if size == NARROW {
+        s.scroll_top();
+        s.scroll_by(-120.0);
+    }
+    s.save(39, "settings-access-unconfirmed");
     s.app().access.show_for_test(admins.clone(), false, None);
     s.frames(2);
 
@@ -1037,6 +1084,30 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
     crate::update::test_can_install(false);
     s.goto("About");
     s.save(34, "settings-about");
+}
+
+/// A scroll request made on the very first frame of a freshly opened
+/// Settings page reaches its section (the room below the last section is not
+/// measured yet on that frame).
+#[test]
+#[ignore = "needs the wgpu adapter like the screenshot run"]
+fn a_scroll_request_on_the_first_frame_reaches_its_section() {
+    let index = fixture_index();
+    let out = std::env::temp_dir();
+    let mut sections = vec!["Own index", "Appearance", "Updates", "About"];
+    if cfg!(windows) {
+        sections.push("Windows");
+    }
+    for target in sections {
+        let mut s = Session::new(Look::Dark, WIDE, &out, &index, false);
+        s.app().page = Page::Settings;
+        s.app().focus_search = false;
+        s.app().settings_scroll_to = Some(target);
+        s.frames(6);
+        let top = s.content_top();
+        let seen = settings_page::section_label_in_view(&s.harness.ctx, top);
+        assert_eq!(seen, target, "request on the first frame");
+    }
 }
 
 #[cfg(test)]

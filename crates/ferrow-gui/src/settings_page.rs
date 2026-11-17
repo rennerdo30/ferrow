@@ -124,10 +124,21 @@ fn row_text_width(inner: f32, control: f32) -> f32 {
     (inner - control - CONTROL_GAP).max(MIN_TEXT_WIDTH)
 }
 
-/// Whether the own-index group is open: the user's choice, else open exactly
-/// when the Ferrow service is not live (its settings then matter).
-fn own_index_open(live: bool, chosen: Option<bool>) -> bool {
-    chosen.unwrap_or(!live)
+/// Whether the own-index group is open: the user's choice, else the default.
+fn own_index_open(default_open: bool, chosen: Option<bool>) -> bool {
+    chosen.unwrap_or(default_open)
+}
+
+/// The group's default, decided once per session: open when the Ferrow
+/// service was not live (its settings then matter), closed when it was. A
+/// service that goes away or reconnects later does not move the group under
+/// the user's cursor.
+fn latched_own_index_default(ctx: &egui::Context, live: bool) -> bool {
+    ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(own_default_id(), || !live))
+}
+
+fn own_default_id() -> egui::Id {
+    egui::Id::unique("settings-own-default")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -316,6 +327,13 @@ struct Anchors {
     tail: f32,
 }
 
+/// Screenshot tests: which section is in view (the page's own rule).
+#[cfg(all(test, feature = "screenshots"))]
+pub(crate) fn section_label_in_view(ctx: &egui::Context, content_top: f32) -> &'static str {
+    let anchors: Anchors = ctx.data(|d| d.get_temp(anchors_id())).unwrap_or_default();
+    section_in_view(&anchors.tops, content_top + TITLE_HEIGHT + 56.0).label()
+}
+
 fn anchors_id() -> egui::Id {
     egui::Id::unique("settings-anchors")
 }
@@ -448,6 +466,15 @@ impl FerrowApp {
                     });
                 });
             });
+        if let Some(section) = target
+            && before.tail <= 0.0
+        {
+            // First frame of the page: the room below the last section is
+            // not measured yet, so a far section could not reach the top.
+            // Ask again once, next frame.
+            self.settings_scroll_to = Some(section.label());
+            ctx.request_repaint();
+        }
         let now = Anchors {
             tops: marks.tops,
             tail,
@@ -484,7 +511,7 @@ impl FerrowApp {
         let input = AccessIn {
             view: &view,
             busy: self.access.busy,
-            message: message.as_deref(),
+            message: message.as_ref(),
             elevate: access::Access::can_elevate(),
             sandboxed: access::Access::sandboxed(),
             add: self.access.add.as_ref(),
@@ -555,7 +582,7 @@ impl FerrowApp {
             .ctx()
             .data(|d| d.get_temp::<Option<bool>>(own_open_id()))
             .flatten();
-        let open = own_index_open(live, chosen);
+        let open = own_index_open(latched_own_index_default(ui.ctx(), live), chosen);
         let summary = format!(
             "{} · {}",
             count_text(self.settings.sources.len(), "location", "locations"),
@@ -1453,7 +1480,7 @@ fn unix_now() -> u64 {
 struct AccessIn<'a> {
     view: &'a access::View,
     busy: bool,
-    message: Option<&'a str>,
+    message: Option<&'a access::Notice>,
     /// This app can start the administrator command itself.
     elevate: bool,
     sandboxed: bool,
@@ -1490,6 +1517,12 @@ fn access_block(
         );
         ui.add_space(6.0);
         let (title, detail) = access::summary(input.view);
+        // The status above already says the app uses its own index.
+        let detail = if info.you_allowed {
+            detail
+        } else {
+            access::rule(info)
+        };
         let tone = if info.you_allowed {
             Tone::Good
         } else {
@@ -1570,7 +1603,7 @@ fn access_block(
                         action = Some(access::Action::Admins);
                     }
                     if add.is_none() && ui.add(std_button(p, "Add account…", 150.0)).clicked() {
-                        add = Some(access::AddAccount::default());
+                        add = Some(access::AddAccount::opened());
                     }
                 });
             });
@@ -1591,15 +1624,10 @@ fn access_block(
                 .flatten()
                 .filter_map(|a| a.terminal_command())
             {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&command).monospace().size(12.0).color(p.text));
-                    if ui.add(std_button(p, "Copy", 70.0)).clicked() {
-                        platform::copy_text(&command);
-                    }
-                });
+                command_row(ui, p, &command);
             }
             if add.is_none() && ui.add(std_button(p, "Add account…", 150.0)).clicked() {
-                add = Some(access::AddAccount::default());
+                add = Some(access::AddAccount::opened());
             }
         }
         if add.is_some() && !(confirm && !busy) {
@@ -1618,14 +1646,16 @@ fn access_block(
             "Approve it to continue. Over remote desktop it can be on the secure desktop or behind this window.",
         );
     }
-    if let Some(text) = input.message {
+    if let Some(notice) = input.message {
         ui.add_space(10.0);
-        let (tone, filled) = match access::outcome_of(text) {
+        let (tone, filled) = match notice.outcome {
             access::Outcome::Done => (Tone::Good, true),
+            // The command succeeded but this account cannot see the result.
+            access::Outcome::Unconfirmed => (Tone::Neutral, true),
             access::Outcome::Declined => (Tone::Neutral, false),
             access::Outcome::Problem => (Tone::Caution, true),
         };
-        dot_row(ui, p, tone, filled, text, "");
+        dot_row(ui, p, tone, filled, &notice.text, "");
     }
     AccessOut {
         action,
@@ -1681,6 +1711,12 @@ fn add_account_editor(
                     .corner_radius(CornerRadius::same(4)),
             );
         let r = ui.add_enabled(!busy, edit);
+        if field.focus {
+            // Just opened: the cursor goes in, and the field is shown.
+            field.focus = false;
+            r.request_focus();
+            r.scroll_to_me(Some(Align::Center));
+        }
         if r.changed() {
             field.state = access::AddState::Idle;
         }
@@ -1717,34 +1753,69 @@ fn add_account_editor(
         }
         access::AddState::Found(found) => {
             ui.add_space(8.0);
-            let detail = if found.name == found.id {
-                String::new()
-            } else {
+            // Off Windows nothing was looked up, only the name's characters
+            // were checked: the line must not look verified.
+            let (verified, title) = access::found_line(found, cfg!(windows));
+            let detail = if verified && found.name != found.id {
                 format!("Account id: {}", found.id)
+            } else {
+                String::new()
             };
-            dot_row(ui, p, Tone::Good, true, &found.name, &detail);
+            let tone = if verified { Tone::Good } else { Tone::Neutral };
+            dot_row(ui, p, tone, verified, &title, &detail);
             ui.add_space(6.0);
             if elevate {
                 let can = !busy;
+                let label = format!("Add {}", shortened(&found.name, 32));
                 if ui
-                    .add_enabled(can, accent_button(p, "Add", 90.0, can))
+                    .add_enabled(can, accent_button(p, &label, 90.0, can))
                     .clicked()
                 {
                     *action = Some(access::Action::Add(found.id.clone()));
                 }
             } else if let Some(command) = access::add_command(found) {
                 row_header(ui, p, "To add it, run in an administrator terminal:", "");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&command).monospace().size(12.0).color(p.text));
-                    if ui.add(std_button(p, "Copy", 70.0)).clicked() {
-                        platform::copy_text(&command);
-                    }
-                });
+                command_row(ui, p, &command);
             }
         }
     }
     if close {
         *add = None;
+    }
+}
+
+/// A terminal command with its Copy button: on one line when it fits, else
+/// wrapped with Copy below it.
+fn command_row(ui: &mut egui::Ui, p: &theme::Palette, command: &str) {
+    let width = ui
+        .painter()
+        .layout_no_wrap(command.to_owned(), FontId::monospace(12.0), p.text)
+        .size()
+        .x;
+    let label = || egui::Label::new(RichText::new(command).monospace().size(12.0).color(p.text));
+    let copy = |ui: &mut egui::Ui| {
+        if ui.add(std_button(p, "Copy", 70.0)).clicked() {
+            platform::copy_text(command);
+        }
+    };
+    if width + 70.0 + ui.spacing().item_spacing.x <= ui.available_width() {
+        ui.horizontal(|ui| {
+            ui.add(label());
+            copy(ui);
+        });
+    } else {
+        ui.add(label().wrap());
+        copy(ui);
+    }
+}
+
+/// `text` cut to `max` characters with an ellipsis.
+fn shortened(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let head: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
     }
 }
 
@@ -1988,11 +2059,39 @@ mod tests {
 
     #[test]
     fn own_index_is_closed_while_the_service_is_live_and_open_when_it_is_not() {
-        assert!(!own_index_open(true, None));
-        assert!(own_index_open(false, None));
+        let ctx = egui::Context::default();
+        assert!(!own_index_open(latched_own_index_default(&ctx, true), None));
+        let fresh = egui::Context::default();
+        assert!(own_index_open(
+            latched_own_index_default(&fresh, false),
+            None
+        ));
         // The user's choice wins either way.
-        assert!(own_index_open(true, Some(true)));
-        assert!(!own_index_open(false, Some(false)));
+        assert!(own_index_open(false, Some(true)));
+        assert!(!own_index_open(true, Some(false)));
+    }
+
+    #[test]
+    fn the_default_is_decided_once_and_a_reconnect_does_not_move_it() {
+        // Opened while the service was live: closed, and it stays closed
+        // when the service goes away and comes back.
+        let ctx = egui::Context::default();
+        assert!(!latched_own_index_default(&ctx, true));
+        assert!(!latched_own_index_default(&ctx, false));
+        assert!(!latched_own_index_default(&ctx, true));
+        // Opened while it was not: open, and it stays open when it connects.
+        let other = egui::Context::default();
+        assert!(latched_own_index_default(&other, false));
+        assert!(latched_own_index_default(&other, true));
+    }
+
+    #[test]
+    fn a_long_account_name_is_cut_with_an_ellipsis_for_the_button() {
+        assert_eq!(shortened(r"ALEX-PC\Sam", 32), r"ALEX-PC\Sam");
+        let long = "x".repeat(40);
+        let cut = shortened(&long, 32);
+        assert_eq!(cut.chars().count(), 32);
+        assert!(cut.ends_with('…'));
     }
 
     #[test]

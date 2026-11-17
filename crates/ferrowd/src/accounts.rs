@@ -235,7 +235,7 @@ mod platform {
         };
         match describe(&id) {
             Some((_, false)) => Err(format!(
-                "{} is a group or alias; add individual users, or use `everyone`",
+                "{} is not a user account; add individual users, or use `everyone`",
                 printable(text)
             )),
             Some((name, true)) => Ok(AccessUser {
