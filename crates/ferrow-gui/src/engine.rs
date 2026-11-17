@@ -270,7 +270,7 @@ impl Engine {
     /// returned sender injects the events the worker would report (loaded,
     /// scanning, service connected, failed) so the real app code handles
     /// them.
-    #[cfg(all(test, feature = "screenshots"))]
+    #[cfg(test)]
     pub fn isolated(index: Option<Arc<Index>>) -> (Engine, Sender<Event>) {
         let (commands, command_rx) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
@@ -947,7 +947,7 @@ impl RemoteQuery {
 
 /// Rows as the Ferrow service would answer them, for UI tests: `total` rows
 /// in the whole list, the first `rows.len()` loaded.
-#[cfg(all(test, feature = "screenshots"))]
+#[cfg(test)]
 pub fn service_hits_for_test(
     generation: u64,
     total: usize,

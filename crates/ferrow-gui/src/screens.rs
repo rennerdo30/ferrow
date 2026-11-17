@@ -911,7 +911,12 @@ fn syntax_group(ui: &mut egui::Ui, p: &theme::Palette, (title, rows): (&str, &[(
 
 #[cfg(test)]
 mod tests {
+    use super::super::State;
     use super::*;
+    use crate::engine::{Engine, Event, Hits, ServiceGap};
+    use crate::settings::Settings;
+    use crate::theme::Palette;
+    use ferrow_index::flags;
 
     #[test]
     fn elapsed_time_reads_like_a_clock() {
@@ -953,5 +958,213 @@ mod tests {
         ] {
             assert!(all.contains(needle), "{needle} is missing from the help");
         }
+    }
+
+    // ---- States driven through the real event handling (isolated engine).
+
+    fn test_app() -> (FerrowApp, std::sync::mpsc::Sender<Event>) {
+        let (engine, events) = Engine::isolated(None);
+        let settings = Settings::default();
+        let app = FerrowApp::assemble(
+            engine,
+            settings,
+            Palette::new(true, None),
+            false,
+            true,
+            None,
+            false,
+        );
+        (app, events)
+    }
+
+    fn sample_index() -> Arc<Index> {
+        let b = ferrow_index::IndexBuilder::new();
+        let root = b.add_root(b"/r", flags::DIR);
+        for name in ["alpha.txt", "beta.rs", "gamma"] {
+            b.add(root, name.as_bytes(), 0);
+        }
+        Arc::new(b.freeze())
+    }
+
+    /// Hand the app the events and let it handle them; the isolated engine
+    /// delivers in order.
+    fn feed(app: &mut FerrowApp, tx: &std::sync::mpsc::Sender<Event>, events: Vec<Event>) {
+        for e in events {
+            tx.send(e).unwrap();
+        }
+        // The channel is read by `poll`, which `drain_events` loops on.
+        app.drain_events();
+    }
+
+    fn loaded(index: &Arc<Index>) -> Event {
+        Event::Loaded {
+            index: index.clone(),
+            elapsed: Duration::from_millis(5),
+            source: "test".into(),
+        }
+    }
+
+    fn results(generation: u64) -> Event {
+        Event::Results {
+            generation,
+            hits: Hits::All,
+            complete: true,
+            elapsed: Duration::from_micros(300),
+            sort_pending: false,
+            sort_unavailable: false,
+        }
+    }
+
+    /// A search text that does not parse must not blank the list: the last
+    /// results stay (the page dims them), the message goes to the status
+    /// bar. On the base commit this state showed a full-page "Check the
+    /// search text" instead.
+    #[test]
+    fn a_search_text_error_keeps_the_last_results() {
+        let (mut app, tx) = test_app();
+        let index = sample_index();
+        feed(&mut app, &tx, vec![loaded(&index), results(1)]);
+        assert_eq!(app.row_count(), 4);
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::QueryError {
+                generation: 2,
+                message: "unclosed group at bytes 0..1".into(),
+                span: 0..1,
+            }],
+        );
+        assert!(app.query_error.is_some());
+        assert_eq!(app.row_count(), 4, "the list keeps its rows");
+        let (text, _, _) = app.count_text();
+        assert_eq!(text, "Check the search text · Unclosed group");
+        // The next good search clears the message.
+        feed(&mut app, &tx, vec![results(3)]);
+        assert!(app.query_error.is_none());
+        assert_eq!(app.count_text().0, "4 files");
+    }
+
+    /// A lost service keeps the rows on screen and says so in a notice bar;
+    /// it never becomes the full-page "Something went wrong".
+    #[test]
+    fn a_lost_service_keeps_the_results_and_shows_a_notice() {
+        let (mut app, tx) = test_app();
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::Remote {
+                entries: 18_422_907,
+                report: "NTFS journal".into(),
+            }],
+        );
+        let row = |path: &str| ferrow_ipc::FileRow {
+            path: path.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::Results {
+                generation: 1,
+                hits: crate::engine::service_hits_for_test(
+                    1,
+                    2,
+                    vec![row("/a/x.txt"), row("/a/y.txt")],
+                ),
+                complete: true,
+                elapsed: Duration::from_micros(900),
+                sort_pending: false,
+                sort_unavailable: false,
+            }],
+        );
+        assert_eq!(app.row_count(), 2);
+        assert!(
+            app.chip()
+                .unwrap()
+                .text
+                .starts_with("Live · Ferrow service")
+        );
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::ServiceLost {
+                error: "the pipe has been ended. (os error 109)".into(),
+            }],
+        );
+        assert!(matches!(app.state, State::Ready), "not a failure page");
+        assert_eq!(app.row_count(), 2, "the rows stay");
+        let notices = app.notices();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .text
+                .starts_with("The Ferrow service stopped answering.")
+        );
+        assert!(
+            !notices[0].text.contains("os error"),
+            "the raw error is only in the tooltip"
+        );
+        assert!(notices[0].tooltip.contains("os error 109"));
+        assert_eq!(app.chip().unwrap().text, "Own index · service stopped");
+        // It is back: the notice goes.
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::Remote {
+                entries: 18_422_907,
+                report: "NTFS journal".into(),
+            }],
+        );
+        assert!(app.notices().is_empty());
+    }
+
+    /// A refused account is its own state in the app, shown in the chip.
+    #[test]
+    fn a_refused_account_is_its_own_chip_state() {
+        let (mut app, tx) = test_app();
+        let index = sample_index();
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::ServiceGap(ServiceGap::Refused), loaded(&index)],
+        );
+        let chip = app.chip().unwrap();
+        assert_eq!(chip.text, "Own index · account not allowed");
+        assert!(chip.tooltip.contains("doesn't allow this account"));
+        assert!(chip.opens_settings);
+        // Not installed or not running is a different text.
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::ServiceGap(ServiceGap::NotRunning)],
+        );
+        assert_eq!(app.chip().unwrap().text, "Own index · not live");
+    }
+
+    /// Progress reports only matter while a scan runs: a late report after the
+    /// index is loaded must not bring the indexing state back.
+    #[test]
+    fn a_late_progress_report_is_ignored_and_a_live_one_shows_in_the_chip() {
+        let (mut app, tx) = test_app();
+        let index = sample_index();
+        let progress = |entries| Event::ScanProgress {
+            entries,
+            location: r"D:\x".into(),
+            elapsed: Duration::from_secs(3),
+        };
+        feed(&mut app, &tx, vec![loaded(&index), progress(5)]);
+        assert!(app.scan_info.is_none());
+        assert_eq!(app.chip().unwrap().text, "Own index · not live");
+        feed(
+            &mut app,
+            &tx,
+            vec![
+                Event::Scanning(r"Indexing D:\…".into()),
+                progress(1_204_331),
+            ],
+        );
+        assert_eq!(app.chip().unwrap().text, "Indexing · 1.2 M files");
+        feed(&mut app, &tx, vec![loaded(&index)]);
+        assert!(app.scan_info.is_none());
     }
 }

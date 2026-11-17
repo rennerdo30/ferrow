@@ -63,8 +63,5 @@ number order so the files sort like the tour of the app.
 ## Not captured
 
 - The Explorer shell menu on a result row (opens a real OS menu).
-- A distinct "service refused this account" screen: the app does not have
-  one. A refused connection looks exactly like "no service running" and the
-  app uses its own index silently.
 - Anything that needs a real file dialog, tray icon, global hotkey or the
   Windows caption buttons' system hover (those are drawn by Windows).

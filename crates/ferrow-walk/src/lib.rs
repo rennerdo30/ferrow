@@ -116,10 +116,7 @@ impl ScanProgress {
 
     /// A recently scanned directory (empty before the first one).
     pub fn location(&self) -> PathBuf {
-        self.location
-            .lock()
-            .map(|l| l.clone())
-            .unwrap_or_default()
+        self.location.lock().map(|l| l.clone()).unwrap_or_default()
     }
 
     fn set_location(&self, dir: &Path) {
@@ -168,7 +165,8 @@ impl<'a> Batch<'a> {
         if self.pending > 0
             && let Some(p) = self.progress
         {
-            p.entries.fetch_add(u64::from(self.pending), Ordering::Relaxed);
+            p.entries
+                .fetch_add(u64::from(self.pending), Ordering::Relaxed);
         }
         self.pending = 0;
     }
@@ -695,10 +693,7 @@ pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMa
 
 /// [`scan`], publishing its progress to `progress` as it runs (read it from
 /// another thread; see [`ScanProgress`]).
-pub fn scan_with_progress(
-    options: &WalkOptions,
-    progress: &ScanProgress,
-) -> (Index, ScanReport) {
+pub fn scan_with_progress(options: &WalkOptions, progress: &ScanProgress) -> (Index, ScanReport) {
     let (index, report, _) = scan_inner(options, Some(progress));
     (index, report)
 }

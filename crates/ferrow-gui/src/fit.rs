@@ -424,7 +424,8 @@ mod tests {
         let words: Vec<&str> = mapped.iter().map(|r| &cut.text[r.clone()]).collect();
         assert_eq!(words, ["report", "final"]);
         // A range inside the removed middle disappears.
-        let gone = remap_ranges(&[at("review")..at("review") + 6], name.len(), &cut);
+        let review = at("review")..at("review") + 6;
+        let gone = remap_ranges(std::slice::from_ref(&review), name.len(), &cut);
         assert!(gone.is_empty());
     }
 
