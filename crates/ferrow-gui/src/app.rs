@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 use ferrow_index::{Index, flags};
 
-use crate::engine::{Engine, Event, Hits, home_dir};
+use crate::engine::{Engine, Event, Hits, ServiceGap};
 use crate::logo::TitleLogo;
 use crate::settings::{ColumnId, Settings};
 
@@ -21,6 +21,12 @@ mod columns;
 
 #[path = "settings_page.rs"]
 mod settings_page;
+
+#[path = "fit.rs"]
+mod fit;
+
+#[path = "screens.rs"]
+mod screens;
 
 /// Headless screenshots of the real app (see docs/gui-screenshots.md).
 #[cfg(all(test, feature = "screenshots"))]
@@ -41,10 +47,14 @@ const GEAR_WIDTH: f32 = 40.0;
 const CAPTION_BUTTON_WIDTH: f32 = 46.0;
 const CAPTION_BUTTONS_WIDTH: f32 = CAPTION_BUTTON_WIDTH * 3.0;
 const STATUS_HEIGHT: f32 = 28.0;
+/// One notice bar above the list (service lost, search text error).
+const NOTICE_HEIGHT: f32 = 28.0;
+/// Gap between stacked notice bars and the list.
+const NOTICE_GAP: f32 = 4.0;
 
 enum State {
     Loading,
-    NoIndex { path: Option<PathBuf> },
+    NoIndex,
     Scanning(String),
     Failed(String),
     Ready,
@@ -54,6 +64,22 @@ enum State {
 enum Page {
     Results,
     Settings,
+}
+
+/// Why the Ferrow service is not answering this app.
+enum ServiceProblem {
+    /// It runs, but does not allow this account.
+    Refused,
+    /// It answered before and stopped; the text is the raw cause.
+    Lost(String),
+}
+
+/// How far the running scan is (from the engine, at most twice a second).
+#[derive(Clone, Default)]
+struct ScanInfo {
+    entries: u64,
+    location: String,
+    elapsed: Duration,
 }
 
 /// Which folder list a folder dialog adds to.
@@ -114,9 +140,28 @@ pub struct FerrowApp {
     access: crate::access::Access,
     /// Set while the Ferrow service answers searches: its entry count.
     pub(crate) service_entries: Option<u64>,
+    /// Why the service is not used (refused account, lost); `None` when it
+    /// is simply not installed or not running.
+    service_problem: Option<ServiceProblem>,
+    /// Progress of the running scan, once the first report arrived.
+    scan_info: Option<ScanInfo>,
+    /// The service was lost and this app has no index of its own to fall
+    /// back on (yet): the last results stay on screen until the service is
+    /// back or the user builds an index.
+    no_own_index: bool,
+    /// While `no_own_index` holds: why the service is still not usable, as
+    /// the probe reports it (refused account / not running). The problem
+    /// itself stays "lost" so the kept rows never sit under no problem.
+    gap_cause: Option<ServiceGap>,
     /// A page asks Settings to scroll to a section (for example "Service
     /// access"); Settings takes it when it is drawn.
     pub(crate) settings_scroll_to: Option<&'static str>,
+    /// Fitted folder and name texts of the visible rows.
+    fit_cache: fit::FitCache,
+    /// Bumped when the rows' ids may refer to something else.
+    fit_epoch: u64,
+    /// The search syntax popup is open.
+    syntax_open: bool,
     /// Re-run the query for a live change without jumping to the top.
     refreshing: bool,
     /// The service changed while the window was hidden or minimized: search
@@ -230,7 +275,14 @@ impl FerrowApp {
             updater: crate::update::Updater::new(),
             access: crate::access::Access::new(),
             service_entries: None,
+            service_problem: None,
+            scan_info: None,
+            no_own_index: false,
+            gap_cause: None,
             settings_scroll_to: None,
+            fit_cache: fit::FitCache::default(),
+            fit_epoch: 0,
+            syntax_open: false,
             refreshing: false,
             live_change_pending: false,
         }
@@ -251,6 +303,13 @@ impl FerrowApp {
 
     fn drain_events(&mut self) {
         while let Some(event) = self.engine.poll() {
+            // Rows (ids) may change meaning with every event but these.
+            if !matches!(
+                event,
+                Event::ScanProgress { .. } | Event::ServiceGap(_) | Event::IndexChanged
+            ) {
+                self.fit_epoch += 1;
+            }
             match event {
                 Event::Loaded {
                     index,
@@ -271,14 +330,70 @@ impl FerrowApp {
                     // re-run below fills the list again.
                     self.hits = None;
                     self.scan_status = None;
+                    self.scan_info = None;
+                    self.no_own_index = false;
+                    self.gap_cause = None;
                     self.load_time = elapsed;
                     self.index_source = source;
                     self.state = State::Ready;
                     self.sent_query = None; // re-run the current query
                 }
-                Event::NoIndex { path } => self.state = State::NoIndex { path },
+                Event::NoIndex => {
+                    if matches!(self.service_problem, Some(ServiceProblem::Lost(_)))
+                        && self.hits.is_some()
+                    {
+                        // A service-only user whose service restarts: the
+                        // rows stay, the notice bar says there is no own
+                        // index yet. The first-start page is for people who
+                        // never had results.
+                        self.no_own_index = true;
+                    } else {
+                        self.state = State::NoIndex;
+                    }
+                }
+                Event::ServiceGap(gap) if self.no_own_index => {
+                    // Rows from the lost service are on screen: whatever the
+                    // probe finds, they stay under the "last results" notice;
+                    // the cause only changes what the chip says.
+                    self.gap_cause = Some(gap);
+                }
+                Event::ServiceGap(gap) => match gap {
+                    ServiceGap::Refused => self.service_problem = Some(ServiceProblem::Refused),
+                    // A lost service stays "lost" until it answers again.
+                    ServiceGap::NotRunning => {
+                        if matches!(self.service_problem, Some(ServiceProblem::Refused)) {
+                            self.service_problem = None;
+                        }
+                    }
+                },
+                Event::ServiceLost { error } => {
+                    // The engine continues with the app's own index. The
+                    // rows on screen stay (they carry their own small
+                    // index) until the new index is loaded; the notice bar
+                    // says what happened.
+                    self.service_entries = None;
+                    self.service_problem = Some(ServiceProblem::Lost(error));
+                    self.scan_status = None;
+                    self.scan_info = None;
+                }
+                Event::ScanProgress {
+                    entries,
+                    location,
+                    elapsed,
+                } => {
+                    if self.scan_status.is_some() {
+                        self.scan_info = Some(ScanInfo {
+                            entries,
+                            location,
+                            elapsed,
+                        });
+                    }
+                }
                 Event::Remote { entries, report } => {
                     let first = self.service_entries.is_none();
+                    self.service_problem = None;
+                    self.no_own_index = false;
+                    self.gap_cause = None;
                     self.service_entries = Some(entries);
                     self.index_source = format!("Ferrow service: {report}");
                     if first {
@@ -309,6 +424,7 @@ impl FerrowApp {
                 }
                 Event::Failed(msg) => {
                     self.scan_status = None;
+                    self.scan_info = None;
                     if self.service_entries.take().is_some() {
                         // The engine falls back to the app's own index.
                         self.index = None;
@@ -322,6 +438,7 @@ impl FerrowApp {
                     }
                 }
                 Event::Scanning(msg) => {
+                    self.scan_info = Some(ScanInfo::default());
                     if self.index.is_none() {
                         self.state = State::Scanning(msg.clone());
                     }
@@ -379,7 +496,7 @@ impl FerrowApp {
     /// scheduled with one delayed repaint, never with a polling timer.
     fn auto_rebuild(&mut self, ctx: &egui::Context) {
         use crate::settings::AutoRebuild;
-        if !matches!(self.state, State::Ready | State::NoIndex { .. })
+        if !matches!(self.state, State::Ready | State::NoIndex)
             || self.scan_status.is_some()
             || !self.settings.has_locations()
         {
@@ -654,29 +771,14 @@ impl FerrowApp {
             FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into())),
             p.text_secondary,
         );
-        let help = help.on_hover_text("Search syntax");
-        egui::Popup::menu(&help).show(|ui| {
-            ui.set_min_width(460.0);
-            ui.label(
-                egui::RichText::new("Search syntax")
-                    .font(FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into()))),
-            );
-            ui.add_space(6.0);
-            egui::Grid::new("syntax-grid")
-                .num_columns(2)
-                .spacing(vec2(16.0, 6.0))
-                .show(ui, |ui| {
-                    for (example, meaning) in SYNTAX_HELP {
-                        ui.label(
-                            egui::RichText::new(*example)
-                                .monospace()
-                                .color(p.accent_text),
-                        );
-                        ui.label(egui::RichText::new(*meaning).color(p.text_secondary));
-                        ui.end_row();
-                    }
-                });
-        });
+        if help.clicked() {
+            self.syntax_open = !self.syntax_open;
+        }
+        if self.syntax_open {
+            self.syntax_help(ui, rect, hr);
+        } else {
+            help.on_hover_text("Search syntax");
+        }
         if self.focus_search {
             response.request_focus();
             self.focus_search = false;
@@ -713,50 +815,37 @@ impl FerrowApp {
         match &self.state {
             State::Ready => {}
             State::Loading => return self.placeholder(ui, outer, "Loading index…", None),
-            State::Scanning(msg) => {
-                let msg = msg.clone();
-                return self.placeholder(
-                    ui,
-                    outer,
-                    &msg,
-                    Some("Search becomes available when the scan finishes."),
-                );
+            State::Scanning(sources) => {
+                let sources = sources.clone();
+                return self.scanning_page(ui, outer, &sources);
             }
             State::Failed(msg) => {
                 let msg = msg.clone();
                 return self.placeholder(ui, outer, "Something went wrong", Some(&msg));
             }
-            State::NoIndex { path } => {
-                let detail = match path {
-                    Some(p) => format!("No index yet at {}.", p.display()),
-                    None => "No index location is available.".to_owned(),
-                };
-                return self.empty_state(ui, outer, &detail);
-            }
+            State::NoIndex => return self.first_start(ui, outer),
         }
         let Some(index) = self.index.clone() else {
             return;
         };
 
-        if let Some((err, _)) = &self.query_error {
-            let err = err.clone();
-            // The position is shown by the underline in the search box, so
-            // drop the technical "at bytes …" suffix.
-            let friendly = err.split(" at bytes").next().unwrap_or(&err).to_owned();
-            let mut friendly = friendly;
-            if let Some(first) = friendly.get_mut(0..1) {
-                first.make_ascii_uppercase();
-            }
-            return self.placeholder(ui, outer, "Check the search text", Some(&friendly));
-        }
+        // A search text that does not parse keeps the last results on screen,
+        // dimmed (nothing moves); the message is in the bar above the list.
+        let stale = self.query_error.is_some();
         let Some(hits) = self.hits.clone() else {
+            if stale {
+                self.placeholder(ui, outer, "Fix the search text to see results", None);
+            }
             return;
         };
         // Service results carry the index of their loaded rows.
         let index = hits.own_index().unwrap_or(index);
         let rows = hits.len(&index);
+        if rows == 0 && !stale {
+            return self.no_results(ui, outer, &index);
+        }
         if rows == 0 {
-            return self.placeholder(ui, outer, "No results", Some("Try fewer or shorter words."));
+            return;
         }
 
         // Header.
@@ -865,6 +954,32 @@ impl FerrowApp {
         let parsed = ferrow_query::Query::parse(&self.query).ok();
         let name_font = FontId::proportional(14.0);
         let sub_font = FontId::proportional(13.0);
+        // Last results while the search text does not parse: text at about
+        // half strength, nothing else changes.
+        let fade = |c: Color32| if stale { c.gamma_multiply(0.5) } else { c };
+        let (name_c, hl_c, sub_c) = (fade(p.text), fade(p.accent_text), fade(p.text_secondary));
+        // Fitted folder and name texts are cached per visible row and column
+        // width, so a repaint (scroll, hover) costs one lookup per row.
+        let width_of = |id: ColumnId, inset: f32| {
+            cols.iter()
+                .find(|c| c.id == id)
+                .map_or(0.0, |c| (c.right - c.left - inset).max(0.0))
+        };
+        // The cache hands back the whole-pixel widths it is keyed on; text is
+        // fitted to those, never to the fractional width.
+        let (folder_w, name_w) = self.fit_cache.begin(
+            self.fit_epoch,
+            width_of(ColumnId::Folder, 16.0),
+            width_of(ColumnId::Name, 40.0),
+        );
+        let ctx = ui.ctx().clone();
+        let measure = |font: &FontId, text: &str| {
+            ctx.fonts_mut(|f| {
+                f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+                    .size()
+                    .x
+            })
+        };
         let mut clicked_row = None;
         for i in 0..count {
             let row = first + i;
@@ -944,36 +1059,61 @@ impl FerrowApp {
                             }
                             _ => Vec::new(),
                         };
-                        let mut job =
-                            highlighted(&name, &ranges, name_font.clone(), p.text, p.accent_text);
-                        job.wrap.max_width = name_clip.width();
-                        job.wrap.overflow_character = Some('…');
-                        job.wrap.break_anywhere = true;
-                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        let layout =
+                            |ui: &egui::Ui, text: &str, ranges: &[std::ops::Range<usize>]| {
+                                let mut job =
+                                    highlighted(text, ranges, name_font.clone(), name_c, hl_c);
+                                job.wrap.max_width = name_clip.width();
+                                job.wrap.overflow_character = Some('…');
+                                job.wrap.break_anywhere = true;
+                                ui.ctx().fonts_mut(|f| f.layout_job(job))
+                            };
+                        let mut galley = layout(ui, &name, &ranges);
+                        if galley.elided {
+                            // Too long: cut in the middle so the extension
+                            // (and the end of the name) stays visible.
+                            // The first match stays visible, whole.
+                            let first = ranges.iter().min_by_key(|r| r.start).cloned();
+                            let fitted = self.fit_cache.name(id, || {
+                                fit::fit_name(&name, name_w, &|t| measure(&name_font, t), first)
+                            });
+                            if let Some(fitted) = fitted {
+                                let ranges = fit::remap_ranges(&ranges, &fitted);
+                                galley = layout(ui, &fitted.text, &ranges);
+                            }
+                        }
                         row_painter.with_clip_rect(name_clip).galley(
                             pos2(name_clip.left(), cy - galley.size().y / 2.0),
                             galley,
-                            p.text,
+                            name_c,
                         );
                     }
                     ColumnId::Folder => {
                         let parent = index.parent(id);
                         let folder = if parent == ferrow_index::ROOT_PARENT {
-                            String::new()
+                            Arc::<str>::from("")
                         } else {
-                            index.path(parent).display().to_string()
+                            // The drive and top folder, then the last folders:
+                            // the end of a path is what tells folders apart.
+                            self.fit_cache.folder(parent, || {
+                                fit::fit_path(
+                                    &index.path(parent).display().to_string(),
+                                    folder_w,
+                                    &|t| measure(&sub_font, t),
+                                )
+                            })
                         };
                         let galley = ellipsized(
                             ui,
-                            folder,
+                            folder.to_string(),
                             sub_font.clone(),
-                            p.text_secondary,
+                            sub_c,
                             clip.width(),
                         );
                         row_painter.with_clip_rect(clip).galley(
                             pos2(clip.left(), cy - galley.size().y / 2.0),
                             galley,
-                            p.text_secondary,
+                            sub_c,
                         );
                     }
                     ColumnId::Type => {
@@ -982,7 +1122,7 @@ impl FerrowApp {
                             Align2::LEFT_CENTER,
                             type_label(&name, is_dir),
                             sub_font.clone(),
-                            p.text_secondary,
+                            sub_c,
                         );
                     }
                     other => {
@@ -991,7 +1131,7 @@ impl FerrowApp {
                             (t.to_owned(), c)
                         } else {
                             match columns::cell_text(other, &meta, is_dir) {
-                                Some(t) => (t, p.text_secondary),
+                                Some(t) => (t, sub_c),
                                 None => continue,
                             }
                         };
@@ -1090,57 +1230,6 @@ impl FerrowApp {
                 p.text_secondary,
             );
         }
-    }
-
-    fn empty_state(&mut self, ui: &mut egui::Ui, rect: Rect, detail: &str) {
-        let p = self.palette;
-        let c = rect.center();
-        let painter = ui.painter_at(rect);
-        painter.text(
-            c - vec2(0.0, 44.0),
-            Align2::CENTER_CENTER,
-            "Build your first index",
-            FontId::new(20.0, FontFamily::Name(theme::SEMIBOLD.into())),
-            p.text,
-        );
-        painter.text(
-            c - vec2(0.0, 14.0),
-            Align2::CENTER_CENTER,
-            detail,
-            FontId::proportional(13.0),
-            p.text_secondary,
-        );
-        let home = home_dir();
-        let label = "Index my home folder";
-        let btn = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(200.0, 32.0));
-        let resp = ui.interact(btn, egui::Id::unique("index-home"), Sense::click());
-        let fill = if resp.is_pointer_button_down_on() {
-            p.accent.gamma_multiply(0.85)
-        } else if resp.hovered() {
-            p.accent.gamma_multiply(0.92)
-        } else {
-            p.accent
-        };
-        painter.rect_filled(btn, CornerRadius::same(4), fill);
-        painter.text(
-            btn.center(),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into())),
-            Color32::WHITE,
-        );
-        if resp.on_hover_cursor(CursorIcon::Default).clicked()
-            && let Some(home) = home
-        {
-            self.index_home(home);
-        }
-        painter.text(
-            c + vec2(0.0, 64.0),
-            Align2::CENTER_CENTER,
-            "Other folders: ferrow index <folder>",
-            FontId::proportional(12.0),
-            p.text_tertiary,
-        );
     }
 
     /// Settings button (gear) in the title row.
@@ -1250,69 +1339,6 @@ impl FerrowApp {
                     _ => {}
                 }
             }
-        }
-    }
-
-    fn status_bar(&self, ui: &mut egui::Ui) {
-        let p = self.palette;
-        let rect = ui.max_rect();
-        let painter = ui.painter();
-        let font = FontId::proportional(12.0);
-        let left = match (&self.state, &self.index) {
-            (State::Ready, Some(_)) if self.query_error.is_some() => String::new(),
-            (State::Ready, Some(index)) => {
-                let rows = self.row_count();
-                let results = if self.query.trim().is_empty() {
-                    format!("{} objects", group(self.object_count(index)))
-                } else if self.complete {
-                    format!(
-                        "{} {}",
-                        group(rows),
-                        if rows == 1 { "result" } else { "results" }
-                    )
-                } else {
-                    format!("{}+ results", group(rows))
-                };
-                let mut line = format!("{results}   ·   {}", fmt_ms(self.search_time));
-                if self.sort_pending {
-                    line.push_str(&format!(
-                        "   ·   Preparing sort by {}…",
-                        self.settings.sort.label()
-                    ));
-                } else if let Some(hint) = filter_column_hint(&self.query, index) {
-                    line.push_str(&hint);
-                } else if self.columns_need_rebuild {
-                    line.push_str("   ·   Rebuild the index to fill the new columns");
-                }
-                line
-            }
-            _ => String::new(),
-        };
-        painter.text(
-            pos2(rect.left() + 4.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            left,
-            font.clone(),
-            p.text_secondary,
-        );
-        if let (State::Ready, Some(index)) = (&self.state, &self.index) {
-            let right = match self.service_entries {
-                Some(n) => format!("Ferrow service  ·  {} entries  ·  live", group(n as usize)),
-                None => format!(
-                    "Local index  ·  {} entries  ·  loaded in {}",
-                    group(index.len()),
-                    fmt_ms(self.load_time)
-                ),
-            };
-            let resp = ui.interact(rect, egui::Id::unique("status"), Sense::hover());
-            painter.text(
-                pos2(rect.right() - 4.0, rect.center().y),
-                Align2::RIGHT_CENTER,
-                right,
-                font,
-                p.text_tertiary,
-            );
-            resp.on_hover_text(&self.index_source);
         }
     }
 }
@@ -1452,10 +1478,19 @@ impl eframe::App for FerrowApp {
             let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
             self.settings_page(&mut page_ui);
         } else {
-            let list_h = (content.height() - STATUS_HEIGHT).max(0.0);
+            // Notice bars (service lost, search text error) sit above the list
+            // and push it down; the list never changes size while a bar
+            // stays.
+            let notices = self.notices();
+            let bars_h = notices.len() as f32 * (NOTICE_HEIGHT + NOTICE_GAP);
+            self.draw_notices(ui, &notices, content.min, content.width());
+            let list_h = (content.height() - STATUS_HEIGHT - bars_h).max(0.0);
             let visible_rows = ((list_h - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(1.0) as usize;
             self.handle_keys(&ctx, visible_rows);
-            let list_rect = Rect::from_min_size(content.min, vec2(content.width(), list_h));
+            let list_rect = Rect::from_min_size(
+                content.min + vec2(0.0, bars_h),
+                vec2(content.width(), list_h),
+            );
             let mut list_ui = ui.new_child(egui::UiBuilder::new().max_rect(list_rect));
             self.results(&mut list_ui);
             let status_rect = Rect::from_min_max(
@@ -1566,40 +1601,6 @@ fn highlighted(
     job
 }
 
-/// Rows of the search syntax help: (example, meaning).
-const SYNTAX_HELP: &[(&str, &str)] = &[
-    ("report 2024", "Both words (AND)"),
-    ("jpg | png", "Either word (OR)"),
-    ("!tmp", "Without this word (NOT)"),
-    ("<a | b> c", "Group terms"),
-    ("\"two words\"", "Exact phrase"),
-    (
-        "*.log",
-        "Wildcards match the whole name: * any run, ? one character",
-    ),
-    ("report*2024*", "Starts with report, contains 2024"),
-    ("ext:log;txt", "File extensions"),
-    (
-        "audio:beatles",
-        "File types: audio: video: pic: doc: archive: exe:",
-    ),
-    ("path:docs", "Match the full path, not just the name"),
-    ("file:  folder:", "Only files, or only folders"),
-    ("case:Readme", "Case-sensitive"),
-    ("wholeword:log", "Whole words only"),
-    ("regex:^\\d+\\.txt$", "Regular expression"),
-    ("parent:C:\\logs", "Direct children of a folder"),
-    ("depth:2", "Folder depth"),
-    ("size:>10mb", "Size: >, >=, <, <=, or a range 1mb..5mb"),
-    ("dm:today", "Modified today (dc: created, da: accessed)"),
-    (
-        "dm:last10minutes",
-        "Modified in the last 10 minutes (hours, days, weeks)",
-    ),
-    ("dm:2026-01-01..2026-01-31", "Modified in a date range"),
-    ("attrib:H", "Attributes: R H S A C E and more"),
-];
-
 /// A filter that reads a column this index does not have matches nothing;
 /// say which column to show and rebuild.
 fn filter_column_hint(query: &str, index: &Index) -> Option<String> {
@@ -1620,7 +1621,7 @@ fn filter_column_hint(query: &str, index: &Index) -> Option<String> {
     .find(|(c, _)| needed.contains(*c) && !present.contains(*c))?
     .1;
     Some(format!(
-        "   ·   This filter needs the {missing} column: show it (right-click the header) and rebuild the index"
+        "This filter needs the {missing} column: show it (right-click the header) and rebuild the index"
     ))
 }
 

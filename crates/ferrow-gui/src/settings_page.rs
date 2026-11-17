@@ -31,7 +31,7 @@ const MIN_TEXT_WIDTH: f32 = 140.0;
 
 /// The page's sections, in order: what the list on the left shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Section {
+pub(super) enum Section {
     FastIndex,
     OwnIndex,
     Windows,
@@ -67,7 +67,7 @@ impl Section {
 
     /// The section a "scroll to" request names (the list's labels, and
     /// "Service access", which lives in the fast index section).
-    fn from_target(name: &str) -> Option<Section> {
+    pub(super) fn from_target(name: &str) -> Option<Section> {
         let name = if name == "Service access" {
             "Fast index"
         } else {
