@@ -4,16 +4,21 @@
 //! Nothing here runs on the UI thread. The service control manager (Windows)
 //! and the service's `Health` report are read on threads of their own with
 //! short deadlines; the UI only draws the last answer. While Settings is shown
-//! one watcher thread asks at most once every [`REFRESH`], and it exists only
-//! while Settings is visible (closed, minimized or hidden: no thread, no
-//! timer). It wakes the window only when what is shown has changed. Actions
-//! that need administrator rights run the fixed `ferrow.exe service <verb>`
-//! through the access card's `runas` path; the service's own answer, not the
-//! exit code, decides whether they worked.
+//! one watcher thread makes the periodic asks, at least [`REFRESH`] apart. It
+//! exists only while Settings is visible: closed or minimized (the UI says so
+//! every frame), hidden in the tray (the watcher checks the window itself
+//! before every ask, because hiding requests no frame), and it ends when one
+//! of these holds. It wakes the window only when what is shown has changed.
+//! Actions that need administrator rights run the fixed `ferrow.exe service
+//! <verb>` through the access card's `runas` path; the service's own answer,
+//! not the exit code, decides whether they worked. An action's follow-up asks
+//! (at 0, 1.2 and 2.4 s, then every [`REFRESH`]) are the one exception to the
+//! gap, and they push the next periodic ask back.
 // The Settings section that draws this follows in the next change.
 #![allow(dead_code)]
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,10 +31,12 @@ pub const SERVICE_NAME: &str = "ferrowd";
 const HEALTH_DEADLINE: Duration = Duration::from_millis(1000);
 const STATUS_DEADLINE: Duration = Duration::from_millis(800);
 const RESCAN_DEADLINE: Duration = Duration::from_secs(2);
-/// The longest gap between two periodic asks while Settings is shown.
+/// The shortest gap between two periodic asks while Settings is shown.
 pub const REFRESH: Duration = Duration::from_secs(5);
-/// After an action: look again every step, for at most this long.
-const SETTLE_STEP: Duration = Duration::from_secs(1);
+/// After an action: look again after 1.2 s and 2.4 s (the service applies a
+/// change within about a second), then at the normal cadence, for at most
+/// this long.
+const SETTLE_FIRST: Duration = Duration::from_millis(1200);
 const SETTLE_MAX: Duration = Duration::from_secs(30);
 /// How long the elevated command may run (a restart loads the saved index).
 const COMMAND_WAIT_MS: u32 = 90_000;
@@ -122,9 +129,16 @@ pub enum HealthView {
     NoAnswer,
     /// It answered, and refuses this account.
     Refused,
-    /// It answers searches but not `Health`: older than this app.
+    /// Connected or timed out, but neither `Health` nor `Status` was answered
+    /// in time: busy (when a report was seen before, see `Stale`).
+    Silent,
+    /// It answers searches but not `Health`, and no report was ever seen in
+    /// this session: older than this app, or busy.
     Older,
     Report(Box<Health>),
+    /// A report was seen in this session, but the service does not answer
+    /// `Health` right now (busy): the last report, no longer current.
+    Stale(Box<Health>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,9 +155,20 @@ impl Snapshot {
         }
     }
 
+    /// The last report, current or not (the details of a busy service).
+    pub fn last_report(&self) -> Option<&Health> {
+        match &self.health {
+            HealthView::Report(h) | HealthView::Stale(h) => Some(h),
+            _ => None,
+        }
+    }
+
     /// The service process answered something (even a refusal).
     pub fn answers(&self) -> bool {
-        !matches!(self.health, HealthView::NoAnswer)
+        !matches!(
+            self.health,
+            HealthView::NoAnswer | HealthView::Silent | HealthView::Stale(_)
+        )
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -152,9 +177,10 @@ impl Snapshot {
 
     /// Everything the section shows, as text: two snapshots with the same key
     /// look the same, so the window is not repainted for the difference
-    /// (uptime seconds, working-set jitter, a few more items).
+    /// (uptime seconds, working-set jitter, a few more items). Numbers are
+    /// cut to the precision they are shown with.
     pub fn display_key(&self) -> String {
-        let Some(h) = self.report() else {
+        let Some(h) = self.last_report() else {
             return format!("{:?}|{:?}", self.scm, self.health);
         };
         let volumes: Vec<_> = h
@@ -168,20 +194,19 @@ impl Snapshot {
                 )
             })
             .collect();
-        format!(
-            "{:?}|{}|{}|{}|{}|{:?}|{}|{}|{}|{:?}|{volumes:?}|{:?}",
-            self.scm,
-            h.version,
-            uptime_text(h.uptime_s),
-            items_text(h.entries),
-            memory_text(h.working_set),
-            h.private_bytes.map(memory_text),
-            h.mode,
-            h.access,
-            h.scanning,
-            h.last_save,
-            h.events
-        )
+        let stale = matches!(self.health, HealthView::Stale(_));
+        let shown = (
+            (stale, h.connection_errors, h.more_volumes, h.started_ms),
+            (self.scm, &h.version, &h.mode, &h.access, h.scanning),
+            (
+                uptime_text(h.uptime_s),
+                items_text(h.entries),
+                memory_text(h.working_set),
+                h.private_bytes.map(memory_text),
+            ),
+            (&h.last_save, volumes, &h.events),
+        );
+        format!("{shown:?}")
     }
 }
 
@@ -200,6 +225,13 @@ pub fn query_snapshot() -> Snapshot {
     }
 }
 
+fn is_silence(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
 fn refused(error: &std::io::Error) -> bool {
     crate::engine::service_gap(error) == crate::engine::ServiceGap::Refused
 }
@@ -214,9 +246,12 @@ fn health_view(
     match health {
         Ok(report) => HealthView::Report(Box::new(report)),
         Err(e) if refused(&e) => HealthView::Refused,
-        Err(_) => match status() {
+        Err(first) => match status() {
             Ok(()) => HealthView::Older,
             Err(e) if refused(&e) => HealthView::Refused,
+            // A deadline means something is there and does not answer; any
+            // other failure (nothing listens) means it is gone.
+            Err(_) if is_silence(&first) => HealthView::Silent,
             Err(_) => HealthView::NoAnswer,
         },
     }
@@ -349,7 +384,8 @@ pub enum Level {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
     pub level: Level,
-    /// A filled dot (the service is up) or a ring (it is not).
+    /// A filled dot: the service process runs (even when something is wrong
+    /// with it); a ring: it does not, or nothing is known yet.
     pub filled: bool,
     /// The state word, in the state's colour.
     pub head: String,
@@ -357,6 +393,10 @@ pub struct Summary {
     pub rest: String,
     /// What to do about it, when something is wrong.
     pub hint: String,
+    /// The button the hint points at: always an enabled action.
+    pub hint_verb: Option<Verb>,
+    /// The hint points to Fast index (this account is refused).
+    pub hint_access: bool,
 }
 
 /// `C:\` as `C:`; a folder root stays as it is.
@@ -400,143 +440,137 @@ fn volume_roots<'a>(h: &'a Health, mode: &str) -> Vec<&'a str> {
         .collect()
 }
 
-pub fn summary(snap: Option<&Snapshot>, app_version: &str) -> Summary {
-    let make = |level, filled, head: &str, rest: String, hint: &str| Summary {
+fn make(level: Level, filled: bool, head: &str, rest: String) -> Summary {
+    Summary {
         level,
         filled,
         head: head.to_owned(),
         rest,
-        hint: hint.to_owned(),
-    };
-    let Some(snap) = snap else {
-        return make(
-            Level::Neutral,
-            false,
-            "Checking the service…",
-            String::new(),
-            "",
-        );
-    };
-    if let Some(h) = snap.report() {
-        let items = format!("{} items", items_text(h.entries));
-        let up = format!("running {}", uptime_text(h.uptime_s));
-        let live = volume_roots(h, health::MODE_LIVE);
-        let lost = volume_roots(h, health::MODE_UNAVAILABLE);
+        hint: String::new(),
+        hint_verb: None,
+        hint_access: false,
+    }
+}
+
+impl Summary {
+    fn hint(mut self, text: &str) -> Summary {
+        self.hint = text.to_owned();
+        self
+    }
+
+    /// The hint names a button: "Start it below."
+    fn hint_do(mut self, verb: Verb) -> Summary {
+        self.hint = match verb {
+            Verb::Start => "Start it below.",
+            _ => "Restart it below.",
+        }
+        .to_owned();
+        self.hint_verb = Some(verb);
+        self
+    }
+}
+
+/// The one line for a service whose report is current.
+fn report_summary(h: &Health, app_version: &str) -> Summary {
+    let items = format!("{} items", items_text(h.entries));
+    let live = volume_roots(h, health::MODE_LIVE);
+    let lost = volume_roots(h, health::MODE_UNAVAILABLE);
+    let journal_bad = h.volumes.iter().any(|v| v.journal == health::JOURNAL_ERROR);
+    let running = |rest: String| make(Level::Caution, true, "Running", rest);
+    if let Some(v) = h.volumes.iter().find(|v| v.rescan_pending.is_some()) {
         let pending: Vec<&str> = h
             .volumes
             .iter()
             .filter(|v| v.rescan_pending.is_some())
             .map(|v| short_root(&v.root))
             .collect();
-        let journal_bad = h.volumes.iter().any(|v| v.journal == health::JOURNAL_ERROR);
-        return if let Some(v) = h.volumes.iter().find(|v| v.rescan_pending.is_some()) {
-            let why = v.rescan_pending.as_ref().map_or("", |r| r.reason.as_str());
-            let why = if why.is_empty() {
-                String::new()
-            } else {
-                format!(" ({why})")
-            };
-            make(
-                Level::Caution,
-                true,
-                "Running",
-                format!("rescan pending on {}{why}", pending.join(" ")),
-                "",
-            )
-        } else if !lost.is_empty() || journal_bad {
-            let list = if lost.is_empty() {
-                volume_roots(h, "")
-            } else {
-                lost
-            };
-            let on = if list.is_empty() {
-                String::new()
-            } else {
-                format!(" on {}", list.join(" "))
-            };
-            make(
-                Level::Caution,
-                true,
-                "Running",
-                format!("live updates unavailable{on}"),
-                "Details below.",
-            )
-        } else if h.last_save.as_ref().is_some_and(|s| !s.ok) {
-            make(
-                Level::Caution,
-                true,
-                "Running",
-                "the last save of the index failed".to_owned(),
-                "Details below.",
-            )
-        } else if h.version != app_version {
-            make(
-                Level::Caution,
-                true,
-                "Running",
-                format!("service {}, app {app_version}", h.version),
-                "Update Ferrow with Setup so both match.",
-            )
-        } else if h.scanning {
-            make(
-                Level::Neutral,
-                true,
-                "Scanning",
-                format!("{items} so far"),
-                "",
-            )
-        } else if live.is_empty() {
-            make(
-                Level::Good,
-                true,
-                "Healthy",
-                format!("{up} · {items} · not live (directory walk)"),
-                "",
-            )
+        let why = v.rescan_pending.as_ref().map_or("", |r| r.reason.as_str());
+        let why = if why.is_empty() {
+            String::new()
         } else {
-            make(
-                Level::Good,
-                true,
-                "Healthy",
-                format!("{up} · {items} · live on {}", live.join(" ")),
-                "",
-            )
+            format!(" ({why})")
         };
+        running(format!("rescan pending on {}{why}", pending.join(" ")))
+    } else if !lost.is_empty() || journal_bad {
+        let list = if lost.is_empty() {
+            h.volumes
+                .iter()
+                .filter(|v| v.journal == health::JOURNAL_ERROR)
+                .map(|v| short_root(&v.root))
+                .collect()
+        } else {
+            lost
+        };
+        running(format!("live updates unavailable on {}", list.join(" ")))
+    } else if h.last_save.as_ref().is_some_and(|s| !s.ok) {
+        running("the last save of the index failed".to_owned())
+    } else if h.version != app_version {
+        running(format!("service {}, app {app_version}", h.version))
+            .hint("Update Ferrow with Setup so both match.")
+    } else if h.scanning {
+        make(Level::Neutral, true, "Scanning", format!("{items} so far"))
+    } else {
+        let up = format!("running {}", uptime_text(h.uptime_s));
+        let how = if live.is_empty() {
+            "not live (directory walk)".to_owned()
+        } else {
+            format!("live on {}", live.join(" "))
+        };
+        make(
+            Level::Good,
+            true,
+            "Healthy",
+            format!("{up} · {items} · {how}"),
+        )
     }
+}
+
+pub fn summary(snap: Option<&Snapshot>, app_version: &str) -> Summary {
     let none = String::new;
+    let Some(snap) = snap else {
+        return make(Level::Neutral, false, "Checking the service…", none());
+    };
+    // The manager's word wins over a report that is about to be out of date.
+    match snap.scm.state {
+        ScmState::Starting => return make(Level::Neutral, false, "Starting…", none()),
+        ScmState::Stopping => return make(Level::Neutral, false, "Stopping…", none()),
+        _ => {}
+    }
+    if let Some(h) = snap.report() {
+        return report_summary(h, app_version);
+    }
+    // The service process runs, whatever else is wrong: a dot, not a ring.
+    let running = snap.scm.state == ScmState::Running || snap.answers();
+    let caution = |head: &str, rest: String| make(Level::Caution, running, head, rest);
     match (snap.scm.state, &snap.health) {
-        (ScmState::NotInstalled, _) => make(
-            Level::Caution,
-            false,
-            "Not installed",
-            none(),
-            "Install it with Setup.",
+        (ScmState::NotInstalled, _) => {
+            caution("Not installed", none()).hint("Install it with Setup.")
+        }
+        (ScmState::Stopped, _) => caution("Stopped", none()).hint_do(Verb::Start),
+        (_, HealthView::Refused) => {
+            let mut s = caution(
+                "Running, but this account isn't allowed to see its health",
+                none(),
+            )
+            .hint("Allow this account under Fast index.");
+            s.hint_access = true;
+            s
+        }
+        (_, HealthView::Older) => caution(
+            "Older service, or busy",
+            "update with Setup if this stays".to_owned(),
         ),
-        (ScmState::Stopped, _) => make(Level::Caution, false, "Stopped", none(), "Start it below."),
-        (ScmState::Starting, _) => make(Level::Neutral, false, "Starting…", none(), ""),
-        (ScmState::Stopping, _) => make(Level::Neutral, false, "Stopping…", none(), ""),
-        (_, HealthView::Refused) => make(
-            Level::Caution,
-            false,
-            "Running, but this account isn't allowed to see its health",
-            none(),
-            "Allow this account under Fast index.",
-        ),
-        (_, HealthView::Older) => make(
-            Level::Caution,
-            false,
-            "Older service",
-            "update with Setup".to_owned(),
-            "",
-        ),
-        (ScmState::Other, _) => make(Level::Caution, false, "Paused", none(), ""),
-        _ => make(
-            Level::Caution,
-            false,
-            "Not answering",
-            none(),
-            "Restart it below.",
-        ),
+        (_, HealthView::Stale(_)) => caution(
+            "Not answering right now",
+            "it may be busy; showing its last report".to_owned(),
+        )
+        .hint_do(Verb::Restart),
+        (ScmState::Other, _) => caution("Paused", none()),
+        // No service manager to ask (Linux, macOS): silence means it is not running.
+        (ScmState::Unsupported, HealthView::NoAnswer) => {
+            caution("Not answering", none()).hint_do(Verb::Start)
+        }
+        _ => caution("Not answering", none()).hint_do(Verb::Restart),
     }
 }
 
@@ -594,9 +628,9 @@ impl Verb {
             Verb::Start => "Started. The service is running.",
             Verb::Restart => "Restarted. The service is running again.",
             Verb::Rescan => "Rescan started. The volumes are read again in the background.",
-            Verb::Repair => {
-                "Repaired. The service is registered, its folder checked and it is running again."
-            }
+            // The CLI says what it did on its own output, which an elevated
+            // launch cannot capture: claim only what the answer shows.
+            Verb::Repair => "Repair finished. The service is running.",
         }
     }
 }
@@ -660,8 +694,14 @@ pub fn actions(snap: Option<&Snapshot>, can_elevate: bool, busy: bool) -> Action
         },
         rescan: match &snap.health {
             HealthView::Report(h) if h.scanning => Can::No("A scan is running already."),
+            HealthView::Report(h) if h.volumes.iter().any(|v| v.rescan_pending.is_some()) => {
+                Can::No("A rescan is queued already (see the volumes).")
+            }
             HealthView::Report(_) => Can::Yes,
-            HealthView::Older => Can::No("Older service. Update with Setup."),
+            HealthView::Older => Can::No("Older service, or busy. Update with Setup."),
+            HealthView::Stale(_) | HealthView::Silent => {
+                Can::No("The service isn't answering right now.")
+            }
             HealthView::Refused => admin(true, ""),
             HealthView::NoAnswer => Can::No("The service isn't running."),
         },
@@ -684,7 +724,14 @@ fn expected(verb: Verb, before: &Snapshot, now: &Snapshot) -> bool {
     }
 }
 
+/// The pause before look number `n` (0 is the first pause): 1.2 s, 1.2 s,
+/// then the normal cadence.
+fn settle_pause(n: usize) -> Duration {
+    if n < 2 { SETTLE_FIRST } else { REFRESH }
+}
+
 /// Look again until the answer shows it, or `SETTLE_MAX` of pauses is used up.
+/// The asks are at 0, 1.2 and 2.4 s, then every `REFRESH`.
 fn settle(
     verb: Verb,
     before: &Snapshot,
@@ -693,12 +740,15 @@ fn settle(
 ) -> (Snapshot, bool) {
     let mut now = ask();
     let mut waited = Duration::ZERO;
+    let mut n = 0;
     while !expected(verb, before, &now) {
         if waited >= SETTLE_MAX {
             return (now, false);
         }
-        pause(SETTLE_STEP);
-        waited += SETTLE_STEP;
+        let gap = settle_pause(n);
+        pause(gap);
+        waited += gap;
+        n += 1;
         now = ask();
     }
     (now, true)
@@ -720,7 +770,7 @@ fn outcome(verb: Verb, ran: Result<u32, RunError>, seen: bool) -> Notice {
         Ok(4) => problem("The service refused this account."),
         Ok(5) => Notice::new(
             Outcome::NoChange,
-            "Nothing was started: a scan is running already, or one started in the last minute.",
+            "Nothing was started. A scan is running, already requested, or ended less than a minute ago.",
         ),
         Ok(_) => problem(&format!(
             "It did not work. Run `{}` in an administrator terminal for the reason.",
@@ -758,64 +808,133 @@ fn ask_rescan() -> IpcRescan {
 // -------------------------------------------------------------------
 // Keeping the answer fresh
 
-/// Where every ask publishes: remembers when the last one started (so asks
-/// stay at least `REFRESH` apart, whoever makes them) and what was last shown.
+struct FeedState {
+    /// When the last ask started, whoever made it.
+    last_ask: Option<Instant>,
+    /// What the UI shows now ([`Snapshot::display_key`]).
+    shown: Option<String>,
+    /// The last current report of this session.
+    report: Option<Box<Health>>,
+}
+
+/// Where every ask publishes. It remembers when the last ask started (a
+/// periodic ask waits `interval` after any ask, an action's included), what the
+/// UI shows, and the last report: a service that answered `Health` before and
+/// goes silent while its process runs is shown as busy, with that report.
 pub struct Feed {
-    state: Mutex<(Option<Instant>, Option<String>)>,
+    state: Mutex<FeedState>,
     tx: Sender<Snapshot>,
     wake: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Feed {
+    fn new(tx: Sender<Snapshot>, wake: impl Fn() + Send + Sync + 'static) -> Feed {
+        Feed {
+            state: Mutex::new(FeedState {
+                last_ask: None,
+                shown: None,
+                report: None,
+            }),
+            tx,
+            wake: Box::new(wake),
+        }
+    }
+
     /// The time left until the next periodic ask may start.
     fn wait(&self, interval: Duration) -> Duration {
-        let last = self.state.lock().map_or(None, |s| s.0);
+        let last = self.state.lock().map_or(None, |s| s.last_ask);
         last.map_or(Duration::ZERO, |t| interval.saturating_sub(t.elapsed()))
     }
 
     fn mark(&self) {
         if let Ok(mut s) = self.state.lock() {
-            s.0 = Some(Instant::now());
+            s.last_ask = Some(Instant::now());
         }
+    }
+
+    /// Take an answer as what the UI will show: a silent service that was
+    /// answering before becomes `Stale` (its last report), and the answer is
+    /// noted as shown. True when that differs from what was shown before.
+    fn adopt(&self, snap: Snapshot) -> (Snapshot, bool) {
+        let Ok(mut s) = self.state.lock() else {
+            return (snap, true);
+        };
+        let snap = match (&snap.health, &s.report) {
+            (HealthView::Report(h), _) => {
+                s.report = Some(h.clone());
+                snap
+            }
+            (HealthView::Older | HealthView::Silent, Some(last)) if snap.scm.up() => Snapshot {
+                health: HealthView::Stale(last.clone()),
+                ..snap
+            },
+            _ => snap,
+        };
+        let key = snap.display_key();
+        let changed = s.shown.as_ref() != Some(&key);
+        s.shown = Some(key);
+        (snap, changed)
     }
 
     /// Hand the answer to the UI; the window wakes only if what it shows
     /// changed.
     fn publish(&self, snap: Snapshot) {
-        if self.remember(&snap) && self.tx.send(snap).is_ok() {
+        let (snap, changed) = self.adopt(snap);
+        if changed && self.tx.send(snap).is_ok() {
             (self.wake)();
         }
     }
-
-    /// Note what the UI shows now; true when that differs from before.
-    fn remember(&self, snap: &Snapshot) -> bool {
-        let key = snap.display_key();
-        self.state.lock().is_ok_and(|mut s| {
-            let changed = s.1.as_ref() != Some(&key);
-            s.1 = Some(key);
-            changed
-        })
-    }
 }
 
-/// The periodic asker: first ask at once (or when the throttle allows), then
-/// every `interval`, until the returned sender is dropped.
+/// The periodic asker thread: it ends when its handle is dropped, or when it
+/// finds the window may not be asking (`allowed` is false).
+struct Watcher {
+    _stop: Sender<()>,
+    ended: Arc<AtomicBool>,
+}
+
+/// First ask at once (or when the throttle allows), then every `interval`.
+/// `allowed` is asked before every ask: hiding the window to the tray
+/// requests no frame, so the UI cannot tell the thread itself.
 fn spawn_watcher(
     feed: Arc<Feed>,
     interval: Duration,
     ask: impl Fn() -> Snapshot + Send + 'static,
-) -> Option<Sender<()>> {
+    allowed: impl Fn() -> bool + Send + 'static,
+) -> Option<Watcher> {
     let (stop, stopped) = channel::<()>();
+    let ended = Arc::new(AtomicBool::new(false));
+    let flag = ended.clone();
     std::thread::Builder::new()
         .name("ferrow-health-watch".into())
         .spawn(move || {
-            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(feed.wait(interval)) {
+            loop {
+                if !matches!(
+                    stopped.recv_timeout(feed.wait(interval)),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+                // An action asked meanwhile: its asks count.
+                if !feed.wait(interval).is_zero() {
+                    continue;
+                }
+                if !allowed() {
+                    break;
+                }
                 feed.mark();
                 feed.publish(ask());
             }
+            flag.store(true, Ordering::Release);
         })
         .ok()
-        .map(|_| stop)
+        .map(|_| Watcher { _stop: stop, ended })
+}
+
+/// Whether the section is on screen: Settings is the page, and the window is
+/// neither minimized nor hidden in the tray.
+pub fn shown(settings_open: bool, minimized: bool, hidden: bool) -> bool {
+    settings_open && !minimized && !hidden
 }
 
 // -------------------------------------------------------------------
@@ -829,7 +948,7 @@ struct Done {
 pub struct ServiceHealth {
     pub snap: Option<Snapshot>,
     /// The running action, and whether its administrator prompt is still open.
-    pub busy: Option<(Verb, Arc<std::sync::atomic::AtomicBool>)>,
+    pub busy: Option<(Verb, Arc<AtomicBool>)>,
     pub notice: Option<Notice>,
     /// "Repair…" was clicked and waits for its confirmation.
     pub confirm_repair: bool,
@@ -838,7 +957,9 @@ pub struct ServiceHealth {
     updates: Receiver<Snapshot>,
     tx: Sender<Snapshot>,
     feed: Option<Arc<Feed>>,
-    watcher: Option<Sender<()>>,
+    watcher: Option<Watcher>,
+    /// What the UI last said about [`shown`]; the watcher reads it too.
+    visible: Arc<AtomicBool>,
     /// The gap between periodic asks ([`REFRESH`]; shorter in tests).
     interval: Duration,
     done: Option<Receiver<Done>>,
@@ -857,18 +978,24 @@ impl ServiceHealth {
             tx,
             feed: None,
             watcher: None,
+            visible: Arc::new(AtomicBool::new(false)),
             interval: REFRESH,
             done: None,
         }
     }
 
-    /// Settings is on screen (not closed, minimized or hidden): keep the
-    /// answer fresh. Otherwise nothing runs.
+    /// The section is on screen ([`shown`]): keep the answer fresh. Otherwise
+    /// nothing runs.
     pub fn set_visible(&mut self, visible: bool, wake: impl Fn() + Send + Sync + 'static) {
         // Test builds never ask the real service (the screenshot harness
         // injects its answers); unit tests start the watcher themselves.
         #[cfg(not(test))]
-        self.set_visible_with(visible, wake, query_snapshot);
+        self.set_visible_with(
+            visible,
+            wake,
+            query_snapshot,
+            crate::platform::is_hidden_in_tray,
+        );
         #[cfg(test)]
         let _ = (visible, wake);
     }
@@ -878,42 +1005,54 @@ impl ServiceHealth {
         visible: bool,
         wake: impl Fn() + Send + Sync + 'static,
         ask: impl Fn() -> Snapshot + Send + 'static,
+        hidden: impl Fn() -> bool + Send + 'static,
     ) {
+        self.visible.store(visible, Ordering::Relaxed);
         if !visible {
             self.watcher = None;
-        } else if self.watcher.is_none() {
-            let tx = self.tx.clone();
-            let feed = self.feed.get_or_insert_with(|| {
-                Arc::new(Feed {
-                    state: Mutex::new((None, None)),
-                    tx,
-                    wake: Box::new(wake),
-                })
+        } else if !self.watching() {
+            let feed = self
+                .feed
+                .get_or_insert_with(|| Arc::new(Feed::new(self.tx.clone(), wake)));
+            let on_screen = self.visible.clone();
+            self.watcher = spawn_watcher(feed.clone(), self.interval, ask, move || {
+                on_screen.load(Ordering::Relaxed) && !hidden()
             });
-            self.watcher = spawn_watcher(feed.clone(), self.interval, ask);
         }
     }
 
-    #[cfg(test)]
+    /// The periodic asker runs.
     pub fn watching(&self) -> bool {
-        self.watcher.is_some()
+        self.watcher
+            .as_ref()
+            .is_some_and(|w| !w.ended.load(Ordering::Acquire))
     }
 
     /// Take finished answers and results (every frame, also while Settings is
-    /// closed). True when an action was attempted: the engine should look for
-    /// the service again.
+    /// closed). True when an action ended: the engine should look for the
+    /// service again.
     pub fn poll(&mut self) -> bool {
         while let Ok(snap) = self.updates.try_recv() {
             self.snap = Some(snap);
         }
         let Some(rx) = &self.done else { return false };
-        let Ok(done) = rx.try_recv() else {
-            return false;
-        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.snap = Some(done.snap);
+                self.notice = Some(done.notice);
+            }
+            Err(TryRecvError::Empty) => return false,
+            // The worker ended without a result: never leave the buttons
+            // waiting for it.
+            Err(TryRecvError::Disconnected) => {
+                self.notice = Some(Notice::new(
+                    Outcome::Problem,
+                    "The action stopped unexpectedly. Check the service and try again.",
+                ));
+            }
+        }
         self.done = None;
         self.busy = None;
-        self.snap = Some(done.snap);
-        self.notice = Some(done.notice);
         true
     }
 
@@ -926,8 +1065,7 @@ impl ServiceHealth {
         notice: Option<Notice>,
     ) {
         self.snap = snap;
-        self.busy =
-            busy.map(|(v, prompt)| (v, Arc::new(std::sync::atomic::AtomicBool::new(prompt))));
+        self.busy = busy.map(|(v, prompt)| (v, Arc::new(AtomicBool::new(prompt))));
         self.notice = notice;
     }
 
@@ -955,7 +1093,7 @@ impl ServiceHealth {
         if self.busy.is_some() || self.done.is_some() {
             return;
         }
-        let prompt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prompt = Arc::new(AtomicBool::new(false));
         let shown = prompt.clone();
         let known = self.snap.clone();
         let (tx, rx) = channel();
@@ -963,13 +1101,21 @@ impl ServiceHealth {
         let started = std::thread::Builder::new()
             .name("ferrow-health-action".into())
             .spawn(move || {
+                // Every look counts as an ask (the periodic asker waits after
+                // it) and is judged like the periodic ones (busy, not gone).
+                let mut look = || {
+                    let snap = ask();
+                    match &feed {
+                        Some(f) => {
+                            f.mark();
+                            f.adopt(snap).0
+                        }
+                        None => snap,
+                    }
+                };
                 // No answer shown yet: look first, here, not on the UI thread.
-                let before = known.unwrap_or_else(&mut ask);
-                let done = perform(verb, &before, &prompt, rescan, elevate, &mut ask, pause);
-                // The periodic asker compares with what the UI shows now.
-                if let Some(feed) = feed {
-                    feed.remember(&done.snap);
-                }
+                let before = known.unwrap_or_else(&mut look);
+                let done = perform(verb, &before, &prompt, rescan, elevate, &mut look, pause);
                 let _ = tx.send(done);
                 wake();
             });
@@ -1034,38 +1180,57 @@ pub fn events_shown(events: &[health::EventInfo], all: bool) -> Vec<&health::Eve
     }
 }
 
-/// `path` words (a drive path, a UNC path or an absolute Unix path longer than
-/// a root) replaced by `<path>`, except the volume roots themselves.
-pub fn scrub(text: &str, roots: &[&str]) -> String {
-    let trim = |w: &str| {
-        w.trim_matches(['"', '\'', '(', ')', ',', ';', '.'])
-            .to_owned()
-    };
-    let same = |a: &str, b: &str| {
-        a.trim_end_matches(['\\', '/'])
-            .eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
-    };
-    let drive = |w: &str| {
-        let b = w.as_bytes();
-        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
-    };
-    text.split(' ')
-        .map(|word| {
-            let w = trim(word);
-            // Any backslash makes a word a path (a folder name with a space
-            // in it splits into words, and each part must go too).
-            let pathlike = w.contains('\\') || drive(&w) || (w.starts_with('/') && w.len() > 1);
-            if pathlike && !roots.iter().any(|r| same(&w, r)) {
-                "<path>".to_owned()
-            } else {
-                word.to_owned()
-            }
+/// The length of a volume root that `text` starts with, when it is a whole
+/// word (the root may hold spaces; `C:\Users` is not the root `C:\`).
+fn root_len(text: &str, roots: &[&str]) -> Option<usize> {
+    roots
+        .iter()
+        .filter(|r| !r.is_empty())
+        .filter_map(|root| {
+            let head = text.get(..root.len())?;
+            let ends = text[root.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || ",;:)\"'.".contains(c));
+            (head.eq_ignore_ascii_case(root) && ends).then_some(root.len())
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .max()
 }
 
-/// The text "Copy diagnostics" puts on the clipboard: versions, the service
+/// A word that names a file or folder: it holds a backslash, starts like a
+/// drive, UNC or absolute path, or has one after `=` or `:`.
+fn path_word(word: &str) -> bool {
+    let word = word.trim_matches(['"', '\'', '(', ')', ',', ';', '.']);
+    let starts = |w: &str| {
+        let b = w.as_bytes();
+        let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+        (drive && matches!(b[2], b'\\' | b'/')) || (w.starts_with('/') && w.len() > 1)
+    };
+    word.contains('\\') || starts(word) || word.split(['=', ':']).skip(1).any(starts)
+}
+
+/// `text` up to the first file or folder that is not a volume root, then
+/// `<path omitted>`. A path can hold spaces (`C:\Users\Jane Doe`), so nothing
+/// after its first word is kept: that is the one cut that cannot leak part of it.
+pub fn scrub(text: &str, roots: &[&str]) -> String {
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let lead = rest.len() - rest.trim_start_matches(['(', '"', '\'']).len();
+        if let Some(n) = root_len(&rest[lead..], roots) {
+            at += lead + n;
+            continue;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if path_word(&rest[..end]) {
+            return format!("{}<path omitted>", &text[..at]);
+        }
+        at += end + rest[end..].chars().next().map_or(0, char::len_utf8);
+    }
+    text.to_owned()
+}
+
+// The text "Copy diagnostics" puts on the clipboard: versions, the service
 /// manager's state, the health report and the newest events. No file names
 /// beyond the volume roots.
 pub fn diagnostics(snap: &Snapshot, app_version: &str, os: &str) -> String {
