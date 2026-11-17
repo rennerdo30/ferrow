@@ -353,7 +353,7 @@ fn elevated_verbs_are_fixed_words() {
 
 #[test]
 fn every_way_an_action_can_end_has_its_own_outcome() {
-    let o = |ran, seen| outcome(Verb::Restart, ran, seen);
+    let o = |ran, seen| outcome(Verb::Restart, ran, Some(seen));
     assert_eq!(o(Ok(0), true).outcome, Outcome::Done);
     assert!(o(Ok(0), true).text.starts_with("Restarted"));
     assert_eq!(o(Ok(0), false).outcome, Outcome::Problem);
@@ -369,12 +369,12 @@ fn every_way_an_action_can_end_has_its_own_outcome() {
         assert_eq!(n.outcome, Outcome::Problem, "{code}");
         assert!(n.text.contains(word), "{code}: {}", n.text);
     }
-    let nothing = outcome(Verb::Rescan, Ok(5), false);
+    let nothing = outcome(Verb::Rescan, Ok(5), Some(false));
     assert_eq!(nothing.outcome, Outcome::NoChange);
     assert!(nothing.text.contains("ended less than a minute ago"));
     // The repair text claims only what the answer shows: it may have found
     // nothing to repair.
-    let repaired = outcome(Verb::Repair, Ok(0), true).text;
+    let repaired = outcome(Verb::Repair, Ok(0), Some(true)).text;
     assert_eq!(repaired, "Repair finished. The service is running.");
     for claim in ["registered", "re-registered", "restarted", "moved"] {
         assert!(!repaired.to_lowercase().contains(claim), "{claim}");
@@ -404,9 +404,10 @@ fn after_an_action_it_looks_again_until_the_answer_shows_it_and_gives_up_in_time
                 healthy()
             }
         },
+        || true,
         |d| *paused.borrow_mut() += d,
     );
-    assert!(seen && shown == healthy());
+    assert!(seen == Some(true) && shown == Some(healthy()));
     assert_eq!(*calls.borrow(), 4);
     // Looks come at 0, 1.2 and 2.4 s, then at the normal cadence, and it
     // never waits longer than the bound; then it reports "not seen".
@@ -415,9 +416,10 @@ fn after_an_action_it_looks_again_until_the_answer_shows_it_and_gives_up_in_time
         Verb::Start,
         &stopped,
         || stopped.clone(),
+        || true,
         |d| pauses.borrow_mut().push(d),
     );
-    assert!(!seen);
+    assert_eq!(seen, Some(false));
     let pauses = pauses.into_inner();
     assert_eq!(
         pauses[..3],
@@ -473,6 +475,7 @@ fn perform_with(
             ran
         },
         &mut ask,
+        &|| true,
         |_| {},
     );
     assert!(
@@ -561,6 +564,7 @@ fn an_action_runs_off_the_calling_thread_and_its_result_arrives_through_poll() {
             *a.lock().unwrap() = Some(std::thread::current().id());
             healthy()
         },
+        || true,
         |_| {},
     );
     assert!(
@@ -576,6 +580,7 @@ fn an_action_runs_off_the_calling_thread_and_its_result_arrives_through_poll() {
         || IpcRescan::NotAllowed,
         |_| Ok(0),
         healthy,
+        || true,
         |_| {},
     );
     release.send(()).unwrap();
@@ -1122,6 +1127,7 @@ fn every_look_of_an_action_goes_through_the_throttle() {
         || IpcRescan::NotAllowed,
         |_| Ok(0),
         healthy,
+        || true,
         |_| {},
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1151,6 +1157,7 @@ fn a_worker_that_vanishes_does_not_leave_the_buttons_waiting() {
         || IpcRescan::NotAllowed,
         |_| Ok(0),
         healthy,
+        || true,
         |_| {},
     );
     assert!(state.busy.is_some());
@@ -1222,4 +1229,168 @@ fn while_the_service_starts_or_stops_nothing_can_be_done_whatever_the_report_say
         }
     }
     assert_eq!(CHANGING, "It is changing state. Wait a moment.");
+}
+
+/// Run `verb` on a state that shows "stopped", with `allowed` the window test
+/// and `elevate` the command; return the finished state and the asks made.
+fn run_hidden_case(
+    allowed: Arc<AtomicBool>,
+    elevate: impl FnOnce(&str) -> Result<u32, RunError> + Send + 'static,
+    ask_hides: bool,
+) -> (ServiceHealth, usize) {
+    let mut state = ServiceHealth::new();
+    state.snap = Some(snap(ScmState::Stopped, HealthView::NoAnswer));
+    let asks = Arc::new(AtomicUsize::new(0));
+    let (a, window) = (asks.clone(), allowed.clone());
+    state.run_with(
+        Verb::Start,
+        || {},
+        || IpcRescan::NotAllowed,
+        elevate,
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            if ask_hides {
+                window.store(false, Ordering::SeqCst); // hidden during the wait
+            }
+            snap(ScmState::Stopped, HealthView::NoAnswer) // never "started"
+        },
+        move || allowed.load(Ordering::SeqCst),
+        |_| {},
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !state.poll() {
+        assert!(Instant::now() < deadline, "the result never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let asked = asks.load(Ordering::SeqCst);
+    (state, asked)
+}
+
+#[test]
+fn hiding_the_window_during_the_wait_stops_the_follow_up_asks() {
+    // Without the check this would ask about eight times (30 s of fake pauses).
+    let window = Arc::new(AtomicBool::new(true));
+    let (state, asked) = run_hidden_case(window, |_| Ok(0), true);
+    assert_eq!(asked, 1, "one look, then the window was gone");
+    // The outcome still comes from the exit code, and says what was not checked.
+    let notice = state.notice.expect("an outcome");
+    assert_eq!(notice.outcome, Outcome::Unconfirmed);
+    assert!(notice.text.contains("hidden"));
+    assert!(state.busy.is_none());
+}
+
+#[test]
+fn hiding_while_the_prompt_is_open_asks_nothing_at_all() {
+    let window = Arc::new(AtomicBool::new(true));
+    let w = window.clone();
+    let (state, asked) = run_hidden_case(
+        window,
+        move |_| {
+            w.store(false, Ordering::SeqCst); // the window went to the tray
+            Ok(0)
+        },
+        false,
+    );
+    assert_eq!(asked, 0);
+    assert_eq!(state.notice.as_ref().unwrap().outcome, Outcome::Unconfirmed);
+    // The state shown stays what it was: nothing newer is known.
+    assert_eq!(
+        state.snap,
+        Some(snap(ScmState::Stopped, HealthView::NoAnswer))
+    );
+    // A declined prompt is still declined, and a failure still a failure.
+    for (ran, outcome) in [
+        (Err(RunError::Declined), Outcome::Declined),
+        (Ok(1), Outcome::Problem),
+        (Err(RunError::Failed("x".into())), Outcome::Problem),
+    ] {
+        let window = Arc::new(AtomicBool::new(true));
+        let w = window.clone();
+        let (state, asked) = run_hidden_case(
+            window,
+            move |_| {
+                w.store(false, Ordering::SeqCst);
+                ran
+            },
+            false,
+        );
+        assert_eq!(asked, 0);
+        assert_eq!(state.notice.unwrap().outcome, outcome);
+    }
+}
+
+#[test]
+fn a_wait_that_may_not_ask_reports_nothing_checked() {
+    let stopped = snap(ScmState::Stopped, HealthView::NoAnswer);
+    let (shown, seen) = settle(
+        Verb::Start,
+        &stopped,
+        || panic!("asked while not allowed"),
+        || false,
+        |_| {},
+    );
+    assert_eq!((shown, seen), (None, None));
+    assert_eq!(
+        outcome(Verb::Start, Ok(0), None).outcome,
+        Outcome::Unconfirmed
+    );
+    // The exit codes keep their own words whether or not it was checked.
+    assert_eq!(
+        outcome(Verb::Start, Ok(4), None).text,
+        outcome(Verb::Start, Ok(4), Some(false)).text
+    );
+}
+
+#[test]
+fn a_silent_service_nobody_heard_before_reads_like_an_older_one() {
+    let older = line(&snap(ScmState::Running, HealthView::Older));
+    let silent = line(&snap(ScmState::Running, HealthView::Silent));
+    assert_eq!(silent, older);
+    assert_eq!(
+        silent.2,
+        "Older service, or busy · update with Setup if this stays"
+    );
+    // Still no button is promised: nothing to press for "older, or busy".
+    assert_eq!(
+        summary(Some(&snap(ScmState::Running, HealthView::Silent)), APP).hint_verb,
+        None
+    );
+}
+
+#[test]
+fn a_rescan_the_service_answered_does_not_look_again_when_the_window_is_hidden() {
+    let mut state = ServiceHealth::new();
+    state.snap = Some(healthy());
+    let window = Arc::new(AtomicBool::new(true));
+    let w = window.clone();
+    let asks = Arc::new(AtomicUsize::new(0));
+    let a = asks.clone();
+    let gate = window.clone();
+    state.run_with(
+        Verb::Rescan,
+        || {},
+        move || {
+            w.store(false, Ordering::SeqCst); // hidden while the request ran
+            IpcRescan::Started("rescan requested".into())
+        },
+        |_| Ok(0),
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            healthy()
+        },
+        move || gate.load(Ordering::SeqCst),
+        |_| {},
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !state.poll() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(asks.load(Ordering::SeqCst), 0);
+    // The service's own sentence is still shown.
+    let notice = state.notice.unwrap();
+    assert_eq!(
+        (notice.outcome, notice.text.as_str()),
+        (Outcome::Done, "rescan requested")
+    );
 }
