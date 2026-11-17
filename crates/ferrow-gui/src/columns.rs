@@ -12,7 +12,13 @@ use crate::theme::{self, Palette};
 
 /// Smallest width a column can be dragged to.
 const MIN_WIDTH: f32 = 60.0;
-/// The flexible Folder column never shrinks below this.
+/// The flexible Folder column never shrinks below this: a folder you cannot
+/// read is no use. Other columns give way first.
+const MIN_FOLDER: f32 = 160.0;
+/// In a narrow window Folder is given this much when Name can spare it: room
+/// for the last two folders of a path, which is what tells rows apart.
+const COMFORT_FOLDER: f32 = 200.0;
+/// Smallest the flexible column gets when it is not Folder.
 const MIN_FLEX: f32 = 120.0;
 
 /// One visible column with its horizontal span.
@@ -23,40 +29,115 @@ pub(super) struct Placed {
     pub right: f32,
 }
 
+/// The least width a column keeps before it is left out of a narrow window:
+/// enough to show its content.
+fn useful_width(id: ColumnId) -> f32 {
+    match id {
+        ColumnId::Name => 220.0,
+        ColumnId::Size => 72.0,
+        ColumnId::Modified | ColumnId::Created | ColumnId::Accessed => 128.0,
+        ColumnId::Type => 84.0,
+        _ => MIN_WIDTH,
+    }
+}
+
 /// Place the visible columns between `left` and `right`. Folder (or, if
-/// hidden, the last column) takes the space the fixed columns leave.
+/// hidden, the last column) takes the space the fixed columns leave, and is
+/// never narrower than [`MIN_FOLDER`]. When the window is too narrow for
+/// that, the other columns give way, right to left: first they shrink to a
+/// useful minimum, then Name shrinks, and only then are columns left out of
+/// the view (the saved column choice is untouched).
 pub(super) fn layout(app: &FerrowApp, left: f32, right: f32) -> Vec<Placed> {
-    let visible: Vec<_> = app.settings.columns.iter().filter(|c| c.visible).collect();
+    let visible: Vec<(ColumnId, f32)> = app
+        .settings
+        .columns
+        .iter()
+        .filter(|c| c.visible)
+        .map(|c| (c.id, c.width))
+        .collect();
+    place(&visible, left, right)
+}
+
+fn place(visible: &[(ColumnId, f32)], left: f32, right: f32) -> Vec<Placed> {
     let flex = visible
         .iter()
-        .position(|c| c.id == ColumnId::Folder)
+        .position(|c| c.0 == ColumnId::Folder)
         .unwrap_or(visible.len().saturating_sub(1));
-    let fixed: f32 = visible
+    let min_flex = match visible.get(flex) {
+        Some((ColumnId::Folder, _)) => MIN_FOLDER,
+        _ => MIN_FLEX,
+    };
+    let room = (right - left - min_flex).max(0.0);
+    // Fixed columns: (position, column, width they would like).
+    let mut fixed: Vec<(usize, ColumnId, f32)> = visible
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != flex)
-        .map(|(_, c)| c.width.max(MIN_WIDTH))
-        .sum();
-    let flex_w = (right - left - fixed).max(MIN_FLEX);
+        .map(|(i, c)| (i, c.0, c.1.max(MIN_WIDTH)))
+        .collect();
+    // Leave columns out (rightmost first, never Name) while even their
+    // useful minimums do not fit.
+    while fixed.iter().map(|c| useful_width(c.1)).sum::<f32>() > room {
+        match fixed.iter().rposition(|c| c.1 != ColumnId::Name) {
+            Some(at) => {
+                fixed.remove(at);
+            }
+            None => break,
+        }
+    }
+    // In a narrow view Name stops at its useful width: what it does not need
+    // goes to Folder, whose end (the folder that tells rows apart) is what a
+    // narrow window loses first.
+    // It only happens when Folder would otherwise fall below its minimum,
+    // and Name keeps everything above what Folder is given (up to
+    // COMFORT_FOLDER), never less than its useful width.
+    if fixed.iter().map(|c| c.2).sum::<f32>() > room {
+        let others: f32 = fixed
+            .iter()
+            .filter(|c| c.1 != ColumnId::Name)
+            .map(|c| c.2)
+            .sum();
+        let cap = (right - left - others - COMFORT_FOLDER).max(useful_width(ColumnId::Name));
+        for c in fixed.iter_mut().filter(|c| c.1 == ColumnId::Name) {
+            c.2 = c.2.min(cap);
+        }
+    }
+    // Shrink the rest, right to left, Name last.
+    let mut excess = fixed.iter().map(|c| c.2).sum::<f32>() - room;
+    let order: Vec<usize> = (0..fixed.len())
+        .rev()
+        .filter(|&i| fixed[i].1 != ColumnId::Name)
+        .chain((0..fixed.len()).filter(|&i| fixed[i].1 == ColumnId::Name))
+        .collect();
+    for i in order {
+        if excess <= 0.0 {
+            break;
+        }
+        let min = useful_width(fixed[i].1).min(fixed[i].2);
+        let cut = (fixed[i].2 - min).min(excess);
+        fixed[i].2 -= cut;
+        excess -= cut;
+    }
+    let fixed_sum: f32 = fixed.iter().map(|c| c.2).sum();
+    let flex_w = (right - left - fixed_sum).max(min_flex);
     let mut x = left;
-    visible
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let w = if i == flex {
-                flex_w
-            } else {
-                c.width.max(MIN_WIDTH)
-            };
-            let placed = Placed {
-                id: c.id,
-                left: x,
-                right: x + w,
-            };
-            x += w;
-            placed
-        })
-        .collect()
+    let mut out = Vec::with_capacity(fixed.len() + 1);
+    for (i, (id, _)) in visible.iter().enumerate() {
+        let w = if i == flex {
+            flex_w
+        } else if let Some(c) = fixed.iter().find(|c| c.0 == i) {
+            c.2
+        } else {
+            continue; // left out of this narrow view
+        };
+        out.push(Placed {
+            id: *id,
+            left: x,
+            right: x + w,
+        });
+        x += w;
+    }
+    out
 }
 
 /// Whether the loaded index carries data for a column.
@@ -210,13 +291,9 @@ impl FerrowApp {
                     .size(12.0),
             );
             for cfg in self.settings.columns.iter_mut() {
-                let mut on = cfg.visible;
                 let enabled = cfg.id != ColumnId::Name;
-                if ui
-                    .add_enabled(enabled, egui::Checkbox::new(&mut on, cfg.id.label()))
-                    .changed()
-                {
-                    cfg.visible = on;
+                if check_item(ui, &p, cfg.id.label(), cfg.visible, enabled) {
+                    cfg.visible = !cfg.visible;
                     columns_changed = true;
                 }
             }
@@ -251,6 +328,38 @@ impl FerrowApp {
             self.columns_need_rebuild = !present.contains(wanted);
         }
     }
+}
+
+/// A menu row with a check mark in front when it is on: the same look for
+/// every row (a tick or nothing, never a box), like a Windows 11 menu.
+fn check_item(ui: &mut egui::Ui, p: &Palette, label: &str, checked: bool, enabled: bool) -> bool {
+    let size = vec2(230.0, 30.0);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    if enabled && resp.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink2(vec2(0.0, 1.0)), 4, p.row_hover);
+    }
+    let color = if enabled { p.text } else { p.text_tertiary };
+    let painter = ui.painter();
+    if checked {
+        let c = pos2(rect.left() + 16.0, rect.center().y);
+        let stroke = Stroke::new(1.6, color);
+        painter.line_segment([c + vec2(-4.5, 0.5), c + vec2(-1.5, 3.5)], stroke);
+        painter.line_segment([c + vec2(-1.5, 3.5), c + vec2(4.5, -3.5)], stroke);
+    }
+    painter.text(
+        pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(14.0),
+        color,
+    );
+    enabled && resp.clicked()
 }
 
 fn sort_arrow(painter: &egui::Painter, c: egui::Pos2, descending: bool, color: Color32) {
@@ -392,6 +501,76 @@ mod tests {
         frame(vec![egui::Event::PointerMoved(at)]);
         frame(vec![button(true)]);
         assert_eq!(frame(vec![button(false)]), (true, false));
+    }
+
+    fn defaults() -> Vec<(ColumnId, f32)> {
+        vec![
+            (ColumnId::Name, 320.0),
+            (ColumnId::Folder, 0.0),
+            (ColumnId::Size, 90.0),
+            (ColumnId::Modified, 150.0),
+            (ColumnId::Type, 110.0),
+        ]
+    }
+
+    fn width_of(cols: &[Placed], id: ColumnId) -> Option<f32> {
+        cols.iter().find(|c| c.id == id).map(|c| c.right - c.left)
+    }
+
+    #[test]
+    fn a_wide_window_keeps_every_column_as_chosen() {
+        let cols = place(&defaults(), 0.0, 1000.0);
+        assert_eq!(cols.len(), 5);
+        assert_eq!(width_of(&cols, ColumnId::Name), Some(320.0));
+        assert_eq!(width_of(&cols, ColumnId::Size), Some(90.0));
+        assert_eq!(width_of(&cols, ColumnId::Folder), Some(1000.0 - 670.0));
+    }
+
+    #[test]
+    fn a_narrow_window_keeps_folder_readable_and_gives_way_elsewhere() {
+        let cols = place(&defaults(), 0.0, 520.0);
+        assert!(width_of(&cols, ColumnId::Folder).unwrap() >= MIN_FOLDER);
+        assert!(width_of(&cols, ColumnId::Name).unwrap() >= useful_width(ColumnId::Name));
+        // Name gives up what Folder needs (not below its useful width).
+        assert_eq!(width_of(&cols, ColumnId::Name), Some(230.0));
+        assert!(width_of(&cols, ColumnId::Folder).unwrap() >= COMFORT_FOLDER);
+        // The rightmost column is left out first; the rest fill the width.
+        assert_eq!(width_of(&cols, ColumnId::Type), None);
+        assert!((cols.last().unwrap().right - 520.0).abs() < 0.01);
+        for pair in cols.windows(2) {
+            assert!((pair[0].right - pair[1].left).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn name_is_never_left_out_and_the_chosen_order_is_kept() {
+        for total in [200.0, 300.0, 400.0, 520.0, 700.0] {
+            let cols = place(&defaults(), 0.0, total);
+            assert_eq!(cols.first().map(|c| c.id), Some(ColumnId::Name), "{total}");
+            let order: Vec<_> = cols.iter().map(|c| c.id).collect();
+            let wanted: Vec<_> = defaults()
+                .iter()
+                .map(|c| c.0)
+                .filter(|id| order.contains(id))
+                .collect();
+            assert_eq!(order, wanted, "{total}");
+        }
+    }
+
+    #[test]
+    fn dates_keep_a_width_that_shows_a_date() {
+        let cols = place(&defaults(), 0.0, 640.0);
+        if let Some(w) = width_of(&cols, ColumnId::Modified) {
+            assert!(w >= 128.0, "{w}");
+        }
+    }
+
+    #[test]
+    fn without_a_folder_column_the_last_one_flexes() {
+        let visible = vec![(ColumnId::Name, 320.0), (ColumnId::Size, 90.0)];
+        let cols = place(&visible, 0.0, 700.0);
+        assert_eq!(cols.len(), 2);
+        assert!((cols[1].right - 700.0).abs() < 0.01);
     }
 
     #[test]
