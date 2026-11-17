@@ -229,12 +229,7 @@ mod linux {
     /// `Name:   123 kB` lines of `/proc/self/status`, in bytes.
     fn status_kb(text: &str, key: &str) -> Option<u64> {
         let line = text.lines().find(|l| l.starts_with(key))?;
-        let kb: u64 = line[key.len()..]
-            .trim()
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()?;
+        let kb: u64 = line[key.len()..].split_whitespace().next()?.parse().ok()?;
         Some(kb * 1024)
     }
 
