@@ -7,14 +7,16 @@
 //! published, so a change shows up in results well within a second.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ferrow_ipc::health::{JOURNAL_NONE, JOURNAL_OK, MODE_LIVE, MODE_UNAVAILABLE};
 use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 
+use crate::health::{STATE, VolumeState};
 use crate::live::{Change, HARD_DELTA, Live, RecordSource, RecordState, RescanPolicy};
-use crate::{Snapshot, SnapshotStore};
+use crate::{Snapshot, SnapshotStore, eventlog};
 
 /// How long changes are collected after the first one of a batch.
 const BATCH: Duration = Duration::from_millis(200);
@@ -26,8 +28,121 @@ enum Message {
         device: String,
         records: Vec<(u64, u32)>,
     },
-    /// The journal was deleted, recreated or overrun: rescan.
-    Reset { device: String, reason: String },
+    /// The journal was deleted, recreated or overrun: rescan. `fatal`: the
+    /// reader has stopped and is not restarted until the service restarts.
+    Reset {
+        device: String,
+        reason: String,
+        fatal: bool,
+    },
+    /// An administrator asked for a rescan now.
+    RescanNow,
+}
+
+/// What `next_batch` found.
+enum Batch {
+    Changes(Vec<Change>),
+    Reset {
+        device: String,
+        reason: String,
+        fatal: bool,
+    },
+    RescanNow,
+}
+
+/// Where a requested rescan is delivered: the maintainer's channel.
+static CONTROL: Mutex<Option<Sender<Message>>> = Mutex::new(None);
+
+/// Ask the maintainer for a rescan of every volume now (bypassing the rate
+/// limit once). A scan already running, or one already requested, answers
+/// instead of queueing another.
+pub fn request_rescan() -> (bool, String) {
+    if let Err(why) = STATE.claim_rescan() {
+        return (false, why.into());
+    }
+    let sender = CONTROL.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if sender.is_some_and(|tx| tx.send(Message::RescanNow).is_ok()) {
+        return (
+            true,
+            "rescan requested; every volume is scanned again now".into(),
+        );
+    }
+    STATE.release_rescan();
+    (
+        false,
+        "live updates are not running on this service (no raw volume access, or they stopped); restart the service to rescan"
+            .into(),
+    )
+}
+
+/// A root for comparison: case, separators and the trailing separator ignored.
+fn root_key(root: &str) -> String {
+    root.replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// How each configured root is read and, for volumes read through their MFT,
+/// what the scan found (device, entries, journal).
+fn describe_volumes(
+    options: &WalkOptions,
+    base: &ferrow_index::Index,
+    maps: &[VolumeMap],
+) -> Vec<VolumeState> {
+    let mut buf = Vec::new();
+    let found: Vec<(Vec<String>, &VolumeMap)> = maps
+        .iter()
+        .map(|m| {
+            let roots = m
+                .roots
+                .iter()
+                .map(|&(_, id)| {
+                    base.path_bytes(id, &mut buf);
+                    root_key(&String::from_utf8_lossy(&buf))
+                })
+                .collect();
+            (roots, m)
+        })
+        .collect();
+    options
+        .roots
+        .iter()
+        .map(|root| {
+            let text = root.display().to_string();
+            if options.follow_symlinks {
+                return VolumeState::walked(
+                    text,
+                    "following symbolic links needs a directory walk",
+                );
+            }
+            if !ferrow_walk::is_volume_root(root) {
+                return VolumeState::walked(text, "");
+            }
+            let key = root_key(&text);
+            let Some((_, map)) = found.iter().find(|(roots, _)| roots.contains(&key)) else {
+                let why = if ntfs::can_read_volume(root) {
+                    "the volume is not NTFS or its MFT could not be read; walked instead"
+                } else {
+                    "reading the MFT needs raw volume access (administrator or SYSTEM)"
+                };
+                return VolumeState::walked(text, why);
+            };
+            let journal = map.journal.is_some();
+            VolumeState {
+                root: text,
+                device: Some(map.device.clone()),
+                mode: if journal { MODE_LIVE } else { MODE_UNAVAILABLE },
+                reason: if journal {
+                    String::new()
+                } else {
+                    "this volume has no change journal".into()
+                },
+                entries: Some(map.entries.len() as u64),
+                journal: if journal { JOURNAL_OK } else { JOURNAL_NONE },
+                journal_detail: String::new(),
+            }
+        })
+        .collect()
 }
 
 struct Volumes {
@@ -65,7 +180,7 @@ pub fn start(store: SnapshotStore, options: WalkOptions) {
         .name("index-live".into())
         .spawn(move || maintain(store, options));
     if let Err(error) = spawned {
-        eprintln!("ferrowd: live updates unavailable: {error}");
+        eventlog::error(format!("live updates unavailable: {error}"));
     }
 }
 
@@ -83,6 +198,7 @@ fn background_pool() -> Option<rayon::ThreadPool> {
 
 fn maintain(store: SnapshotStore, options: WalkOptions) {
     let (tx, rx) = channel::<Message>();
+    *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let mut readers: HashMap<String, ()> = HashMap::new();
     let mut reason = "startup".to_string();
     let pool = background_pool();
@@ -90,6 +206,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
     // that index answers searches meanwhile.
     let mut background = !store.get().index.is_empty();
     loop {
+        STATE.scan_started();
         let started = Instant::now();
         let scan = || ferrow_walk::scan_with_maps(&options);
         let (index, report, maps) = match (&pool, background) {
@@ -106,7 +223,8 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         background = true;
         let took = started.elapsed();
         if let Some(fatal) = &report.fatal_error {
-            eprintln!("ferrowd: scan failed: {fatal}");
+            eventlog::error(format!("scan failed: {fatal}"));
+            STATE.scan_failed();
             return;
         }
         let base = Arc::new(index);
@@ -121,7 +239,8 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             },
             took.as_secs_f64()
         );
-        eprintln!("ferrowd: {summary}");
+        eventlog::info(&summary);
+        STATE.scan_finished(&reason, took, describe_volumes(&options, &base, &maps));
         store.swap(Snapshot {
             index: base.clone(),
             live: None,
@@ -150,7 +269,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 Ok(_) => {
                     readers.insert(map.device.clone(), ());
                 }
-                Err(e) => eprintln!("ferrowd: journal reader for {}: {e}", map.device),
+                Err(e) => eventlog::error(format!("journal reader for {}: {e}", map.device)),
             }
         }
         let volumes = Volumes {
@@ -164,7 +283,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 .collect(),
         };
         if volumes.handles.len() != maps.len() {
-            eprintln!("ferrowd: cannot reopen every volume; live updates stopped");
+            eventlog::error("cannot reopen every volume; live updates stopped");
             return;
         }
         let device_index: HashMap<String, usize> = maps
@@ -187,9 +306,22 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 return;
             };
             let changes = match batch {
-                Ok(changes) => changes,
-                Err(reset) => {
-                    rescan.request(reset);
+                Batch::Changes(changes) => changes,
+                Batch::Reset {
+                    device,
+                    reason,
+                    fatal,
+                } => {
+                    eventlog::warn(format!("journal of {device}: {reason}"));
+                    STATE.journal_problem(&device, fatal, &reason);
+                    rescan.request(format!("{device}: {reason}"));
+                    STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                    continue;
+                }
+                Batch::RescanNow => {
+                    eventlog::info("rescan requested by an administrator");
+                    rescan.force(Instant::now(), "requested by an administrator".into());
+                    STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
                     continue;
                 }
             };
@@ -198,11 +330,14 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             }
             let outcome = live.apply(&changes, &volumes);
             if let Some(why) = outcome.rescan {
+                eventlog::info(format!("rescan wanted: {why}"));
                 rescan.request(why);
+                STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
             }
             if outcome.changed == 0 {
                 continue;
             }
+            STATE.add_live_changes(outcome.changed);
             applied_total += outcome.changed;
             let mut report = format!("{summary}; {applied_total} live changes");
             if let Some(why) = rescan.pending() {
@@ -225,20 +360,29 @@ fn next_batch(
     rx: &Receiver<Message>,
     device_index: &HashMap<String, usize>,
     wake_at: Option<Instant>,
-) -> Option<Result<Vec<Change>, String>> {
+) -> Option<Batch> {
     let first = match wake_at {
         None => rx.recv().ok()?,
         Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
             Ok(message) => message,
-            Err(RecvTimeoutError::Timeout) => return Some(Ok(Vec::new())),
+            Err(RecvTimeoutError::Timeout) => return Some(Batch::Changes(Vec::new())),
             Err(RecvTimeoutError::Disconnected) => return None,
         },
     };
     let deadline = Instant::now() + BATCH;
     let mut changes: HashMap<(usize, u64), bool> = HashMap::new();
-    let mut take = |message: Message| -> Result<(), String> {
+    let mut take = |message: Message| -> Result<(), Batch> {
         match message {
-            Message::Reset { device, reason } => Err(format!("{device}: {reason}")),
+            Message::Reset {
+                device,
+                reason,
+                fatal,
+            } => Err(Batch::Reset {
+                device,
+                reason,
+                fatal,
+            }),
+            Message::RescanNow => Err(Batch::RescanNow),
             Message::Records { device, records } => {
                 if let Some(&volume) = device_index.get(&device) {
                     for (record, reason) in records {
@@ -250,15 +394,15 @@ fn next_batch(
             }
         }
     };
-    if let Err(reset) = take(first) {
-        return Some(Err(reset));
+    if let Err(batch) = take(first) {
+        return Some(batch);
     }
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
             Ok(message) => {
-                if let Err(reset) = take(message) {
-                    return Some(Err(reset));
+                if let Err(batch) = take(message) {
+                    return Some(batch);
                 }
             }
             Err(RecvTimeoutError::Timeout) => break,
@@ -274,7 +418,7 @@ fn next_batch(
         })
         .collect();
     out.sort_by_key(|c| (c.volume, c.record));
-    Some(Ok(out))
+    Some(Batch::Changes(out))
 }
 
 fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
@@ -284,6 +428,7 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
             let _ = tx.send(Message::Reset {
                 device,
                 reason: format!("cannot open the volume: {e}"),
+                fatal: true,
             });
             return;
         }
@@ -315,6 +460,7 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
                     let _ = tx.send(Message::Reset {
                         device,
                         reason: format!("change journal keeps failing: {error}"),
+                        fatal: true,
                     });
                     return;
                 }
@@ -324,6 +470,7 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
                     let _ = tx.send(Message::Reset {
                         device,
                         reason: format!("change journal unavailable: {error}"),
+                        fatal: true,
                     });
                     return;
                 };
@@ -333,6 +480,7 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
                     .send(Message::Reset {
                         device: device.clone(),
                         reason: format!("change journal reset: {error}"),
+                        fatal: false,
                     })
                     .is_err()
                 {

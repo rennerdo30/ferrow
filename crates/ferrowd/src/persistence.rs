@@ -59,7 +59,17 @@ impl Persistence {
                     return Ok(());
                 }
                 let index = Arc::downgrade(&snapshot.index);
-                save(config, snapshot)?;
+                let started = Instant::now();
+                let result = save(config, snapshot);
+                let took = started.elapsed();
+                crate::health::STATE.save_done(took, result.as_ref().err().map(|e| e.to_string()));
+                match &result {
+                    Ok(()) => {
+                        crate::eventlog::info(format!("index saved in {:.1} s", took.as_secs_f64()))
+                    }
+                    Err(error) => crate::eventlog::error(format!("index save failed: {error}")),
+                }
+                result?;
                 last = Some(index);
                 Ok(())
             },
@@ -137,7 +147,7 @@ impl Persistence {
                     }
                 })();
                 if let Err(error) = &result {
-                    eprintln!("ferrowd: persistence failed: {error}");
+                    crate::eventlog::error(format!("persistence failed: {error}"));
                     shutdown.request(&config.endpoint);
                 }
                 result

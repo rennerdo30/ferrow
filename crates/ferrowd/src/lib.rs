@@ -25,6 +25,8 @@ pub mod accounts;
 mod admission;
 #[cfg(any(unix, test))]
 mod definition;
+pub mod eventlog;
+pub mod health;
 pub mod install;
 pub mod live;
 #[cfg(windows)]
@@ -286,10 +288,24 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
                 report: "first scan running".into(),
             });
         }
+        health::STATE.scan_started();
         let (snapshot, report) = Snapshot::from_scan(&options);
         for sample in &report.error_samples {
+            // Samples name files: stderr only, never the event log.
             eprintln!("ferrowd: warning: {sample}");
         }
+        if report.errors > 0 {
+            eventlog::warn(format!("the first scan met {} errors", report.errors));
+        }
+        health::STATE.scan_finished(
+            "startup",
+            report.elapsed,
+            options
+                .roots
+                .iter()
+                .map(|r| health::VolumeState::walked(r.display().to_string(), ""))
+                .collect(),
+        );
         if let Some(path) = &config.index_path {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -693,8 +709,8 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
         // one-way and never receives a separate reply under Cancel's own id.
         Request::Cancel { .. } => vec![],
         Request::Hello { .. } => vec![bad_request("unexpected Hello".into())],
-        Request::AccessInfo => vec![bad_request(
-            "access info is answered before the snapshot is touched".into(),
+        Request::AccessInfo | Request::Health | Request::Rescan => vec![bad_request(
+            "answered with the caller's identity, before the snapshot is touched".into(),
         )],
     }
 }
@@ -762,11 +778,38 @@ fn handle_authorized_cancel(
             caller.uid.is_some() && caller.uid == owner.uid
         }
     };
+    if matches!(request, Request::Health | Request::Rescan) {
+        return with_policy(access, |policy| {
+            let scope = health::Scope {
+                system,
+                allowed,
+                state: &health::STATE,
+                store,
+                policy,
+            };
+            health::answer(&request, caller, &scope, rescan_now)
+        });
+    }
     if !allowed {
         return vec![Response::Error { code: ErrorCode::Unauthorized,
             msg: "per-user visibility not yet available; the system service answers SYSTEM, accounts in the Administrators group (not sandboxed), root and accounts an administrator allowed with `ferrow service access`; development access requires its owner".into() }];
     }
     handle_cancel(store, request, cancel)
+}
+
+/// Ask the live maintainer for a rescan of every volume now: `(started, message)`.
+fn rescan_now() -> (bool, String) {
+    #[cfg(windows)]
+    {
+        live_windows::request_rescan()
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            false,
+            "this platform's service scans when it starts; restart it to rescan".into(),
+        )
+    }
 }
 
 /// Cooperative shutdown with persistent listener cancellation. Registration
@@ -824,12 +867,16 @@ pub fn serve(
     shutdown.register(&listener)?;
     let owner = CallerIdentity::current()?;
     let system = config.endpoint == Endpoint::default_service();
+    health::STATE.mark_started();
+    if system && let Some(index) = &config.index_path {
+        eventlog::attach_beside(index);
+    }
     // The development endpoint ignores the policy: it serves its owner only.
     let access = if system {
         // Read what the account rules need (the Unix UID_MIN) now, not on a request.
         CallerIdentity::prime_account_rules();
         let store = Arc::new(access::PolicyStore::open(access::default_path()?));
-        eprintln!("ferrowd: access policy: {}", store.current().mode.as_str());
+        eventlog::info(format!("access policy: {}", store.current().mode.as_str()));
         Some(store)
     } else {
         None
@@ -839,7 +886,7 @@ pub fn serve(
     if !config.roots.is_empty() {
         live_windows::start(store.clone(), config.walk_options());
     }
-    eprintln!("ferrowd: listening on {}", config.endpoint);
+    eventlog::info(format!("listening on {}", config.endpoint));
     let budget = admission::Admission::new(32);
     let mut workers: Vec<(ferrow_ipc::Stream, std::thread::JoinHandle<()>)> =
         Vec::with_capacity(32);
@@ -889,7 +936,7 @@ pub fn serve(
                     if let Err(error) = result
                         && !stopping.is_requested()
                     {
-                        eprintln!("ferrowd: connection closed: {error}");
+                        eventlog::warn(format!("connection closed: {error}"));
                     }
                 })?;
             workers.push((control, thread));
@@ -935,7 +982,7 @@ pub fn serve_foreground(config: &DaemonConfig) -> std::io::Result<()> {
     };
     let result = (|| {
         let store = SnapshotStore::new(initial_snapshot(config)?);
-        eprintln!("ferrowd: {}", store.get().report);
+        eventlog::info(store.get().report.clone());
         serve(config, store, shutdown)
     })();
     #[cfg(unix)]

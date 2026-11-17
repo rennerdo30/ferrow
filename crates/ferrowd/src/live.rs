@@ -70,8 +70,20 @@ impl RescanPolicy {
         self.pending.get_or_insert(reason);
     }
 
+    /// An administrator asked for a rescan now: it replaces the waiting
+    /// reason and is not held back by the rate limit.
+    pub fn force(&mut self, now: Instant, reason: String) {
+        self.pending = Some(reason);
+        self.earliest = now;
+    }
+
     pub fn pending(&self) -> Option<&str> {
         self.pending.as_deref()
+    }
+
+    /// When a pending rescan may start.
+    pub fn earliest(&self) -> Instant {
+        self.earliest
     }
 
     /// The reason to rescan now: one is pending and its gap has passed, or
@@ -815,6 +827,30 @@ mod tests {
         let mut p = RescanPolicy::after_scan(t0, Duration::from_secs(10));
         p.request("x".into());
         assert_eq!(p.due(t0, true).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn a_requested_rescan_skips_the_rate_limit_once() {
+        let t0 = Instant::now();
+        let mut p = RescanPolicy::after_scan(t0, Duration::from_secs(180));
+        p.request("50001 live changes".into());
+        assert_eq!(
+            p.due(t0 + Duration::from_secs(60), false),
+            None,
+            "rate limited"
+        );
+        p.force(
+            t0 + Duration::from_secs(60),
+            "requested by an administrator".into(),
+        );
+        assert_eq!(
+            p.due(t0 + Duration::from_secs(60), false).as_deref(),
+            Some("requested by an administrator"),
+            "the request replaces the waiting reason and starts now"
+        );
+        // The next scan is rate limited again.
+        let p = RescanPolicy::after_scan(t0 + Duration::from_secs(61), Duration::from_secs(180));
+        assert_eq!(p.earliest(), t0 + Duration::from_secs(61 + 27 * 60));
     }
 
     #[test]

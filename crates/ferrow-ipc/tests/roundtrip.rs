@@ -250,7 +250,9 @@ fn handler(request: Request) -> Vec<Response> {
         Request::Hello { .. }
         | Request::Page { .. }
         | Request::Watch { .. }
-        | Request::AccessInfo => vec![],
+        | Request::AccessInfo
+        | Request::Health
+        | Request::Rescan => vec![],
     }
 }
 
@@ -356,4 +358,69 @@ fn default_and_user_endpoints_are_named_as_documented() {
         assert_eq!(service, "/private/var/run/ferrow/ferrowd.sock");
     }
     assert!(Endpoint::user_service().display().contains("ferrowd-user-"));
+}
+
+#[test]
+fn health_and_rescan_are_served_like_any_request() {
+    use ferrow_ipc::health::Health;
+    let endpoint = test_endpoint("health");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve_stream(stream, |request| match request {
+            Request::Health => vec![Response::Health(Box::new(Health {
+                pid: 77,
+                ..Health::default()
+            }))],
+            Request::Rescan => vec![Response::Rescan {
+                started: true,
+                msg: "requested".into(),
+            }],
+            _ => vec![],
+        })
+    });
+    let mut client = Client::connect(&endpoint).unwrap();
+    assert_eq!(client.health().unwrap().pid, 77);
+    assert_eq!(client.rescan().unwrap(), (true, "requested".to_string()));
+    drop(client);
+    server.join().unwrap().unwrap();
+}
+
+/// A service from before `Health` never answers it: the client must give up
+/// at its own deadline with a plain I/O error (not a server error code), so
+/// callers can say "the service is older, or busy" instead of hanging.
+#[test]
+fn an_older_service_that_never_answers_health_times_out_gracefully() {
+    let endpoint = test_endpoint("old-health");
+    let listener = Listener::bind(&endpoint).unwrap();
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        ferrow_ipc::server_handshake(&mut stream).unwrap();
+        // The request arrives and is dropped without a reply, as an old
+        // service does with a kind it does not know.
+        let _ = read_message(&mut stream);
+        let _ = gate.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(400);
+    let mut client = loop {
+        match Client::connect_deadline(&endpoint, deadline) {
+            Ok(client) => break client,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("connect: {e}"),
+        }
+    };
+    let error = client.health().unwrap_err();
+    assert_eq!(ferrow_ipc::error_code(&error), None, "{error}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "health waited {:?} instead of stopping at its deadline",
+        started.elapsed()
+    );
+    release.send(()).unwrap();
+    drop(client);
+    server.join().unwrap();
 }
