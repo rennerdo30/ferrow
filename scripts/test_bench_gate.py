@@ -26,6 +26,20 @@ def fixture(language=True):
     return "\n".join(lines)
 
 
+def with_cold(text, special=None, cold_first=0.2, cold_full=10):
+    """Give every query row its cold samples; `special` maps a row prefix to (first, full)."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith(("FERROW-QUERY ", "FERROW-SERVICE ")):
+            first, full = cold_first, cold_full
+            for prefix, values in (special or {}).items():
+                if line.startswith(prefix):
+                    first, full = values
+            line += f" first_page_cold_ms={first} full_count_cold_ms={full}"
+        out.append(line)
+    return "\n".join(out)
+
+
 def without_service(text):
     return "\n".join(line for line in text.splitlines() if not line.startswith("FERROW-SERVICE"))
 
@@ -53,7 +67,7 @@ class GateTests(unittest.TestCase):
                 for field in ("probe","binary","index"):
                     args.extend([f"--{arm}-{field}",str(root/field)])
             def measure(_args,arm,kind,*_):
-                return 1,16 if kind=="load" else 2,42,800,16
+                return 1,16 if kind=="load" else 2,42,800,16,1
             with patch.object(sys,"argv",args),patch.object(gate,"probe",side_effect=measure),patch.object(gate,"publish") as publish:
                 self.assertEqual(gate.main(),0)
                 self.assertIn("Required head-only",publish.call_args.args[0])
@@ -237,7 +251,7 @@ class GateTests(unittest.TestCase):
         calls = []
         def measure(*args):
             calls.append(args)
-            return (1 if args[0] == "base" else 1.05), 2, 42, 800, 16
+            return (1 if args[0] == "base" else 1.05), 2, 42, 800, 16, 1
         rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
         self.assertFalse(any(row[-1] for row in rows))
         # Sub-millisecond first pages collect 10 balanced samples (FR-31).
@@ -252,11 +266,11 @@ class GateTests(unittest.TestCase):
     def test_retry_repeat_breach_fails_and_bad_evidence_refuses(self):
         self.head[0]["load_ms_median"] = 200
         rows = gate.retry_failures(self.rows(), self.base, self.head,
-                                   lambda arm, *_: (100 if arm == "base" else 111, 16, 0, 800, 16))
+                                   lambda arm, *_: (100 if arm == "base" else 111, 16, 0, 800, 16, 1))
         self.assertTrue(any(row[-1] for row in rows))
         for bad in ((float("nan"), 16), (100, 17), (-1, 16)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: (*bad, 0, 800, 16))
+                gate.retry_failures(self.rows(), self.base, self.head, lambda *_: (*bad, 0, 800, 16, 1))
 
     def test_retry_pass_does_not_run_producers(self):
         def unexpected(*_):
@@ -268,7 +282,7 @@ class GateTests(unittest.TestCase):
         values = {"base": iter([999, 1, 50, 2, 100, 3]), "head": iter([999, 2, 60, 3, 90, 4])}
         def measure(arm, *_):
             calls.append(arm)
-            return next(values[arm]), 2, 42, 800, 16
+            return next(values[arm]), 2, 42, 800, 16, 1
         result = gate.interleaved(measure, "IPC", "a", "first_page_ms", trace=trace)
         self.assertEqual(calls, ["base", "head", "base", "head", "head", "base", "base", "head", "head", "base", "base", "head"])
         self.assertEqual((result["base"][0], result["head"][0]), (3, 4))
@@ -276,9 +290,11 @@ class GateTests(unittest.TestCase):
 
     def wildcard_head(self, median, cold):
         row = 'query="*.log" first_page_ms=0.2 page_hits=2 full_count_ms=10 total_hits=2'
-        text = fixture().replace(row, row.replace("first_page_ms=0.2", f"first_page_ms={median}")
-                                 + (f" first_page_cold_ms={cold}" if cold is not None else ""))
-        return gate.compare(gate.parse(fixture(language=False), require_new=False), gate.parse(text), 16)
+        text = fixture().replace(row, row.replace("first_page_ms=0.2", f"first_page_ms={median}"))
+        if cold is not None:
+            text = with_cold(text, {"FERROW-QUERY query=\"*.log\"": (cold, 10), "FERROW-SERVICE query=\"*.log\"": (cold, 10)})
+        return gate.compare(gate.parse(fixture(language=False), require_new=False),
+                            gate.parse(text, require_cold=cold is not None), 16)
 
     def test_absolute_limits_are_judged_on_the_cold_sample_not_the_repeated_median(self):
         names = ["new-language in-process '*.log' first_page_ms", "new-language IPC '*.log' first_page_ms"]
@@ -306,7 +322,7 @@ class GateTests(unittest.TestCase):
                                    base_index=Path(folder)/"fixture", head_index=Path(folder)/"fixture", entries=16)
             def measure(arm, kind, query, operation):
                 # repeated median 1 ms, cold sample 7 ms
-                return (1, 16, 42, 800, 16) if kind == "load" else (1, 2, 42, 800, 16, 7)
+                return (1, 16, 42, 800, 16, 1) if kind == "load" else (1, 2, 42, 800, 16, 7)
             gate.measure_pair(args, measure, [])
             head_text = args.head.read_text(encoding="utf-8")
             self.assertIn("first_page_cold_ms=7.000000000", head_text)
@@ -323,12 +339,66 @@ class GateTests(unittest.TestCase):
             result = gate.interleaved(measure, "IPC", "a", "first_page_ms")
             self.assertEqual((result["base"][0], result["base"][5]), (1, 7))
 
+    def test_cold_samples_are_all_or_none_per_file_and_required_when_producers_ran(self):
+        full = with_cold(fixture())
+        gate.parse(full, require_cold=True)
+        gate.parse(fixture())  # legacy file: none at all is fine
+        with self.assertRaises(ValueError):
+            gate.parse(fixture(), require_cold=True)
+        # One row with a cold field, or one row missing it, in an otherwise complete file.
+        one = fixture().replace('FERROW-SERVICE query="a" first_page_ms=0.2', 'FERROW-SERVICE query="a" first_page_cold_ms=1 first_page_ms=0.2', 1)
+        with self.assertRaises(ValueError):
+            gate.parse(one)
+        lines = full.splitlines()
+        index = next(i for i, line in enumerate(lines) if line.startswith("FERROW-QUERY") and 'query="re"' in line)
+        lines[index] = lines[index].replace(" first_page_cold_ms=0.2", "")
+        for require in (False, True):
+            with self.assertRaises(ValueError):
+                gate.parse("\n".join(lines), require_cold=require)
+
+    def test_a_sample_without_its_cold_value_is_never_substituted(self):
+        with self.assertRaisesRegex(ValueError, "cold first sample"):
+            gate.interleaved(lambda *_: (1, 2, 42, 800, 16), "IPC", "a", "first_page_ms")
+
+    def test_main_fails_closed_on_missing_cold_samples(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            def run(measure, base_text, head_text, extra):
+                (root / "base.txt").write_text(base_text, encoding="utf-8")
+                (root / "head.txt").write_text(head_text, encoding="utf-8")
+                argv = ["bench-gate.py", str(root / "base.txt"), str(root / "head.txt"), "--entries", "16", *extra]
+                for arm in ("base", "head"):
+                    for field in ("probe", "binary", "index"):
+                        argv += [f"--{arm}-{field}", str(root / "shared") if field == "index" else str(root / field)]
+                with patch.object(sys, "argv", argv), patch.object(gate, "publish"), patch.object(gate, "probe", side_effect=measure), patch("sys.stderr"):
+                    return gate.main()
+            # Producers ran (--measure) but one returns no cold sample: refused.
+            five = lambda _a, arm, kind, *_: (1, 16 if kind == "load" else 2, 42, 800, 16)
+            self.assertEqual(run(five, "", "", ["--measure"]), 2)
+            # Files from producers (no --measure) that carry cold samples on only some rows: refused.
+            partial = with_cold(fixture()).replace(" first_page_cold_ms=0.2 full_count_cold_ms=10", "", 1)
+            self.assertEqual(run(five, with_cold(fixture(language=False)), partial, []), 2)
+            self.assertEqual(run(five, with_cold(fixture(language=False)), with_cold(fixture()), []), 0)
+
+    def test_the_smoke_step_accepts_exactly_exit_codes_0_1_and_3(self):
+        import re
+        text = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        step = text.split("Smoke interleaved collection on the shared 16-entry fixture", 1)[1].split("\n      - name:", 1)[0]
+        tests = [line.strip() for line in step.splitlines() if line.strip().startswith("test ")]
+        self.assertEqual(len(tests), 1, tests)
+        self.assertNotIn(" -a ", tests[0])
+        terms = re.findall(r'"\$result" -(le|lt|eq|ne|ge|gt) (\d+)', tests[0])
+        self.assertEqual(len(terms), tests[0].count('"$result"'))
+        compare = {"le": int.__le__, "lt": int.__lt__, "eq": int.__eq__, "ne": int.__ne__, "ge": int.__ge__, "gt": int.__gt__}
+        accepted = [code for code in range(0, 8) if any(compare[op](code, int(n)) for op, n in terms)]
+        self.assertEqual(accepted, [0, 1, 3])
+
     def test_submillisecond_first_pages_take_ten_balanced_samples(self):
         def run(value, kind="IPC", operation="first_page_ms", head_value=None):
             calls = []
             def measure(arm, *_):
                 calls.append(arm)
-                return (head_value if arm == "head" and head_value is not None else value), 2, 42, 800, 16
+                return (head_value if arm == "head" and head_value is not None else value), 2, 42, 800, 16, 1
             result = gate.interleaved(measure, kind, "a", operation)
             return calls, result
         calls, result = run(0.5)
@@ -351,7 +421,7 @@ class GateTests(unittest.TestCase):
             def measure(*_):
                 nonlocal calls
                 calls += 1
-                sample = [1, 2, 42, 800, 16]
+                sample = [1, 2, 42, 800, 16, 1]
                 if calls == 3:
                     sample[slot] += 1
                 return tuple(sample)
@@ -366,7 +436,7 @@ class GateTests(unittest.TestCase):
             calls, trace = [], []
             def measure(arm, kind, query, operation):
                 calls.append((arm, kind, query, operation))
-                return 1, 16 if kind == "load" else 2, 42, 800, 16
+                return 1, 16 if kind == "load" else 2, 42, 800, 16, 1
             gate.measure_pair(args, measure, trace)
             rows = gate.compare(gate.parse(args.base.read_text(encoding="utf-8"), require_new=False), gate.parse(args.head.read_text(encoding="utf-8")), 16)
             self.assertEqual(len(rows), 50)
@@ -391,7 +461,7 @@ class GateTests(unittest.TestCase):
         values = iter([999, 1, 50, 2, 100, 3])
         def measure(arm, kind, query, operation):
             calls.append((arm, query))
-            return (next(values), 3, 99, 800, 16) if query == "*.log" else (5, 2, 42, 800, 16)
+            return (next(values), 3, 99, 800, 16, 1) if query == "*.log" else (5, 2, 42, 800, 16, 1)
         result = gate.interleaved(measure, "IPC", "a", "first_page_ms",
                                   observation=("IPC", "*.log", "first_page_ms"))
         a, b, c = ("base", "a"), ("head", "a"), ("head", "*.log")
@@ -401,7 +471,7 @@ class GateTests(unittest.TestCase):
             observed = 0
             def broken(arm, kind, query, operation):
                 nonlocal observed
-                sample = [1, 2, 42, 800, 16]
+                sample = [1, 2, 42, 800, 16, 1]
                 if query == "*.log":
                     observed += 1
                     if observed == 3:
@@ -422,7 +492,7 @@ class GateTests(unittest.TestCase):
         calls = []
         def measure(arm, kind, query, operation):
             calls.append((arm, kind, query, operation))
-            return 1, 2, 42, 800, 16
+            return 1, 2, 42, 800, 16, 1
         rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
         self.assertTrue(any(row[-1] for row in rows))
         self.assertEqual(len(calls), 22)  # 1 ms first page: 2 warm-ups + 10 samples per arm
@@ -452,7 +522,7 @@ class GateTests(unittest.TestCase):
                 for field in ("probe", "binary", "index"):
                     argv += [f"--{arm}-{field}", "dummy"]
             with patch.object(sys, "argv", argv), patch.object(gate, "publish") as publish, \
-                    patch.object(gate, "probe", side_effect=lambda *args: (100, 16, 0, 800, 16)) as probe:
+                    patch.object(gate, "probe", side_effect=lambda *args: (100, 16, 0, 800, 16, 1)) as probe:
                 self.assertEqual(gate.main(), 0)
                 self.assertEqual(probe.call_count, 8)
                 self.assertIn("One paired latency remeasurement", publish.call_args.args[0])
@@ -546,15 +616,16 @@ class ConfirmationRoundTests(unittest.TestCase):
             with patch.object(sys, "argv", argv), patch.object(gate, "publish") as publish, \
                     patch.object(gate, "probe", side_effect=producer) as probe, \
                     patch("sys.stderr"):
+                self.publish_mock = publish
                 code = gate.main()
-            return code, probe, publish.call_args.args[0]
+            return code, probe, "".join(call.args[0] for call in publish.call_args_list)
 
     def spike(self):
         return fixture().replace('FERROW-SERVICE query="a" first_page_ms=0.2', 'FERROW-SERVICE query="a" first_page_ms=4', 1)
 
     @staticmethod
     def steady(_args, arm, kind, query, operation):
-        return (0.2 if operation == "first_page_ms" else 10), 2, 0, 800, 16
+        return (0.2 if operation == "first_page_ms" else 10), 2, 0, 800, 16, 1
 
     def test_single_round_spike_passes_and_is_reported(self):
         code, probe, report = self.run_main(self.spike(), self.steady)
@@ -566,7 +637,7 @@ class ConfirmationRoundTests(unittest.TestCase):
 
     def test_persistent_regression_fails_in_both_rounds(self):
         code, probe, report = self.run_main(
-            self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
+            self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1))
         self.assertEqual(code, 1)
         self.assertIn("confirmed regression", report)
 
@@ -575,50 +646,50 @@ class ConfirmationRoundTests(unittest.TestCase):
         name = "IPC 'a' first_page_ms"
         for slow_arm in ("base", "head"):
             def biased(arm, *_):
-                return (4 if arm == slow_arm else 0.2), 2, 0, 800, 16
+                return (4 if arm == slow_arm else 0.2), 2, 0, 800, 16, 1
             with self.subTest(slow_arm=slow_arm):
                 self.assertTrue(gate.control_rows([name], base, biased)[0][-1])
-        control = gate.control_rows([name], base, lambda arm, *_: (0.2, 2, 0, 800, 16))
+        control = gate.control_rows([name], base, lambda arm, *_: (0.2, 2, 0, 800, 16, 1))
         self.assertFalse(control[0][-1])
         self.assertIn("identical binaries within the limit", gate.control_table(control))
 
     def test_confirmed_regression_with_clean_control_is_still_a_regression(self):
         code, probe, report = self.run_main(
-            self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
+            self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1))
         self.assertEqual(code, 1)
         self.assertIn("A/A control", report)
         self.assertIn("identical binaries within the limit", report)
-        self.assertNotIn("Benchmark harness biased", report)
+        self.assertNotIn("Harness unresolved: identical", report)
         # The control always runs the head binaries, in both arms.
         self.assertTrue(all(call.args[1] == "head" for call in probe.call_args_list[-12:]))
 
     def test_biased_harness_is_reported_not_called_a_regression(self):
-        producer = lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16)
-        def control(names, base, measure):
+        producer = lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1)
+        def control(names, base, measure, trace=None):
             return [(name, 0.2, 4, True) for name in names]
         with patch.object(gate, "control_rows", side_effect=control):
             code, _, report = self.run_main(self.spike(), producer)
         self.assertEqual(code, 3)
-        self.assertIn("Benchmark harness biased", report)
-        self.assertIn("not evidence of a regression", report)
+        self.assertIn("Harness unresolved: identical binaries also differ. Rerun; do not merge on this result.", report)
+        self.assertNotIn("not evidence of a regression", report)
 
     def test_one_clean_control_keeps_the_regression_verdict(self):
         two = self.spike().replace('FERROW-SERVICE query="re" first_page_ms=0.2', 'FERROW-SERVICE query="re" first_page_ms=4', 1)
-        def control(names, base, measure):
+        def control(names, base, measure, trace=None):
             self.assertEqual(len(names), 2)
             return [(name, 0.2, 4, index == 0) for index, name in enumerate(names)]
         with patch.object(gate, "control_rows", side_effect=control):
-            code, _, report = self.run_main(two, lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
+            code, _, report = self.run_main(two, lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1))
         self.assertEqual(code, 1)
-        self.assertNotIn("Benchmark harness biased", report)
+        self.assertNotIn("Harness unresolved: identical", report)
 
     def test_metadata_refusal_does_not_hide_the_paired_result(self):
         # FR-30 (core + 15% load) is a separate, known failure; the paired rows are still
         # re-measured, controlled and reported before the gate refuses.
         def refuse(*_):
             raise ValueError("default-column load target exceeded (core + 15%)")
-        control = lambda names, base, measure: [(n, 0.2, 4, False) for n in names]
-        regression = lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16)
+        control = lambda names, base, measure, trace=None: [(n, 0.2, 4, False) for n in names]
+        regression = lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1)
         with patch.object(gate, "metadata_observations", side_effect=refuse), \
                 patch.object(gate, "control_rows", side_effect=control):
             code, probe, report = self.run_main(self.spike(), regression, extra=("--require-metadata",))
@@ -627,7 +698,7 @@ class ConfirmationRoundTests(unittest.TestCase):
         self.assertIn("One paired latency remeasurement", report)
         self.assertIn("A/A control", report)
         self.assertIn("default-column load target exceeded", report)
-        self.assertNotIn("Benchmark harness biased", report)
+        self.assertNotIn("Harness unresolved: identical", report)
 
     def test_control_never_runs_for_a_passing_gate_or_a_memory_failure(self):
         with patch.object(gate, "control_rows") as control:
@@ -635,6 +706,106 @@ class ConfirmationRoundTests(unittest.TestCase):
             self.run_main(self.spike(), self.steady)
             self.run_main(self.spike().replace("heap_bytes=800", "heap_bytes=1000"), self.steady)
         control.assert_not_called()
+
+    @staticmethod
+    def regression(_args, arm, *_):
+        return (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1)
+
+    def test_round_two_report_is_published_before_the_control_runs(self):
+        order = []
+        def control(names, base, measure, trace=None):
+            published = "".join(call.args[0] for call in self.publish_mock.call_args_list)
+            order.append((self.publish_mock.call_count, "One paired latency remeasurement" in published, "A/A control" in published))
+            return [(name, 0.2, 0.2, False) for name in names]
+        with patch.object(gate, "control_rows", side_effect=control):
+            code, _, report = self.run_main(self.spike(), self.regression)
+        self.assertEqual(code, 1)
+        self.assertEqual(order, [(1, True, False)])  # one publish, round 2 in it, no control yet
+        self.assertEqual(self.publish_mock.call_count, 2)
+        self.assertEqual(report.count("### One paired latency remeasurement"), 1)  # not published twice
+        self.assertEqual(report.count("### A/A control"), 1)
+        self.assertEqual(report.count("### Sample order"), 1)
+
+    def test_a_failing_control_still_leaves_the_round_two_report_published(self):
+        def broken(names, base, measure, trace=None):
+            raise subprocess.TimeoutExpired("probe", 120)
+        with patch.object(gate, "control_rows", side_effect=broken):
+            code, _, report = self.run_main(self.spike(), self.regression)
+        self.assertEqual(code, 2)
+        self.assertIn("confirmed regression", report)
+        self.assertIn("refused", report)
+
+    def spiked_rows(self, count):
+        """A head file with `count` paired first-page rows over their limit."""
+        text = fixture()
+        targets = [("FERROW-QUERY", q) for q in sorted(gate.QUERIES)] + [("FERROW-SERVICE", q) for q in sorted(gate.QUERIES)]
+        for prefix, query in targets[:count]:
+            text = text.replace(f'{prefix} query="{query}" first_page_ms=0.2', f'{prefix} query="{query}" first_page_ms=4', 1)
+        return text
+
+    def test_a_broad_failure_skips_the_control_and_exits_1_directly(self):
+        calls = []
+        def control(names, base, measure, trace=None):
+            calls.append(len(names))
+            return [(name, 0.2, 4, True) for name in names]
+        with patch.object(gate, "control_rows", side_effect=control):
+            code, _, report = self.run_main(self.spiked_rows(gate.MAX_CONTROL_ROWS), self.regression)
+            self.assertEqual((code, calls), (3, [gate.MAX_CONTROL_ROWS]))  # 8 rows: the control still runs
+            calls.clear()
+            code, _, report = self.run_main(self.spiked_rows(gate.MAX_CONTROL_ROWS + 1), self.regression)
+        self.assertEqual((code, calls), (1, []))  # 9 rows: not plausibly harness bias
+        self.assertIn("no A/A control was run", report)
+        self.assertNotIn("Harness unresolved", report)
+
+    def test_the_control_sample_order_is_reported_with_its_own_label(self):
+        with patch.object(gate, "control_rows", wraps=gate.control_rows) as control:
+            code, _, report = self.run_main(self.spike(), lambda _a, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1))
+        self.assertEqual(code, 1)
+        self.assertTrue(control.call_args.args[3][-1].startswith("| A/A control: "))  # the trace list reaches the control
+        self.assertIn("| A/A control: IPC 'a' first_page_ms |", report)
+
+    def test_metadata_refusal_wins_over_a_biased_control(self):
+        # Mutation guard: a biased control must not turn the refusal (2) into 3.
+        def refuse(*_):
+            raise ValueError("default-column load target exceeded (core + 15%)")
+        biased = lambda names, base, measure, trace=None: [(n, 0.2, 4, True) for n in names]
+        with patch.object(gate, "metadata_observations", side_effect=refuse), patch.object(gate, "control_rows", side_effect=biased):
+            code, _, report = self.run_main(self.spike(), self.regression, extra=("--require-metadata",))
+        self.assertEqual(code, 2)
+        self.assertIn("default-column load target exceeded", report)
+        self.assertNotIn("Harness unresolved: identical", report)
+
+    def test_an_absolute_limit_failure_beside_biased_paired_rows_is_still_exit_1(self):
+        # Mutation guard: only paired timing rows may be excused by the control.
+        head = with_cold(self.spike(), {'FERROW-QUERY query="*.log"': (17, 10), 'FERROW-SERVICE query="*.log"': (17, 10)})
+        biased = lambda names, base, measure, trace=None: [(n, 0.2, 4, True) for n in names]
+        with patch.object(gate, "control_rows", side_effect=biased):
+            code, _, report = self.run_main(head, self.regression)
+        self.assertEqual(code, 1)
+        self.assertNotIn("Harness unresolved: identical", report)
+
+    def test_a_real_control_run_end_to_end_returns_3_when_identical_binaries_differ(self):
+        real = gate.control_rows
+        phase = {"control": False, "n": 0}
+        def wrapped(names, base, measure, trace=None):
+            phase["control"] = True
+            return real(names, base, measure, trace)
+        def producer(_args, arm, *_):
+            if not phase["control"]:
+                return (0.2 if arm == "base" else 4, 2, 0, 800, 16, 1)
+            phase["n"] += 1  # identical binaries, but the second half of the control runs slow
+            return (0.2 if phase["n"] <= 11 else 4, 2, 0, 800, 16, 1)
+        with patch.object(gate, "control_rows", side_effect=wrapped):
+            code, probe, report = self.run_main(self.spike(), producer)
+        self.assertEqual(code, 3)
+        self.assertIn("Harness unresolved: identical binaries also differ. Rerun; do not merge on this result.", report)
+        self.assertIn("harness unresolved", report)  # the control table row
+        self.assertIn("confirmed regression", report)  # round 2 is still reported
+        # And a quiet control keeps the regression verdict through the same real path.
+        phase.update(control=False, n=0)
+        with patch.object(gate, "control_rows", side_effect=wrapped):
+            code, _, report = self.run_main(self.spike(), lambda _a, arm, *_: (0.2 if arm == "base" or phase["control"] else 4, 2, 0, 800, 16, 1))
+        self.assertEqual(code, 1)
 
     def test_nothing_over_runs_no_second_round(self):
         code, probe, report = self.run_main(fixture(), self.steady)

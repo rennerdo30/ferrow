@@ -40,6 +40,8 @@ MIN_PROBE_REPEATS = 3
 # where the 0.1 ms absolute tolerance dominates, collect 10 balanced samples.
 SUBMS_LIMIT_MS = 2.0
 SUBMS_SAMPLES = 10
+# The A/A control is for isolated rows: a broad failure is not plausibly harness bias.
+MAX_CONTROL_ROWS = 8
 
 
 def number(value):
@@ -49,7 +51,10 @@ def number(value):
     return value
 
 
-def parse(text, require_new=True):
+COLD_KEYS = ("first_page_cold_ms", "full_count_cold_ms")
+
+
+def parse(text, require_new=True, require_cold=False):
     measures, queries, service = {}, {}, {}
     for line in text.splitlines():
         prefix, _, body = line.partition(" ")
@@ -68,8 +73,7 @@ def parse(text, require_new=True):
             target[query] = {key: number(fields[key]) for key in (
                 "first_page_ms", "full_count_ms", "page_hits", "total_hits")}
             # Optional: the cold first sample (see probe); absent in legacy single-sample files.
-            target[query].update({key: number(fields[key]) for key in (
-                "first_page_cold_ms", "full_count_cold_ms") if key in fields})
+            target[query].update({key: number(fields[key]) for key in COLD_KEYS if key in fields})
     for key in ("entries", "seed", "heap_bytes", "bytes_per_entry", "load_ms_median"):
         if key not in measures:
             raise ValueError(f"missing measurement: {key}")
@@ -82,6 +86,13 @@ def parse(text, require_new=True):
     # missing evidence, never a reason to compare fewer metrics.
     if set(service) != expected:
         raise ValueError("missing or unexpected service (IPC) query set")
+    # Cold samples are all-or-none per file: a partly cold file would silently judge
+    # some rows on the cold sample and others on the median. Producers that ran in
+    # this job (require_cold) must always have written them.
+    records = [*queries.values(), *service.values()]
+    complete = all(key in record for record in records for key in COLD_KEYS)
+    if (require_cold or any(key in record for record in records for key in COLD_KEYS)) and not complete:
+        raise ValueError("cold first samples must be present on every query row of a file, or on none")
     return measures, queries, service
 
 
@@ -265,7 +276,7 @@ def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=N
     return rows, report
 
 
-def interleaved(measure, kind, query, operation, expected=None, trace=None, observation=None):
+def interleaved(measure, kind, query, operation, expected=None, trace=None, observation=None, tag=""):
     """Warm both arms, then sample ABBA, optionally interleaving head-only C.
 
     C runs the new-syntax descriptor on head and never participates in the
@@ -294,13 +305,16 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
         for arm in arms:
             order.append(("warm " if warmup else "") + {"base": "A", "head": "B", "observation": "C"}[arm])
             if trace is not None:
-                label = f"{kind} {query!r} {operation}"
+                label = f"{tag}{kind} {query!r} {operation}"
                 if observation is not None:
                     label += f"; C = head-only {observation[1]!r} {observation[2]}"
                 trace[trace_index] = f"| {label.replace('|', chr(92) + '|')} | {' '.join(order)} |"
             sample = measure("head", *observation) if arm == "observation" else measure(arm, kind, query, operation)
-            value, hits, digest, heap, entries = sample[:5]
+            if len(sample) != 6:
+                raise ValueError("probe sample must carry its cold first sample")
+            value, hits, digest, heap, entries, cold = sample
             number(value)
+            number(cold)
             if arm != "observation" and expected is not None and hits != expected:
                 raise ValueError(f"remeasure changed hits: {arm} {kind} {query!r}")
             signature = hits, digest, entries
@@ -314,7 +328,7 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
                 samples[arm].append(sample)
     # (median, hits, digest, heap, entries, median of the cold first samples)
     return {arm: (statistics.median(s[0] for s in values), *values[0][1:5],
-                  statistics.median(s[5] if len(s) > 5 else s[0] for s in values))
+                  statistics.median(s[5] for s in values))
             for arm, values in samples.items()}
 
 
@@ -332,7 +346,7 @@ def exceeds(low, high):
     return high > low + max(low * 0.10, 0.1)
 
 
-def control_rows(names, base, measure):
+def control_rows(names, base, measure, trace=None):
     """A/A control: measure each named row with identical binaries in both arms.
 
     `measure` must run the head binaries for either arm. The arm labels are
@@ -341,7 +355,7 @@ def control_rows(names, base, measure):
     result = []
     for name in names:
         kind, query, operation, expected = descriptors[name]
-        samples = interleaved(measure, kind, query, operation, expected)
+        samples = interleaved(measure, kind, query, operation, expected, trace, tag="A/A control: ")
         a, b = samples["base"][0], samples["head"][0]
         result.append((name, a, b, exceeds(a, b) or exceeds(b, a)))
     return result
@@ -349,11 +363,11 @@ def control_rows(names, base, measure):
 
 def control_table(control):
     lines = [f"| {name.replace('|', chr(92) + '|')} | {a:.6f} | {b:.6f} | "
-             f"{'biased harness' if biased else 'identical binaries within the limit'} |"
+             f"{'harness unresolved' if biased else 'identical binaries within the limit'} |"
              for name, a, b, biased in control]
     return ("\n### A/A control (identical head binaries in both arms, same runner/job)\n\n"
-            "Run only for rows that failed both rounds. A row whose control is also over the limit "
-            "is a biased harness, not a regression.\n\n"
+            "Run only for rows that failed both rounds (at most 8 rows). A row whose control is also over "
+            "the limit is unresolved: identical binaries also differ, so the result is not a verdict.\n\n"
             "| Metric | Arm A | Arm B | Result |\n|---|---:|---:|---|\n" + "\n".join(lines) + "\n")
 
 
@@ -507,6 +521,7 @@ def main():
     args = parser.parse_args()
     trace = []
     report = ""
+    published = 0  # characters of `report` already published
     try:
         retry_paths = [getattr(args, arm + "_" + field) for arm in ("base", "head") for field in ("probe", "binary", "index")]
         if (any(retry_paths) or args.measure) and not all(retry_paths):
@@ -517,8 +532,9 @@ def main():
         if args.head_observations:
             args.head.write_text(args.head.read_text(encoding="utf-8") + "\n" +
                                  args.head_observations.read_text(encoding="utf-8"), encoding="utf-8")
-        base = parse(args.base.read_text(encoding="utf-8"), require_new=False)
-        head = parse(args.head.read_text(encoding="utf-8"))
+        # When the producers ran here, every row must carry its cold sample.
+        base = parse(args.base.read_text(encoding="utf-8"), require_new=False, require_cold=args.measure)
+        head = parse(args.head.read_text(encoding="utf-8"), require_cold=args.measure)
         rows = compare(base, head, args.entries)
         report = render(rows) + cold_table(base, head)
         # A refused head-only metadata observation must not hide the paired
@@ -550,22 +566,31 @@ def main():
             rows = retried
             timed_failures = [row[0] for row in rows if row[-1] and row[1] is not None and row[0] != "bytes/entry"]
             if timed_failures and retryable and not memory_failed:
-                control = control_rows(timed_failures, base, lambda arm, *metric: probe(args, "head", *metric))
-                report += control_table(control)
-                biased = {name for name, _, _, bad in control if bad}
-                if metadata_error is None and all(row[0] in biased for row in rows if row[-1]):
-                    note = ("Benchmark harness biased: identical head binaries in both arms differ beyond the limit on "
-                            + ", ".join(sorted(biased)) + "; the paired result for these rows is not evidence of a regression.")
-                    print(note, file=sys.stderr)
-                    publish(report + f"\n{note}\n" + sample_order(trace))
-                    return 3
+                if len(timed_failures) > MAX_CONTROL_ROWS:
+                    # A broad failure is not plausibly harness bias: no control, verdict stays 1.
+                    report += (f"\nMore than {MAX_CONTROL_ROWS} rows failed both rounds ({len(timed_failures)}): "
+                               "not plausibly harness bias, so no A/A control was run.\n")
+                else:
+                    # The round-2 report is out before the control runs, so a control
+                    # that hangs or is killed never hides the paired result.
+                    publish(report[published:])
+                    published = len(report)
+                    control = control_rows(timed_failures, base, lambda arm, *metric: probe(args, "head", *metric), trace)
+                    report += control_table(control)
+                    biased = {name for name, _, _, bad in control if bad}
+                    if metadata_error is None and all(row[0] in biased for row in rows if row[-1]):
+                        note = ("Harness unresolved: identical binaries also differ. Rerun; do not merge on this result. "
+                                "Rows: " + ", ".join(sorted(biased)) + ".")
+                        print(note, file=sys.stderr)
+                        publish(report[published:] + f"\n{note}\n" + sample_order(trace))
+                        return 3
         if metadata_error is not None:
             raise metadata_error
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"benchmark gate refused incomplete evidence: {error}", file=sys.stderr)
-        publish(report + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))
+        publish(report[published:] + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))
         return 2
-    publish(report + sample_order(trace))
+    publish(report[published:] + sample_order(trace))
     return int(any(row[-1] for row in rows))
 
 
