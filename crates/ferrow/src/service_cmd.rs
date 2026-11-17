@@ -288,6 +288,12 @@ pub fn render(h: &Health, json: bool) -> String {
             out.push_str(&format!(", {n} entries"));
         }
         out.push_str(&format!(", journal {}\n", p(&v.journal)));
+        // A live volume may carry a warning (for example a journal that
+        // could not be re-checked after the MFT read); it is not a problem,
+        // but the terminal should show it as the app does.
+        if !v.journal_detail.is_empty() {
+            out.push_str(&format!("  note: {}\n", p(&v.journal_detail)));
+        }
         if let Some(scan) = &v.last_scan {
             out.push_str(&format!(
                 "  last scan {} ({}, {})\n",
@@ -636,6 +642,16 @@ mod tests {
         let text = render(&bad, false);
         assert!(text.starts_with("ATTENTION: 2 problem(s)\n"), "{text}");
         assert!(text.contains("disk full") && text.contains("live updates stopped"));
+
+        // A live volume's warning is shown under it, but is not a problem.
+        let mut warned = sample();
+        warned.volumes[0].journal_detail = "could not re-check the change journal".into();
+        let text = render(&warned, false);
+        assert!(text.starts_with("OK\n"), "{text}");
+        assert!(
+            text.contains("  note: could not re-check the change journal\n"),
+            "{text}"
+        );
     }
 
     #[test]

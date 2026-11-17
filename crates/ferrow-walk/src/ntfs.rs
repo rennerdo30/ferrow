@@ -724,6 +724,11 @@ const USN_PAGE: i64 = 4096;
 /// that had not reached the disk when the raw read ran.
 #[cfg_attr(not(windows), allow(dead_code))]
 const RECENT_WINDOW_BYTES: i64 = 64 << 20;
+/// A refused start is retried from the journal's first record only when
+/// the whole journal is at most this long: a journal of many GiB would be a
+/// long read at SYSTEM priority for two minutes of changes.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAX_FULL_REREAD_BYTES: i64 = 256 << 20;
 
 /// Where the re-read of the journal after an MFT read starts: the position
 /// `RECENT_WINDOW_BYTES` before `before` (the journal's next position when
@@ -752,13 +757,15 @@ struct Reread {
 /// `(id, first usn, next usn)`.
 ///
 /// - A start that the journal refuses as a bad parameter is retried once
-///   from `first`.
+///   from `first`, when the journal is short enough to read whole.
 /// - A purged start continues from the journal's new beginning (up to three
 ///   times); a purge that cannot be followed is an error, as is a journal
 ///   that was replaced.
-/// - Any other failure keeps the MFT read: the position stays at `before`, so
-///   the live reader replays every change since the read began, and a
-///   warning says that changes just before the read may be missing.
+/// - Any other failure keeps the MFT read when the same journal still holds
+///   every record since `before`: the position stays at `before`, so the
+///   live reader replays every change since the read began, and a warning
+///   says that changes just before the read may be missing. A journal that
+///   is gone, was replaced or was purged past `before` is an error.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn reread_journal(
     journal: (u64, i64, i64),
@@ -793,17 +800,32 @@ fn reread_journal(
                 }
                 _ => return Err(format!("read change journal: {e}")),
             },
-            Some(ERROR_INVALID_PARAMETER) if !from_first => {
+            Some(ERROR_INVALID_PARAMETER)
+                if !from_first && before.saturating_sub(first) <= MAX_FULL_REREAD_BYTES =>
+            {
                 from_first = true;
                 start = first;
             }
             _ => {
-                return Ok(Reread {
-                    next: before,
-                    warning: Some(format!(
-                        "could not re-check the change journal after reading the MFT ({e}); files changed just before the scan may show their old state until the next scan"
+                return match query() {
+                    Some((now_id, now_first, _)) if now_id == id && now_first <= before => {
+                        Ok(Reread {
+                            next: before,
+                            warning: Some(format!(
+                                "could not re-check the change journal after reading the MFT ({e}); files changed just before the scan may show their old state until the next scan"
+                            )),
+                        })
+                    }
+                    Some((now_id, _, _)) if now_id != id => Err(format!(
+                        "read change journal: {e}; the journal was replaced during the scan"
                     )),
-                });
+                    Some(_) => Err(format!(
+                        "read change journal: {e}; changes since the scan began were already purged"
+                    )),
+                    None => Err(format!(
+                        "read change journal: {e}; the change journal is no longer available"
+                    )),
+                };
             }
         }
     }
@@ -1969,7 +1991,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_refused_start_is_retried_once_from_the_first_record() {
-        let (first, before) = (10 * MIB + 8, 500 * MIB + 5);
+        let (first, before) = (10 * MIB + 8, 200 * MIB + 5);
         let mut starts = Vec::new();
         let out = reread_journal(
             (7, first, before),
@@ -1992,7 +2014,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_journal_that_cannot_be_re_read_keeps_the_mft_and_replays_from_before() {
-        let (first, before) = (10 * MIB + 8, 500 * MIB + 5);
+        let (first, before) = (10 * MIB + 8, 200 * MIB + 5);
         for code in [ERROR_INVALID_PARAMETER, 5, 1117] {
             let mut calls = 0;
             let out = reread_journal(
@@ -2001,7 +2023,7 @@ pub(crate) mod tests {
                     calls += 1;
                     Err(os(code))
                 },
-                || panic!("no query needed"),
+                || Some((7, first, before + 4096)),
             )
             .unwrap();
             // The refused start is retried once, other errors are not.
@@ -2035,12 +2057,47 @@ pub(crate) mod tests {
                 calls += 1;
                 Err(os(ERROR_INVALID_PARAMETER))
             },
-            || panic!("no query needed"),
+            || Some((7, first, before)),
         )
         .unwrap();
         assert_eq!(calls, 1);
         assert_eq!(out.next, before);
         assert!(out.warning.is_some());
+    }
+
+    #[test]
+    fn a_big_journal_that_refuses_the_aligned_start_is_not_read_whole() {
+        // 18 GiB journal: a retry from its first record would read all of it.
+        let (first, before) = (1_000 * MIB, 18_000 * MIB + 3_333);
+        let mut starts = Vec::new();
+        let out = reread_journal(
+            (7, first, before),
+            |s| {
+                starts.push(s);
+                Err(os(ERROR_INVALID_PARAMETER))
+            },
+            || Some((7, first, before)),
+        )
+        .unwrap();
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_ne!(starts[0], first);
+        assert_eq!(out.next, before);
+        assert!(out.warning.is_some());
+    }
+
+    #[test]
+    fn a_failed_re_read_of_a_gone_replaced_or_purged_journal_is_an_error() {
+        let (first, before) = (10 * MIB, 200 * MIB + 5);
+        let failing = |_: i64| Err(os(1117));
+        let err = reread_journal((7, first, before), failing, || None).unwrap_err();
+        assert!(err.contains("no longer available"), "{err}");
+        let err = reread_journal((7, first, before), failing, || Some((8, 0, before))).unwrap_err();
+        assert!(err.contains("replaced"), "{err}");
+        let err = reread_journal((7, first, before), failing, || {
+            Some((7, before + 4096, before + 8192))
+        })
+        .unwrap_err();
+        assert!(err.contains("purged"), "{err}");
     }
 
     #[test]
