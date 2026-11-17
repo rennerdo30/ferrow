@@ -246,9 +246,10 @@ impl EventLog {
         // free: a busy file counts the line as not written instead of waiting.
         let write = |file: &mut Option<FileLog>| {
             if let Some(file) = file.as_mut() {
+                let busy = self.busy.swap(0, Ordering::Relaxed);
                 file.skipped = file
                     .skipped
-                    .saturating_add(self.busy.swap(0, Ordering::Relaxed) as u32);
+                    .saturating_add(u32::try_from(busy).unwrap_or(u32::MAX));
                 file.write(&event, Instant::now());
             }
         };
