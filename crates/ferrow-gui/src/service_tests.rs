@@ -1203,3 +1203,23 @@ fn the_engine_is_told_when_the_service_starts_or_stops_answering() {
         .unwrap();
     assert!(state.poll());
 }
+
+#[test]
+fn while_the_service_starts_or_stops_nothing_can_be_done_whatever_the_report_says() {
+    for state in [ScmState::Starting, ScmState::Stopping] {
+        // Also with a (soon stale) report and with none.
+        for health in [
+            HealthView::NoAnswer,
+            HealthView::Refused,
+            HealthView::Report(Box::new(report(vec![live("C:\\")]))),
+        ] {
+            let acts = actions(Some(&snap(state, health.clone())), true, false);
+            let what = format!("{state:?} / {health:?}");
+            assert_eq!(acts.start, Can::Hidden, "{what}");
+            for can in [acts.restart, acts.rescan, acts.repair] {
+                assert_eq!(can, Can::No(CHANGING), "{what}");
+            }
+        }
+    }
+    assert_eq!(CHANGING, "It is changing state. Wait a moment.");
+}

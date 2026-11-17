@@ -233,3 +233,43 @@ fn the_nav_dot_and_the_headline_agree() {
     assert_eq!((line.level, line.filled), (Level::Caution, false));
     assert_eq!(tone_of(line.level), Tone::Caution);
 }
+
+#[test]
+fn the_reasons_for_off_buttons_are_said_once_each() {
+    use crate::service::{Actions, CHANGING, NEEDS_INSTALLED};
+    let all = |can| Actions {
+        start: Can::Hidden,
+        restart: can,
+        rescan: can,
+        repair: can,
+    };
+    // Starting or stopping: one line for the three buttons.
+    assert_eq!(
+        off_reasons(&all(Can::No(CHANGING)), false),
+        ["Restart, Rescan now, Repair: It is changing state. Wait a moment."]
+    );
+    // Different reasons stay separate; an enabled button has none.
+    let mixed = Actions {
+        restart: Can::Yes,
+        rescan: Can::No("A rescan is queued already (see the volumes)."),
+        repair: Can::Yes,
+        ..all(Can::Yes)
+    };
+    assert_eq!(
+        off_reasons(&mixed, false),
+        ["Rescan now: A rescan is queued already (see the volumes)."]
+    );
+    // Not installed: the restart line says it, the rescan line would repeat it.
+    let missing = Actions {
+        restart: Can::No("The service isn't installed."),
+        rescan: Can::No("The service isn't running."),
+        repair: Can::Yes,
+        ..all(Can::Yes)
+    };
+    assert_eq!(
+        off_reasons(&missing, true),
+        ["Restart: The service isn't installed."]
+    );
+    // A copy that cannot elevate: the commands below say it.
+    assert!(off_reasons(&all(Can::No(NEEDS_INSTALLED)), false).is_empty());
+}

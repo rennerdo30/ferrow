@@ -423,6 +423,31 @@ fn events_card(ui: &mut egui::Ui, p: &theme::Palette, h: &Health, out: &mut Heal
     });
 }
 
+/// The lines that say why buttons are off: one per reason, naming every
+/// button it applies to. "Not installed" already explains a rescan that
+/// cannot run, and a copy that cannot elevate has its commands below.
+fn off_reasons(acts: &service::Actions, not_installed: bool) -> Vec<String> {
+    let mut lines: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (label, can) in [
+        ("Restart", acts.restart),
+        ("Rescan now", acts.rescan),
+        ("Repair", acts.repair),
+    ] {
+        let Can::No(reason) = can else { continue };
+        if reason == service::NEEDS_INSTALLED || (not_installed && label == "Rescan now") {
+            continue;
+        }
+        match lines.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, labels)) => labels.push(label),
+            None => lines.push((reason, vec![label])),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(reason, labels)| format!("{}: {reason}", labels.join(", ")))
+        .collect()
+}
+
 /// Which buttons stand on which row when `avail` points are free: as many
 /// per row as fit, in order. (A wrapped row cannot hold disabled buttons.)
 fn button_rows(widths: &[f32], avail: f32, gap: f32) -> Vec<Vec<usize>> {
@@ -500,24 +525,8 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
         let missing = i
             .snap
             .is_some_and(|s| s.scm.state == service::ScmState::NotInstalled);
-        for (label, can) in [
-            ("Restart", acts.restart),
-            ("Rescan now", acts.rescan),
-            ("Repair", acts.repair),
-        ] {
-            // "Not installed" already says it; once is enough.
-            if missing && label == "Rescan now" {
-                continue;
-            }
-            if let Can::No(reason) = can
-                && reason != service::NEEDS_INSTALLED
-            {
-                ui.label(
-                    RichText::new(format!("{label}: {reason}"))
-                        .size(12.0)
-                        .color(p.text_secondary),
-                );
-            }
+        for line in off_reasons(&acts, missing) {
+            ui.label(RichText::new(line).size(12.0).color(p.text_secondary));
         }
     }
     if out.confirm_repair && i.busy.is_none() {
