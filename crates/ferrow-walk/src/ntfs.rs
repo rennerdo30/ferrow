@@ -552,7 +552,7 @@ pub(crate) use platform::low_io_priority;
 #[cfg(windows)]
 pub use platform::{
     can_read_volume, fetch_record, fetch_state, open_volume, query_journal, read_journal,
-    read_volume, wait_journal,
+    read_volume, record_is_free, wait_journal,
 };
 
 #[cfg(windows)]
@@ -1023,6 +1023,23 @@ mod platform {
     /// Re-read one record through the file system (always current, unlike
     /// raw volume reads that can lag the cache by a few seconds).
     pub fn fetch_record(volume: &std::fs::File, record: u64, size: usize) -> Option<Vec<u8>> {
+        read_record(volume, record, size).ok().flatten()
+    }
+
+    /// Whether the file system answers that `record` is not in use. A failed
+    /// read is not an answer.
+    pub fn record_is_free(volume: &std::fs::File, record: u64, size: usize) -> bool {
+        matches!(read_record(volume, record, size), Ok(None))
+    }
+
+    /// Read one record: `Ok(None)` when it is not in use (the file system
+    /// answers with the nearest lower used record instead), `Err` when the
+    /// read itself failed.
+    fn read_record(
+        volume: &std::fs::File,
+        record: u64,
+        size: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         use windows_sys::Win32::System::IO::DeviceIoControl;
         use windows_sys::Win32::System::Ioctl::{
             FSCTL_GET_NTFS_FILE_RECORD, NTFS_FILE_RECORD_INPUT_BUFFER,
@@ -1045,20 +1062,25 @@ mod platform {
                 std::ptr::null_mut(),
             )
         };
-        if ok == 0 || returned < 12 {
-            return None;
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if returned < 12 {
+            return Err(std::io::Error::other("short file record answer"));
         }
         // SAFETY: `returned` bytes were written.
         let bytes =
             unsafe { std::slice::from_raw_parts(out.as_ptr().cast::<u8>(), returned as usize) };
-        let got = u64::from_le_bytes(bytes[0..8].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
+        let short = || std::io::Error::other("short file record answer");
+        let got = u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| short())?)
+            & 0x0000_FFFF_FFFF_FFFF;
         // An unused record yields the nearest lower used one instead.
         if got != record {
-            return None;
+            return Ok(None);
         }
-        let len = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
-        let rec = bytes.get(12..12 + len)?.to_vec();
-        Some(rec)
+        let len = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| short())?) as usize;
+        let rec = bytes.get(12..12 + len).ok_or_else(short)?.to_vec();
+        Ok(Some(rec))
     }
 
     /// Records written in the last two minutes may not have reached the

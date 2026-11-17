@@ -205,6 +205,14 @@ pub struct Change {
 /// Reads records' current state (`None`: deleted or unreadable).
 pub trait RecordSource {
     fn fetch(&self, volume: usize, record: u64) -> Option<RecordState>;
+
+    /// Whether the file system answered that `record` is not in use, as
+    /// opposed to the read failing: asked after `fetch` gave `None`, when a
+    /// failed read must not be taken for a deletion. A source that cannot
+    /// tell reads `None` as deleted.
+    fn certainly_free(&self, _volume: usize, _record: u64) -> bool {
+        true
+    }
 }
 
 struct Volume {
@@ -299,7 +307,9 @@ struct Walk {
     /// Position in the shared change log when it was queued: the records
     /// reported after it are the ones to look at again once it is merged.
     since: u64,
-    /// When the reader began it (for the watchdog); none while it waits.
+    /// When it was queued, and when the reader began it (for the watchdog;
+    /// none while it waits).
+    queued: Instant,
     started: Option<Instant>,
     /// The log could not keep every record since `since`.
     overflowed: bool,
@@ -339,6 +349,9 @@ pub struct Live {
     /// One log of the records reported while any walk is outstanding.
     log: HashMap<(usize, u64), Touch>,
     log_seq: u64,
+    /// When the reader last showed it is alive (ready, began or finished a
+    /// folder): a queued folder only waits for it from then on.
+    progress: Instant,
 }
 
 impl Live {
@@ -389,6 +402,7 @@ impl Live {
             next_walk: 0,
             log: HashMap::new(),
             log_seq: 0,
+            progress: Instant::now(),
             base,
         }
     }
@@ -723,7 +737,14 @@ impl Live {
 
     /// Forget what no outstanding walk needs any more.
     fn prune_log(&mut self) {
-        match self.walks.iter().map(|w| w.since).min() {
+        // A walk that lost its window needs nothing from the log.
+        match self
+            .walks
+            .iter()
+            .filter(|w| !w.overflowed)
+            .map(|w| w.since)
+            .min()
+        {
             None => self.log.clear(),
             Some(oldest) => self.log.retain(|_, t| t.last > oldest),
         }
@@ -802,6 +823,7 @@ impl Live {
             record,
             sequence,
             since: self.log_seq,
+            queued: Instant::now(),
             started: None,
             overflowed: false,
             covered: Vec::new(),
@@ -820,20 +842,38 @@ impl Live {
         Ok(())
     }
 
+    /// The reader is up and has its volumes open.
+    pub fn reader_ready(&mut self, now: Instant) {
+        self.progress = now;
+    }
+
     /// The reader began walk `id` at `now`.
     pub fn walk_started(&mut self, id: u64, now: Instant) {
+        self.progress = now;
         if let Some(walk) = self.walks.iter_mut().find(|w| w.id == id) {
             walk.started = Some(now);
         }
     }
 
-    /// When the maintainer must wake to check on a walk the reader started.
+    /// When the maintainer must wake to check on the reader. A walk the
+    /// reader began is due its time budget plus slack after it began. While
+    /// none has begun, the queue is not being served: a folder is due that
+    /// long after it was queued or the reader last showed life, whichever is
+    /// later (the reader can hang opening its volumes before it takes a job).
     pub fn next_walk_deadline(&self) -> Option<Instant> {
-        self.walks
+        let patience = MAX_WALK_TIME + WALK_SLACK;
+        let running = self
+            .walks
             .iter()
             .filter_map(|w| w.started)
-            .map(|started| started + MAX_WALK_TIME + WALK_SLACK)
-            .min()
+            .map(|started| started + patience)
+            .min();
+        running.or_else(|| {
+            self.walks
+                .iter()
+                .map(|w| w.queued.max(self.progress) + patience)
+                .min()
+        })
     }
 
     /// Give up on walks that outlived their budget by more than the slack:
@@ -851,6 +891,7 @@ impl Live {
         ));
         self.walks.clear();
         self.log.clear();
+        self.progress = now;
         applied
     }
 
@@ -890,6 +931,7 @@ impl Live {
             return Applied::default();
         };
         let walk = self.walks.remove(at);
+        self.progress = Instant::now();
         let applied = self.merge_walk(&walk, result, source);
         self.prune_log();
         applied
@@ -903,10 +945,12 @@ impl Live {
     ) -> Applied {
         let mut applied = Applied::default();
         let volume = walk.volume;
-        let exists = |record: u64, sequence: u16| {
-            source
-                .fetch(volume, record)
-                .is_some_and(|s| s.info.is_dir && (sequence == 0 || s.info.sequence == sequence))
+        // Whether the record may still be that folder: it is, unless the
+        // file system said it is free or now something else. A read that
+        // failed proves nothing.
+        let exists = |record: u64, sequence: u16| match source.fetch(volume, record) {
+            Some(s) => s.info.is_dir && (sequence == 0 || s.info.sequence == sequence),
+            None => !source.certainly_free(volume, record),
         };
         let listing = match result {
             Ok(listing) => listing,
@@ -1949,7 +1993,10 @@ mod tests {
         f2.set(100, DIR_INFO, &[(5, "Other")]);
         let waiting = live.apply(&[change(100, false)], &f2).walks[0].clone();
         let t0 = Instant::now();
-        assert_eq!(live.next_walk_deadline(), None, "none while they wait");
+        assert!(
+            live.next_walk_deadline().is_some(),
+            "a queued folder has one too"
+        );
         live.walk_started(job.id, t0);
         assert_eq!(
             live.next_walk_deadline(),
@@ -2093,6 +2140,114 @@ mod tests {
             live.walks.is_empty() && live.log.is_empty(),
             "nothing is kept"
         );
+    }
+
+    /// A source whose reads of a missing record fail instead of saying "free".
+    struct Unsure<'a>(&'a Fake);
+    impl RecordSource for Unsure<'_> {
+        fn fetch(&self, volume: usize, record: u64) -> Option<RecordState> {
+            self.0.fetch(volume, record)
+        }
+        fn certainly_free(&self, _volume: usize, _record: u64) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_reader_that_never_takes_a_job_is_given_up() {
+        // The reader hangs before it takes its first job (opening a volume):
+        // no walk ever starts, yet the queued folder must not wait forever.
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let patience = MAX_WALK_TIME + WALK_SLACK;
+        let queued = live.walks[0].queued;
+        let due = live
+            .next_walk_deadline()
+            .expect("a queued folder has a deadline");
+        assert_eq!(due, queued.max(live.progress) + patience);
+        assert_eq!(live.expire_walks(queued), Applied::default());
+        // A reader that shows life (ready) gets its patience from then on.
+        let later = queued + Duration::from_secs(20);
+        live.reader_ready(later);
+        assert_eq!(live.next_walk_deadline(), Some(later + patience));
+        assert_eq!(
+            live.expire_walks(later + patience - Duration::from_secs(1)),
+            Applied::default()
+        );
+        let r = live.expire_walks(later + patience);
+        let why = r.rescan.expect("falls back to the rescan");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        assert_eq!(r.abandoned, 1);
+        assert!(live.walks.is_empty());
+        assert_eq!(
+            live.finish_walk(job.id, Ok(Subtree::default()), &f),
+            Applied::default()
+        );
+        // A folder behind a running one waits for it: only the running
+        // walk's own deadline counts.
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let mut f2 = f;
+        f2.set(100, DIR_INFO, &[(5, "Other")]);
+        live.apply(&[change(100, false)], &f2);
+        let t0 = Instant::now() + Duration::from_secs(5);
+        live.walk_started(job.id, t0);
+        assert_eq!(live.next_walk_deadline(), Some(t0 + patience));
+    }
+
+    #[test]
+    fn a_failed_read_is_not_a_deletion() {
+        // The folder's record cannot be read (not "free"): not confirmed
+        // gone, so the walk that could not open it falls back to the rescan.
+        let mut f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        for r in [60, 61, 62, 63] {
+            f.0.remove(&r);
+        }
+        let done = live.finish_walk(job.id, Err(WalkError::Gone), &Unsure(&f));
+        let why = done.rescan.expect("not confirmed gone");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        // The same for a subfolder that could not be opened.
+        let mut f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        f.0.remove(&62);
+        f.0.remove(&63);
+        let listing = Subtree {
+            entries: walk_fake(&f, &job),
+            skipped: vec![(1u64 << 48) | 62],
+        };
+        let done = live.finish_walk(job.id, Ok(listing), &Unsure(&f));
+        assert!(done.rescan.is_some());
+    }
+
+    #[test]
+    fn a_full_log_drops_the_oldest_window_first() {
+        let f = moved_in();
+        let (mut live, _, first) = after_move_in(&f);
+        let mut f = f;
+        // 40,000 changes during the first walk…
+        let before: Vec<Change> = (0..40_000u64).map(|r| change(10_000 + r, false)).collect();
+        live.apply(&before, &f);
+        f.set(100, DIR_INFO, &[(5, "Other")]);
+        let second = live.apply(&[change(100, false)], &f).walks[0].clone();
+        // …and 20,000 more during both: the log (50,000 at most) cannot hold
+        // them all.
+        let after: Vec<Change> = (0..20_000u64).map(|r| change(100_000 + r, false)).collect();
+        live.apply(&after, &f);
+        assert!(live.log.len() <= MAX_TOUCHED);
+        let (a, b) = (&live.walks[0], &live.walks[1]);
+        assert!(a.overflowed, "the oldest walk lost its window");
+        assert!(!b.overflowed, "the younger one keeps its own");
+        assert_eq!(live.changes_since(b.since).len(), 20_000);
+        // The younger walk merges first: the older, which lost its window,
+        // needs nothing from the log, so nothing is kept for it.
+        let done = live.finish_walk(second.id, Ok(walk_fake(&f, &second).into()), &f);
+        assert_eq!(done.rescan, None);
+        assert!(live.log.is_empty(), "{} records kept", live.log.len());
+        // The older one falls back to the rescan when it finishes.
+        let done = live.finish_walk(first.id, Ok(walk_fake(&f, &first).into()), &f);
+        let why = done.rescan.expect("its window is gone");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
     }
 
     #[test]
