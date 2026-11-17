@@ -3,11 +3,17 @@
 
 Timed rows over their limit in round 1 are re-measured once (interleaved, same
 runner/job); they fail only if over the limit in both rounds. Memory is never
-re-measured."""
+re-measured. Each probe process repeats its timed operation and reports the
+median (FR-31: one cold sample per process is dominated by scheduling jitter).
+A row that fails both rounds is then re-measured against itself (the head
+binaries in both arms, an A/A control); if the control also exceeds the limit
+the harness cannot resolve the tolerance and the gate reports a biased
+harness (exit 3), not a regression."""
 import argparse
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import sys
 import subprocess
@@ -24,6 +30,23 @@ PAIRED_METRICS = 2 + 2 * 2 * len(QUERIES)
 EXPECTED_METRICS = PAIRED_METRICS + 2 * 2 * len(NEW_QUERIES)
 EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES) + 2 * len(FILTER_QUERIES)
 EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
+# In-process repeats per probe process (at most; the probe stops after about
+# 100 ms of repeats, never below MIN_PROBE_REPEATS). The probe proves it ran.
+PROBE_REPEATS = 31
+MIN_PROBE_REPEATS = 3
+# Process-to-process variance (which CPUs the client and service threads land
+# on) moves one IPC first-page sample by ~0.15 ms; a median of 5 can flip
+# between those modes. When both arms are in the sub-millisecond regime,
+# where the 0.1 ms absolute tolerance dominates, collect 10 balanced samples.
+SUBMS_LIMIT_MS = 2.0
+SUBMS_SAMPLES = 10
+# Cold-path check (owner, 2026-11-17): the cold first sample per row is compared
+# as well, next to the 10% rule on the repeated medians. The cold sample is far
+# noisier, hence a ratio plus a fixed allowance. Fails when head > base * 1.5 + 1.2 ms.
+COLD_RATIO = 1.5
+COLD_ALLOWANCE_MS = 1.2
+# The A/A control is for isolated rows: a broad failure is not plausibly harness bias.
+MAX_CONTROL_ROWS = 8
 
 
 def number(value):
@@ -33,7 +56,10 @@ def number(value):
     return value
 
 
-def parse(text, require_new=True):
+COLD_KEYS = ("first_page_cold_ms", "full_count_cold_ms")
+
+
+def parse(text, require_new=True, require_cold=False):
     measures, queries, service = {}, {}, {}
     for line in text.splitlines():
         prefix, _, body = line.partition(" ")
@@ -51,6 +77,8 @@ def parse(text, require_new=True):
                 raise ValueError("duplicate query measurement")
             target[query] = {key: number(fields[key]) for key in (
                 "first_page_ms", "full_count_ms", "page_hits", "total_hits")}
+            # Optional: the cold first sample (see probe); absent in legacy single-sample files.
+            target[query].update({key: number(fields[key]) for key in COLD_KEYS if key in fields})
     for key in ("entries", "seed", "heap_bytes", "bytes_per_entry", "load_ms_median"):
         if key not in measures:
             raise ValueError(f"missing measurement: {key}")
@@ -63,6 +91,13 @@ def parse(text, require_new=True):
     # missing evidence, never a reason to compare fewer metrics.
     if set(service) != expected:
         raise ValueError("missing or unexpected service (IPC) query set")
+    # Cold samples are all-or-none per file: a partly cold file would silently judge
+    # some rows on the cold sample and others on the median. Producers that ran in
+    # this job (require_cold) must always have written them.
+    records = [*queries.values(), *service.values()]
+    complete = all(key in record for record in records for key in COLD_KEYS)
+    if (require_cold or any(key in record for record in records for key in COLD_KEYS)) and not complete:
+        raise ValueError("cold first samples must be present on every query row of a file, or on none")
     return measures, queries, service
 
 
@@ -104,6 +139,10 @@ def compare(base, head, expected_entries=5_000_000):
             for key in ("first_page_ms", "full_count_ms"):
                 limit = 16.0 if key == "first_page_ms" and query in COMMON_WILDCARDS else None
                 value = readings[query][key]
+                if limit is not None:
+                    # Absolute limits keep their meaning: judged on the cold first sample
+                    # per process, never on the (lower) median of in-process repeats.
+                    value = readings[query].get("first_page_cold_ms", value)
                 rows.append((f"new-language {label} {query!r} {key}", None, value, limit,
                              limit is not None and value > limit))
     if len(rows) != EXPECTED_METRICS:
@@ -113,9 +152,11 @@ def compare(base, head, expected_entries=5_000_000):
 
 def render(rows):
     lines = ["## Paired benchmark regression gate", "",
-             "Same runner/job; median of 3 loads and 5 queries per arm. "
+             "Same runner/job; median of 3 loads and 5 queries per arm, each query sample the median of in-process repeats. "
              "Limit: base + max(10%, 0.1 ms); memory: base + 10%. "
-             "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms. "
+             "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms, "
+             "judged on the cold first sample of each process (not the repeated median). "
+             "Rows named cold compare the cold first sample per row: head <= 1.5 x base + 1.2 ms. "
              "Section 3 absolute targets remain reported goals.", "",
              "| Metric | Base | Head | Limit | Result |", "|---|---:|---:|---:|---|"]
     def cell(value):
@@ -123,6 +164,36 @@ def render(rows):
     lines += [f"| {name.replace('|', chr(92) + '|')} | {cell(b)} | {h:.6f} | {cell(limit)} | {'FAIL' if bad else 'pass'} |"
               for name, b, h, limit, bad in rows]
     return "\n".join(lines) + "\n"
+
+
+def cold_table(base, head):
+    """Both numbers for every measured row: cold first sample and repeated median.
+
+    Cold = median over processes of one cold timed run (the pre-FR-31 meaning, what
+    absolute limits use); repeated = median over processes of each process's median of
+    in-process repeats (what the paired comparison uses). Empty for legacy files."""
+    lines = []
+    for label, b, h in (("in-process", base[1], head[1]), ("IPC", base[2], head[2])):
+        for query in sorted(QUERIES):
+            for key, cold_key in (("first_page_ms", "first_page_cold_ms"), ("full_count_ms", "full_count_cold_ms")):
+                if cold_key not in b[query] or cold_key not in h[query]:
+                    return ""
+                lines.append(f"| {label} {query!r} {key} | {b[query][cold_key]:.6f} / {b[query][key]:.6f} "
+                             f"| {h[query][cold_key]:.6f} / {h[query][key]:.6f} |")
+    for label, h in (("in-process", head[1]), ("IPC", head[2])):
+        for query in sorted(NEW_QUERIES):
+            for key, cold_key in (("first_page_ms", "first_page_cold_ms"), ("full_count_ms", "full_count_cold_ms")):
+                if cold_key not in h[query]:
+                    return ""
+                limited = key == "first_page_ms" and query in COMMON_WILDCARDS
+                lines.append(f"| new-language {label} {query!r} {key}{' (limit 16 ms judged on cold)' if limited else ''} "
+                             f"| - | {h[query][cold_key]:.6f} / {h[query][key]:.6f} |")
+    return ("\n### Cold first sample / repeated median (ms)\n\n"
+            "Cold: median over processes of one cold timed run, the meaning every number had before FR-31 "
+            "and the one absolute limits use. Repeated: median over processes of each process's median of "
+            "in-process repeats, used only for the paired base-vs-head comparison. Do not compare a repeated "
+            "median with an older cold number.\n\n"
+            "| Metric | Base cold / repeated | Head cold / repeated |\n|---|---:|---:|\n" + "\n".join(lines) + "\n")
 
 
 def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=None):
@@ -211,7 +282,7 @@ def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=N
     return rows, report
 
 
-def interleaved(measure, kind, query, operation, expected=None, trace=None, observation=None):
+def interleaved(measure, kind, query, operation, expected=None, trace=None, observation=None, tag=""):
     """Warm both arms, then sample ABBA, optionally interleaving head-only C.
 
     C runs the new-syntax descriptor on head and never participates in the
@@ -226,18 +297,30 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
         trace.append("")
     count = 3 if kind == "load" else 5
     forward = tuple(samples)
-    for warmup, arms in [(True, forward)] + [
-            (False, forward if i % 2 == 0 else forward[::-1]) for i in range(count)]:
+    extendable = kind != "load" and operation == "first_page_ms"
+    round_index = -1  # -1 is the warm-up round
+    while True:
+        if round_index == count and extendable and count < SUBMS_SAMPLES and all(
+                statistics.median(s[0] for s in samples[arm]) < SUBMS_LIMIT_MS for arm in ("base", "head")):
+            count = SUBMS_SAMPLES
+        if round_index >= count:
+            break
+        warmup = round_index < 0
+        arms = forward if warmup or round_index % 2 == 0 else forward[::-1]
+        round_index += 1
         for arm in arms:
             order.append(("warm " if warmup else "") + {"base": "A", "head": "B", "observation": "C"}[arm])
             if trace is not None:
-                label = f"{kind} {query!r} {operation}"
+                label = f"{tag}{kind} {query!r} {operation}"
                 if observation is not None:
                     label += f"; C = head-only {observation[1]!r} {observation[2]}"
                 trace[trace_index] = f"| {label.replace('|', chr(92) + '|')} | {' '.join(order)} |"
             sample = measure("head", *observation) if arm == "observation" else measure(arm, kind, query, operation)
-            value, hits, digest, heap, entries = sample
+            if len(sample) != 6:
+                raise ValueError("probe sample must carry its cold first sample")
+            value, hits, digest, heap, entries, cold = sample
             number(value)
+            number(cold)
             if arm != "observation" and expected is not None and hits != expected:
                 raise ValueError(f"remeasure changed hits: {arm} {kind} {query!r}")
             signature = hits, digest, entries
@@ -249,7 +332,78 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
                 raise ValueError("heap changed within one arm")
             if not warmup:
                 samples[arm].append(sample)
-    return {arm: (statistics.median(s[0] for s in values), *values[0][1:]) for arm, values in samples.items()}
+    # (median, hits, digest, heap, entries, median of the cold first samples)
+    return {arm: (statistics.median(s[0] for s in values), *values[0][1:5],
+                  statistics.median(s[5] for s in values))
+            for arm, values in samples.items()}
+
+
+def metric_descriptors(base):
+    descriptors = {"load total (ms)": ("load", "", "load", base[0]["entries"])}
+    for label, queries in (("in-process", base[1]), ("IPC", base[2])):
+        for query, values in queries.items():
+            for operation, hits in (("first_page_ms", "page_hits"), ("full_count_ms", "total_hits")):
+                descriptors[f"{label} {query!r} {operation}"] = (label, query, operation, values[hits])
+    return descriptors
+
+
+def exceeds(low, high):
+    """True when high is over low + max(10%, 0.1 ms): the gate's own limit."""
+    return high > low + max(low * 0.10, 0.1)
+
+
+def cold_limit(base_cold):
+    return base_cold * COLD_RATIO + COLD_ALLOWANCE_MS
+
+
+def cold_exceeds(low, high):
+    """True when a cold median is over base * 1.5 + 1.2 ms."""
+    return high > cold_limit(low)
+
+
+def cold_rows(base, head):
+    """Paired rows on the cold first sample per process (median over processes).
+
+    Row names start with "cold ". Empty for legacy files without cold samples."""
+    rows = []
+    for label, b, h in (("in-process", base[1], head[1]), ("IPC", base[2], head[2])):
+        for query in sorted(QUERIES):
+            for key, cold_key in (("first_page_ms", "first_page_cold_ms"), ("full_count_ms", "full_count_cold_ms")):
+                if cold_key not in b[query] or cold_key not in h[query]:
+                    return []
+                before, after = b[query][cold_key], h[query][cold_key]
+                rows.append((f"cold {label} {query!r} {key}", before, after, cold_limit(before), cold_exceeds(before, after)))
+    return rows
+
+
+def control_rows(names, base, measure, trace=None):
+    """A/A control: measure each named row with identical binaries in both arms.
+
+    `measure` must run the head binaries for either arm. The arm labels are
+    arbitrary here, so a bias in either direction counts."""
+    descriptors = metric_descriptors(base)
+    result, measured = [], {}
+    for name in names:
+        cold = name.startswith("cold ")
+        kind, query, operation, expected = descriptors[name[5:] if cold else name]
+        if (kind, query, operation) not in measured:
+            measured[kind, query, operation] = interleaved(measure, kind, query, operation, expected, trace, tag="A/A control: ")
+        samples = measured[kind, query, operation]
+        index = 5 if cold else 0
+        a, b = samples["base"][index], samples["head"][index]
+        biased = cold_exceeds(a, b) or cold_exceeds(b, a) if cold else exceeds(a, b) or exceeds(b, a)
+        result.append((name, a, b, biased))
+    return result
+
+
+def control_table(control):
+    lines = [f"| {name.replace('|', chr(92) + '|')} | {a:.6f} | {b:.6f} | "
+             f"{'harness unresolved' if biased else 'identical binaries within the limit'} |"
+             for name, a, b, biased in control]
+    return ("\n### A/A control (identical head binaries in both arms, same runner/job)\n\n"
+            "Run only for rows that failed both rounds (at most 8 rows). A row whose control is also over "
+            "the limit is unresolved: identical binaries also differ, so the result is not a verdict.\n\n"
+            "| Metric | Arm A | Arm B | Result |\n|---|---:|---:|---|\n" + "\n".join(lines) + "\n")
 
 
 def retry_failures(rows, base, head, measure, trace=None):
@@ -260,21 +414,21 @@ def retry_failures(rows, base, head, measure, trace=None):
     """
     if any(bad and name == "bytes/entry" for name, _, _, _, bad in rows):
         return rows
-    descriptors = {"load total (ms)": ("load", "", "load", base[0]["entries"])}
-    for label, queries in (("in-process", base[1]), ("IPC", base[2])):
-        for query, values in queries.items():
-            for operation, hits in (("first_page_ms", "page_hits"), ("full_count_ms", "total_hits")):
-                descriptors[f"{label} {query!r} {operation}"] = (label, query, operation, values[hits])
-    result = []
+    descriptors = metric_descriptors(base)
+    result, measured = [], {}
     for row in rows:
         name, _, _, _, bad = row
         if not bad or row[1] is None:
             result.append(row)
             continue
-        kind, query, operation, expected = descriptors[name]
-        samples = interleaved(measure, kind, query, operation, expected, trace)
-        b, h = (samples[arm][0] for arm in ("base", "head"))
-        limit = b + max(b * 0.10, 0.1)
+        cold = name.startswith("cold ")
+        kind, query, operation, expected = descriptors[name[5:] if cold else name]
+        if (kind, query, operation) not in measured:  # a row and its cold row share one measurement
+            measured[kind, query, operation] = interleaved(measure, kind, query, operation, expected, trace)
+        samples = measured[kind, query, operation]
+        index = 5 if cold else 0
+        b, h = (samples[arm][index] for arm in ("base", "head"))
+        limit = cold_limit(b) if cold else b + max(b * 0.10, 0.1)
         result.append((name, b, h, limit, h > limit))
     return result
 
@@ -286,14 +440,22 @@ def probe(args, arm, kind, query, operation):
                str(getattr(args, arm + "_index")), kind, query, operation]
     if arm == "base":
         command.append("--legacy-queries")
+    env = {**os.environ, "FERROW_PROBE_REPEATS": str(PROBE_REPEATS)}
     try:
-        run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True)
+        run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True, env=env)
     except subprocess.CalledProcessError as error:
         if error.stderr:
             print(error.stderr, file=sys.stderr, end="")
         raise
-    if getattr(run, "stderr", ""):
-        print(run.stderr, file=sys.stderr, end="")
+    stderr = getattr(run, "stderr", "") or ""
+    if stderr:
+        print(stderr, file=sys.stderr, end="")
+    if kind != "load":
+        # Every switch proves it ran: a probe that ignored the request would
+        # silently go back to one noisy sample per process.
+        repeats = re.findall(r"^FERROW-PROBE-REPEATS n=(\d+) ", stderr, re.MULTILINE)
+        if len(repeats) != 1 or int(repeats[0]) < MIN_PROBE_REPEATS:
+            raise ValueError("probe did not run its in-process repeats")
     records = [line for line in run.stdout.splitlines() if line.startswith("FERROW-RETRY ")]
     if len(records) != 1:
         raise ValueError("retry producer must emit exactly one receipt")
@@ -301,7 +463,10 @@ def probe(args, arm, kind, query, operation):
     integers = tuple(int(fields[key]) for key in ("hits", "digest", "heap_bytes", "entries"))
     if any(v < 0 for v in integers) or integers[-1] != args.entries or integers[-2] <= 0:
         raise ValueError("invalid probe count, heap or fixture")
-    return number(fields["value_ms"]), *integers
+    # value_ms: median of the in-process repeats (paired comparison); cold_ms: the single
+    # cold sample per process that absolute limits are judged on. A probe that cannot
+    # print both is refused (KeyError).
+    return number(fields["value_ms"]), *integers, number(fields["cold_ms"])
 
 
 def measure_pair(args, measure, trace):
@@ -309,7 +474,7 @@ def measure_pair(args, measure, trace):
         raise ValueError("interleaved arms require the same fixture file")
     output = {"base": [], "head": []}
     load = interleaved(measure, "load", "", "load", args.entries, trace)
-    for arm, (elapsed, _, _, heap, entries) in load.items():
+    for arm, (elapsed, _, _, heap, entries, _) in load.items():
         output[arm].append(f"FERROW-MEASURE entries={entries} seed=2026 heap_bytes={heap} bytes_per_entry={heap/entries:.9f} load_ms_median={elapsed:.9f}")
     for kind, prefix in (("in-process", "FERROW-QUERY"), ("IPC", "FERROW-SERVICE")):
         new_queries = sorted(NEW_QUERIES)
@@ -324,7 +489,8 @@ def measure_pair(args, measure, trace):
                     raise ValueError("page/count evidence disagrees")
                 target = "head" if arm == "observation" else arm
                 text = new_query if arm == "observation" else query
-                output[target].append(f'{prefix} query="{text}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]}')
+                output[target].append(f'{prefix} query="{text}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]} '
+                                      f'first_page_cold_ms={page[arm][5]:.9f} full_count_cold_ms={full[arm][5]:.9f}')
     for arm, lines in output.items():
         getattr(args, arm).write_text("\n".join(lines)+"\n", encoding="utf-8")
 
@@ -394,6 +560,7 @@ def main():
     args = parser.parse_args()
     trace = []
     report = ""
+    published = 0  # characters of `report` already published
     try:
         retry_paths = [getattr(args, arm + "_" + field) for arm in ("base", "head") for field in ("probe", "binary", "index")]
         if (any(retry_paths) or args.measure) and not all(retry_paths):
@@ -404,18 +571,28 @@ def main():
         if args.head_observations:
             args.head.write_text(args.head.read_text(encoding="utf-8") + "\n" +
                                  args.head_observations.read_text(encoding="utf-8"), encoding="utf-8")
-        base = parse(args.base.read_text(encoding="utf-8"), require_new=False)
-        head = parse(args.head.read_text(encoding="utf-8"))
+        # When the producers ran here, every row must carry its cold sample.
+        base = parse(args.base.read_text(encoding="utf-8"), require_new=False, require_cold=args.measure)
+        head = parse(args.head.read_text(encoding="utf-8"), require_cold=args.measure)
         rows = compare(base, head, args.entries)
-        report = render(rows)
+        cold = cold_rows(base, head)
+        report = render(rows + cold) + cold_table(base, head)
+        # A refused head-only metadata observation must not hide the paired
+        # result: finish the paired phase (retry, A/A control), then refuse.
+        metadata_error = None
         if args.require_metadata:
             observations = args.head.read_text(encoding="utf-8")
-            metadata_rows, metadata_report = metadata_observations(
-                observations, head, args.entries,
-                (lambda: metadata_rerun(args)) if args.metadata_rerun_bench and args.metadata_rerun_index else None)
-            if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
-                raise ValueError("incomplete combined metric inventory")
-            report += metadata_report
+            try:
+                metadata_rows, metadata_report = metadata_observations(
+                    observations, head, args.entries,
+                    (lambda: metadata_rerun(args)) if args.metadata_rerun_bench and args.metadata_rerun_index else None)
+            except ValueError as error:
+                metadata_error = error
+            else:
+                if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
+                    raise ValueError("incomplete combined metric inventory")
+                report += metadata_report
+        rows = rows + cold  # after the inventory check: cold rows are not part of the fixed inventory
         if any(retry_paths):
             if not all(retry_paths):
                 raise ValueError("all paired retry paths are required")
@@ -428,11 +605,33 @@ def main():
             if retryable and not memory_failed:
                 report += "\n### One paired latency remeasurement (final decision)\n\n" + render(retried) + confirmation_table(rows, retried)
             rows = retried
+            timed_failures = [row[0] for row in rows if row[-1] and row[1] is not None and row[0] != "bytes/entry"]
+            if timed_failures and retryable and not memory_failed:
+                if len(timed_failures) > MAX_CONTROL_ROWS:
+                    # A broad failure is not plausibly harness bias: no control, verdict stays 1.
+                    report += (f"\nMore than {MAX_CONTROL_ROWS} rows failed both rounds ({len(timed_failures)}): "
+                               "not plausibly harness bias, so no A/A control was run.\n")
+                else:
+                    # The round-2 report is out before the control runs, so a control
+                    # that hangs or is killed never hides the paired result.
+                    publish(report[published:])
+                    published = len(report)
+                    control = control_rows(timed_failures, base, lambda arm, *metric: probe(args, "head", *metric), trace)
+                    report += control_table(control)
+                    biased = {name for name, _, _, bad in control if bad}
+                    if metadata_error is None and all(row[0] in biased for row in rows if row[-1]):
+                        note = ("Harness unresolved: identical binaries also differ. Rerun; do not merge on this result. "
+                                "Rows: " + ", ".join(sorted(biased)) + ".")
+                        print(note, file=sys.stderr)
+                        publish(report[published:] + f"\n{note}\n" + sample_order(trace))
+                        return 3
+        if metadata_error is not None:
+            raise metadata_error
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"benchmark gate refused incomplete evidence: {error}", file=sys.stderr)
-        publish(report + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))
+        publish(report[published:] + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))
         return 2
-    publish(report + sample_order(trace))
+    publish(report[published:] + sample_order(trace))
     return int(any(row[-1] for row in rows))
 
 
