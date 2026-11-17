@@ -27,7 +27,12 @@ FERROW_SCREENSHOT_DIR=/some/folder \
   check.
 - It needs the OS UI font (Segoe UI on Windows), like the app. Dates are
   shown in UTC and the fixture index is fixed, so two runs of the same code
-  give the same pictures except for font hinting differences between GPUs.
+  give the same pictures except for font hinting differences between GPUs and
+  the "Add drive" list on the Settings pictures, which shows the machine's
+  real drives. Test builds format dates in UTC (`format_time`), so the
+  local-time path is only exercised by the app itself.
+- Before a run it removes only its own pictures (`NN-screen-dark|light-WxH.png`)
+  from the output folder; other files there are kept.
 
 ## How the app is isolated
 

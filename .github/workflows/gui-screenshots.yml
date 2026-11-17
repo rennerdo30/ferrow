@@ -31,6 +31,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Lint the harness code
+        run: cargo clippy --workspace --all-targets --features ferrow-gui/screenshots --locked -- -D warnings
+      - name: Harness unit tests
+        run: cargo test -p ferrow-gui --bin ferrow-gui --features screenshots --locked
       - name: Render the screens (offscreen, no window)
         run: >
           timeout -k 10s 1500s

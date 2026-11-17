@@ -1050,10 +1050,11 @@ mod tests {
     /// location is the one a test set explicitly.
     #[test]
     fn test_builds_never_resolve_the_real_data_folder() {
-        if let Some(path) = default_index_path() {
-            let set = test_data_dir::get().expect("a data folder without an override");
-            assert!(path.starts_with(set));
-        }
+        // No test outside the (ignored) screenshot run sets an override, so
+        // a test build must resolve no data folder at all; a real-folder
+        // fallback would make this fail.
+        assert!(test_data_dir::get().is_none());
+        assert!(default_index_path().is_none());
     }
 
     #[test]

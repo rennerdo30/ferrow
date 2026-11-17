@@ -711,11 +711,37 @@ fn render_all_screens() {
     }
 }
 
+/// Whether `name` is a picture this harness writes
+/// (`NN-screen-dark|light-WxH.png`). Only those are removed before a run, so
+/// pointing `FERROW_SCREENSHOT_DIR` at a folder with other pictures is safe.
+fn is_harness_picture(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".png") else {
+        return false;
+    };
+    let b = stem.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_digit() || !b[1].is_ascii_digit() || b[2] != b'-' {
+        return false;
+    }
+    let Some((rest, size)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    let size_ok = size.split_once('x').is_some_and(|(w, h)| {
+        !w.is_empty()
+            && !h.is_empty()
+            && w.bytes().all(|c| c.is_ascii_digit())
+            && h.bytes().all(|c| c.is_ascii_digit())
+    });
+    size_ok && (rest.ends_with("-dark") || rest.ends_with("-light"))
+}
+
 fn capture_all(out: &Path) {
     // Stale files from an older run would be mistaken for fresh ones.
     for entry in std::fs::read_dir(out).into_iter().flatten().flatten() {
         let p = entry.path();
-        if p.extension().is_some_and(|e| e == "png") {
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_harness_picture)
+        {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -881,5 +907,29 @@ fn capture_all(out: &Path) {
         s.settings_page();
         s.scroll_to("Follow symbolic links");
         s.save(23, "settings-service-index");
+    }
+}
+
+#[cfg(test)]
+mod picture_names {
+    use super::is_harness_picture;
+
+    #[test]
+    fn only_the_harness_pictures_are_cleaned_up() {
+        assert!(is_harness_picture("05-results-name-dark-1040x680.png"));
+        assert!(is_harness_picture(
+            "23-settings-service-index-light-560x360.png"
+        ));
+        for other in [
+            "keep.png",
+            "Screenshot 2026-11-14 091522.png",
+            "05-results-name-dark-1040x680.jpg",
+            "05-results-name-sepia-1040x680.png",
+            "5-results-dark-1040x680.png",
+            "05-results-dark-1040.png",
+            "holiday-dark-1x1.png",
+        ] {
+            assert!(!is_harness_picture(other), "{other} must be kept");
+        }
     }
 }
