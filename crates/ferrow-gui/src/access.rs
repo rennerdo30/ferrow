@@ -112,7 +112,9 @@ impl Notice {
 /// Why the elevated command did not run to success.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunError {
-    /// The user declined the administrator prompt.
+    /// The user declined the administrator prompt (Windows only: elsewhere
+    /// nothing is elevated from the app).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Declined,
     Failed(String),
 }
@@ -1311,17 +1313,13 @@ mod tests {
     fn an_answer_that_is_not_a_canonical_id_is_refused() {
         // Whatever the resolver says, only a usable id can be offered for the
         // elevated command line.
-        for bad in [
-            "1000 & calc",
-            "S-1-5-21-1\" --x",
-            "",
-            "-rf",
-            "a b",
-            "S-2-5-18",
-        ] {
+        for bad in ["1000 & calc", "S-1-5-21-1\" --x", "", "-rf", "a b"] {
             let r = lookup_t("x", move |_| Ok(found(bad, "x")), QUICK);
             assert!(r.is_err(), "{bad:?}");
         }
+        // Off Windows "S-2-5-18" is a safe user name; on Windows it is not a SID.
+        let odd = lookup_t("x", |_| Ok(found("S-2-5-18", "x")), QUICK);
+        assert_eq!(odd.is_err(), cfg!(windows));
         assert!(lookup_t("x", |_| Ok(found(SID, "x")), QUICK).is_ok());
         assert_eq!(add_command(&found("1000 & calc", "x")), None);
         assert!(
