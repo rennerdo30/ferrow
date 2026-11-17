@@ -316,6 +316,12 @@ pub struct LoadTimings {
     /// Disjoint subspans of `derived`; do not add the parent again.
     pub derived_fold: Duration,
     pub derived_sort: Duration,
+    /// Disjoint subspans of `read`, `checksum` and `decode` spent on the
+    /// optional metadata payload; zero for a core-only file. Do not add
+    /// the parents again.
+    pub metadata_read: Duration,
+    pub metadata_checksum: Duration,
+    pub metadata_decode: Duration,
 }
 
 impl LoadTimings {
@@ -519,7 +525,10 @@ fn stream_sections<R: std::io::Read>(
     let arena = s.bytes(arena_len)?;
     let folded_arena = s.bytes(arena_len)?;
     let sorted = s.values(n, u32::from_le_bytes)?;
+    let (read_before, checksum_before) = (s.timings.read, s.timings.checksum);
     let metadata_bytes = s.bytes(header.metadata_len as usize)?;
+    let metadata_read = s.timings.read - read_before;
+    let metadata_checksum = s.timings.checksum - checksum_before;
     let sum = s.crc.finalize();
     drop(s.chunk);
     if sum != header.checksum {
@@ -532,7 +541,11 @@ fn stream_sections<R: std::io::Read>(
         return Err(LoadError::Corrupt("unexpected metadata bytes"));
     }
     drop(metadata_bytes);
-    timings.decode += t.elapsed();
+    let metadata_decode = t.elapsed();
+    timings.decode += metadata_decode;
+    timings.metadata_read = metadata_read;
+    timings.metadata_checksum = metadata_checksum;
+    timings.metadata_decode = metadata_decode;
     validate(
         Parts {
             parent,
