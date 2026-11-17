@@ -17,6 +17,9 @@ use crate::settings::{SourceKind, ThemeChoice, UpdateChannel};
 use crate::theme;
 use crate::update::{self, UpdateState};
 
+#[path = "service_section.rs"]
+mod service_section;
+
 const CARD_GAP: f32 = 4.0;
 const SECTION_GAP: f32 = 20.0;
 const MAX_WIDTH: f32 = 860.0;
@@ -33,6 +36,7 @@ const MIN_TEXT_WIDTH: f32 = 140.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Section {
     FastIndex,
+    ServiceHealth,
     OwnIndex,
     Windows,
     Appearance,
@@ -41,8 +45,9 @@ pub(super) enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::FastIndex,
+        Section::ServiceHealth,
         Section::OwnIndex,
         Section::Windows,
         Section::Appearance,
@@ -53,6 +58,7 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::FastIndex => "Fast index",
+            Section::ServiceHealth => "Service health",
             Section::OwnIndex => "Own index",
             Section::Windows => "Windows",
             Section::Appearance => "Appearance",
@@ -443,6 +449,9 @@ impl FerrowApp {
                         marks.begin(ui, Section::FastIndex);
                         self.fast_index_section(ui);
                         ui.add_space(SECTION_GAP);
+                        marks.begin(ui, Section::ServiceHealth);
+                        self.service_health_section(ui);
+                        ui.add_space(SECTION_GAP);
                         marks.begin(ui, Section::OwnIndex);
                         self.own_index_section(ui);
                         if cfg!(windows) {
@@ -523,6 +532,13 @@ impl FerrowApp {
             look_up: false,
         };
         let mut retry = false;
+        // The service is down or needs a look: point to Service health.
+        let attention = self
+            .service_health
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.needs_attention(env!("CARGO_PKG_VERSION")));
+        let mut open_health = false;
         let color = tone_color(&p, status.tone);
         status_card(ui, &p, color, |ui| {
             ui.horizontal(|ui| {
@@ -537,9 +553,16 @@ impl FerrowApp {
                         .font(FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into())))
                         .color(if status.on { color } else { p.text }),
                 );
-                if status.retry {
+                if status.retry || attention {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        retry = ui.add(std_button(&p, "Retry", 90.0)).clicked();
+                        if status.retry {
+                            retry = ui.add(std_button(&p, "Retry", 90.0)).clicked();
+                        }
+                        if attention {
+                            open_health = ui
+                                .add(std_button(&p, "Open Service health", 170.0))
+                                .clicked();
+                        }
                     });
                 }
             });
@@ -566,6 +589,9 @@ impl FerrowApp {
         }
         if retry {
             self.access.retry();
+        }
+        if open_health {
+            self.settings_scroll_to = Some("Service health");
         }
         if let Some(action) = out.action {
             let wake = ctx.clone();
@@ -1648,15 +1674,7 @@ fn access_block(
     }
     if let Some(notice) = input.message {
         ui.add_space(10.0);
-        let (tone, filled) = match notice.outcome {
-            access::Outcome::Done => (Tone::Good, true),
-            // The command succeeded but this account cannot see the result.
-            access::Outcome::Unconfirmed => (Tone::Neutral, true),
-            // The command ran and there was nothing to do (Service health).
-            access::Outcome::NoChange => (Tone::Neutral, true),
-            access::Outcome::Declined => (Tone::Neutral, false),
-            access::Outcome::Problem => (Tone::Caution, true),
-        };
+        let (tone, filled) = notice_look(notice.outcome);
         dot_row(ui, p, tone, filled, &notice.text, "");
     }
     AccessOut {
@@ -1664,6 +1682,18 @@ fn access_block(
         confirm,
         add,
         look_up,
+    }
+}
+
+/// How an outcome is drawn: the dot's tone, filled or a ring.
+fn notice_look(outcome: access::Outcome) -> (Tone, bool) {
+    match outcome {
+        access::Outcome::Done => (Tone::Good, true),
+        // The command succeeded but this account cannot see the result, or
+        // there was nothing to do.
+        access::Outcome::Unconfirmed | access::Outcome::NoChange => (Tone::Neutral, true),
+        access::Outcome::Declined => (Tone::Neutral, false),
+        access::Outcome::Problem => (Tone::Caution, true),
     }
 }
 
