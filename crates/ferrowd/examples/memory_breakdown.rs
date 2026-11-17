@@ -371,7 +371,7 @@ impl Report {
     }
 
     /// The highest value the process reached during a phase (Linux: since the
-    /// phase's `reset_peak`; Windows: peak commit of the whole run).
+    /// phase's `reset_peak`; Windows: the sampled maximum of private bytes).
     fn peak(&mut self, phase: &str, before: u64, peak: Option<u64>, note: &str) {
         let peak = peak.unwrap_or(0);
         println!(

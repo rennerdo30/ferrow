@@ -137,23 +137,33 @@ pub fn process() -> ProcessMemory {
     }
 }
 
-/// Start a new peak window where the platform allows it (Linux: reset the
-/// resident high-water mark). Windows keeps one peak for the whole run.
+/// Start a new peak window (measurement only). Linux resets the resident
+/// high-water mark. Windows has no reset, so the first call starts a thread
+/// that samples the private bytes every millisecond into the window's maximum;
+/// [`process`] then reports that maximum as `peak`. The service never calls
+/// this: its `peak` stays the whole-run peak commit.
 pub fn reset_peak() {
     #[cfg(target_os = "linux")]
     linux::reset_peak();
+    #[cfg(windows)]
+    windows::reset_peak();
 }
 
 /// Ask the allocator to give free memory back to the system (glibc's
-/// `malloc_trim`); false where there is no such call. Measurement only: it
-/// shows how much of the remainder is free memory the allocator still holds.
+/// `malloc_trim`, Windows `HeapCompact` on the process heap); false where
+/// there is no such call or it freed nothing. Measurement only: it shows how
+/// much of the remainder is free memory the allocator still holds.
 pub fn release_free_heap() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // SAFETY: no preconditions.
         unsafe { libc::malloc_trim(0) != 0 }
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(windows)]
+    {
+        windows::compact_heap()
+    }
+    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), windows)))]
     {
         false
     }
@@ -162,8 +172,41 @@ pub fn release_free_heap() -> bool {
 #[cfg(windows)]
 mod windows {
     use super::{HeapStats, ProcessMemory};
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub fn process() -> ProcessMemory {
+    /// Highest private bytes seen since the last [`reset_peak`].
+    static WINDOW_MAX: AtomicU64 = AtomicU64::new(0);
+    static SAMPLER: Once = Once::new();
+
+    pub fn reset_peak() {
+        SAMPLER.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("memory-peak-sampler".into())
+                .spawn(|| {
+                    loop {
+                        if let Some(c) = counters() {
+                            WINDOW_MAX.fetch_max(c.PrivateUsage as u64, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                });
+        });
+        WINDOW_MAX.store(
+            counters().map_or(0, |c| c.PrivateUsage as u64),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Defragment the default process heap and decommit what it can
+    /// (`HeapCompact`); true when it returned a non-zero largest free block.
+    pub fn compact_heap() -> bool {
+        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+        // SAFETY: the process heap handle is valid for the process's life.
+        unsafe { HeapCompact(GetProcessHeap(), 0) != 0 }
+    }
+
+    fn counters() -> Option<windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS_EX> {
         use windows_sys::Win32::System::ProcessStatus::{
             K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
         };
@@ -191,13 +234,27 @@ mod windows {
                 c.cb,
             )
         };
-        if ok == 0 {
+        (ok != 0).then_some(c)
+    }
+
+    pub fn process() -> ProcessMemory {
+        let Some(c) = counters() else {
             return ProcessMemory::default();
-        }
+        };
+        let private = c.PrivateUsage as u64;
+        // With a sampler running (measurement code called `reset_peak`) the
+        // window's maximum; otherwise the whole-run peak commit.
+        let peak = if SAMPLER.is_completed() {
+            WINDOW_MAX
+                .fetch_max(private, Ordering::Relaxed)
+                .max(private)
+        } else {
+            c.PeakPagefileUsage as u64
+        };
         ProcessMemory {
-            private: Some(c.PrivateUsage as u64),
+            private: Some(private),
             resident: c.WorkingSetSize as u64,
-            peak: Some(c.PeakPagefileUsage as u64),
+            peak: Some(peak),
             heap: heap(),
         }
     }
