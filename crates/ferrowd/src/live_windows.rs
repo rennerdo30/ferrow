@@ -19,8 +19,9 @@ use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 use crate::health::{STATE, VolumeState};
 use crate::live::{
     Applied, Change, HARD_DELTA, Live, MAX_WALK_TIME, NOTABLE_WALK, REASON_ADMIN, RecordSource,
-    RecordState, RescanPolicy, WALK_SLACK, WalkJob, walk_limits_text,
+    RecordState, RescanPolicy, WALK_SLACK, WalkJob, index_parts, walk_limits_text,
 };
+use crate::memory::Breakdown;
 use crate::{Snapshot, SnapshotStore, eventlog};
 
 /// How long changes are collected after the first one of a batch.
@@ -178,6 +179,23 @@ fn describe_volumes(
             }
         })
         .collect()
+}
+
+/// Log where the service's memory is after a scan and before a rescan
+/// (FR-37): process counters, bytes per entry by group, the largest
+/// components and the unattributed remainder. Computed here only, never per
+/// request or batch.
+fn log_memory(when: &str, live: Option<&Live>, base: &ferrow_index::Index, store: &SnapshotStore) {
+    let breakdown = match live {
+        Some(live) => {
+            let snapshot = store.get();
+            live.breakdown(snapshot.live.as_deref(), 0)
+        }
+        None => Breakdown::new(base.len(), index_parts(base, "index"), 0),
+    };
+    for line in breakdown.event_lines(when) {
+        eventlog::info(line);
+    }
 }
 
 struct Volumes {
@@ -415,6 +433,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             report: summary.clone(),
         });
         if live_volumes.is_empty() {
+            log_memory("after scan", None, &base, &store);
             return;
         }
         for map in &live_volumes {
@@ -464,11 +483,15 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             "folders moved into the index are read in the background ({}), not rescanned",
             walk_limits_text()
         ));
+        log_memory("after scan", Some(&live), &base, &store);
         let mut applied_total = 0usize;
         let mut rescan = RescanPolicy::after_scan(Instant::now(), took);
         reason = loop {
             let urgent = live.delta_len() > HARD_DELTA;
             if let Some(why) = rescan.due(Instant::now(), urgent) {
+                // The fullest the live layer gets: what it holds before the
+                // rescan replaces it.
+                log_memory("before rescan", Some(&live), &base, &store);
                 break why;
             }
             // Wake for a pending rescan, and to check on a folder read that

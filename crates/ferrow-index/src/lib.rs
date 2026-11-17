@@ -230,6 +230,41 @@ impl Index {
             + 2 * std::mem::size_of::<usize>()
     }
 
+    /// [`Index::heap_bytes`] split into named parts (capacity, not length):
+    /// the columns, both name arenas, the name order and, per present
+    /// metadata column, its values, validity bitmap, overflows, cached sort
+    /// order (zero until prepared) and fixed objects. The parts add up to
+    /// `heap_bytes()` exactly. Memory accounting only; allocates a short list.
+    pub fn heap_parts(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = vec![
+            ("parent".into(), self.parent.capacity() * 4),
+            ("name_off".into(), self.name_off.capacity() * 4),
+            ("name_len".into(), self.name_len.capacity() * 2),
+            ("flags".into(), self.flags.capacity() * 2),
+            ("name_arena".into(), self.arena.capacity()),
+            ("folded_arena".into(), self.folded_arena.capacity()),
+            ("name_order".into(), self.sorted.capacity() * 4),
+        ];
+        let mut columns = Vec::new();
+        self.metadata.heap_parts(&mut columns);
+        out.extend(
+            columns
+                .into_iter()
+                .map(|(name, bytes)| (format!("metadata.{name}"), bytes)),
+        );
+        out.push((
+            "objects".into(),
+            std::mem::size_of::<Vec<u32>>() + 2 * std::mem::size_of::<usize>(),
+        ));
+        out
+    }
+
+    /// Bytes of the saved file, which is also the size of the single buffer a
+    /// save fills in memory before it writes (memory accounting).
+    pub fn serialized_len(&self) -> Result<usize, SaveError> {
+        persist::serialized_len(self)
+    }
+
     /// Save to the versioned binary format. See [`persist`].
     pub fn save(&self, path: &std::path::Path) -> Result<(), SaveError> {
         persist::save(self, path)
@@ -691,5 +726,55 @@ mod tests {
         assert_eq!(idx.arena.len(), idx.folded_arena.len());
         let live_floor = idx.len() * (4 + 4 + 2 + 2 + 4) + idx.arena.len() * 2;
         assert!(idx.heap_bytes() > live_floor);
+    }
+
+    #[test]
+    fn heap_parts_add_up_to_heap_bytes_with_every_column_and_a_ready_order() {
+        let b = IndexBuilder::with_columns(ColumnSet::ALL);
+        let root = b.add_root(b"root", flags::DIR);
+        for i in 0..40u64 {
+            b.add_with_metadata(
+                root,
+                format!("file{i}.txt").as_bytes(),
+                0,
+                EntryMetadata {
+                    size: Some(i * 1000),
+                    modified: Some(i as i64 * 10_000_000),
+                    created: Some(i as i64 * 10_000_000),
+                    accessed: None,
+                    attributes: Some(0x20),
+                },
+            );
+        }
+        let idx = b.freeze();
+        let before = idx.heap_parts();
+        let total = |parts: &[(String, usize)]| parts.iter().map(|(_, b)| b).sum::<usize>();
+        assert_eq!(total(&before), idx.heap_bytes());
+        for name in [
+            "parent",
+            "name_arena",
+            "metadata.size.values",
+            "metadata.modified.validity",
+            "metadata.attributes.values",
+        ] {
+            assert!(before.iter().any(|(n, _)| n == name), "{name} missing");
+        }
+        let order = |parts: &[(String, usize)]| {
+            parts
+                .iter()
+                .find(|(n, _)| n == "metadata.size.order")
+                .unwrap()
+                .1
+        };
+        assert_eq!(order(&before), 0, "a sort order is zero until prepared");
+        idx.request_sort(SortKey::Size);
+        let ticket = idx.sort_ticket(SortKey::Size).unwrap();
+        assert_eq!(
+            ticket.wait_timeout(std::time::Duration::from_secs(30)),
+            SortStatus::Ready
+        );
+        let after = idx.heap_parts();
+        assert!(order(&after) >= idx.len() * 3, "a ready order is counted");
+        assert_eq!(total(&after), idx.heap_bytes());
     }
 }
