@@ -436,6 +436,21 @@ jobs:
       - name: Write fixture profiling summary (separate from paired samples)
         if: always()
         run: ./scripts/bench-summary.sh fixture-output.txt
+      - name: TEMPORARY A/A diagnostic (FR-31, removed before merge)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/aa-a/examples" "$T/aa-b/examples" "$T/aa-c/examples"
+          for d in aa-a aa-b aa-c; do
+            cp target/release/ferrow "$T/$d/ferrow"
+            cp target/release/examples/latency_probe "$T/$d/examples/latency_probe"
+          done
+          {
+            echo "## A/A diagnostic (identical head binaries; FR-31)"
+            timeout -k 10s 1500s python3 scripts/aa_diag.py "$T/ferrow-bench.bin" 6 \
+              "$T/ferrow-base-target/release" "$PWD/target/release" "$T/aa-a" "$T/aa-b" "$T/aa-c"
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
         run: |
