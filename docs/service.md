@@ -136,7 +136,9 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   returns to `admins`. Names resolve with `LookupAccountNameW` /
   `getpwnam_r` in the short-lived administrator process; groups are refused,
   and control characters in names are escaped when printed.
-- **The app** (Settings → Service access) shows in one line whether this
+- **The app** (Settings → **Fast index → Who can use the service**; the
+  **Fast index** card at the top says whether the live index is on and, if
+  not, why) shows in one line whether this
   account uses the service, and runs the same commands through the installed
   `ferrow.exe` with a UAC prompt (Windows; elsewhere it shows the `sudo`
   commands to copy). When a standard user approves it with an
@@ -152,6 +154,23 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   only start `ferrow.exe` from the Setup-installed Program Files folder (found
   with the shell's known-folder API, with that folder as the working
   directory), never from a portable or development copy.
+- **Add account…** (same card) adds another account by name. The name
+  (`DOMAIN\user`, `user` or a SID) is looked up in the app's own, unelevated
+  process with `LookupAccountNameW` (`LookupAccountSidW` for the display
+  name) on a thread of its own with a 5 s deadline, since a domain lookup can
+  stall; at most one such thread exists, and a new lookup while a stuck one
+  still runs says so. Unknown names and anything that is not a user account
+  (groups, well-known SIDs such as Everyone or SYSTEM) get an error. Only the
+  looked-up canonical SID is passed to the elevated `ferrow service access add`
+  command line, never the typed text, so nothing typed reaches the `runas`
+  parameters; a plain number is not accepted as an id on Windows. Without
+  elevation the command is shown to copy (Linux and macOS show
+  `sudo ferrow service access add <name>`, with the name limited to letters,
+  digits and `. _ - @`; nothing is looked up there). A standard user who
+  approves the prompt with administrator credentials cannot read the account
+  list, so the answer cannot show another account's addition or removal: the
+  app then goes by how the command ended and says it cannot confirm
+  (a declined prompt is never reported as done).
 - Uninstall keeps `access.json` with the rest of the state (as it keeps
   `index.bin`), so a reinstall picks the choice up again. Delete the folder to
   reset it, or run `ferrow service access admins`.
