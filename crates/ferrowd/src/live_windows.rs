@@ -17,11 +17,10 @@ use ferrow_walk::subtree::{Subtree, WalkError, walk_subtree};
 use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 
 use crate::health::{STATE, VolumeState};
-use crate::live;
 use crate::live::{
-    Applied, Change, Due, Live, MAX_WALK_TIME, Maintenance, NOTABLE_WALK, PublishGate,
-    REASON_ADMIN, RecordSource, RecordState, WALK_SLACK, WalkJob, compact_and_publish, index_parts,
-    walk_limits_text,
+    Applied, Change, Due, Live, Load, MAX_WALK_TIME, Maintenance, NOTABLE_WALK, PublishGate,
+    REASON_ADMIN, Reason, ReasonKind, RecordSource, RecordState, WALK_SLACK, WalkJob,
+    compact_and_publish, index_parts, walk_limits_text,
 };
 use crate::memory::Breakdown;
 use crate::{Snapshot, SnapshotStore, eventlog};
@@ -515,8 +514,13 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         let mut base = base;
         let mut gate = PublishGate::new();
         reason = loop {
-            let urgent = live.delta_len() > hard_delta;
-            match rescan.due(Instant::now(), urgent, live.walks_outstanding()) {
+            let load = Load::of(
+                live.delta_len(),
+                hard_delta,
+                live.walks_outstanding(),
+                STATE.is_saving(),
+            );
+            match rescan.due(Instant::now(), load) {
                 Some(Due::Rescan(why)) => {
                     // The fullest the live layer gets: what it holds before
                     // the rescan replaces it.
@@ -529,10 +533,25 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                     // Single writer: this thread, on the low-priority pool.
                     // Journal changes queue in the channel meanwhile, and
                     // searches read the snapshot published before.
-                    let took = compact_and_publish(&mut live, &store, report, |live| match &pool {
-                        Some(pool) => pool.install(|| live.compact()),
-                        None => live.compact(),
-                    });
+                    let took = compact_and_publish(
+                        &mut live,
+                        &store,
+                        report,
+                        |live| match &pool {
+                            Some(pool) => pool.install(|| live.compact()),
+                            None => live.compact(),
+                        },
+                        // The sort orders the old index had ready are built
+                        // again by one background thread each, at the lowest
+                        // priority, so a sorted search is not left on name
+                        // order. Nothing waits for them.
+                        |index, key| {
+                            index.request_sort_starting(
+                                key,
+                                ferrow_walk::priority::enter_background,
+                            );
+                        },
+                    );
                     if let Some(took) = took {
                         base = live.base().clone();
                         hard_delta = live.limits().hard_delta;
@@ -540,7 +559,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                         rescan.compacted(Instant::now(), took);
                         STATE.compaction_done(&why, took);
                         eventlog::info(format!(
-                            "folded the live changes into the index in memory ({why}) in {:.1} s: {} entries, no disk read",
+                            "merged the live changes into the index in memory ({why}) in {:.1} s: {} entries, no disk read",
                             took.as_secs_f64(),
                             base.len()
                         ));
@@ -554,7 +573,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             // owed but held back by the duty gate, and to check on a folder
             // read that may be stuck.
             let wake = [
-                rescan.wake_at(live.walks_outstanding()),
+                rescan.wake_at(Instant::now(), load),
                 gate.wake_at(),
                 live.next_walk_deadline(),
             ]
@@ -573,7 +592,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 } => {
                     eventlog::warn(format!("journal of {device}: {reason}"));
                     STATE.journal_problem(&device, fatal, &reason);
-                    if rescan.request(format!("{device}: {reason}")) {
+                    if rescan.request(Reason::disk(format!("{device}: {reason}"))) {
                         STATE.set_pending(rescan.rescan_pending());
                     }
                     continue;
@@ -644,10 +663,9 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             if let Some(why) = outcome.rescan {
                 // The reason text changes with every batch (it carries the
                 // delta size): only the start of an episode is an event.
-                let wanted = if live::is_overflow(&why) {
-                    format!("compaction wanted: {why}")
-                } else {
-                    format!("rescan wanted: {why}")
+                let wanted = match why.kind() {
+                    ReasonKind::Compact => format!("merge in memory wanted: {why}"),
+                    ReasonKind::Disk => format!("rescan wanted: {why}"),
                 };
                 if rescan.request(why) {
                     eventlog::info(wanted);

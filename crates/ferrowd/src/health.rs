@@ -73,7 +73,8 @@ struct Inner {
     last_finished: Option<Instant>,
     /// Scans started, by kind of reason.
     scans_by_reason: BTreeMap<String, u64>,
-    /// The last in-memory compaction, how many there were and their total time.
+    /// The last in-memory compaction since the last scan, how many there were
+    /// and their total time.
     compaction: Option<ScanInfo>,
     compactions: u64,
     compaction_ms: u64,
@@ -82,6 +83,15 @@ struct Inner {
 /// Least time between the end of one scan and a requested rescan: an
 /// administrator's own repeated requests must not keep the service scanning.
 pub const MIN_FORCED_GAP: Duration = Duration::from_secs(60);
+
+/// An index save in flight (see [`State::saving`]).
+pub struct SavingGuard<'a>(&'a AtomicBool);
+
+impl Drop for SavingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 pub struct State {
     inner: Mutex<Inner>,
@@ -96,6 +106,8 @@ pub struct State {
     scanning: AtomicBool,
     /// A requested rescan was sent and has not started yet.
     forced: AtomicBool,
+    /// The index is being written to disk (the saver holds it alive).
+    saving: AtomicBool,
 }
 
 impl State {
@@ -122,6 +134,7 @@ impl State {
             connection_errors: AtomicU64::new(0),
             scanning: AtomicBool::new(false),
             forced: AtomicBool::new(false),
+            saving: AtomicBool::new(false),
         }
     }
 
@@ -165,6 +178,9 @@ impl State {
         }
         inner.volumes = volumes;
         inner.last_finished = Some(Instant::now());
+        // The index was built from the disks again: an earlier merge of live
+        // changes says nothing about it.
+        inner.compaction = None;
         inner.scan = Some(ScanInfo {
             at_ms: now_ms(),
             reason: reason.into(),
@@ -220,15 +236,10 @@ impl State {
     }
 
     /// A compaction finished: the live layer grown past `reason`'s limit was
-    /// folded into a new index in memory in `took`. Counted as its own kind
-    /// next to the scans, but it is not a scan: no disk was read and
-    /// [`State::is_scanning`] never said so.
+    /// folded into a new index in memory in `took`. Not a scan (no disk was
+    /// read, [`State::is_scanning`] never said so): it has its own counters.
     pub fn compaction_done(&self, reason: &str, took: Duration) {
         let mut inner = self.lock();
-        *inner
-            .scans_by_reason
-            .entry(crate::live::KIND_COMPACTION.into())
-            .or_default() += 1;
         inner.compactions += 1;
         inner.compaction_ms += took.as_millis() as u64;
         inner.compaction = Some(ScanInfo {
@@ -253,6 +264,19 @@ impl State {
     /// A background read failed or was too large: a rescan is asked for.
     pub fn folder_read_fell_back(&self) {
         self.folder_read_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The index save starts; it is in flight until the guard is dropped (on
+    /// success, failure or panic). The maintainer holds back an in-memory
+    /// compaction meanwhile: the saver keeps the old index alive.
+    pub fn saving(&self) -> SavingGuard<'_> {
+        self.saving.store(true, Ordering::Release);
+        SavingGuard(&self.saving)
+    }
+
+    /// Whether an index save is in flight.
+    pub fn is_saving(&self) -> bool {
+        self.saving.load(Ordering::Acquire)
     }
 
     pub fn save_done(&self, took: Duration, error: Option<String>) {
@@ -321,7 +345,6 @@ impl State {
                 journal_detail: v.journal_detail.clone(),
                 last_scan: inner.scan.clone(),
                 rescan_pending: inner.pending.clone(),
-                last_compaction: inner.compaction.clone(),
             })
             .collect();
         let mut health = Health {
@@ -349,6 +372,7 @@ impl State {
                 scans_by_reason: inner.scans_by_reason.clone(),
                 compactions: inner.compactions,
                 compaction_ms: inner.compaction_ms,
+                last_compaction: inner.compaction.clone(),
             },
             events,
             ..Health::default()
@@ -604,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_is_counted_as_its_own_kind_and_is_not_a_scan() {
+    fn a_merge_in_memory_has_its_own_counters_and_is_not_a_scan() {
         let state = State::new();
         state.scan_started();
         state.scan_finished("startup", Duration::from_secs(70), vec![live_volume()]);
@@ -619,14 +643,17 @@ mod tests {
         };
         let report = state.report(&store, &policy);
         let stats = &report.live_stats;
-        assert_eq!(stats.scans_by_reason["compaction"], 2);
+        // Counted beside the scans, never among them.
+        assert_eq!(stats.scans_by_reason.len(), 1);
         assert_eq!(stats.scans_by_reason["startup"], 1);
         assert_eq!((stats.compactions, stats.compaction_ms), (2, 13_000));
-        // The volume still reports its last real scan, and the last compaction
-        // beside it with its own time.
-        let volume = &report.volumes[0];
-        assert_eq!(volume.last_scan.as_ref().unwrap().reason, "startup");
-        let last = volume.last_compaction.as_ref().unwrap();
+        // The volume still reports its last real scan; the last merge is one
+        // service-level fact, not repeated on every volume.
+        assert_eq!(
+            report.volumes[0].last_scan.as_ref().unwrap().reason,
+            "startup"
+        );
+        let last = stats.last_compaction.as_ref().unwrap();
         assert_eq!(
             (last.reason.as_str(), last.took_ms),
             ("60000 live changes", 600)
@@ -640,7 +667,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.live_stats.compactions, 0);
-        assert_eq!(old.volumes[0].last_compaction, None);
+        assert_eq!(old.live_stats.last_compaction, None);
+        // A later scan builds the index from the disks again: the earlier
+        // merge no longer says anything about it, the totals stay.
+        state.scan_started();
+        state.scan_finished("journal", Duration::from_secs(60), vec![live_volume()]);
+        let report = state.report(&store, &policy);
+        assert_eq!(report.live_stats.last_compaction, None);
+        assert_eq!(report.live_stats.compactions, 2);
+    }
+
+    #[test]
+    fn an_index_save_in_flight_is_visible_until_its_guard_ends() {
+        let state = State::new();
+        assert!(!state.is_saving());
+        {
+            let _saving = state.saving();
+            assert!(state.is_saving());
+        }
+        assert!(!state.is_saving());
+        // Also when the save panics.
+        let state = std::sync::Arc::new(State::new());
+        let s = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _saving = s.saving();
+            panic!("save failed");
+        })
+        .join();
+        assert!(!state.is_saving(), "a panic does not leave it set");
     }
 
     #[test]

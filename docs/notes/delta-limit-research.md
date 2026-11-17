@@ -390,8 +390,8 @@ within about 10 % except one outlier of 1,025 ms on the service pool while the P
 | search "zzzqq" (no match), ms (with delta / after) | 1.97 / 1.77 | 2.81 / 2.22 |
 
 - **Against a rescan of the same base** (`memory_breakdown`, 1 M entries, synthetic MFT build,
-  one scan with the old index and view held): the scan's peak is 163 B per entry above the old
-  state (163 MB), the compaction's about 85; a rescan of 27 million entries measured 74 s and
+  one scan with the old index and view held): the scan's peak is 161 B per entry above the old
+  state (about 161 MB), the compaction's about 85; a rescan of 27 million entries measured 74 s and
   198 s on the author's PCs and reads the whole file table (or walks the disks), a compaction
   reads no disk. Linear to 27 M: about 9 s of one thread's CPU (about 3 to 4 s wall on the
   background pool) and about 2.3 GB of peak, against 74 to 198 s and about 4.4 GB.

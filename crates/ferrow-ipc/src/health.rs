@@ -113,14 +113,17 @@ pub struct LiveStats {
     pub folder_read_fallbacks: u64,
     /// Scans started, by why: `startup`, `moved-in folder`, `large folder
     /// move`, `too many live changes`, `too many replaced entries`,
-    /// `too many superseded entries`, `journal`, `administrator`; and
-    /// `compaction`, which is not a scan: a live layer grown too large was
-    /// folded into a new index in memory, with no disk read.
+    /// `too many superseded entries`, `journal`, `administrator`. A merge of
+    /// the live changes in memory is not a scan and is not counted here.
     pub scans_by_reason: BTreeMap<String, u64>,
-    /// In-memory compactions finished since the service started…
+    /// Merges of the live changes into a new index in memory (no disk read)
+    /// finished since the service started…
     pub compactions: u64,
-    /// …and the milliseconds they took in total.
+    /// …the milliseconds they took in total…
     pub compaction_ms: u64,
+    /// …and the last one since the last scan (a scan starts from the disks
+    /// and clears it); its `reason` is the size limit that asked for it.
+    pub last_compaction: Option<ScanInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,9 +148,6 @@ pub struct VolumeHealth {
     pub journal_detail: String,
     pub last_scan: Option<ScanInfo>,
     pub rescan_pending: Option<RescanInfo>,
-    /// The last in-memory compaction (service wide; its `reason` is the
-    /// size limit that asked for it). Absent in reports of older services.
-    pub last_compaction: Option<ScanInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

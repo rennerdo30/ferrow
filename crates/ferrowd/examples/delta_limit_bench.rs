@@ -27,7 +27,10 @@
 //!   new frozen index in memory instead of a disk rescan: wall time on the
 //!   service's pool, on one thread (a CPU proxy) and on the default pool, the
 //!   private-byte peak per entry, the new live layer's bytes per entry, and
-//!   the same searches against the compacted index.
+//!   the same searches against the compacted index, and `DELTA-SORT-READY`:
+//!   the time until the size and the date sort orders (the ones a compaction
+//!   asks the new index to prepare, as the service does) are ready, alone and
+//!   both at once.
 //!
 //! Change mix per batch: 70 % new file (into one of 2000 "build output"
 //! folders), 25 % modified existing file (base entry hidden, delta entry
@@ -45,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrow_fixture::Rng;
-use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags};
+use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, SortKey, SortStatus, flags};
 use ferrow_ipc::{Request, Response, Sort};
 use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
@@ -287,6 +290,27 @@ fn view_bytes(view: &LiveView) -> u64 {
 }
 
 // NEW-API-BEGIN
+/// Milliseconds until each sort order is ready, from one request of all of
+/// them at once, as the service asks (`request_sort_starting` with the
+/// background priority); polled every millisecond.
+fn sort_ready_ms(index: &Index, keys: &[SortKey]) -> Vec<f64> {
+    let t = Instant::now();
+    for &key in keys {
+        index.request_sort_starting(key, ferrow_walk::priority::enter_background);
+    }
+    let mut ready: Vec<Option<f64>> = vec![None; keys.len()];
+    while ready.iter().any(Option::is_none) {
+        for (&key, at) in keys.iter().zip(ready.iter_mut()) {
+            if at.is_none() && index.request_sort(key) == SortStatus::Ready {
+                *at = Some(ms(t.elapsed()));
+            }
+        }
+        assert!(t.elapsed() < Duration::from_secs(120), "sort never ready");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    ready.into_iter().flatten().collect()
+}
+
 /// What folding the live layer into a new frozen index in memory costs
 /// (FR-42, part 2: `Live::compact`, which the service runs instead of a disk
 /// rescan when the delta outgrows its limit), at this checkpoint's delta:
@@ -330,10 +354,12 @@ fn compaction_row(
         .install(|| live.compact())
         .expect("no folder is being read");
     let wall_one = t.elapsed();
+    let single_size = again.base().clone();
     drop(again);
     let t = Instant::now();
     let again = live.compact().expect("no folder is being read");
     let wall_default = t.elapsed();
+    let single_modified = again.base().clone();
     drop(again);
     println!(
         "DELTA-COMPACT checkpoint={target} base_entries={old_len} delta_len={delta} new_entries={entries} compact_ms_service_pool_{svc_threads}_threads={:.0} compact_ms_one_thread={:.0} compact_ms_default_pool={:.0} peak_growth_mb={:.0} compact_peak_B_per_entry={:.1} held_growth_mb={:.0} new_live_B_per_entry={:.1}",
@@ -344,6 +370,16 @@ fn compaction_row(
         peak.saturating_sub(before) as f64 / entries as f64,
         held.saturating_sub(before) as f64 / 1e6,
         new_live as f64 / entries as f64,
+    );
+    // The sort orders the service asks the new index for right after the swap
+    // (the ones that were ready before): each on its own thread at the lowest
+    // priority, both at once as the service does, then each alone.
+    let both = sort_ready_ms(&new_base, &[SortKey::Size, SortKey::Modified]);
+    let size = sort_ready_ms(&single_size, &[SortKey::Size]);
+    let modified = sort_ready_ms(&single_modified, &[SortKey::Modified]);
+    println!(
+        "DELTA-SORT-READY checkpoint={target} entries={entries} size_ms_alone={:.0} modified_ms_alone={:.0} size_ms_with_both={:.0} modified_ms_with_both={:.0}",
+        size[0], modified[0], both[0], both[1]
     );
     // The searches the service would answer right after the swap, and the
     // same ones against the old base with its delta (printed above).
@@ -609,9 +645,9 @@ fn main() {
             batch_times.push(took);
             if let Some(why) = out.rescan {
                 if why.ends_with("live changes") {
-                    asked.get_or_insert((live.delta_len(), why));
+                    asked.get_or_insert((live.delta_len(), why.to_string()));
                 } else {
-                    asked_removed.get_or_insert((live.delta_len(), why));
+                    asked_removed.get_or_insert((live.delta_len(), why.to_string()));
                 }
             }
         }

@@ -83,11 +83,20 @@ fixed 50,000 entries. The design above is now true, with these differences:
 - There is no pending log and no replay. The maintainer is the only writer
   and runs the compaction itself, so journal batches queue in its channel and
   are applied to the new layer after the swap. It does not start while a
-  background folder read is outstanding.
+  background folder read is outstanding or the index is being saved (the
+  saver holds the old index). The hard limit stays a cap: a delta past it that
+  has waited as long as a folder read can last (40 s), or past twice it, is
+  not held back by a save, and if folder reads still keep arriving the volumes
+  are rescanned, as before this change.
+- The new index starts without its cached sort orders; the ones that were
+  ready on the old index are prepared again in the background right after the
+  swap (one thread each, lowest priority; about 0.13 s at 1 M entries), so a
+  sorted search shows name order only that long.
 - The new base is built through `IndexBuilder` (ids are re-dealt: frozen
   entries still shown, then the live ones), not by a merge of sorted orders;
   that primitive is a possible later change. Peak memory is about 85 bytes
-  per entry above the old state (a rescan: about 161), not two full bases.
+  per entry above the old state (measured at 1 M entries: 84 to 85; a rescan:
+  161).
 - A new `Live` is built over the new index from the same volume tables,
   roots, excluded records and hard links, and one `SnapshotStore::swap`
   publishes it with no delta; searches use the old snapshot until then.

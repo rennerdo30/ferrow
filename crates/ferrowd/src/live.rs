@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
-use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, flags};
+use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, SortKey, flags};
 use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
 use ferrow_walk::subtree::{Limits, Subtree, WalkError};
@@ -280,19 +280,59 @@ impl PublishGate {
     }
 }
 
-/// The name health reports for compactions (in the scans-by-reason counters).
-pub const KIND_COMPACTION: &str = "compaction";
+/// What answers a reason for maintenance. Carried with the reason from the
+/// place that found it (never read back from its text, which is for people).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonKind {
+    /// The live layer has grown too large: the service folds it in memory
+    /// ([`Live::compact`]) instead of reading the disks again.
+    Compact,
+    /// The index may be wrong (a journal reset, a folder that could not be
+    /// read, an administrator's request, startup): only a scan can fix it.
+    Disk,
+}
 
-/// Whether a rescan reason only says the live layer has grown too large: the
-/// service folds it in memory ([`Live::compact`]) instead of reading the
-/// disks again. Every other reason (a journal reset, a folder that could not
-/// be read, an administrator's request, startup) means the index may be
-/// wrong, which only a scan can fix.
-pub fn is_overflow(reason: &str) -> bool {
-    matches!(
-        reason_kind(reason),
-        "too many live changes" | "too many replaced entries" | "too many superseded entries"
-    )
+/// A reason for maintenance: what it needs, and the text shown for it. It
+/// derefs to its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reason {
+    kind: ReasonKind,
+    text: String,
+}
+
+impl Reason {
+    /// The live layer is large: a compaction answers it.
+    pub fn compact(text: impl Into<String>) -> Reason {
+        Reason {
+            kind: ReasonKind::Compact,
+            text: text.into(),
+        }
+    }
+
+    /// The disks must be read again.
+    pub fn disk(text: impl Into<String>) -> Reason {
+        Reason {
+            kind: ReasonKind::Disk,
+            text: text.into(),
+        }
+    }
+
+    pub fn kind(&self) -> ReasonKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for Reason {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
 }
 
 /// A compaction may use this share of the time (1 in 6): the next one waits
@@ -302,6 +342,14 @@ const COMPACT_DUTY: u32 = 5;
 const MIN_COMPACT_GAP: Duration = Duration::from_secs(60);
 /// …and at most this long.
 const MAX_COMPACT_GAP: Duration = Duration::from_secs(10 * 60);
+/// How long an overgrown delta (past [`DeltaLimits::hard_delta`]) may wait
+/// for folder reads or for the index save to end before the cap is enforced
+/// anyway: the longest a folder read can last.
+const URGENT_PATIENCE: Duration =
+    Duration::from_secs(MAX_WALK_TIME.as_secs() + WALK_SLACK.as_secs());
+/// While an index save runs, a held-back compaction looks again this often
+/// (the save's end does not wake the maintainer).
+const SAVE_POLL: Duration = Duration::from_secs(2);
 
 /// What the maintainer does next about the size of the live layer.
 #[derive(Debug, PartialEq, Eq)]
@@ -312,9 +360,34 @@ pub enum Due {
     Compact(String),
 }
 
+/// What is going on while the maintainer asks what is due.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Load {
+    /// The delta outgrew [`DeltaLimits::hard_delta`]: no waiting for the gap.
+    pub urgent: bool,
+    /// It outgrew twice that: no waiting for anything.
+    pub severe: bool,
+    /// Folders are being read.
+    pub walks: bool,
+    /// The index is being saved to disk (the saver holds the old index).
+    pub saving: bool,
+}
+
+impl Load {
+    /// The load of a live layer with `delta` entries and the given limit.
+    pub fn of(delta: usize, hard_delta: usize, walks: bool, saving: bool) -> Load {
+        Load {
+            urgent: delta > hard_delta,
+            severe: delta > hard_delta.saturating_mul(2),
+            walks,
+            saving,
+        }
+    }
+}
+
 /// When a requested rescan or compaction may start. A reason that only says
 /// the live layer is large asks for a compaction (seconds of one low-priority
-/// thread, no disk); any other reason asks for a rescan (see [`is_overflow`]).
+/// thread, no disk); any other reason asks for a rescan (see [`ReasonKind`]).
 /// A pending rescan covers a pending compaction: a fresh index has no live
 /// layer.
 #[derive(Debug)]
@@ -322,6 +395,8 @@ pub struct Maintenance {
     rescan: RescanPolicy,
     compact: Option<String>,
     compact_earliest: Instant,
+    /// Since when the delta has been past its hard limit (without a break).
+    urgent_since: Option<Instant>,
 }
 
 impl Maintenance {
@@ -331,19 +406,21 @@ impl Maintenance {
             rescan: RescanPolicy::after_scan(now, took),
             compact: None,
             compact_earliest: now + MIN_COMPACT_GAP,
+            urgent_since: None,
         }
     }
 
-    /// Ask for a rescan or a compaction, by the reason; the first of each is
-    /// kept. True when this started a pending episode of the kind it asks
-    /// for: only then is it news.
-    pub fn request(&mut self, reason: String) -> bool {
-        if is_overflow(&reason) {
-            let fresh = self.compact.is_none();
-            self.compact.get_or_insert(reason);
-            fresh
-        } else {
-            self.rescan.request(reason)
+    /// Ask for a rescan or a compaction, by the reason's kind; the first of
+    /// each is kept. True when this started a pending episode of the kind it
+    /// asks for: only then is it news.
+    pub fn request(&mut self, reason: Reason) -> bool {
+        match reason.kind {
+            ReasonKind::Compact => {
+                let fresh = self.compact.is_none();
+                self.compact.get_or_insert(reason.text);
+                fresh
+            }
+            ReasonKind::Disk => self.rescan.request(reason.text),
         }
     }
 
@@ -364,20 +441,48 @@ impl Maintenance {
         self.rescan.pending().is_some()
     }
 
-    /// What to do now, if anything. `urgent`: the delta outgrew
-    /// [`DeltaLimits::hard_delta`] (no waiting for the gap). A compaction
-    /// never starts while `walks` (folders are being read) or a rescan waits.
-    pub fn due(&mut self, now: Instant, urgent: bool, walks: bool) -> Option<Due> {
-        if let Some(why) = self.rescan.due(now, urgent) {
+    /// Whether an overgrown delta has waited as long as it may.
+    fn overdue(&self, now: Instant, load: Load) -> bool {
+        load.severe
+            || self
+                .urgent_since
+                .is_some_and(|since| now >= since + URGENT_PATIENCE)
+    }
+
+    /// What to do now, if anything. A compaction waits for folder reads (their
+    /// results are merged into the delta) and for an index save (which holds
+    /// the old index); while the delta is [`Load::urgent`] it does not wait
+    /// for its gap. The hard limit stays a cap: an urgent delta that has
+    /// waited [`URGENT_PATIENCE`], or a [`Load::severe`] one, is not held
+    /// back by a save, and when folders keep being read the volumes are
+    /// rescanned, as before compactions existed.
+    pub fn due(&mut self, now: Instant, load: Load) -> Option<Due> {
+        self.urgent_since = if load.urgent {
+            self.urgent_since.or(Some(now))
+        } else {
+            None
+        };
+        if let Some(why) = self.rescan.due(now, load.urgent) {
             return Some(Due::Rescan(why));
         }
-        if walks || self.rescan.pending().is_some() {
+        if self.rescan.pending().is_some()
+            || self.compact.is_none()
+            || !(load.urgent || now >= self.compact_earliest)
+        {
             return None;
         }
-        if self.compact.is_some() && (urgent || now >= self.compact_earliest) {
-            return self.compact.take().map(Due::Compact);
+        let overdue = self.overdue(now, load);
+        if load.walks {
+            return if overdue {
+                self.compact.take().map(Due::Rescan)
+            } else {
+                None
+            };
         }
-        None
+        if load.saving && !overdue {
+            return None;
+        }
+        self.compact.take().map(Due::Compact)
     }
 
     /// A compaction that took `took` ended at `now`: the next waits for its
@@ -385,13 +490,27 @@ impl Maintenance {
     pub fn compacted(&mut self, now: Instant, took: Duration) {
         let gap = (took * COMPACT_DUTY).clamp(MIN_COMPACT_GAP, MAX_COMPACT_GAP);
         self.compact_earliest = now + gap;
+        self.urgent_since = None;
     }
 
     /// When the maintainer must wake to start what is pending. A compaction
-    /// held back by a folder read needs no timer: the read's answer wakes it.
-    pub fn wake_at(&self, walks: bool) -> Option<Instant> {
-        let compact = (self.compact.is_some() && !walks && !self.rescan_waiting())
-            .then_some(self.compact_earliest);
+    /// held back by a folder read needs no timer of its own (the read's answer
+    /// wakes it), but an overgrown delta wakes it when its patience ends; a
+    /// save is looked at again every [`SAVE_POLL`].
+    pub fn wake_at(&self, now: Instant, load: Load) -> Option<Instant> {
+        let compact = (self.compact.is_some() && !self.rescan_waiting())
+            .then(|| {
+                let patience = self.urgent_since.map(|since| since + URGENT_PATIENCE);
+                match (load.walks, load.saving) {
+                    (true, _) => patience,
+                    (false, true) => {
+                        let looks = self.compact_earliest.max(now + SAVE_POLL);
+                        Some(patience.map_or(looks, |p| p.min(looks)))
+                    }
+                    (false, false) => Some(self.compact_earliest),
+                }
+            })
+            .flatten();
         [self.rescan.wake_at(), compact].into_iter().flatten().min()
     }
 }
@@ -402,14 +521,19 @@ impl Maintenance {
 /// test can make it slow. Searches use the snapshot published before for as
 /// long as it runs, and never wait for it; the old index is freed when the
 /// last search that holds it ends. `report` is the new snapshot's report
-/// line. Returns how long it took.
+/// line. `warm` is called with each metadata sort order that was ready on the
+/// old index, right after the swap, so the new index prepares them in the
+/// background (see [`Live::compact`]). Returns how long the compaction took
+/// (without the warming, which does not block).
 pub fn compact_and_publish(
     live: &mut Live,
     store: &crate::SnapshotStore,
     report: String,
     build: impl FnOnce(&mut Live) -> Option<Live>,
+    warm: impl Fn(&Index, SortKey),
 ) -> Option<Duration> {
     let started = Instant::now();
+    let ready = ready_sorts(live.base());
     let new = build(live)?;
     let took = started.elapsed();
     // Everything applied so far is in the new index: no delta to show.
@@ -419,9 +543,25 @@ pub fn compact_and_publish(
         mode: "live".into(),
         report,
     });
+    for key in ready {
+        warm(new.base(), key);
+    }
     // The old layer's tables go now; its index goes with the old snapshot.
     *live = new;
     Some(took)
+}
+
+/// The metadata sort orders `index` has prepared.
+pub fn ready_sorts(index: &Index) -> Vec<SortKey> {
+    [
+        SortKey::Size,
+        SortKey::Modified,
+        SortKey::Created,
+        SortKey::Accessed,
+    ]
+    .into_iter()
+    .filter(|&key| index.metadata_order(key, false).is_some())
+    .collect()
 }
 
 /// Where an entry lives.
@@ -575,10 +715,10 @@ pub struct Applied {
     pub changed: usize,
     /// Entries a finished walk added.
     pub merged: usize,
-    /// The overlay is too large or a change cannot be applied
-    /// incrementally (a folder too large to read in the background, a
-    /// failed walk): rescan the volumes.
-    pub rescan: Option<String>,
+    /// The overlay is too large (a compaction answers it) or a change cannot
+    /// be applied incrementally (a folder too large to read in the
+    /// background, a failed walk: rescan the volumes).
+    pub rescan: Option<Reason>,
     /// Folders to read in the background.
     pub walks: Vec<WalkJob>,
     /// Folder reads given up because the reader never answered: the reader
@@ -598,14 +738,15 @@ impl Applied {
         }
     }
 
-    /// Ask for a rescan, or for a compaction when the reason only says the
-    /// live layer is large ([`is_overflow`]). The first reason is kept,
-    /// except that one which needs the disks read again replaces one which
-    /// a compaction answers: the maintainer routes by this reason.
-    fn ask(&mut self, reason: String) {
+    /// Ask for a rescan or a compaction, by the reason's kind. The first
+    /// reason is kept, except that one which needs the disks read again
+    /// replaces one which a compaction answers: the maintainer routes by it.
+    fn ask(&mut self, reason: Reason) {
         match &self.rescan {
             None => self.rescan = Some(reason),
-            Some(old) if is_overflow(old) && !is_overflow(&reason) => self.rescan = Some(reason),
+            Some(old) if old.kind == ReasonKind::Compact && reason.kind == ReasonKind::Disk => {
+                self.rescan = Some(reason)
+            }
             Some(_) => {}
         }
     }
@@ -865,6 +1006,8 @@ impl Live {
 
     fn add(&mut self, entry: DeltaEntry) -> Loc {
         let d = self.delta.len() as u32;
+        // `compact` places the delta in one pass because of this.
+        debug_assert!(!matches!(entry.parent, Loc::Delta(p) if p >= d));
         self.delta_children.entry(entry.parent).or_default().push(d);
         self.delta.push(entry);
         self.delta_alive += 1;
@@ -1076,7 +1219,7 @@ impl Live {
                 if blocked {
                     deferred.push((change, state));
                 } else if let Err(reason) = self.apply_one(change, state, &mut applied) {
-                    applied.ask(reason);
+                    applied.ask(Reason::disk(reason));
                 }
             }
             pending = deferred;
@@ -1086,7 +1229,7 @@ impl Live {
         }
         for (change, state) in pending {
             if let Err(reason) = self.apply_one(change, state, &mut applied) {
-                applied.ask(reason);
+                applied.ask(Reason::disk(reason));
             }
         }
         self.check_limits(&mut applied);
@@ -1096,16 +1239,24 @@ impl Live {
     /// Ask for a rescan when the overlay has outgrown its limits.
     fn check_limits(&self, applied: &mut Applied) {
         if self.delta_alive > self.limits.max_delta {
-            applied.ask(format!("{} live changes", self.delta_alive));
+            applied.ask(Reason::compact(format!(
+                "{} live changes",
+                self.delta_alive
+            )));
         }
         // Entries replaced or deleted again stay in the delta until the next
         // rescan: few live ones among many dead still cost memory.
         let dead = self.delta.len() - self.delta_alive;
         if dead > self.limits.max_dead {
-            applied.ask(format!("{dead} {REASON_SUPERSEDED_SUFFIX}"));
+            applied.ask(Reason::compact(format!(
+                "{dead} {REASON_SUPERSEDED_SUFFIX}"
+            )));
         }
         if self.removed_count > self.base.len() / MAX_REMOVED_DIVISOR + 1000 {
-            applied.ask(format!("{} replaced entries", self.removed_count));
+            applied.ask(Reason::compact(format!(
+                "{} replaced entries",
+                self.removed_count
+            )));
         }
     }
 
@@ -1317,9 +1468,9 @@ impl Live {
             return applied;
         }
         applied.abandoned = self.walks.len();
-        applied.rescan = Some(format!(
+        applied.rescan = Some(Reason::disk(format!(
             "{REASON_MOVED_IN} (reading its contents did not finish in time)"
-        ));
+        )));
         self.walks = Vec::new();
         self.log = HashMap::new();
         self.progress = now;
@@ -1391,20 +1542,20 @@ impl Live {
             // really is not a folder any more.
             Err(WalkError::Gone) if !exists(walk.record, walk.sequence) => Subtree::default(),
             Err(WalkError::Gone) => {
-                applied.rescan = Some(format!(
+                applied.rescan = Some(Reason::disk(format!(
                     "{REASON_MOVED_IN} (the folder exists but could not be opened)"
-                ));
+                )));
                 return applied;
             }
             Err(error) => {
-                applied.rescan = Some(format!("{REASON_MOVED_IN} ({error})"));
+                applied.rescan = Some(Reason::disk(format!("{REASON_MOVED_IN} ({error})")));
                 return applied;
             }
         };
         if walk.overflowed {
-            applied.rescan = Some(format!(
+            applied.rescan = Some(Reason::disk(format!(
                 "{REASON_MOVED_IN} (too many changes while its contents were read)"
-            ));
+            )));
             return applied;
         }
         // A subfolder that could not be opened is deleted or moved away (the
@@ -1414,9 +1565,9 @@ impl Live {
             .iter()
             .any(|&r| exists(r & RECORD_MASK, (r >> 48) as u16))
         {
-            applied.rescan = Some(format!(
+            applied.rescan = Some(Reason::disk(format!(
                 "{REASON_MOVED_IN} (a subfolder exists but could not be opened)"
-            ));
+            )));
             return applied;
         }
         // One state per record, applied once every folder it lists is
@@ -1458,7 +1609,7 @@ impl Live {
                 created: true,
             };
             if let Err(reason) = self.apply_one(change, Some(state), &mut applied) {
-                applied.ask(reason);
+                applied.ask(Reason::disk(reason));
             }
         }
         applied.merged = std::mem::take(&mut applied.changed);
@@ -1488,7 +1639,7 @@ impl Live {
                 && !listed.contains(&record)
                 && let Err(reason) = self.walk_moved_in(volume, record, sequence, &mut applied)
             {
-                applied.ask(reason);
+                applied.ask(Reason::disk(reason));
             }
         }
         self.check_limits(&mut applied);
@@ -1626,8 +1777,10 @@ impl Live {
     /// Entry ids change (a page re-runs its query, so nothing holds an id).
     /// Hard links, record numbers, excluded records and roots carry over;
     /// entries without a record stay in the index without a map entry. The
-    /// cached metadata sort orders start empty, as after a scan, and are
-    /// built when first sorted by.
+    /// cached metadata sort orders start empty, as after a scan;
+    /// [`compact_and_publish`] asks for the ones that were ready before to be
+    /// built again in the background, so a sorted search does not fall back to
+    /// name order for longer than a scan would make it.
     ///
     /// `None` while folders are being read: their records are not placed
     /// yet, and a compaction must not drop the state that merges them.
@@ -1646,9 +1799,14 @@ impl Live {
         self.log = HashMap::new();
 
         let n = self.base.len();
-        // Frozen entries that survive: shown, and (every id is above its
-        // parent's) with a surviving parent. An entry whose parent was
-        // hidden without it cannot be placed, and a scan would not list it.
+        // Frozen entries that survive: shown, and with a surviving parent. An
+        // entry whose parent was hidden without it cannot be placed, and a
+        // scan would not list it. Nothing guarantees that a parent has the
+        // lower id (a builder takes any id for a parent; a reader that lists
+        // records in record order can give a folder a later id than its
+        // children), so the pass repeats until nothing more is dropped. It
+        // runs once more than needed only when some entry's parent has the
+        // higher id; an index whose parents all come first takes one pass.
         let mut keep: Vec<u64> = self.removed.iter().map(|w| !w).collect();
         if !n.is_multiple_of(64)
             && let Some(last) = keep.last_mut()
@@ -1656,18 +1814,33 @@ impl Live {
             *last &= (1u64 << (n % 64)) - 1;
         }
         let bit = |keep: &[u64], id: u32| keep[id as usize / 64] >> (id % 64) & 1 != 0;
+        loop {
+            let (mut dropped, mut parent_after_child) = (false, false);
+            for id in 0..n as u32 {
+                if !bit(&keep, id) {
+                    continue;
+                }
+                let parent = self.base.parent(id);
+                if parent == ROOT_PARENT {
+                    continue;
+                }
+                parent_after_child |= parent > id;
+                if !bit(&keep, parent) {
+                    keep[id as usize / 64] &= !(1 << (id % 64));
+                    dropped = true;
+                }
+            }
+            // With every parent below its child, one pass is exact.
+            if !dropped || !parent_after_child {
+                break;
+            }
+        }
         let (mut kept_base, mut name_bytes) = (0usize, 0usize);
         for id in 0..n as u32 {
-            if !bit(&keep, id) {
-                continue;
+            if bit(&keep, id) {
+                kept_base += 1;
+                name_bytes += self.base.name(id).len();
             }
-            let parent = self.base.parent(id);
-            if parent != ROOT_PARENT && !bit(&keep, parent) {
-                keep[id as usize / 64] &= !(1 << (id % 64));
-                continue;
-            }
-            kept_base += 1;
-            name_bytes += self.base.name(id).len();
         }
         // Surviving entries before each word: a frozen id's new id is that
         // plus the survivors below it in its word.
@@ -1717,8 +1890,10 @@ impl Live {
             next += 1;
             records.push(self.base_record[id as usize]);
         }
-        // The live entries follow the frozen ones. A parent comes before its
-        // children in `delta` as well; one whose parent is gone is skipped.
+        // The live entries follow the frozen ones. A delta entry's parent is
+        // always a lower delta index: `add` takes a parent that was found
+        // among the entries that exist, and asserts it. One whose parent is
+        // gone is skipped.
         let mut placed: Vec<u32> = vec![u32::MAX; self.delta.len()];
         for (d, e) in self.delta.iter().enumerate() {
             if !e.alive {
@@ -1829,6 +2004,7 @@ mod tests {
     use super::*;
     use ferrow_query::{CancelToken, Query, SearchOptions};
     use ferrow_walk::subtree::SubtreeEntry;
+    use std::sync::atomic::AtomicBool;
 
     const DIR_INFO: RecordInfo = RecordInfo {
         in_use: true,
@@ -3888,10 +4064,16 @@ mod tests {
             report: String::new(),
         });
         let built = std::cell::Cell::new(false);
-        let took = compact_and_publish(&mut live, &store, "r".into(), |live| {
-            built.set(true);
-            live.compact()
-        });
+        let took = compact_and_publish(
+            &mut live,
+            &store,
+            "r".into(),
+            |live| {
+                built.set(true);
+                live.compact()
+            },
+            |_, _| panic!("nothing was compacted"),
+        );
         assert!(took.is_none() && built.get());
         assert!(Arc::ptr_eq(&store.get().index, &base), "no swap");
         assert_eq!(shown(&live, &base).len(), 5);
@@ -3966,11 +4148,17 @@ mod tests {
             // The compaction, with a stage that stays slow until released.
             let (live_ref, store_ref) = (&mut live, &store);
             let compaction = scope.spawn(move || {
-                compact_and_publish(live_ref, store_ref, "after".into(), |live| {
-                    started_tx.send(()).unwrap();
-                    go_rx.recv().unwrap();
-                    live.compact()
-                })
+                compact_and_publish(
+                    live_ref,
+                    store_ref,
+                    "after".into(),
+                    |live| {
+                        started_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        live.compact()
+                    },
+                    |_, _| {},
+                )
             });
             started_rx.recv().unwrap();
             // Mid-compaction: searches are answered, from the old snapshot
@@ -4027,113 +4215,238 @@ mod tests {
     fn compactions_are_rate_limited_by_their_own_short_gap() {
         let t0 = Instant::now();
         let s = Duration::from_secs;
+        let calm = Load::default();
+        let urgent = Load::of(60, 50, false, false);
+        let walking = Load {
+            walks: true,
+            ..calm
+        };
         // After a 3-minute scan a rescan waits 27 minutes; a compaction
         // only a minute.
         let mut m = Maintenance::after_scan(t0, s(180));
-        assert!(m.request("50001 live changes".into()), "starts an episode");
-        assert!(!m.request("50002 live changes".into()));
+        assert!(
+            m.request(Reason::compact("50001 live changes")),
+            "starts an episode"
+        );
+        assert!(!m.request(Reason::compact("50002 live changes")));
         assert_eq!(m.rescan_pending(), None, "a compaction is not a rescan");
-        assert_eq!(m.wake_at(false), Some(t0 + MIN_COMPACT_GAP));
-        assert_eq!(m.due(t0 + s(59), false, false), None);
+        assert_eq!(m.wake_at(t0, calm), Some(t0 + MIN_COMPACT_GAP));
+        assert_eq!(m.due(t0 + s(59), calm), None);
         assert_eq!(
-            m.due(t0 + s(60), false, false),
+            m.due(t0 + s(60), calm),
             Some(Due::Compact("50001 live changes".into())),
             "the first reason is kept"
         );
-        assert_eq!(m.due(t0 + s(61), false, false), None, "taken");
+        assert_eq!(m.due(t0 + s(61), calm), None, "taken");
         // A compaction that took 30 s: the next waits 5 times that.
         let end = t0 + s(100);
         m.compacted(end, s(30));
-        assert!(m.request("60000 live changes".into()));
-        assert_eq!(m.wake_at(false), Some(end + s(150)));
-        assert_eq!(m.due(end + s(149), false, false), None);
-        assert!(matches!(
-            m.due(end + s(150), false, false),
-            Some(Due::Compact(_))
-        ));
+        assert!(m.request(Reason::compact("60000 live changes")));
+        assert_eq!(m.wake_at(end, calm), Some(end + s(150)));
+        assert_eq!(m.due(end + s(149), calm), None);
+        assert!(matches!(m.due(end + s(150), calm), Some(Due::Compact(_))));
         // A quick one still waits the minimum, a very slow one at most ten minutes.
         m.compacted(end, Duration::from_millis(300));
-        m.request("x live changes".into());
-        assert_eq!(m.wake_at(false), Some(end + MIN_COMPACT_GAP));
+        m.request(Reason::compact("x live changes"));
+        assert_eq!(m.wake_at(end, calm), Some(end + MIN_COMPACT_GAP));
         m.compacted(end, s(3600));
-        assert_eq!(m.wake_at(false), Some(end + MAX_COMPACT_GAP));
-        // A delta far past its limit does not wait for the gap.
-        assert!(matches!(
-            m.due(end + s(1), true, false),
-            Some(Due::Compact(_))
-        ));
-        // Folders being read hold it back, urgent or not, without a timer
-        // (the read's answer wakes the maintainer).
-        m.request("y live changes".into());
-        assert_eq!(m.wake_at(true), None);
-        assert_eq!(m.due(end + s(3600), true, true), None);
-        assert!(matches!(
-            m.due(end + s(3600), false, false),
-            Some(Due::Compact(_))
-        ));
+        assert_eq!(m.wake_at(end, calm), Some(end + MAX_COMPACT_GAP));
+        // A delta past its hard limit does not wait for the gap.
+        assert!(matches!(m.due(end + s(1), urgent), Some(Due::Compact(_))));
+        // Folders being read hold it back without a timer of its own (the
+        // read's answer wakes the maintainer)…
+        m.due(end + s(2), calm);
+        m.request(Reason::compact("y live changes"));
+        assert_eq!(m.wake_at(end, walking), None);
+        assert_eq!(m.due(end + s(3600), walking), None);
+        assert!(matches!(m.due(end + s(3600), calm), Some(Due::Compact(_))));
     }
 
     #[test]
-    fn only_overflow_reasons_are_compacted_and_a_real_rescan_covers_a_compaction() {
+    fn the_hard_limit_stays_a_cap_while_folder_reads_keep_arriving() {
         let t0 = Instant::now();
         let s = Duration::from_secs;
-        for overflow in [
-            "50001 live changes",
-            "12345 replaced entries",
-            "99999 superseded entries",
-        ] {
-            assert!(is_overflow(overflow), "{overflow}");
-        }
-        for rescan in [
-            REASON_MOVED_IN,
-            "a folder moved into an indexed location (too many changes to read its contents live)",
-            REASON_LARGE_MOVE,
-            REASON_ADMIN,
-            "startup",
-            "\\\\?\\Volume{1}: change journal reset: overrun",
-        ] {
-            assert!(!is_overflow(rescan), "{rescan}");
-        }
+        let hard = 100;
+        let walking = |delta| Load::of(delta, hard, true, false);
         let mut m = Maintenance::after_scan(t0, s(10));
-        m.request("50001 live changes".into());
-        // A journal reset asks for a rescan: it is shown as pending, and the
-        // compaction is not run first (a fresh scan replaces everything).
-        assert!(m.request("Volume{1}: change journal reset".into()));
+        m.request(Reason::compact("101 live changes"));
+        // Just past the limit with a read outstanding: it waits for the read,
+        // and wakes when its patience ends (no timer for the read itself).
+        assert_eq!(m.due(t0 + s(100), walking(101)), None);
+        let patience = t0 + s(100) + URGENT_PATIENCE;
+        assert_eq!(m.wake_at(t0 + s(100), walking(101)), Some(patience));
+        assert_eq!(
+            m.due(t0 + s(100) + URGENT_PATIENCE - s(1), walking(150)),
+            None,
+            "still within its patience"
+        );
+        // Reads kept arriving for as long as a read can last: rescan, as
+        // before compactions existed.
+        assert_eq!(
+            m.due(patience, walking(150)),
+            Some(Due::Rescan("101 live changes".into()))
+        );
+        // Back under the limit, the clock starts again.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("101 live changes"));
+        assert_eq!(m.due(t0 + s(100), walking(101)), None);
+        assert_eq!(m.due(t0 + s(110), walking(99)), None);
+        assert_eq!(m.due(patience + s(5), walking(101)), None, "restarted");
+        // Twice the limit does not wait at all.
+        assert_eq!(
+            m.due(patience + s(5), walking(2 * hard + 1)),
+            Some(Due::Rescan("101 live changes".into()))
+        );
+        // Not urgent and walking: only the walk's answer matters, however long.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("90 live changes"));
+        assert_eq!(m.due(t0 + s(3600), walking(90)), None);
+        // A burst that queues walks without end on a live layer: the delta
+        // never gets past twice the limit unanswered.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("101 live changes"));
+        let mut answered_at = None;
+        for second in 0..=300u64 {
+            let delta = 101 + second as usize * 2;
+            if let Some(due) = m.due(t0 + s(100 + second), walking(delta)) {
+                answered_at = Some((second, delta, due));
+                break;
+            }
+        }
+        let (second, delta, due) = answered_at.expect("answered");
+        assert!(matches!(due, Due::Rescan(_)));
+        assert!(
+            delta <= 2 * hard + 1 && second <= URGENT_PATIENCE.as_secs(),
+            "{second} s, {delta} entries"
+        );
+    }
+
+    #[test]
+    fn a_compaction_waits_for_the_index_save_but_not_past_the_cap() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let hard = 100;
+        let saving = |delta| Load::of(delta, hard, false, true);
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("60 live changes"));
+        // Its time has come, but the saver holds the old index: look again
+        // soon, not at once and not never.
+        assert_eq!(m.due(t0 + s(60), saving(60)), None);
+        assert_eq!(
+            m.wake_at(t0 + s(60), saving(60)),
+            Some(t0 + s(60) + SAVE_POLL)
+        );
+        assert_eq!(
+            m.due(t0 + s(3600), saving(60)),
+            None,
+            "however long it takes"
+        );
+        // The save ended.
+        assert_eq!(
+            m.due(t0 + s(3601), Load::of(60, hard, false, false)),
+            Some(Due::Compact("60 live changes".into()))
+        );
+        // Past the hard limit the save is waited for only so long…
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("101 live changes"));
+        assert_eq!(m.due(t0 + s(100), saving(101)), None);
+        assert_eq!(
+            m.wake_at(t0 + s(100), saving(101)),
+            Some((t0 + s(100) + SAVE_POLL).min(t0 + s(100) + URGENT_PATIENCE))
+        );
+        assert_eq!(
+            m.due(t0 + s(100) + URGENT_PATIENCE, saving(120)),
+            Some(Due::Compact("101 live changes".into()))
+        );
+        // …and twice the limit does not wait.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("201 live changes"));
+        assert_eq!(
+            m.due(t0 + s(100), saving(2 * hard + 1)),
+            Some(Due::Compact("201 live changes".into()))
+        );
+    }
+
+    #[test]
+    fn what_answers_a_reason_is_carried_with_it_never_read_from_its_text() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let calm = Load::default();
+        // A journal reason that happens to end like a size reason is still a
+        // rescan, and a size reason with an unexpected text is still a
+        // compaction.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        assert!(m.request(Reason::disk("Volume{1}: 5 live changes")));
+        assert_eq!(
+            m.rescan_pending().map(|(why, _)| why),
+            Some("Volume{1}: 5 live changes")
+        );
+        let mut m = Maintenance::after_scan(t0, s(10));
+        assert!(m.request(Reason::compact("anything at all")));
+        assert_eq!(m.rescan_pending(), None);
+        assert_eq!(
+            m.due(t0 + s(60), calm),
+            Some(Due::Compact("anything at all".into()))
+        );
+        // The reasons the live layer itself raises carry the right kind.
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        live.limits = DeltaLimits {
+            max_delta: 0,
+            ..live.limits
+        };
+        let mut f = initial();
+        f.set(40, file_info(9), &[(20, "fresh.txt")]);
+        let r = live.apply(&[change(40, true)], &f);
+        let why = r.rescan.expect("past the limit");
+        assert_eq!((why.kind(), &*why), (ReasonKind::Compact, "1 live changes"));
+        let mut r = Applied::default();
+        r.ask(Reason::disk(REASON_LARGE_MOVE));
+        assert_eq!(r.rescan.as_ref().map(Reason::kind), Some(ReasonKind::Disk));
+
+        // A real rescan covers a compaction, and is shown as pending.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request(Reason::compact("50001 live changes"));
+        assert!(m.request(Reason::disk("Volume{1}: change journal reset")));
         assert_eq!(
             m.rescan_pending().map(|(why, _)| why),
             Some("Volume{1}: change journal reset")
         );
         // A 10 s scan: the rescan waits 9 times that.
-        assert_eq!(m.wake_at(false), Some(t0 + s(90)));
-        assert_eq!(m.due(t0 + s(60), false, false), None);
+        assert_eq!(m.wake_at(t0, calm), Some(t0 + s(90)));
+        assert_eq!(m.due(t0 + s(60), calm), None);
         assert_eq!(
-            m.due(t0 + s(90), false, false),
+            m.due(t0 + s(90), calm),
             Some(Due::Rescan("Volume{1}: change journal reset".into()))
         );
         // An administrator's request is not held back, and replaces any wait.
         let mut m = Maintenance::after_scan(t0, s(10));
-        m.request("50001 live changes".into());
+        m.request(Reason::compact("50001 live changes"));
         m.force(t0 + s(5), REASON_ADMIN.into());
         assert_eq!(
-            m.due(t0 + s(5), false, false),
+            m.due(t0 + s(5), calm),
             Some(Due::Rescan(REASON_ADMIN.into()))
         );
         // Within one batch, the reason that needs the disks wins over the
         // size of the delta, whichever came first.
         let mut applied = Applied::default();
-        applied.ask("50001 live changes".into());
-        applied.ask(REASON_LARGE_MOVE.into());
-        applied.ask("60000 replaced entries".into());
+        applied.ask(Reason::compact("50001 live changes"));
+        applied.ask(Reason::disk(REASON_LARGE_MOVE));
+        applied.ask(Reason::compact("60000 replaced entries"));
         assert_eq!(applied.rescan.as_deref(), Some(REASON_LARGE_MOVE));
+        assert_eq!(
+            applied.rescan.as_ref().map(Reason::kind),
+            Some(ReasonKind::Disk)
+        );
         let mut first = Applied::default();
-        first.ask("50001 live changes".into());
+        first.ask(Reason::compact("50001 live changes"));
         let mut second = Applied::default();
-        second.ask(REASON_MOVED_IN.into());
+        second.ask(Reason::disk(REASON_MOVED_IN));
         first.absorb(second);
         assert_eq!(first.rescan.as_deref(), Some(REASON_MOVED_IN));
         let mut kept = Applied::default();
-        kept.ask("1 live changes".into());
-        kept.ask("2 replaced entries".into());
+        kept.ask(Reason::compact("1 live changes"));
+        kept.ask(Reason::compact("2 replaced entries"));
         assert_eq!(kept.rescan.as_deref(), Some("1 live changes"));
     }
 
@@ -4183,16 +4496,93 @@ mod tests {
     }
 
     #[test]
-    fn compaction_counters_and_kinds() {
-        assert_eq!(KIND_COMPACTION, "compaction");
-        // A compaction is never counted under a reason of a scan.
-        for why in [
-            "50001 live changes",
-            "1 replaced entries",
-            "9 superseded entries",
-        ] {
-            assert_ne!(reason_kind(why), KIND_COMPACTION);
+    fn compaction_drops_what_hangs_below_a_hidden_folder_whatever_the_id_order() {
+        // Nothing orders ids by depth: here a file has a lower id than its
+        // folder, and that folder a lower id than the one that is hidden.
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let root = b.add_root(b"C:", flags::DIR); // 0
+        let meta = DIR_INFO.metadata(ColumnSet::DEFAULT);
+        let leaf = b.add_with_metadata(2, b"leaf.txt", 0, meta); // 1, parent 2
+        let mid = b.add_with_metadata(3, b"mid", flags::DIR, meta); // 2, parent 3
+        let top = b.add_with_metadata(root, b"top", flags::DIR, meta); // 3
+        let keep = b.add_with_metadata(root, b"keep.txt", 0, meta); // 4
+        assert_eq!((leaf, mid, top, keep), (1, 2, 3, 4));
+        let map = VolumeMap {
+            entries: vec![(5, root), (21, leaf), (22, mid), (20, top), (23, keep)],
+            excluded: vec![],
+            roots: vec![(5, root)],
+            ..VolumeMap::default()
+        };
+        let mut live = Live::new(Arc::new(b.freeze()), &[map]);
+        live.remove(Loc::Base(top));
+        let new = live.compact().unwrap();
+        let index = new.base();
+        let names: Vec<String> = (0..index.len() as u32)
+            .map(|id| String::from_utf8_lossy(index.name(id)).into_owned())
+            .collect();
+        assert_eq!(names, ["C:", "keep.txt"], "nothing below `top` survives");
+        for id in 0..index.len() as u32 {
+            let parent = index.parent(id);
+            assert!(
+                parent == ROOT_PARENT || (parent as usize) < index.len(),
+                "{id}: parent {parent}"
+            );
         }
-        assert_eq!(reason_kind("50001 live changes"), "too many live changes");
+        assert_eq!(index.parent(1), 0);
+    }
+
+    #[test]
+    fn compaction_asks_the_new_index_for_the_sort_orders_the_old_one_had_ready() {
+        use ferrow_index::SortStatus;
+        let mut w = World::new(11);
+        let (base, map) = scan(&w.fs, &[]);
+        let mut live = Live::new(base.clone(), &[map]);
+        drive(&mut w, &mut [&mut live], 10);
+        let wait = |index: &Index, key: SortKey| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while index.request_sort(key) != SortStatus::Ready {
+                assert!(Instant::now() < until, "{key:?} never ready");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        // Only the size order was ever used on the old index.
+        assert!(ready_sorts(&base).is_empty());
+        wait(&base, SortKey::Size);
+        assert_eq!(ready_sorts(&base), [SortKey::Size]);
+        let store = crate::SnapshotStore::new(crate::Snapshot {
+            index: base.clone(),
+            live: Some(Arc::new(live.view())),
+            mode: "live".into(),
+            report: String::new(),
+        });
+        let warmed = std::cell::RefCell::new(Vec::new());
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = started.clone();
+        compact_and_publish(
+            &mut live,
+            &store,
+            "r".into(),
+            |live| live.compact(),
+            |index, key| {
+                let flag = flag.clone();
+                warmed.borrow_mut().push(key);
+                let status = index.request_sort_starting(key, move || {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst)
+                });
+                assert_ne!(status, SortStatus::Unavailable);
+            },
+        )
+        .expect("compacted");
+        assert_eq!(*warmed.borrow(), [SortKey::Size], "only what was ready");
+        // The published index prepares it in the background, and the start
+        // hook ran on the preparing thread.
+        let new = store.get().index.clone();
+        assert!(!Arc::ptr_eq(&new, &base));
+        wait(&new, SortKey::Size);
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            new.metadata_order(SortKey::Modified, false).is_none(),
+            "an order nobody used is not built"
+        );
     }
 }

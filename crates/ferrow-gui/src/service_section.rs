@@ -79,6 +79,19 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
             Some(Level::Caution),
         ),
     });
+    // Not a scan, and not per volume: the service merged the live changes
+    // into a new index in memory (no disk read).
+    if let Some(c) = &h.live_stats.last_compaction {
+        rows.push((
+            "Live changes",
+            format!(
+                "merged in memory {}, took {}",
+                when(c.at_ms),
+                health::format_duration(c.took_ms)
+            ),
+            None,
+        ));
+    }
     let access = match h.access.as_str() {
         "admins" => "administrators only",
         "everyone" => "everyone who signs in to this PC",
@@ -169,14 +182,6 @@ fn volume_lines(v: &VolumeHealth) -> (String, Level, String, String) {
             "last scan {}, took {}{why}",
             when(scan.at_ms),
             health::format_duration(scan.took_ms)
-        ));
-    }
-    if let Some(c) = &v.last_compaction {
-        // Not a scan: the live changes were folded into the index in memory.
-        parts.push(format!(
-            "live changes last merged {}, took {}",
-            when(c.at_ms),
-            health::format_duration(c.took_ms)
         ));
     }
     if let Some(r) = &v.rescan_pending {

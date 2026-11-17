@@ -54,6 +54,27 @@ fn the_details_say_what_is_wrong_in_the_row_that_is_wrong() {
     assert_eq!(row(&ok, "Starts").unwrap().1, "automatically at boot");
     assert!(row(&ok, "Connection errors").is_none());
 
+    // Live changes merged into the index in memory: said once, in the
+    // service's own rows (not a scan, and not repeated on every volume).
+    assert!(row(&ok, "Live changes").is_none());
+    let mut merged = report();
+    merged.live_stats.last_compaction = Some(health::ScanInfo {
+        at_ms: 6_000,
+        reason: "50001 live changes".into(),
+        took_ms: 12_400,
+    });
+    let rows = details(&merged, &scm(Some(2)));
+    let live_changes = row(&rows, "Live changes").unwrap();
+    assert!(
+        live_changes.1.starts_with("merged in memory ")
+            && live_changes.1.ends_with(", took 12.4 s"),
+        "{live_changes:?}"
+    );
+    assert_eq!(live_changes.2, None, "nothing to warn about");
+    for v in &merged.volumes {
+        assert!(!volume_lines(v).3.contains("merged"), "not on a volume row");
+    }
+
     let mut old = report();
     old.version = "0.1.0-beta.1".into();
     let skew = details(&old, &scm(None));
@@ -114,22 +135,6 @@ fn a_volume_shows_its_mode_its_reason_and_what_it_knows() {
         detail.ends_with(", took 38.0 s, when the service started"),
         "{detail}"
     );
-
-    // Live changes folded into the index in memory: not a scan, said so.
-    let folded = VolumeHealth {
-        last_compaction: Some(ScanInfo {
-            at_ms: 6_000,
-            reason: "50001 live changes".into(),
-            took_ms: 12_400,
-        }),
-        ..live.clone()
-    };
-    let (_, _, _, detail) = volume_lines(&folded);
-    assert!(
-        detail.contains(" · live changes last merged ") && detail.contains(", took 12.4 s"),
-        "{detail}"
-    );
-    assert!(!volume_lines(&live).3.contains("last merged"));
 
     let lost = VolumeHealth {
         mode: MODE_UNAVAILABLE.into(),
