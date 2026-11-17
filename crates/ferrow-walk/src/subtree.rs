@@ -13,10 +13,13 @@
 //! and, on a thread marked with [`crate::priority::enter_background`], asks
 //! for low disk priority on every directory handle it opens.
 //!
-//! The buffer parser is plain byte parsing, unit-tested on every platform;
-//! only the handle calls are Windows.
+//! The walk itself ([`walk_by`]) and the buffer parser are plain code,
+//! unit-tested on every platform with a mocked lister; only the handle calls
+//! are Windows.
 
-use std::time::Duration;
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::ntfs::RecordInfo;
 
@@ -32,11 +35,32 @@ pub struct SubtreeEntry {
     pub info: RecordInfo,
 }
 
+/// What a finished walk found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subtree {
+    /// Parents come before their children. A folder moved between two of the
+    /// walk's listings appears once per listing (its children only once).
+    pub entries: Vec<SubtreeEntry>,
+    /// References of folders that could not be opened because they no longer
+    /// exist as far as the open could tell. The caller checks each one: a
+    /// folder that does exist makes the walk incomplete.
+    pub skipped: Vec<u64>,
+}
+
+impl From<Vec<SubtreeEntry>> for Subtree {
+    fn from(entries: Vec<SubtreeEntry>) -> Subtree {
+        Subtree {
+            entries,
+            skipped: Vec::new(),
+        }
+    }
+}
+
 /// Why a subtree walk produced nothing usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalkError {
-    /// The directory does not exist (any more): it was deleted or its
-    /// reference is stale. The journal reports the deletion.
+    /// The directory could not be opened and looks deleted (or its reference
+    /// is stale). The caller confirms that before trusting it.
     Gone,
     /// More entries than [`Limits::max_entries`].
     OverBudget,
@@ -51,7 +75,7 @@ pub enum WalkError {
 impl std::fmt::Display for WalkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WalkError::Gone => f.write_str("the folder no longer exists"),
+            WalkError::Gone => f.write_str("the folder could not be opened"),
             WalkError::OverBudget => f.write_str("more entries than the walk budget"),
             WalkError::TimedOut => f.write_str("the walk took longer than its time budget"),
             WalkError::Cancelled => f.write_str("the walk was cancelled"),
@@ -65,6 +89,34 @@ impl std::fmt::Display for WalkError {
 pub struct Limits {
     pub max_entries: usize,
     pub max_time: Duration,
+}
+
+/// A running walk's limits, start time and cancel flag.
+pub struct Budget<'a> {
+    pub limits: Limits,
+    cancel: &'a AtomicBool,
+    started: Instant,
+}
+
+impl<'a> Budget<'a> {
+    pub fn new(limits: Limits, cancel: &'a AtomicBool) -> Budget<'a> {
+        Budget {
+            limits,
+            cancel,
+            started: Instant::now(),
+        }
+    }
+
+    /// Cancelled or out of time.
+    pub fn check(&self) -> Result<(), WalkError> {
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(WalkError::Cancelled)
+        } else if self.started.elapsed() >= self.limits.max_time {
+            Err(WalkError::TimedOut)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// One child as the directory listing reports it.
@@ -152,18 +204,72 @@ pub fn parse_dir_buffer(buf: &[u8]) -> Option<Vec<RawEntry>> {
     }
 }
 
+/// Walk the subtree below the directory with reference `root`, breadth
+/// first, calling `list(reference, budget, out)` to list each directory:
+/// it appends the directory's entries to `out` and answers whether the
+/// directory could be opened (`false`: gone). It checks the budget between
+/// buffers of a big directory itself.
+///
+/// A directory is entered at most once, so one that moved between two
+/// listings (and so shows up under both parents) does not list its children
+/// twice; it is still reported under both of its names, in listing order.
+/// Records in `excluded` are left out with everything below them.
+pub fn walk_by(
+    root: u64,
+    excluded: &HashSet<u64>,
+    budget: &Budget<'_>,
+    mut list: impl FnMut(u64, &Budget<'_>, &mut Vec<RawEntry>) -> Result<bool, WalkError>,
+) -> Result<Subtree, WalkError> {
+    let mut out = Subtree::default();
+    let mut entered: HashSet<u64> = HashSet::from([root & RECORD_MASK]);
+    let mut queue: VecDeque<u64> = VecDeque::from([root]);
+    let mut first = true;
+    while let Some(reference) = queue.pop_front() {
+        budget.check()?;
+        let mut raw = Vec::new();
+        if !list(reference, budget, &mut raw)? {
+            if first {
+                return Err(WalkError::Gone);
+            }
+            out.skipped.push(reference);
+            continue;
+        }
+        first = false;
+        let parent = reference & RECORD_MASK;
+        for entry in raw {
+            let record = entry.record();
+            if excluded.contains(&record) {
+                continue;
+            }
+            let info = entry.info();
+            if info.is_descended_dir() && entered.insert(record) {
+                queue.push_back(entry.reference);
+            }
+            out.entries.push(SubtreeEntry {
+                record,
+                parent,
+                name: entry.name,
+                info,
+            });
+            if out.entries.len() > budget.limits.max_entries {
+                return Err(WalkError::OverBudget);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(windows)]
 pub use platform::{file_reference, walk_subtree};
 
 #[cfg(windows)]
 mod platform {
-    use super::{Limits, RECORD_MASK, SubtreeEntry, WalkError, parse_dir_buffer};
-    use std::collections::{HashSet, VecDeque};
+    use super::{Budget, Limits, RawEntry, Subtree, WalkError, parse_dir_buffer, walk_by};
+    use std::collections::HashSet;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::sync::atomic::AtomicBool;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_LIST_DIRECTORY,
@@ -177,6 +283,7 @@ mod platform {
     const ERROR_NO_MORE_FILES: i32 = 18;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_PATH_NOT_FOUND: i32 = 3;
+    /// What opening a deleted folder's reference returns on NTFS.
     const ERROR_INVALID_PARAMETER: i32 = 87;
     /// Bytes per listing call.
     const BUFFER: usize = 64 * 1024;
@@ -208,6 +315,8 @@ mod platform {
         }
     }
 
+    /// An open failure that means "no such folder (any more)". The caller
+    /// confirms it against the file system before trusting it.
     fn vanished(e: &std::io::Error) -> bool {
         matches!(
             e.raw_os_error(),
@@ -244,6 +353,58 @@ mod platform {
         Ok(Some(u64::from_le_bytes(id[..8].try_into().unwrap())))
     }
 
+    /// List one directory by reference into `out`; `false` when it cannot be
+    /// opened because it looks gone.
+    fn list_directory(
+        hint: &std::fs::File,
+        reference: u64,
+        budget: &Budget<'_>,
+        out: &mut Vec<RawEntry>,
+        buf: &mut [u64],
+    ) -> Result<bool, WalkError> {
+        let dir = match open_by_reference(hint, reference) {
+            Ok(dir) => dir,
+            Err(e) if vanished(&e) => return Ok(false),
+            Err(e) => return Err(WalkError::Io(format!("open folder: {e}"))),
+        };
+        if crate::priority::is_background() {
+            crate::ntfs::low_io_priority(&dir);
+        }
+        let mut class = FILE_ID_EXTD_DIRECTORY_RESTART_INFO;
+        loop {
+            budget.check()?;
+            // SAFETY: live handle; the buffer is writable for BUFFER bytes.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    dir.as_raw_handle(),
+                    class,
+                    buf.as_mut_ptr().cast(),
+                    BUFFER as u32,
+                )
+            };
+            class = FILE_ID_EXTD_DIRECTORY_INFO;
+            if ok == 0 {
+                let e = std::io::Error::last_os_error();
+                // The end of the listing; a folder deleted meanwhile ends it
+                // too (the journal reports the deletion).
+                if e.raw_os_error() == Some(ERROR_NO_MORE_FILES) || vanished(&e) {
+                    return Ok(true);
+                }
+                return Err(WalkError::Io(format!("list folder: {e}")));
+            }
+            // SAFETY: the buffer is `BUFFER` initialized bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), BUFFER) };
+            let entries = parse_dir_buffer(bytes)
+                .ok_or_else(|| WalkError::Io("malformed folder listing".into()))?;
+            out.extend(entries);
+            // A huge folder must not be held in memory before the budget
+            // is looked at.
+            if out.len() > budget.limits.max_entries {
+                return Err(WalkError::OverBudget);
+            }
+        }
+    }
+
     /// List every entry below the directory with file reference `root`
     /// (record number plus sequence), parents before their children.
     /// `hint` is any handle on the volume (the volume handle itself).
@@ -254,91 +415,19 @@ mod platform {
         excluded: &HashSet<u64>,
         limits: Limits,
         cancel: &AtomicBool,
-    ) -> Result<Vec<SubtreeEntry>, WalkError> {
-        let started = Instant::now();
-        let background = crate::priority::is_background();
-        let mut out: Vec<SubtreeEntry> = Vec::new();
-        let mut queue: VecDeque<u64> = VecDeque::from([root]);
+    ) -> Result<Subtree, WalkError> {
+        let budget = Budget::new(limits, cancel);
         let mut buf = vec![0u64; BUFFER / 8];
-        let mut first = true;
-        while let Some(reference) = queue.pop_front() {
-            let dir = match open_by_reference(hint, reference) {
-                Ok(dir) => dir,
-                // A folder deleted or moved away since it was listed.
-                Err(e) if vanished(&e) => {
-                    if first {
-                        return Err(WalkError::Gone);
-                    }
-                    continue;
-                }
-                Err(e) => return Err(WalkError::Io(format!("open folder: {e}"))),
-            };
-            first = false;
-            if background {
-                crate::ntfs::low_io_priority(&dir);
-            }
-            let parent = reference & RECORD_MASK;
-            let mut class = FILE_ID_EXTD_DIRECTORY_RESTART_INFO;
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(WalkError::Cancelled);
-                }
-                if started.elapsed() > limits.max_time {
-                    return Err(WalkError::TimedOut);
-                }
-                // SAFETY: live handle; the buffer is writable for its length.
-                let ok = unsafe {
-                    GetFileInformationByHandleEx(
-                        dir.as_raw_handle(),
-                        class,
-                        buf.as_mut_ptr().cast(),
-                        BUFFER as u32,
-                    )
-                };
-                class = FILE_ID_EXTD_DIRECTORY_INFO;
-                if ok == 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
-                        break;
-                    }
-                    if vanished(&e) {
-                        break;
-                    }
-                    return Err(WalkError::Io(format!("list folder: {e}")));
-                }
-                // SAFETY: the buffer is `BUFFER` initialized bytes.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), BUFFER) };
-                let entries = parse_dir_buffer(bytes)
-                    .ok_or_else(|| WalkError::Io("malformed folder listing".into()))?;
-                for raw in entries {
-                    let record = raw.record();
-                    if excluded.contains(&record) {
-                        continue;
-                    }
-                    let info = raw.info();
-                    if info.is_descended_dir() {
-                        queue.push_back(raw.reference);
-                    }
-                    out.push(SubtreeEntry {
-                        record,
-                        parent,
-                        name: raw.name,
-                        info,
-                    });
-                    if out.len() > limits.max_entries {
-                        return Err(WalkError::OverBudget);
-                    }
-                }
-            }
-        }
-        Ok(out)
+        walk_by(root, excluded, &budget, |reference, budget, out| {
+            list_directory(hint, reference, budget, out, &mut buf)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// One `FILE_ID_EXTD_DIR_INFO` record.
     fn record(next: u32, reference: u64, attrs: u32, size: i64, name: &str) -> Vec<u8> {
@@ -416,17 +505,161 @@ mod tests {
         assert!(parse_dir_buffer(&bad).is_none());
     }
 
+    fn raw(reference: u64, attributes: u32, name: &str) -> RawEntry {
+        RawEntry {
+            reference,
+            attributes,
+            created: 0,
+            accessed: 0,
+            modified: 0,
+            size: 1,
+            reparse_tag: 0,
+            name: name.as_bytes().to_vec(),
+        }
+    }
+
+    const DIR: u32 = 0x10;
+    const FILE: u32 = 0x20;
+    const LIMITS: Limits = Limits {
+        max_entries: 1000,
+        max_time: Duration::from_secs(30),
+    };
+
+    /// A mocked file system: directory reference → its listing. A directory
+    /// that is not in the map cannot be opened.
+    fn walk(
+        fs: &HashMap<u64, Vec<RawEntry>>,
+        root: u64,
+        excluded: &HashSet<u64>,
+        limits: Limits,
+        cancel: &AtomicBool,
+    ) -> (Result<Subtree, WalkError>, Vec<u64>) {
+        let budget = Budget::new(limits, cancel);
+        let mut listed = Vec::new();
+        let result = walk_by(root, excluded, &budget, |reference, _, out| {
+            listed.push(reference);
+            match fs.get(&reference) {
+                Some(entries) => {
+                    out.extend(entries.iter().cloned());
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        });
+        (result, listed)
+    }
+
+    /// 1 {a(100){f(110)}, b(101){g(111)}, h(102)}
+    fn tree() -> HashMap<u64, Vec<RawEntry>> {
+        HashMap::from([
+            (
+                1,
+                vec![raw(100, DIR, "a"), raw(101, DIR, "b"), raw(102, FILE, "h")],
+            ),
+            (100, vec![raw(110, FILE, "f")]),
+            (101, vec![raw(111, FILE, "g")]),
+        ])
+    }
+
+    fn names(s: &Subtree) -> Vec<String> {
+        s.entries
+            .iter()
+            .map(|e| String::from_utf8(e.name.clone()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_walk_lists_parents_first_and_leaves_excluded_records_out() {
+        let none = AtomicBool::new(false);
+        let (r, _) = walk(&tree(), 1, &HashSet::new(), LIMITS, &none);
+        let s = r.unwrap();
+        assert_eq!(names(&s), ["a", "b", "h", "f", "g"]);
+        assert!(s.skipped.is_empty());
+        assert_eq!(s.entries[3].parent, 100);
+        // An excluded folder goes with everything below it.
+        let (r, listed) = walk(&tree(), 1, &HashSet::from([100]), LIMITS, &none);
+        assert_eq!(names(&r.unwrap()), ["b", "h", "g"]);
+        assert!(!listed.contains(&100));
+    }
+
+    #[test]
+    fn a_folder_that_moved_between_two_listings_is_entered_once() {
+        // b lists a again (a moved from the root into b after the root was
+        // listed): a's children must not be listed twice.
+        let mut fs = tree();
+        fs.get_mut(&101).unwrap().push(raw(100, DIR, "a-moved"));
+        let none = AtomicBool::new(false);
+        let (r, listed) = walk(&fs, 1, &HashSet::new(), LIMITS, &none);
+        let s = r.unwrap();
+        assert_eq!(
+            listed.iter().filter(|&&d| d == 100).count(),
+            1,
+            "{listed:?}"
+        );
+        assert_eq!(names(&s).iter().filter(|n| *n == "f").count(), 1);
+        // The folder itself is reported under both names, in listing order.
+        let a: Vec<_> = s.entries.iter().filter(|e| e.record == 100).collect();
+        assert_eq!(a.len(), 2);
+        assert_eq!((a[0].parent, a[1].parent), (1, 101));
+        // The walked folder itself is never entered again either.
+        let mut fs = tree();
+        fs.get_mut(&100).unwrap().push(raw(1, DIR, "loop"));
+        let (r, listed) = walk(&fs, 1, &HashSet::new(), LIMITS, &none);
+        r.unwrap();
+        assert_eq!(listed.iter().filter(|&&d| d == 1).count(), 1);
+    }
+
+    #[test]
+    fn budget_time_and_cancel_stop_the_walk() {
+        let none = AtomicBool::new(false);
+        let small = Limits {
+            max_entries: 3,
+            ..LIMITS
+        };
+        assert_eq!(
+            walk(&tree(), 1, &HashSet::new(), small, &none)
+                .0
+                .unwrap_err(),
+            WalkError::OverBudget
+        );
+        let late = Limits {
+            max_time: Duration::ZERO,
+            ..LIMITS
+        };
+        assert_eq!(
+            walk(&tree(), 1, &HashSet::new(), late, &none)
+                .0
+                .unwrap_err(),
+            WalkError::TimedOut
+        );
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            walk(&tree(), 1, &HashSet::new(), LIMITS, &cancelled)
+                .0
+                .unwrap_err(),
+            WalkError::Cancelled
+        );
+    }
+
+    #[test]
+    fn an_unopenable_root_is_gone_and_an_unopenable_subfolder_is_reported() {
+        let none = AtomicBool::new(false);
+        let (r, _) = walk(&HashMap::new(), 1, &HashSet::new(), LIMITS, &none);
+        assert_eq!(r.unwrap_err(), WalkError::Gone);
+        // b cannot be opened: the rest is listed and b is handed back.
+        let mut fs = tree();
+        fs.remove(&101);
+        let s = walk(&fs, 1, &HashSet::new(), LIMITS, &none).0.unwrap();
+        assert_eq!(names(&s), ["a", "b", "h", "f"]);
+        assert_eq!(s.skipped, [101]);
+    }
+
     #[cfg(windows)]
     mod windows {
         use super::super::*;
         use std::collections::HashSet;
         use std::os::windows::fs::OpenOptionsExt;
         use std::sync::atomic::AtomicBool;
-
-        const LIMITS: Limits = Limits {
-            max_entries: 1000,
-            max_time: Duration::from_secs(30),
-        };
 
         #[test]
         fn the_struct_layout_matches_the_parser() {
@@ -483,7 +716,9 @@ mod tests {
             };
             let none = HashSet::new();
             let cancel = AtomicBool::new(false);
-            let entries = walk_subtree(&hint, reference, &none, LIMITS, &cancel).unwrap();
+            let entries = walk_subtree(&hint, reference, &none, super::LIMITS, &cancel)
+                .unwrap()
+                .entries;
             let name = |e: &SubtreeEntry| String::from_utf8(e.name.clone()).unwrap();
             let mut names: Vec<_> = entries.iter().map(name).collect();
             names.sort();
@@ -506,7 +741,9 @@ mod tests {
             // An excluded record is left out with everything below it.
             let skip = by("skip").record;
             let excluded = HashSet::from([skip]);
-            let entries = walk_subtree(&hint, reference, &excluded, LIMITS, &cancel).unwrap();
+            let entries = walk_subtree(&hint, reference, &excluded, super::LIMITS, &cancel)
+                .unwrap()
+                .entries;
             let names: Vec<_> = entries.iter().map(name).collect();
             assert!(
                 !names.iter().any(|n| n == "skip" || n == "d.txt"),
@@ -526,31 +763,22 @@ mod tests {
             let cancel = AtomicBool::new(false);
             let small = Limits {
                 max_entries: 3,
-                ..LIMITS
+                ..super::LIMITS
             };
             assert_eq!(
                 walk_subtree(&hint, reference, &none, small, &cancel).unwrap_err(),
                 WalkError::OverBudget
             );
-            let late = Limits {
-                max_time: Duration::ZERO,
-                ..LIMITS
-            };
-            std::thread::sleep(Duration::from_millis(2));
-            assert_eq!(
-                walk_subtree(&hint, reference, &none, late, &cancel).unwrap_err(),
-                WalkError::TimedOut
-            );
             let cancelled = AtomicBool::new(true);
             assert_eq!(
-                walk_subtree(&hint, reference, &none, LIMITS, &cancelled).unwrap_err(),
+                walk_subtree(&hint, reference, &none, super::LIMITS, &cancelled).unwrap_err(),
                 WalkError::Cancelled
             );
             // A deleted folder: its reference no longer opens.
             let sub = file_reference(&root.join("sub")).unwrap().unwrap();
             std::fs::remove_dir_all(root.join("sub")).unwrap();
             assert_eq!(
-                walk_subtree(&hint, sub, &none, LIMITS, &cancel).unwrap_err(),
+                walk_subtree(&hint, sub, &none, super::LIMITS, &cancel).unwrap_err(),
                 WalkError::Gone
             );
             drop(hint);

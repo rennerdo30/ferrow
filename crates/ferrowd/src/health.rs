@@ -86,6 +86,7 @@ pub struct State {
     folder_reads: AtomicU64,
     folder_read_entries: AtomicU64,
     folder_read_ms: AtomicU64,
+    folder_read_skipped: AtomicU64,
     folder_read_fallbacks: AtomicU64,
     connection_errors: AtomicU64,
     scanning: AtomicBool,
@@ -109,6 +110,7 @@ impl State {
             folder_reads: AtomicU64::new(0),
             folder_read_entries: AtomicU64::new(0),
             folder_read_ms: AtomicU64::new(0),
+            folder_read_skipped: AtomicU64::new(0),
             folder_read_fallbacks: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             scanning: AtomicBool::new(false),
@@ -210,8 +212,11 @@ impl State {
             .or_default() += 1;
     }
 
-    /// A background read of a moved-in folder finished with `entries`.
-    pub fn folder_read(&self, entries: usize, took: Duration) {
+    /// A background read of a moved-in folder finished with `entries`,
+    /// `skipped` subfolders having vanished meanwhile.
+    pub fn folder_read(&self, entries: usize, skipped: usize, took: Duration) {
+        self.folder_read_skipped
+            .fetch_add(skipped as u64, Ordering::Relaxed);
         self.folder_reads.fetch_add(1, Ordering::Relaxed);
         self.folder_read_entries
             .fetch_add(entries as u64, Ordering::Relaxed);
@@ -312,6 +317,7 @@ impl State {
                 folder_reads: self.folder_reads.load(Ordering::Relaxed),
                 folder_read_entries: self.folder_read_entries.load(Ordering::Relaxed),
                 folder_read_ms: self.folder_read_ms.load(Ordering::Relaxed),
+                folder_read_skipped: self.folder_read_skipped.load(Ordering::Relaxed),
                 folder_read_fallbacks: self.folder_read_fallbacks.load(Ordering::Relaxed),
                 scans_by_reason: inner.scans_by_reason.clone(),
             },
@@ -537,8 +543,8 @@ mod tests {
         state.count_scan("a folder moved into an indexed location");
         state.count_scan("50001 live changes");
         state.count_scan("\\\\?\\Volume{1}: change journal reset: overrun");
-        state.folder_read(40, Duration::from_millis(1500));
-        state.folder_read(2, Duration::from_millis(30));
+        state.folder_read(40, 0, Duration::from_millis(1500));
+        state.folder_read(2, 3, Duration::from_millis(30));
         state.folder_read_fell_back();
         let store = SnapshotStore::new(Snapshot::empty());
         let policy = Policy {
@@ -558,6 +564,7 @@ mod tests {
             ),
             (2, 42, 1530)
         );
+        assert_eq!(stats.folder_read_skipped, 3);
         assert_eq!(stats.folder_read_fallbacks, 1);
         // The wire form is JSON; an older reader ignores the new field and a
         // newer one reads an older report without it.

@@ -105,6 +105,9 @@ pub struct LiveStats {
     /// …the entries they found, the milliseconds they took…
     pub folder_read_entries: u64,
     pub folder_read_ms: u64,
+    /// Subfolders that vanished while a folder was read (deleted or moved
+    /// away; each is checked, and one that still exists is a fallback).
+    pub folder_read_skipped: u64,
     /// …and reads that failed or were too large, each of which asked for a
     /// rescan instead.
     pub folder_read_fallbacks: u64,

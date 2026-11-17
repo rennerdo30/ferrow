@@ -13,13 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrow_ipc::health::{JOURNAL_NONE, JOURNAL_OK, MODE_LIVE, MODE_UNAVAILABLE};
-use ferrow_walk::subtree::{SubtreeEntry, WalkError, walk_subtree};
+use ferrow_walk::subtree::{Subtree, WalkError, walk_subtree};
 use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 
 use crate::health::{STATE, VolumeState};
 use crate::live::{
-    Applied, Change, HARD_DELTA, Live, NOTABLE_WALK, REASON_ADMIN, RecordSource, RecordState,
-    RescanPolicy, WalkJob, walk_limits_text,
+    Applied, Change, HARD_DELTA, Live, MAX_WALK_TIME, NOTABLE_WALK, REASON_ADMIN, RecordSource,
+    RecordState, RescanPolicy, WALK_SLACK, WalkJob, walk_limits_text,
 };
 use crate::{Snapshot, SnapshotStore, eventlog};
 
@@ -43,7 +43,17 @@ enum Message {
     /// An administrator asked for a rescan now.
     RescanNow,
     /// The folder reader finished a folder.
-    Walked(WalkDone),
+    Walk(WalkEvent),
+}
+
+/// What the folder reader reports.
+enum WalkEvent {
+    /// It began a folder (the watchdog's start time).
+    Started {
+        generation: u64,
+        id: u64,
+    },
+    Done(WalkDone),
 }
 
 /// A folder the reader thread finished (or failed to read).
@@ -51,7 +61,7 @@ struct WalkDone {
     /// The live session it belongs to: a result of an older one is dropped.
     generation: u64,
     id: u64,
-    result: Result<Vec<SubtreeEntry>, WalkError>,
+    result: Result<Subtree, WalkError>,
     took: Duration,
 }
 
@@ -61,7 +71,7 @@ enum Batch {
     /// maintainer woke for a pending rescan).
     Changes {
         changes: Vec<Change>,
-        walked: Vec<WalkDone>,
+        events: Vec<WalkEvent>,
     },
     Reset {
         device: String,
@@ -261,6 +271,13 @@ fn read_folders(
         devices.iter().map(|d| ntfs::open_volume(d).ok()).collect();
     while let Ok(job) = queue.recv() {
         let started = Instant::now();
+        let begun = WalkEvent::Started {
+            generation,
+            id: job.id,
+        };
+        if results.send(Message::Walk(begun)).is_err() {
+            return;
+        }
         let result = match handles.get(job.volume) {
             Some(Some(volume)) => walk_subtree(
                 volume,
@@ -277,7 +294,7 @@ fn read_folders(
             result,
             took: started.elapsed(),
         };
-        if results.send(Message::Walked(done)).is_err() {
+        if results.send(Message::Walk(WalkEvent::Done(done))).is_err() {
             return;
         }
     }
@@ -398,7 +415,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         // the overlay; do not keep them for the whole live session.
         drop(maps);
         generation += 1;
-        let walker = Walker::start(generation, devices, tx.clone());
+        let mut walker = Walker::start(generation, devices.clone(), tx.clone());
         eventlog::info(format!(
             "folders moved into the index are read in the background ({}), not rescanned",
             walk_limits_text()
@@ -410,11 +427,17 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             if let Some(why) = rescan.due(Instant::now(), urgent) {
                 break why;
             }
-            let Some(batch) = next_batch(&rx, &device_index, rescan.wake_at()) else {
+            // Wake for a pending rescan, and to check on a folder read that
+            // may be stuck.
+            let wake = [rescan.wake_at(), live.next_walk_deadline()]
+                .into_iter()
+                .flatten()
+                .min();
+            let Some(batch) = next_batch(&rx, &device_index, wake) else {
                 return;
             };
-            let (changes, walked) = match batch {
-                Batch::Changes { changes, walked } => (changes, walked),
+            let (changes, events) = match batch {
+                Batch::Changes { changes, events } => (changes, events),
                 Batch::Reset {
                     device,
                     reason,
@@ -436,15 +459,31 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             // Finished folder reads first: the changes below are then applied
             // to a state that already holds them.
             let mut outcome = Applied::default();
-            for done in walked.into_iter().filter(|d| d.generation == generation) {
+            for event in events {
+                let done = match event {
+                    WalkEvent::Started { generation: g, id } => {
+                        if g == generation {
+                            live.walk_started(id, Instant::now());
+                        }
+                        continue;
+                    }
+                    WalkEvent::Done(done) if done.generation == generation => done,
+                    WalkEvent::Done(_) => continue,
+                };
                 match &done.result {
-                    Ok(entries) => {
-                        STATE.folder_read(entries.len(), done.took);
-                        if done.took >= NOTABLE_WALK {
+                    Ok(listing) => {
+                        let skipped = listing.skipped.len();
+                        STATE.folder_read(listing.entries.len(), skipped, done.took);
+                        if done.took >= NOTABLE_WALK || skipped > 0 {
                             eventlog::info(format!(
-                                "read {} entries of a folder moved into the index in {:.1} s",
-                                entries.len(),
-                                done.took.as_secs_f64()
+                                "read {} entries of a folder moved into the index in {:.1} s{}",
+                                listing.entries.len(),
+                                done.took.as_secs_f64(),
+                                if skipped > 0 {
+                                    format!(" ({skipped} subfolders vanished while it was read)")
+                                } else {
+                                    String::new()
+                                }
                             ));
                         }
                     }
@@ -459,6 +498,19 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 }
                 outcome.absorb(live.finish_walk(done.id, done.result, &volumes));
             }
+            // A read the reader never finished (it is stuck in a file-system
+            // call): give up on it and start a reader that is not.
+            let expired = live.expire_walks(Instant::now());
+            if expired.abandoned > 0 {
+                STATE.folder_read_fell_back();
+                eventlog::warn(format!(
+                    "the folder reader did not answer within {} s; {} folder reads given up, every volume will be rescanned",
+                    (MAX_WALK_TIME + WALK_SLACK).as_secs(),
+                    expired.abandoned
+                ));
+                walker = Walker::start(generation, devices.clone(), tx.clone());
+            }
+            outcome.absorb(expired);
             if !changes.is_empty() {
                 outcome.absorb(live.apply(&changes, &volumes));
             }
@@ -513,7 +565,7 @@ fn next_batch(
             Err(RecvTimeoutError::Timeout) => {
                 return Some(Batch::Changes {
                     changes: Vec::new(),
-                    walked: Vec::new(),
+                    events: Vec::new(),
                 });
             }
             Err(RecvTimeoutError::Disconnected) => return None,
@@ -521,13 +573,13 @@ fn next_batch(
     };
     let deadline = Instant::now() + BATCH;
     let mut changes: HashMap<(usize, u64), bool> = HashMap::new();
-    let mut walked: Vec<WalkDone> = Vec::new();
+    let mut events: Vec<WalkEvent> = Vec::new();
     let mut take = |message: Message| -> Result<(), Batch> {
         match message {
             // Kept with the batch: returning early would drop the changes
             // already collected.
-            Message::Walked(done) => {
-                walked.push(done);
+            Message::Walk(event) => {
+                events.push(event);
                 Ok(())
             }
             Message::Reset {
@@ -577,7 +629,7 @@ fn next_batch(
     out.sort_by_key(|c| (c.volume, c.record));
     Some(Batch::Changes {
         changes: out,
-        walked,
+        events,
     })
 }
 
