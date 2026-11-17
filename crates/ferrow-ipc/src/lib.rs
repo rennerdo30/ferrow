@@ -41,8 +41,8 @@ fn operation<S: DeadlineIo>(stream: &mut S) -> std::io::Result<()> {
 }
 
 pub use protocol::{
-    Envelope, ErrorCode, FileRow, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, ProtocolError,
-    Request, Response, Sort, read_message, write_message,
+    AccessInfo, AccessMode, AccessUser, Envelope, ErrorCode, FileRow, MAX_FRAME_BYTES, Message,
+    PROTOCOL_VERSION, ProtocolError, Request, Response, Sort, read_message, write_message,
 };
 pub use transport::{CallerIdentity, Endpoint, Listener, Stream};
 
@@ -468,6 +468,17 @@ impl<S: DeadlineIo> Client<S> {
                 report,
             } => Ok((entries, mode, report)),
             _ => Err(io_invalid("expected Status".into())),
+        }
+    }
+
+    /// Who may use the service and whether this caller may (answered even to
+    /// refused callers). A service from before this request closes the
+    /// connection instead of answering, so use a connection of its own.
+    pub fn access_info(&mut self) -> std::io::Result<AccessInfo> {
+        let id = self.send(Request::AccessInfo)?;
+        match Self::check(self.expect(id)?)? {
+            Response::Access(info) => Ok(info),
+            _ => Err(io_invalid("expected Access".into())),
         }
     }
 

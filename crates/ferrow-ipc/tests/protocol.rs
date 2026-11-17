@@ -378,3 +378,76 @@ fn parser_never_panics_on_garbage_or_mutations() {
         }
     }
 }
+
+fn user(id: &str, name: &str) -> ferrow_ipc::AccessUser {
+    ferrow_ipc::AccessUser {
+        id: id.into(),
+        name: name.into(),
+    }
+}
+
+#[test]
+fn access_info_round_trips_with_and_without_the_user_list() {
+    use ferrow_ipc::{AccessInfo, AccessMode};
+    let request = Message::Request(Request::AccessInfo);
+    let frame = encode_frame(9, &request).unwrap();
+    assert_eq!(decode_payload(&frame[4..]).unwrap().message, request);
+    for users in [
+        None,
+        Some(vec![]),
+        Some(vec![
+            user("1000", "alice"),
+            user("S-1-5-21-1-2-3-1001", r"PC\bob"),
+        ]),
+    ] {
+        for mode in [AccessMode::Admins, AccessMode::Everyone, AccessMode::Listed] {
+            let reply = Message::Response(Response::Access(AccessInfo {
+                mode,
+                you_allowed: users.is_some(),
+                you: user("S-1-5-21-1-2-3-1001", ""),
+                users: users.clone(),
+            }));
+            let frame = encode_frame(3, &reply).unwrap();
+            assert_eq!(decode_payload(&frame[4..]).unwrap().message, reply);
+        }
+    }
+}
+
+#[test]
+fn access_info_rejects_oversized_or_malformed_fields() {
+    use ferrow_ipc::AccessInfo;
+    let info = |users| {
+        Message::Response(Response::Access(AccessInfo {
+            mode: ferrow_ipc::AccessMode::Listed,
+            you_allowed: true,
+            you: user("1", ""),
+            users,
+        }))
+    };
+    let many = vec![user("1", ""); ferrow_ipc::protocol::MAX_ACCESS_USERS + 1];
+    assert_eq!(
+        encode_frame(1, &info(Some(many))),
+        Err(ProtocolError::TooLarge)
+    );
+    let long = user(&"9".repeat(ferrow_ipc::protocol::MAX_ACCOUNT_ID + 1), "");
+    assert_eq!(
+        encode_frame(1, &info(Some(vec![long]))),
+        Err(ProtocolError::TooLarge)
+    );
+    // A bad mode byte, a bad flag byte and trailing bytes are all refused.
+    let good = encode_frame(1, &info(None)).unwrap();
+    for (offset, value) in [(10usize, 7u8), (11, 2)] {
+        let mut bad = good.clone();
+        bad[offset] = value;
+        assert!(decode_payload(&bad[4..]).is_err(), "byte {offset}");
+    }
+    let mut trailing = good;
+    trailing.push(0);
+    assert!(decode_payload(&trailing[4..]).is_err());
+}
+
+/// The wire stays version 4: an old peer still reads every older kind.
+#[test]
+fn adding_access_info_does_not_change_the_protocol_version() {
+    assert_eq!(PROTOCOL_VERSION, 4);
+}

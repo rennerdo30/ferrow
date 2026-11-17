@@ -20,6 +20,7 @@ use ferrow_ipc::{
 use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
+pub mod access;
 mod admission;
 #[cfg(any(unix, test))]
 mod definition;
@@ -691,6 +692,9 @@ fn handle_cancel(store: &SnapshotStore, request: Request, cancel: CancelToken) -
         // one-way and never receives a separate reply under Cancel's own id.
         Request::Cancel { .. } => vec![],
         Request::Hello { .. } => vec![bad_request("unexpected Hello".into())],
+        Request::AccessInfo => vec![bad_request(
+            "access info is answered before the snapshot is touched".into(),
+        )],
     }
 }
 
@@ -703,7 +707,24 @@ pub fn handle_authorized(
     owner: &CallerIdentity,
     system: bool,
 ) -> Vec<Response> {
-    handle_authorized_cancel(store, request, caller, owner, system, CancelToken::new())
+    handle_authorized_cancel(
+        store,
+        request,
+        caller,
+        owner,
+        system,
+        None,
+        CancelToken::new(),
+    )
+}
+
+/// Run `f` on the access policy in force: the live store of the system
+/// service, or the administrators-only default when there is none.
+fn with_policy<T>(access: Option<&access::PolicyStore>, f: impl FnOnce(&access::Policy) -> T) -> T {
+    match access {
+        Some(store) => f(&store.current()),
+        None => f(&access::Policy::default()),
+    }
 }
 
 fn handle_authorized_cancel(
@@ -712,10 +733,22 @@ fn handle_authorized_cancel(
     caller: &CallerIdentity,
     owner: &CallerIdentity,
     system: bool,
+    access: Option<&access::PolicyStore>,
     cancel: CancelToken,
 ) -> Vec<Response> {
+    if matches!(request, Request::AccessInfo) {
+        // Answered to every authenticated caller of the system endpoint,
+        // refused ones included; it carries no index data.
+        return if system {
+            vec![Response::Access(with_policy(access, |p| p.info(caller)))]
+        } else {
+            vec![bad_request(
+                "the access policy applies to the system service only".into(),
+            )]
+        };
+    }
     let allowed = if system {
-        caller.is_admin_account()
+        with_policy(access, |p| p.allows(caller))
     } else {
         #[cfg(windows)]
         {
@@ -730,7 +763,7 @@ fn handle_authorized_cancel(
     };
     if !allowed {
         return vec![Response::Error { code: ErrorCode::Unauthorized,
-            msg: "per-user visibility not yet available; the system service answers SYSTEM, accounts in the Administrators group (not sandboxed) or root; development access requires its owner".into() }];
+            msg: "per-user visibility not yet available; the system service answers SYSTEM, accounts in the Administrators group (not sandboxed), root and accounts an administrator allowed with `ferrow service access`; development access requires its owner".into() }];
     }
     handle_cancel(store, request, cancel)
 }
@@ -790,6 +823,14 @@ pub fn serve(
     shutdown.register(&listener)?;
     let owner = CallerIdentity::current()?;
     let system = config.endpoint == Endpoint::default_service();
+    // The development endpoint ignores the policy: it serves its owner only.
+    let access = if system {
+        let store = Arc::new(access::PolicyStore::open(access::default_path()?));
+        eprintln!("ferrowd: access policy: {}", store.current().mode.as_str());
+        Some(store)
+    } else {
+        None
+    };
     let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
     #[cfg(windows)]
     if !config.roots.is_empty() {
@@ -825,6 +866,7 @@ pub fn serve(
             let control = stream.try_clone()?;
             let store = store.clone();
             let owner = owner.clone();
+            let access = access.clone();
             let stopping = shutdown.clone();
             let thread = std::thread::Builder::new()
                 .name("ipc-connection".into())
@@ -837,6 +879,7 @@ pub fn serve(
                             &context.caller,
                             &owner,
                             system,
+                            access.as_deref(),
                             CancelToken::from_flag(context.cancellation_flag()),
                         )
                     });

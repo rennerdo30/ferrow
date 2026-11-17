@@ -175,6 +175,22 @@ impl CallerIdentity {
     pub fn is_admin_account(&self) -> bool {
         platform::is_privileged(self)
     }
+
+    /// Whether the caller has a usable OS identity and is not sandboxed:
+    /// a captured token that is not restricted, not AppContainer and at
+    /// least medium integrity (SYSTEM qualifies); on Unix any known uid.
+    /// Every administrator is unsandboxed.
+    pub fn is_unsandboxed(&self) -> bool {
+        platform::is_unsandboxed(self)
+    }
+
+    /// The account id the access policy matches: the token user SID on
+    /// Windows, the decimal uid on Unix.
+    pub fn account_id(&self) -> Option<String> {
+        self.user_sid
+            .clone()
+            .or_else(|| self.uid.map(|uid| uid.to_string()))
+    }
 }
 
 #[cfg(unix)]
@@ -395,6 +411,10 @@ mod platform {
 
     pub fn is_privileged(caller: &CallerIdentity) -> bool {
         caller.uid == Some(0)
+    }
+
+    pub fn is_unsandboxed(caller: &CallerIdentity) -> bool {
+        caller.uid.is_some()
     }
 
     #[cfg(target_os = "linux")]
@@ -638,13 +658,10 @@ mod platform {
         )
     }
 
-    pub fn is_privileged(caller: &CallerIdentity) -> bool {
-        use windows_sys::Win32::Security::{
-            CreateWellKnownSid, EqualSid, IsTokenRestricted, TOKEN_GROUPS, TokenGroups,
-            WinBuiltinAdministratorsSid,
-        };
-        const SE_GROUP_ENABLED: u32 = 0x4;
-        const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+    /// A captured token that is not restricted, not AppContainer and at
+    /// least medium integrity. SYSTEM qualifies without the last two checks.
+    pub fn is_unsandboxed(caller: &CallerIdentity) -> bool {
+        use windows_sys::Win32::Security::IsTokenRestricted;
         let Some(token) = caller.access_token() else {
             return false;
         };
@@ -653,12 +670,26 @@ mod platform {
         if unsafe { IsTokenRestricted(token) } != 0 {
             return false;
         }
+        caller.user_sid.as_deref() == Some("S-1-5-18")
+            || (is_app_container(token) == Some(false) && at_least_medium_integrity(token))
+    }
+
+    pub fn is_privileged(caller: &CallerIdentity) -> bool {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, EqualSid, TOKEN_GROUPS, TokenGroups, WinBuiltinAdministratorsSid,
+        };
+        const SE_GROUP_ENABLED: u32 = 0x4;
+        const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+        if !is_unsandboxed(caller) {
+            return false;
+        }
         if caller.user_sid.as_deref() == Some("S-1-5-18") {
             return true;
         }
-        if is_app_container(token) != Some(false) || !at_least_medium_integrity(token) {
+        let Some(token) = caller.access_token() else {
             return false;
-        }
+        };
+        let token = token.as_raw_handle();
         let mut admins = [0usize; 16];
         let mut len = std::mem::size_of_val(&admins) as u32;
         // SAFETY: aligned SID buffer (128 bytes > SECURITY_MAX_SID_SIZE) and live length.
@@ -1283,7 +1314,12 @@ mod platform {
             assert_ne!(ok, 0);
             // SAFETY: unique owned token handle.
             let token = unsafe { OwnedHandle::from_raw_handle(out) };
-            assert!(!is_privileged(&identity_of(token)));
+            let caller = identity_of(token);
+            assert!(!is_privileged(&caller));
+            assert!(
+                !is_unsandboxed(&caller),
+                "sandboxed tokens are never unsandboxed"
+            );
         }
 
         #[test]
@@ -1326,7 +1362,12 @@ mod platform {
                 )
             };
             assert_ne!(ok, 0);
-            assert!(!is_privileged(&identity_of(token)));
+            let caller = identity_of(token);
+            assert!(!is_privileged(&caller));
+            assert!(
+                !is_unsandboxed(&caller),
+                "sandboxed tokens are never unsandboxed"
+            );
         }
     }
 }

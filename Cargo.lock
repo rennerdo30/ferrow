@@ -1190,6 +1190,8 @@ dependencies = [
  "ferrow-walk",
  "libc",
  "rayon",
+ "serde",
+ "serde_json",
  "signal-hook",
  "windows-service",
  "windows-sys 0.61.2",
