@@ -21,6 +21,11 @@ mod columns;
 
 #[path = "settings_page.rs"]
 mod settings_page;
+
+/// Headless screenshots of the real app (see docs/gui-screenshots.md).
+#[cfg(all(test, feature = "screenshots"))]
+#[path = "screenshots.rs"]
+mod screenshots;
 use crate::platform;
 use crate::theme::{self, Palette};
 
@@ -121,11 +126,8 @@ impl FerrowApp {
         let ctx = cc.egui_ctx.clone();
         theme::install_fonts(&ctx)?;
         let settings = Settings::load();
-        settings_page::apply_theme_choice(&ctx, settings.theme);
-        let dark = ctx.theme() == egui::Theme::Dark;
         let accent = platform::accent_color();
-        let palette = Palette::new(dark, accent);
-        theme::apply_style(&ctx, &palette);
+        let (dark, palette) = Self::apply_look(&ctx, &settings, accent);
         let backdrop = platform::apply_backdrop(cc, dark);
         let frame_wake = ctx.clone();
         platform::install_frame(cc, dark, move || frame_wake.request_repaint());
@@ -146,7 +148,48 @@ impl FerrowApp {
             closer.request_repaint();
         });
         platform::listen_for_activation(platform::show_from_tray);
-        let mut app = FerrowApp {
+        let mut app = Self::assemble(
+            engine,
+            settings,
+            palette,
+            backdrop,
+            dark,
+            accent,
+            platform::is_remote_session(),
+        );
+        if app.settings.windows.windows_search {
+            app.sync_windows_search();
+        }
+        Ok(app)
+    }
+
+    /// Theme choice, palette and egui style for `settings`; returns whether
+    /// the theme is dark and the palette. Shared by the real start and the
+    /// screenshot harness so both draw with the same look.
+    fn apply_look(
+        ctx: &egui::Context,
+        settings: &Settings,
+        accent: Option<[u8; 3]>,
+    ) -> (bool, Palette) {
+        settings_page::apply_theme_choice(ctx, settings.theme);
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let palette = Palette::new(dark, accent);
+        theme::apply_style(ctx, &palette);
+        (dark, palette)
+    }
+
+    /// The app in its initial state, with the parts that touch the system
+    /// (engine, settings, palette, backdrop) supplied by the caller.
+    fn assemble(
+        engine: Engine,
+        settings: Settings,
+        palette: Palette,
+        backdrop: bool,
+        dark: bool,
+        accent: Option<[u8; 3]>,
+        remote: bool,
+    ) -> FerrowApp {
+        FerrowApp {
             engine,
             state: State::Loading,
             index: None,
@@ -168,7 +211,7 @@ impl FerrowApp {
             accent,
             focus_search: true,
             title_logo: TitleLogo::new(),
-            remote: platform::is_remote_session(),
+            remote,
             page: Page::Results,
             settings,
             folder_pick: None,
@@ -186,11 +229,7 @@ impl FerrowApp {
             service_entries: None,
             refreshing: false,
             live_change_pending: false,
-        };
-        if app.settings.windows.windows_search {
-            app.sync_windows_search();
         }
-        Ok(app)
     }
 
     pub(super) fn sync_windows_search(&mut self) {

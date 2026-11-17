@@ -199,6 +199,37 @@ impl Engine {
         }
     }
 
+    /// An engine for UI tests: no service connection or probe, no index
+    /// file, no disk access. Searches run on a worker over `index`; the
+    /// returned sender injects the events the worker would report (loaded,
+    /// scanning, service connected, failed) so the real app code handles
+    /// them.
+    #[cfg(all(test, feature = "screenshots"))]
+    pub fn isolated(index: Option<Arc<Index>>) -> (Engine, Sender<Event>) {
+        let (commands, command_rx) = mpsc::channel();
+        let (event_tx, events) = mpsc::channel();
+        let injected = event_tx.clone();
+        std::thread::Builder::new()
+            .name("ferrow-engine-test".into())
+            .spawn({
+                let commands = commands.clone();
+                move || {
+                    let mut worker = Worker::new(event_tx, || {}).with_commands(commands);
+                    worker.index = index;
+                    worker.serve(command_rx);
+                }
+            })
+            .expect("spawn engine thread");
+        let engine = Engine {
+            commands,
+            events,
+            generation: 0,
+            in_flight: None,
+            requested: std::collections::HashSet::new(),
+        };
+        (engine, injected)
+    }
+
     /// Start a search for `text`; the previous one is cancelled.
     /// Returns the generation that its results will carry.
     pub fn search(&mut self, text: &str, sort: SortKey, descending: bool) -> u64 {
@@ -284,6 +315,11 @@ impl<W: Fn()> Worker<W> {
             self.load_default();
             self.probe_service();
         }
+        self.serve(commands);
+    }
+
+    /// Answer commands until the UI drops its end.
+    fn serve(mut self, commands: Receiver<Command>) {
         while let Ok(mut command) = commands.recv() {
             // Only the newest search matters; skip superseded ones.
             while let Ok(next) = commands.try_recv() {
@@ -831,6 +867,27 @@ impl RemoteQuery {
     }
 }
 
+/// Rows as the Ferrow service would answer them, for UI tests: `total` rows
+/// in the whole list, the first `rows.len()` loaded.
+#[cfg(all(test, feature = "screenshots"))]
+pub fn service_hits_for_test(
+    generation: u64,
+    total: usize,
+    rows: Vec<ferrow_ipc::FileRow>,
+) -> Hits {
+    let mut query = RemoteQuery {
+        generation,
+        text: String::new(),
+        sort: SortKey::Name,
+        descending: false,
+        total,
+        columns: ferrow_index::ColumnSet::DEFAULT.bits(),
+        rows: std::collections::BTreeMap::new(),
+    };
+    query.insert(0, rows);
+    query.hits()
+}
+
 fn remote_sort(sort: SortKey) -> ferrow_ipc::Sort {
     match sort {
         SortKey::Name => ferrow_ipc::Sort::Name,
@@ -841,8 +898,46 @@ fn remote_sort(sort: SortKey) -> ferrow_ipc::Sort {
     }
 }
 
+/// Where tests keep their data. Test builds never look at the real
+/// per-user folders: with no folder set here, there is no data location at
+/// all (`default_index_path` is `None`), so a test that forgot to isolate
+/// itself cannot read or write the user's settings or index.
+#[cfg(test)]
+pub(crate) mod test_data_dir {
+    #[cfg(feature = "screenshots")]
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// Use `dir` (absolute, already created) as the data folder.
+    #[cfg(feature = "screenshots")]
+    pub fn set(dir: &Path) {
+        assert!(dir.is_absolute(), "test data folder must be absolute");
+        *DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
+    }
+
+    #[cfg(feature = "screenshots")]
+    pub fn clear() {
+        *DIR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub fn get() -> Option<PathBuf> {
+        DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// Same location as the CLI's default index.
 pub fn default_index_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    return test_data_dir::get().map(|dir| dir.join("index.bin"));
+    #[cfg(not(test))]
+    real_index_path()
+}
+
+#[cfg(not(test))]
+fn real_index_path() -> Option<PathBuf> {
     let base = |name: &str| {
         let p = PathBuf::from(std::env::var_os(name)?);
         (p.is_absolute()).then_some(p)
@@ -971,6 +1066,17 @@ mod tests {
         for row in 0..hits.len(&big) {
             assert_eq!(hits.get(&placeholder, row), None);
         }
+    }
+
+    /// Test builds must never see the real per-user folders: the only data
+    /// location is the one a test set explicitly.
+    #[test]
+    fn test_builds_never_resolve_the_real_data_folder() {
+        // No test outside the (ignored) screenshot run sets an override, so
+        // a test build must resolve no data folder at all; a real-folder
+        // fallback would make this fail.
+        assert!(test_data_dir::get().is_none());
+        assert!(default_index_path().is_none());
     }
 
     #[test]
