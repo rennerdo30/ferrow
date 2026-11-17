@@ -1655,7 +1655,7 @@ fn type_label(name: &str, is_dir: bool) -> String {
     }
 }
 
-fn group(n: usize) -> String {
+pub(crate) fn group(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {

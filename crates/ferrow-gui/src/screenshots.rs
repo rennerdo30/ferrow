@@ -1531,6 +1531,28 @@ fn health_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::I
         HealthView::Stale(Box::new(healthy_report())),
     );
     shot(&mut s, busy, 75, "health-busy-last-report");
+    // Two live volumes that could not re-check their change journal after the
+    // MFT read, a scan that followed many live changes, and a long event: the
+    // text wraps and ends in a visible "…" when the service had to cut it.
+    let mut checked = healthy_report();
+    let warning = "could not re-check the change journal after reading the MFT (Falscher Parameter. (os error 87)); files changed just before the scan may show their old state until the next scan";
+    for (n, root) in [(1, r"E:\"), (2, r"F:\")] {
+        let mut v = live(root, 9_100_000);
+        v.journal_detail = warning.into();
+        v.last_scan = scan(1_500, "50001 live changes", 198_000);
+        checked.volumes[n] = v;
+    }
+    checked
+        .events
+        .push(event(1_480, LEVEL_WARN, &format!(r"E:\: {warning}")));
+    checked.events.push(event(
+        1_470,
+        LEVEL_INFO,
+        r"walk: mft \\?\Volume{0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0} (112.4 M records read in 14.20 s, 9100000 entries) + mft \\?\Volume{1a2b3c4d-5e6f-7081-9293-a4b5c6d7e8f9} (3.1 M records read in 3.80 s, 2400000 entries) (live after 50001 live changes, 198.1 s)",
+    ));
+    shot(&mut s, up(checked), 77, "health-journal-warning");
+    s.scroll_by(-420.0);
+    s.save(78, "health-journal-warning-more");
     // A service that is stopping is not "healthy" any more.
     let mut stopping = up(healthy_report());
     stopping.scm.state = ScmState::Stopping;
