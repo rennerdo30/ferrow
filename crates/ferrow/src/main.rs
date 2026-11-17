@@ -6,6 +6,7 @@
 //! ferrow stats [--index <file>]
 //! ferrow status
 //! ferrow service install | uninstall | status | run
+//! ferrow service access show | admins | everyone | add <who> | remove <who>
 //! ```
 //!
 //! `search` talks to the `ferrowd` service when one is reachable
@@ -23,6 +24,8 @@ use ferrow_ipc::{Client, Endpoint, Stream};
 use ferrow_query::{Query, SearchOptions, SortKey, search};
 use ferrow_walk::{WalkOptions, scan};
 
+mod access_cmd;
+
 const USAGE: &str = "\
 ferrow - find any file by name, as fast as you type
 
@@ -36,13 +39,16 @@ Usage:
   ferrow stats [--index <file>]
   ferrow status
   ferrow service install | uninstall | status
+  ferrow service access show | admins | everyone | add <account-or-SID> | remove <account-or-SID>
   ferrow service run [<root>...] [--index <file>] [--exclude <path>]... [--follow-symlinks]
   ferrow --help | --version
 
 Search uses the ferrowd service when it is reachable and falls
 back to the saved index otherwise; `ferrow status` says which.
 `service run` starts the daemon unprivileged in the foreground
-(per-user endpoint) for development.
+(per-user endpoint) for development. `service access` says who may use
+the system service (administrators only by default); changing it needs
+an elevated terminal / sudo.
 
 Build an index first, then search it:
   ferrow index ~/Documents /data
@@ -754,10 +760,13 @@ fn cmd_status() -> Result<(), String> {
 
 fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
     let Some(sub) = rest.first() else {
-        return Err("service needs a subcommand: install | uninstall | status | run".into());
+        return Err(
+            "service needs a subcommand: install | uninstall | status | access | run".into(),
+        );
     };
     match sub.to_str().unwrap_or("") {
         "status" => cmd_status(),
+        "access" => access_cmd::run(&rest[1..]),
         "run" => {
             let args = parse_args(&rest[1..])?;
             let endpoint = match std::env::var("FERROW_ENDPOINT_NAME") {
@@ -785,7 +794,7 @@ fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
         }
         "uninstall" => ferrowd::install::uninstall().map(|msg| println!("{msg}")),
         other => Err(format!(
-            "unknown service subcommand: {other} (install | uninstall | status | run)"
+            "unknown service subcommand: {other} (install | uninstall | status | access | run)"
         )),
     }
 }
