@@ -548,6 +548,8 @@ impl Volume {
 }
 
 #[cfg(windows)]
+pub(crate) use platform::low_io_priority;
+#[cfg(windows)]
 pub use platform::{
     can_read_volume, fetch_record, fetch_state, open_volume, query_journal, read_journal,
     read_volume, wait_journal,
@@ -576,7 +578,7 @@ mod platform {
 
     /// Ask the disk stack to serve this handle's reads at low priority
     /// (background rescans). Best effort: on failure reads stay normal.
-    fn low_io_priority(volume: &std::fs::File) {
+    pub(crate) fn low_io_priority(volume: &std::fs::File) {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_IO_PRIORITY_HINT_INFO, FileIoPriorityHintInfo, IoPriorityHintLow,
             SetFileInformationByHandle,

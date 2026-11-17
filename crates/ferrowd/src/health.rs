@@ -12,13 +12,14 @@
 //! gets `Unauthorized`. `Rescan` additionally needs an administrator or
 //! SYSTEM (root), whatever the policy allows others.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrow_ipc::health::{
-    Health, JOURNAL_ERROR, JOURNAL_NONE, JOURNAL_RESET, MAX_EVENTS, MODE_UNAVAILABLE, MODE_WALK,
-    RescanInfo, SaveInfo, ScanInfo, VolumeHealth, format_duration,
+    Health, JOURNAL_ERROR, JOURNAL_NONE, JOURNAL_RESET, LiveStats, MAX_EVENTS, MODE_UNAVAILABLE,
+    MODE_WALK, RescanInfo, SaveInfo, ScanInfo, VolumeHealth, format_duration,
 };
 use ferrow_ipc::{ErrorCode, Request, Response};
 
@@ -70,6 +71,8 @@ struct Inner {
     volumes: Vec<VolumeState>,
     /// When the last scan ended (the earliest a requested rescan may follow).
     last_finished: Option<Instant>,
+    /// Scans started, by kind of reason.
+    scans_by_reason: BTreeMap<String, u64>,
 }
 
 /// Least time between the end of one scan and a requested rescan: an
@@ -80,6 +83,10 @@ pub struct State {
     inner: Mutex<Inner>,
     started: Mutex<Option<(Instant, u64)>>,
     live_changes: AtomicU64,
+    folder_reads: AtomicU64,
+    folder_read_entries: AtomicU64,
+    folder_read_ms: AtomicU64,
+    folder_read_fallbacks: AtomicU64,
     connection_errors: AtomicU64,
     scanning: AtomicBool,
     /// A requested rescan was sent and has not started yet.
@@ -95,9 +102,14 @@ impl State {
                 pending: None,
                 volumes: Vec::new(),
                 last_finished: None,
+                scans_by_reason: BTreeMap::new(),
             }),
             started: Mutex::new(None),
             live_changes: AtomicU64::new(0),
+            folder_reads: AtomicU64::new(0),
+            folder_read_entries: AtomicU64::new(0),
+            folder_read_ms: AtomicU64::new(0),
+            folder_read_fallbacks: AtomicU64::new(0),
             connection_errors: AtomicU64::new(0),
             scanning: AtomicBool::new(false),
             forced: AtomicBool::new(false),
@@ -188,6 +200,30 @@ impl State {
         self.live_changes.fetch_add(n as u64, Ordering::Relaxed);
     }
 
+    /// A scan starts for `reason`: counted under its kind (see
+    /// [`crate::live::reason_kind`]), so a storm of one kind is visible.
+    pub fn count_scan(&self, reason: &str) {
+        *self
+            .lock()
+            .scans_by_reason
+            .entry(crate::live::reason_kind(reason).into())
+            .or_default() += 1;
+    }
+
+    /// A background read of a moved-in folder finished with `entries`.
+    pub fn folder_read(&self, entries: usize, took: Duration) {
+        self.folder_reads.fetch_add(1, Ordering::Relaxed);
+        self.folder_read_entries
+            .fetch_add(entries as u64, Ordering::Relaxed);
+        self.folder_read_ms
+            .fetch_add(took.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// A background read failed or was too large: a rescan is asked for.
+    pub fn folder_read_fell_back(&self) {
+        self.folder_read_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn save_done(&self, took: Duration, error: Option<String>) {
         self.lock().last_save = Some(SaveInfo {
             at_ms: now_ms(),
@@ -272,6 +308,13 @@ impl State {
             last_save: inner.last_save.clone(),
             volumes,
             connection_errors: self.connection_errors.load(Ordering::Relaxed),
+            live_stats: LiveStats {
+                folder_reads: self.folder_reads.load(Ordering::Relaxed),
+                folder_read_entries: self.folder_read_entries.load(Ordering::Relaxed),
+                folder_read_ms: self.folder_read_ms.load(Ordering::Relaxed),
+                folder_read_fallbacks: self.folder_read_fallbacks.load(Ordering::Relaxed),
+                scans_by_reason: inner.scans_by_reason.clone(),
+            },
             events,
             ..Health::default()
         };
@@ -484,6 +527,44 @@ mod tests {
             policy: &policy,
         };
         answer(&request, caller, &scope, rescan)
+    }
+
+    #[test]
+    fn the_report_counts_scans_by_reason_and_folder_reads() {
+        let state = State::new();
+        state.count_scan("startup");
+        state.count_scan("a folder moved into an indexed location (the walk failed)");
+        state.count_scan("a folder moved into an indexed location");
+        state.count_scan("50001 live changes");
+        state.count_scan("\\\\?\\Volume{1}: change journal reset: overrun");
+        state.folder_read(40, Duration::from_millis(1500));
+        state.folder_read(2, Duration::from_millis(30));
+        state.folder_read_fell_back();
+        let store = SnapshotStore::new(Snapshot::empty());
+        let policy = Policy {
+            mode: AccessMode::Everyone,
+            users: vec![],
+        };
+        let stats = state.report(&store, &policy).live_stats;
+        assert_eq!(stats.scans_by_reason["startup"], 1);
+        assert_eq!(stats.scans_by_reason["moved-in folder"], 2);
+        assert_eq!(stats.scans_by_reason["too many live changes"], 1);
+        assert_eq!(stats.scans_by_reason["journal"], 1);
+        assert_eq!(
+            (
+                stats.folder_reads,
+                stats.folder_read_entries,
+                stats.folder_read_ms
+            ),
+            (2, 42, 1530)
+        );
+        assert_eq!(stats.folder_read_fallbacks, 1);
+        // The wire form is JSON; an older reader ignores the new field and a
+        // newer one reads an older report without it.
+        let json = state.report(&store, &policy).to_json();
+        assert!(json.contains("\"scans_by_reason\""), "{json}");
+        let old = ferrow_ipc::health::Health::from_json(r#"{"version":"1"}"#).unwrap();
+        assert_eq!(old.live_stats, LiveStats::default());
     }
 
     #[test]
