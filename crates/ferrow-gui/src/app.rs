@@ -149,6 +149,10 @@ pub struct FerrowApp {
     /// back on (yet): the last results stay on screen until the service is
     /// back or the user builds an index.
     no_own_index: bool,
+    /// While `no_own_index` holds: why the service is still not usable, as
+    /// the probe reports it (refused account / not running). The problem
+    /// itself stays "lost" so the kept rows never sit under no problem.
+    gap_cause: Option<ServiceGap>,
     /// A page asks Settings to scroll to a section (for example "Service
     /// access"); Settings takes it when it is drawn.
     pub(crate) settings_scroll_to: Option<&'static str>,
@@ -274,6 +278,7 @@ impl FerrowApp {
             service_problem: None,
             scan_info: None,
             no_own_index: false,
+            gap_cause: None,
             settings_scroll_to: None,
             fit_cache: fit::FitCache::default(),
             fit_epoch: 0,
@@ -327,6 +332,7 @@ impl FerrowApp {
                     self.scan_status = None;
                     self.scan_info = None;
                     self.no_own_index = false;
+                    self.gap_cause = None;
                     self.load_time = elapsed;
                     self.index_source = source;
                     self.state = State::Ready;
@@ -344,6 +350,12 @@ impl FerrowApp {
                     } else {
                         self.state = State::NoIndex;
                     }
+                }
+                Event::ServiceGap(gap) if self.no_own_index => {
+                    // Rows from the lost service are on screen: whatever the
+                    // probe finds, they stay under the "last results" notice;
+                    // the cause only changes what the chip says.
+                    self.gap_cause = Some(gap);
                 }
                 Event::ServiceGap(gap) => match gap {
                     ServiceGap::Refused => self.service_problem = Some(ServiceProblem::Refused),
@@ -381,6 +393,7 @@ impl FerrowApp {
                     let first = self.service_entries.is_none();
                     self.service_problem = None;
                     self.no_own_index = false;
+                    self.gap_cause = None;
                     self.service_entries = Some(entries);
                     self.index_source = format!("Ferrow service: {report}");
                     if first {

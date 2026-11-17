@@ -218,7 +218,10 @@ pub fn fit_name(
         }
         let (head, head_chars) = cut_head(name, tail, max, measure);
         let shows = keep.as_ref().is_none_or(|k| head.shows(k));
-        if (head_chars >= 4 || extra == 0) && shows {
+        // A kept end that is wider than the column (a match running into
+        // the extension) never counts as a fit.
+        let fits = measure(&head.text) <= max;
+        if (head_chars >= 4 || extra == 0) && shows && fits {
             return Some(head);
         }
         if let Some(k) = &in_middle
@@ -227,8 +230,14 @@ pub fn fit_name(
             return Some(cut);
         }
         if extra == 0 {
-            // The match cannot be shown whole: the plain cut.
-            return Some(head);
+            // The match cannot be shown whole: the plain cut (the extension
+            // as the end), and no highlight claimed for a partial match.
+            let plain = tail_start(name, ext, 0);
+            return Some(if tail == plain {
+                head
+            } else {
+                cut_head(name, plain, max, measure).0
+            });
         }
     }
     unreachable!("the last candidate (extra = 0) always returns")
@@ -313,17 +322,19 @@ fn cut_around(
 }
 
 /// Byte ranges of `name` (highlight ranges) mapped into the cut name text.
+/// A range that is not shown whole is dropped: never a partial highlight.
 pub fn remap_ranges(
     ranges: &[std::ops::Range<usize>],
     fitted: &FittedName,
 ) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     for r in ranges {
-        for (piece, at) in &fitted.pieces {
-            let (s, e) = (r.start.max(piece.start), r.end.min(piece.end));
-            if s < e {
-                out.push(at + (s - piece.start)..at + (e - piece.start));
-            }
+        if let Some((piece, at)) = fitted
+            .pieces
+            .iter()
+            .find(|(p, _)| p.start <= r.start && r.end <= p.end)
+        {
+            out.push(at + (r.start - piece.start)..at + (r.end - piece.start));
         }
     }
     out
@@ -653,6 +664,50 @@ mod tests {
         }
         let cut = fit_name(name, 36.0, &width, Some(keep)).unwrap();
         assert_eq!(cut.text, "…-10 Northwind report attachment.pdf");
+    }
+
+    /// A match that runs into the extension and is wider than the column:
+    /// the kept end must not exceed the column, and no highlight is claimed.
+    #[test]
+    fn a_match_running_into_the_extension_never_widens_the_cut_past_the_column() {
+        let name = "A long document title about the invoice.report";
+        let m = name.find("invoice.report").unwrap();
+        let keep = m..name.len();
+        for max in [10.0, 12.0] {
+            let cut = fit_name(name, max, &width, Some(keep.clone())).unwrap();
+            assert!(width(&cut.text) <= max, "{max}: {}", cut.text);
+            assert!(cut.text.contains('…'), "{max}: {}", cut.text);
+            assert!(cut.text.ends_with(".report"), "{max}: {}", cut.text);
+            assert!(!cut.shows(&keep));
+            assert!(remap_ranges(std::slice::from_ref(&keep), &cut).is_empty());
+        }
+        let m = name.find("invoice.report").unwrap();
+        let keep = m..name.len();
+        // Wide enough for the match and the extension: shown whole.
+        let cut = fit_name(name, 16.0, &width, Some(keep.clone())).unwrap();
+        assert!(cut.shows(&keep) && width(&cut.text) <= 16.0, "{}", cut.text);
+        // A match that ends inside the extension.
+        let name = "Quarterly invoice summary of everything.pdf";
+        let m = name.find("everything.p").unwrap();
+        let cut = fit_name(name, 12.0, &width, Some(m..m + "everything.p".len())).unwrap();
+        assert!(width(&cut.text) <= 12.0, "{}", cut.text);
+        assert!(cut.text.contains('…'));
+        // A match that is only the extension is shown (it is in the kept end).
+        let m = name.rfind("pdf").unwrap();
+        let keep = m..m + 3;
+        let cut = fit_name(name, 12.0, &width, Some(keep.clone())).unwrap();
+        assert!(width(&cut.text) <= 12.0 && cut.shows(&keep), "{}", cut.text);
+    }
+
+    /// Highlights of a match cut in two are dropped, not shown half.
+    #[test]
+    fn a_range_that_is_cut_through_is_not_highlighted() {
+        let name = "Annual report - draft for review (final).pdf";
+        let cut = fit_name(name, 34.0, &width, None).unwrap();
+        // Spans the head and the removed middle.
+        let a = name.find("draft").unwrap();
+        let across = a..a + 20;
+        assert!(remap_ranges(&[across], &cut).is_empty());
     }
 
     #[test]

@@ -19,6 +19,7 @@ use super::{
     FerrowApp, NOTICE_GAP, NOTICE_HEIGHT, Page, ServiceProblem, State, ellipsized,
     filter_column_hint, fit, fmt_ms, group,
 };
+use crate::engine::ServiceGap;
 use crate::platform;
 use crate::theme;
 
@@ -155,12 +156,23 @@ impl FerrowApp {
                 "The Ferrow service doesn't allow this account — an administrator can allow it in Settings. Click for Settings → Service access."
                     .to_owned(),
             ),
-            Some(ServiceProblem::Lost(error)) if self.no_own_index => (
-                "Own index · none yet",
-                format!(
-                    "The Ferrow service stopped answering ({error}) and this app has no index of its own yet. It reconnects by itself; or build an index in Settings."
-                ),
-            ),
+            Some(ServiceProblem::Lost(error)) if self.no_own_index => {
+                if self.gap_cause == Some(ServiceGap::Refused) {
+                    (
+                        "Own index · none yet · not allowed",
+                        format!(
+                            "The Ferrow service stopped answering ({error}) and now doesn't allow this account; this app has no index of its own yet. An administrator can allow it in Settings, or build an index there."
+                        ),
+                    )
+                } else {
+                    (
+                        "Own index · none yet",
+                        format!(
+                            "The Ferrow service stopped answering ({error}) and this app has no index of its own yet. It reconnects by itself; or build an index in Settings."
+                        ),
+                    )
+                }
+            }
             Some(ServiceProblem::Lost(error)) => (
                 "Own index · service stopped",
                 format!(
@@ -346,10 +358,14 @@ impl FerrowApp {
         if let Some(ServiceProblem::Lost(error)) = &self.service_problem {
             out.push(Notice {
                 color: t.warn,
-                text: if self.no_own_index {
-                    "Showing the last results. This app has no index of its own yet; it reconnects when the service is back."
+                // Short enough for the narrowest window (the full story is in
+                // the tooltip and the chip).
+                text: if !self.no_own_index {
+                    "Results may be older until the service is back (own index in use)."
+                } else if self.gap_cause == Some(ServiceGap::Refused) {
+                    "Last results shown. The service refuses this account; no own index yet."
                 } else {
-                    "Results may be out of date until the service is back. Searching this app's own index meanwhile."
+                    "Last results shown. No own index yet; reconnects with the service."
                 }
                 .to_owned(),
                 tooltip: error.clone(),
@@ -494,25 +510,16 @@ impl FerrowApp {
         let cx = rect.center().x;
         let wide = 312.0_f32.min(rect.width() - 32.0);
         let mut action = None;
-        // The home folder is the default: quick everywhere. All drives walks
-        // every file on the PC, which is slow without the Ferrow service.
+        let (primary, secondary) = first_start_buttons(windows);
         if self.big_button(
             ui,
             Rect::from_center_size(pos2(cx, y + 18.0), vec2(wide, 36.0)),
-            "Your home folder (recommended)",
+            primary.0,
             true,
         ) {
-            action = Some(FirstStart::Home);
+            action = Some(primary.1);
         }
         y += 44.0;
-        let secondary: Vec<(&str, FirstStart)> = if windows {
-            vec![
-                ("All drives", FirstStart::AllDrives),
-                ("Choose folders…", FirstStart::Choose),
-            ]
-        } else {
-            vec![("Choose folders…", FirstStart::Choose)]
-        };
         // Two secondary buttons share a row when they fit.
         let half = (wide - 8.0) / 2.0;
         let row_w = half * secondary.len() as f32 + 8.0 * (secondary.len() as f32 - 1.0);
@@ -660,7 +667,23 @@ impl FerrowApp {
     }
 }
 
-#[derive(Clone, Copy)]
+/// The first-start buttons: the accent (default) one, then the others in
+/// order. The home folder is the default: quick everywhere. All drives walks
+/// every file on the PC, which is slow without the Ferrow service, so it is
+/// offered, not preselected.
+fn first_start_buttons(
+    windows: bool,
+) -> ((&'static str, FirstStart), Vec<(&'static str, FirstStart)>) {
+    let primary = ("Your home folder (recommended)", FirstStart::Home);
+    let mut others = Vec::new();
+    if windows {
+        others.push(("All drives", FirstStart::AllDrives));
+    }
+    others.push(("Choose folders…", FirstStart::Choose));
+    (primary, others)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FirstStart {
     Home,
     /// Every internal drive (Windows).
@@ -1133,7 +1156,7 @@ mod tests {
         assert_eq!(app.row_count(), 2, "the rows stay");
         let notices = app.notices();
         assert_eq!(notices.len(), 1);
-        assert!(notices[0].text.starts_with("Results may be out of date"));
+        assert!(notices[0].text.starts_with("Results may be older"));
         assert!(
             !notices[0].text.contains("os error"),
             "the raw error is only in the tooltip"
@@ -1277,7 +1300,7 @@ mod tests {
         let notices = app.notices();
         assert_eq!(notices.len(), 1);
         assert!(
-            notices[0].text.contains("no index of its own yet"),
+            notices[0].text.contains("No own index yet"),
             "{}",
             notices[0].text
         );
@@ -1332,5 +1355,98 @@ mod tests {
             ],
         );
         assert!(matches!(app.state, State::NoIndex));
+    }
+
+    /// Order after a service restart on a service-only PC: lost, no own
+    /// index, then the probe reports a cause (twice, changing). The kept
+    /// rows always stay under the "last results" notice; the chip shows the
+    /// real cause; stale rows never sit under no problem. The service coming
+    /// back recovers everything.
+    #[test]
+    fn kept_rows_keep_their_notice_whatever_the_probe_finds() {
+        let (mut app, tx) = test_app();
+        feed(&mut app, &tx, vec![remote_event(), service_rows_event()]);
+        feed(
+            &mut app,
+            &tx,
+            vec![
+                Event::ServiceLost {
+                    error: "gone".into(),
+                },
+                Event::NoIndex,
+            ],
+        );
+        assert_eq!(app.chip().unwrap().text, "Own index · none yet");
+        assert!(app.notices()[0].text.contains("No own index yet"));
+
+        feed(&mut app, &tx, vec![Event::ServiceGap(ServiceGap::Refused)]);
+        assert!(matches!(app.state, State::Ready));
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.notices().len(), 1, "the notice stays");
+        assert!(app.notices()[0].text.contains("refuses this account"));
+        assert_eq!(
+            app.chip().unwrap().text,
+            "Own index · none yet · not allowed"
+        );
+        assert!(
+            app.chip()
+                .unwrap()
+                .tooltip
+                .contains("doesn't allow this account")
+        );
+
+        // Refused, then not running again: still the kept rows, never "no
+        // problem".
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::ServiceGap(ServiceGap::NotRunning)],
+        );
+        assert!(app.service_problem.is_some(), "stale rows need a problem");
+        assert_eq!(app.row_count(), 2);
+        assert_eq!(app.notices().len(), 1);
+        assert_eq!(app.chip().unwrap().text, "Own index · none yet");
+
+        // The service answers again: everything is normal.
+        feed(&mut app, &tx, vec![remote_event()]);
+        assert!(app.notices().is_empty());
+        assert!(app.service_problem.is_none() && !app.no_own_index);
+        assert!(app.chip().unwrap().text.starts_with("Live"));
+    }
+
+    /// Notices must fit the narrowest window (508 px of text at 13 px) without
+    /// being cut at the end; the longest is about 75 characters.
+    #[test]
+    fn the_notice_texts_are_short() {
+        let (mut app, tx) = test_app();
+        feed(&mut app, &tx, vec![remote_event(), service_rows_event()]);
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::ServiceLost {
+                error: "gone".into(),
+            }],
+        );
+        let mut longest = app.notices()[0].text.chars().count();
+        feed(&mut app, &tx, vec![Event::NoIndex]);
+        longest = longest.max(app.notices()[0].text.chars().count());
+        feed(&mut app, &tx, vec![Event::ServiceGap(ServiceGap::Refused)]);
+        longest = longest.max(app.notices()[0].text.chars().count());
+        assert!(longest <= 75, "{longest}");
+    }
+
+    /// The accent button of the first-start page is the home folder (a
+    /// visible default; it was that before this page changed).
+    #[test]
+    fn the_first_start_default_is_the_home_folder() {
+        for windows in [true, false] {
+            let (primary, others) = first_start_buttons(windows);
+            assert_eq!(
+                primary,
+                ("Your home folder (recommended)", FirstStart::Home)
+            );
+            assert_eq!(others.last().map(|o| o.1), Some(FirstStart::Choose));
+            assert_eq!(others.iter().any(|o| o.1 == FirstStart::AllDrives), windows);
+        }
     }
 }
