@@ -2,6 +2,12 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Fewer full rescans on large PCs.** The Ferrow service reads every drive again when too many changes have piled up on top of its index. That limit was the same 50,000 changes on every PC, so on a PC with tens of millions of files it came up often and each rescan took over a minute of heavy CPU and disk. The limit now grows with the index: about 1 % of its files, from 50,000 changes up to 250,000 (a PC with 27 million files now allows 250,000 changes, five times more). A file that is written again and again (a log, a database, a browser cache) no longer counts as more and more changes; it counts once.
+- **Less CPU while many files change at once** (a build, an install, a large download). Showing the changes in search used to rebuild a small index after every batch, which could keep a CPU core busy for as long as the storm lasted. It now runs at low priority on the threads the rescans use, and at most about once for each ten times its own build time, so searches keep their speed and the CPU load of a storm is at least halved (and far lower when the changes pile up). Changes still show up within about a second; the last change of a storm is always shown.
+- **A search for the first results asks for less.** When results are sorted by name and the service holds many recent changes, it now only looks for as many of them as the first page needs. Searches that match recent changes are up to 8 times faster on a service holding a million changes; all other searches are unchanged.
+
 ## 0.1.0-beta.18
 
 - **Fixed: the service rescanned every drive while git was busy.** When git, git-lfs or another tool moved a folder into an indexed place, the service could not know what was inside it and read every drive again (about 75 seconds of heavy CPU on a large PC, up to every 11 minutes). Now only that folder is read, in the background at low priority, and its files show up in search within moments. A full rescan happens only for a moved folder with more than about 50,000 files, after 30 seconds, or on an error.

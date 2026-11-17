@@ -18,7 +18,7 @@ use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 
 use crate::health::{STATE, VolumeState};
 use crate::live::{
-    Applied, Change, HARD_DELTA, Live, MAX_WALK_TIME, NOTABLE_WALK, REASON_ADMIN, RecordSource,
+    Applied, Change, Live, MAX_WALK_TIME, NOTABLE_WALK, PublishGate, REASON_ADMIN, RecordSource,
     RecordState, RescanPolicy, WALK_SLACK, WalkJob, index_parts, walk_limits_text,
 };
 use crate::memory::Breakdown;
@@ -481,22 +481,25 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         let mut walker = Walker::start(generation, devices.clone(), tx.clone());
         eventlog::info(format!(
             "folders moved into the index are read in the background ({}), not rescanned",
-            walk_limits_text()
+            walk_limits_text(base.len())
         ));
         log_memory("after scan", Some(&live), &base, &store);
         let mut applied_total = 0usize;
         let mut rescan = RescanPolicy::after_scan(Instant::now(), took);
+        let hard_delta = live.limits().hard_delta;
+        let mut gate = PublishGate::new();
         reason = loop {
-            let urgent = live.delta_len() > HARD_DELTA;
+            let urgent = live.delta_len() > hard_delta;
             if let Some(why) = rescan.due(Instant::now(), urgent) {
                 // The fullest the live layer gets: what it holds before the
                 // rescan replaces it.
                 log_memory("before rescan", Some(&live), &base, &store);
                 break why;
             }
-            // Wake for a pending rescan, and to check on a folder read that
-            // may be stuck.
-            let wake = [rescan.wake_at(), live.next_walk_deadline()]
+            // Wake for a pending rescan, for a view that is owed but held
+            // back by the duty gate, and to check on a folder read that may
+            // be stuck.
+            let wake = [rescan.wake_at(), gate.wake_at(), live.next_walk_deadline()]
                 .into_iter()
                 .flatten()
                 .min();
@@ -589,21 +592,37 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                     STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
                 }
             }
-            if outcome.changed == 0 && outcome.merged == 0 {
+            if outcome.changed > 0 || outcome.merged > 0 {
+                STATE.add_live_changes(outcome.changed);
+                applied_total += outcome.changed;
+                gate.changed();
+            }
+            // The view is built after the batch but not after every batch:
+            // the changes are all in `live`, and a storm gets one view per
+            // gap, not one per 200 ms. Searches read the snapshot published
+            // before and never wait for the build.
+            if !gate.due(Instant::now()) {
                 continue;
             }
-            STATE.add_live_changes(outcome.changed);
-            applied_total += outcome.changed;
             let mut report = format!("{summary}; {applied_total} live changes");
             if let Some(why) = rescan.pending() {
                 report.push_str(&format!("; rescan pending ({why})"));
             }
+            let built = Instant::now();
+            // On the low-priority pool the rescans use, so the build never
+            // takes the cores a search needs.
+            let view = match &pool {
+                Some(pool) => pool.install(|| live.view()),
+                None => live.view(),
+            };
+            let build = built.elapsed();
             store.swap(Snapshot {
                 index: base.clone(),
-                live: Some(Arc::new(live.view())),
+                live: Some(Arc::new(view)),
                 mode: "live".into(),
                 report,
             });
+            gate.published(Instant::now(), build);
         };
     }
 }
