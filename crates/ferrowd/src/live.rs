@@ -493,9 +493,9 @@ impl Maintenance {
     /// waited [`URGENT_PATIENCE`], or a [`Load::severe`] one, is not held
     /// back by a save, and when folders keep being read the volumes are
     /// rescanned, as before compactions existed. Entries hidden by a large
-    /// folder move ([`Load::prompt`]) wait for a save no longer either; past
-    /// their patience, folder reads that keep coming ask for a rescan within
-    /// the usual rescan gap (they hold no extra memory).
+    /// folder move ([`Load::prompt`]) wait for a save no longer either, but
+    /// always wait for folder reads to end (they hold no extra memory, and a
+    /// rescan is what their merge replaces).
     pub fn due(&mut self, now: Instant, load: Load) -> Option<Due> {
         self.urgent_since = if load.urgent {
             self.urgent_since.or(Some(now))
@@ -523,11 +523,12 @@ impl Maintenance {
             if self.urgent_overdue(now, load) {
                 return self.compact.take().map(Due::Rescan);
             }
-            // Hidden entries cost no memory: while folder reads keep coming,
-            // they wait for the rescan the ordinary rescan gap allows (or
-            // for the reads to end), and the patience timer stops.
-            if overdue && let Some(why) = &self.compact {
-                self.rescan.request(why.clone());
+            // Hidden entries cost no memory, and a rescan (over a minute of
+            // heavy CPU and disk on a large PC) is what this merge replaces:
+            // they wait for the reads to end (each ends within its time
+            // limit). The patience timer starts over, so no wake-up is due
+            // in the past.
+            if overdue {
                 self.prompt_since = None;
             }
             return None;
@@ -5171,16 +5172,16 @@ mod tests {
         let t1 = t0 + s(100);
         assert_eq!(m.due(t1, reading), None);
         assert_eq!(m.wake_at(t1, reading), Some(t1 + URGENT_PATIENCE));
-        // Past its patience it asks for a rescan within the usual gap
-        // (hidden entries hold no memory), not at once.
+        // Past its patience it still waits for the reads: no rescan (hidden
+        // entries hold no memory, and a rescan is what the merge replaces).
         assert_eq!(m.due(t1 + URGENT_PATIENCE, reading), None);
-        assert!(m.rescan_waiting());
+        assert!(!m.rescan_waiting());
         let later = t1 + URGENT_PATIENCE + s(1);
         assert!(
             m.wake_at(later, reading).is_some_and(|t| t > later),
             "no spin"
         );
-        // The reads end: the merge runs (the rescan still follows).
+        // The reads end: the merge runs.
         assert!(matches!(m.due(later, prompt_only()), Some(Due::Compact(_))));
     }
 

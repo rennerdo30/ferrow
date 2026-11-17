@@ -112,9 +112,8 @@ pub struct LiveStats {
     /// rescan instead.
     pub folder_read_fallbacks: u64,
     /// Scans started, by why: `startup`, `moved-in folder`, `large folder
-    /// move` (only when folder reads keep holding back the merge that
-    /// answers it), `folders swapped nesting`, `too many live changes`, `too
-    /// many replaced entries`, `too many superseded entries`, `journal`,
+    /// move` (rare since 0.1.0-beta.20: a merge in memory answers it), `folders swapped nesting`, `too many live changes`, `too many
+    /// replaced entries`, `too many superseded entries`, `journal`,
     /// `administrator`. A merge of the live changes in memory is not a scan
     /// and is not counted here.
     pub scans_by_reason: BTreeMap<String, u64>,

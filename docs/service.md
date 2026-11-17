@@ -72,10 +72,10 @@ Windows MFT/USN journal).
     under the old one. That compaction waits only for its duty share (5
     times the last one's duration), not for the 60 s gap, and runs even
     while a rescan is waiting (the rescan still follows). Once its duty
-    share allows it to start, it waits for folder reads and an index save
-    at most 40 s; past that a save no longer holds it back, and folder
-    reads that keep arriving ask for a rescan, which waits for the usual
-    rescan gap (hidden entries hold no extra memory). A folder
+    share allows it to start, it waits for an index save at most 40 s, and
+    for folder reads until they end (each ends within its 40 s limit;
+    hidden entries hold no extra memory, so they never cause a rescan). A
+    folder
     moved below a folder that was inside it waits in its batch until that
     one has moved out; if that move is not reported yet, the volumes are
     rescanned (`folders swapped nesting`), because placing it would hang it
