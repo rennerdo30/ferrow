@@ -105,6 +105,8 @@ pub struct FerrowApp {
     sort_unavailable: bool,
     /// Settings → Updates.
     updater: crate::update::Updater,
+    /// Settings → Service access.
+    access: crate::access::Access,
     /// Set while the Ferrow service answers searches: its entry count.
     pub(crate) service_entries: Option<u64>,
     /// Re-run the query for a live change without jumping to the top.
@@ -180,6 +182,7 @@ impl FerrowApp {
             sort_pending: false,
             sort_unavailable: false,
             updater: crate::update::Updater::new(),
+            access: crate::access::Access::new(),
             service_entries: None,
             refreshing: false,
             live_change_pending: false,
@@ -1290,6 +1293,14 @@ impl eframe::App for FerrowApp {
         self.auto_rebuild(&ctx);
         self.updates_on_open(&ctx);
         self.updater.poll();
+        // Settings → Service access: results apply whether or not the page is
+        // open, and the engine then looks for the service at once.
+        if self.access.poll() {
+            self.engine.service_changed();
+        }
+        if self.page != Page::Settings {
+            self.access.invalidate();
+        }
 
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if self.live_change_pending && !minimized && !platform::is_hidden_in_tray() {
