@@ -370,6 +370,34 @@ pub fn run_repair(steps: &mut dyn RepairSteps, out: &mut dyn io::Write) -> Resul
     Ok(())
 }
 
+/// The "nothing to repair" decision once the registration and the state folder
+/// are fine. A service that reports no problems and a successful save needs no
+/// index check at all; otherwise the index is verified by streaming (never
+/// loaded). One that does not answer `Health` must at least answer `Status`.
+fn quiet(
+    folder: &control::StateCheck,
+    health: Option<Health>,
+    index_ok: impl FnOnce() -> bool,
+    answers: impl FnOnce() -> bool,
+) -> Option<String> {
+    let skip_index = match &health {
+        Some(h) if !h.problems().is_empty() => return None,
+        Some(h) => h.last_save.as_ref().is_some_and(|save| save.ok),
+        None if answers() => false,
+        None => return None,
+    };
+    if !skip_index && !index_ok() {
+        return None;
+    }
+    let mut text =
+        String::from("registration, state folder and saved index are fine and the service answers");
+    for note in &folder.notes {
+        text.push_str("; ");
+        text.push_str(note);
+    }
+    Some(text)
+}
+
 /// The real steps.
 struct Real {
     now: u64,
@@ -381,21 +409,28 @@ impl RepairSteps for Real {
         if !matches!(control::check_registration(), Ok(Registration::Fine(_))) {
             return None;
         }
-        if !control::check_state_folder(self.now, false).is_ok_and(|c| c.clean) {
+        let folder = control::check_state_folder(self.now, false).ok()?;
+        if !folder.clean {
             return None;
         }
-        let index = ferrowd::default_service_index_path().ok()?;
+        let endpoint = Endpoint::default_service();
+        let now = self.now;
         // Read-only: whatever the problem is, nothing is moved here.
-        control::check_index(&index, self.now, |path| {
-            control::load_index(path).map_err(|e| match e {
-                IndexProblem::Damaged(why) | IndexProblem::Unusable(why) => {
-                    IndexProblem::Unusable(why)
-                }
+        let index_ok = || {
+            let Ok(index) = ferrowd::default_service_index_path() else {
+                return false;
+            };
+            control::check_index(&index, now, |path| {
+                control::load_index(path).map_err(|e| match e {
+                    IndexProblem::Damaged(why) | IndexProblem::Unusable(why) => {
+                        IndexProblem::Unusable(why)
+                    }
+                })
             })
-        })
-        .ok()?;
-        control::answers(&Endpoint::default_service()).then(|| {
-            "registration, state folder and saved index are fine and the service answers".into()
+            .is_ok()
+        };
+        quiet(&folder, control::health_of(&endpoint), index_ok, || {
+            control::answers(&endpoint)
         })
     }
     fn registration(&mut self) -> Result<String, String> {
@@ -744,5 +779,42 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(script.calls, ["check"], "no stop, no restart");
         assert_eq!(out, "Nothing to repair: all fine\n");
+    }
+
+    #[test]
+    fn a_healthy_service_needs_no_index_check_and_anything_else_streams_it() {
+        let folder = control::StateCheck {
+            clean: true,
+            text: "x is protected".into(),
+            notes: vec!["access.json fails its check (unprotected); the service ignores it".into()],
+        };
+        let mut healthy = sample();
+        healthy.volumes[0].rescan_pending = None;
+        // No problems and a successful save: the index is not even read.
+        let said = quiet(
+            &folder,
+            Some(healthy.clone()),
+            || panic!("index read"),
+            || panic!("status asked"),
+        )
+        .unwrap();
+        assert!(said.contains("service answers"), "{said}");
+        assert!(
+            said.contains("access.json fails its check"),
+            "the note is shown: {said}"
+        );
+        // Never saved yet: the index is checked (and its verdict decides).
+        let mut fresh = healthy.clone();
+        fresh.last_save = None;
+        assert!(quiet(&folder, Some(fresh.clone()), || true, || unreachable!()).is_some());
+        assert!(quiet(&folder, Some(fresh), || false, || unreachable!()).is_none());
+        // A problem, or an unanswering service, always means repair.
+        let mut sick = healthy.clone();
+        sick.volumes[0].journal = "reader error".into();
+        assert!(quiet(&folder, Some(sick), || true, || true).is_none());
+        assert!(quiet(&folder, None, || true, || false).is_none());
+        // An older service answers Status only: its index is checked.
+        assert!(quiet(&folder, None, || true, || true).is_some());
+        assert!(quiet(&folder, None, || false, || true).is_none());
     }
 }
