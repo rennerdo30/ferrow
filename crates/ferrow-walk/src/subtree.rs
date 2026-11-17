@@ -126,8 +126,10 @@ pub fn parse_dir_buffer(buf: &[u8]) -> Option<Vec<RawEntry>> {
         let name_len = u32_at(at + 60)? as usize;
         let units = buf.get(at + NAME_AT..at + NAME_AT + name_len)?;
         let wide: Vec<u16> = units
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         if wide != [0x2e] && wide != [0x2e, 0x2e] {
             let mut name = Vec::with_capacity(name_len / 2);

@@ -775,7 +775,9 @@ impl Live {
         }
         // One state per record, applied once every folder it lists is
         // placed: at the position of its last name.
-        let mut states: HashMap<u64, (usize, RecordInfo, Vec<(u64, Vec<u8>)>)> = HashMap::new();
+        /// Position of its last name, its info and every `(parent, name)`.
+        type Listed = (usize, RecordInfo, Vec<(u64, Vec<u8>)>);
+        let mut states: HashMap<u64, Listed> = HashMap::new();
         for (i, e) in entries.into_iter().enumerate() {
             let state = states.entry(e.record).or_insert((i, e.info, Vec::new()));
             state.0 = i;
@@ -1777,6 +1779,52 @@ mod tests {
         let r = live.apply(&[change(20, false)], &f);
         assert!(r.walks.is_empty() && r.rescan.is_none());
         assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    /// Prices `Live::view` (run by hand: `cargo test --release -p ferrowd
+    /// --lib price_view -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement, run by hand"]
+    fn price_view() {
+        use std::time::Instant;
+        // The allowed bit set of 27 M base entries: what every view copies.
+        let words = 27_000_000usize.div_ceil(64);
+        let removed = vec![0u64; words];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for i in 0..200 {
+            let mut copy: Vec<u64> = std::hint::black_box(&removed).iter().map(|w| !w).collect();
+            copy[i] = 1;
+            sink ^= std::hint::black_box(&copy)[words / 2] ^ copy[i];
+        }
+        eprintln!(
+            "allowed bit set, 27 M entries ({} KB): {:.3} ms per view (sink {sink})",
+            words * 8 / 1024,
+            t.elapsed().as_secs_f64() * 1000.0 / 200.0
+        );
+        // The delta index rebuilt per view, for growing deltas.
+        for n in [1_000u64, 5_000, 19_000, 50_000] {
+            let (base, map) = fixture();
+            let mut live = Live::new(base, &[map]);
+            let mut f = initial();
+            let mut changes = Vec::new();
+            for i in 0..n {
+                f.set(1000 + i, file_info(i), &[(20, &format!("file-{i:06}.txt"))]);
+                changes.push(change(1000 + i, true));
+            }
+            live.apply(&changes, &f);
+            let t = Instant::now();
+            let views = 10;
+            for _ in 0..views {
+                let v = live.view();
+                sink ^= v.entries as u64;
+            }
+            eprintln!(
+                "delta of {n} entries: {:.2} ms per view",
+                t.elapsed().as_secs_f64() * 1000.0 / views as f64
+            );
+        }
+        assert_ne!(sink, 1);
     }
 
     #[test]
