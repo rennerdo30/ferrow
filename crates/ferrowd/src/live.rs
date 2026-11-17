@@ -5178,8 +5178,8 @@ mod tests {
         assert!(!m.rescan_waiting());
         let later = t1 + URGENT_PATIENCE + s(1);
         assert!(
-            m.wake_at(later, reading).is_some_and(|t| t > later),
-            "no spin"
+            m.wake_at(later, reading).is_none_or(|t| t > later),
+            "no spin (a read's answer wakes it)"
         );
         // The reads end: the merge runs.
         assert!(matches!(m.due(later, prompt_only()), Some(Due::Compact(_))));
