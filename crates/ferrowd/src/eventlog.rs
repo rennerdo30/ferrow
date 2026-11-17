@@ -40,8 +40,10 @@ pub const ROTATE_AT: u64 = 1 << 20;
 pub const MAX_LINES_PER_MINUTE: u32 = 30;
 pub const FILE_NAME: &str = "service.log";
 pub const ROTATED_NAME: &str = "service.1.log";
-/// Longest event text kept.
-const MAX_TEXT: usize = 200;
+/// Longest event text kept. A scan summary names every volume with its device
+/// path and the reason it was walked, so a few hundred characters are common;
+/// 200 cut the reason off mid-word.
+const MAX_TEXT: usize = 600;
 /// After a failed write the file is left alone this long.
 const RETRY: Duration = Duration::from_secs(60);
 
@@ -114,13 +116,19 @@ fn is_hidden(c: char) -> bool {
 }
 
 /// One line of text: control characters become spaces, layout and direction
-/// characters are dropped, at most [`MAX_TEXT`] characters.
+/// characters are dropped, at most [`MAX_TEXT`] characters; a longer text ends
+/// with `…` so a cut is never mistaken for the whole message.
 fn tidy(text: &str) -> String {
-    text.chars()
+    let mut chars = text
+        .chars()
         .filter(|&c| !is_hidden(c))
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX_TEXT)
-        .collect()
+        .map(|c| if c.is_control() { ' ' } else { c });
+    let mut out: String = chars.by_ref().take(MAX_TEXT).collect();
+    if chars.next().is_some() {
+        out.pop();
+        out.push('…');
+    }
+    out
 }
 
 impl FileLog {
@@ -387,12 +395,29 @@ mod tests {
             ),
         );
         let text = log.recent(1).remove(0).text;
-        assert!(text.chars().count() <= MAX_TEXT);
+        assert_eq!(text.chars().count(), MAX_TEXT);
+        assert!(text.ends_with('…'), "a cut text says so");
         assert!(text.starts_with("a b [2Jcdef"), "{text:?}");
         assert!(
             !text.chars().any(|c| c.is_control() || is_hidden(c)),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn a_text_that_fits_is_kept_whole_and_one_that_just_fits_has_no_ellipsis() {
+        let log = EventLog::new();
+        let exact = "y".repeat(MAX_TEXT);
+        log.record(Level::Info, &exact);
+        assert_eq!(log.recent(1).remove(0).text, exact);
+        // The service's own long scan line, with its reason, stays whole.
+        let line = format!(
+            r"walk: walk F:\ (read change journal: Falscher Parameter. (os error 87)) + walk E:\ (read change journal: Falscher Parameter. (os error 87)) + mft \\?\Volume{{{}}}",
+            "0123456789abcdef".repeat(3)
+        );
+        assert!(line.chars().count() > 200 && line.chars().count() < MAX_TEXT);
+        log.record(Level::Info, &line);
+        assert_eq!(log.recent(1).remove(0).text, line);
     }
 
     #[test]

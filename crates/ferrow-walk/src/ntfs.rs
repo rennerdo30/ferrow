@@ -477,6 +477,10 @@ pub struct Volume {
     /// Change journal id and the position after the read, when the
     /// volume has a journal (the starting point for live updates).
     pub journal: Option<(u64, i64)>,
+    /// Set when the MFT was read but the change journal could not be
+    /// re-checked afterwards: the volume still goes live, from the position
+    /// before the read, and this says what may be stale.
+    pub warning: Option<String>,
     /// Bytes per MFT record.
     pub record_size: usize,
 }
@@ -650,6 +654,7 @@ impl Volume {
             first,
             serial,
             journal: None,
+            warning: None,
             record_size: 1024,
         }
     }
@@ -704,6 +709,128 @@ impl Volume {
     }
 }
 
+/// `ERROR_INVALID_PARAMETER`: a journal read at a position that is not the
+/// start of a record.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ERROR_INVALID_PARAMETER: i32 = 87;
+/// `ERROR_JOURNAL_ENTRY_DELETED`: the requested USN was purged.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ERROR_JOURNAL_ENTRY_DELETED: i32 = 1181;
+/// The change journal's page size: a record never crosses it, so a
+/// page-aligned position is the start of a record.
+#[cfg_attr(not(windows), allow(dead_code))]
+const USN_PAGE: i64 = 4096;
+/// How far before the MFT read the journal is re-read, to catch changes
+/// that had not reached the disk when the raw read ran.
+#[cfg_attr(not(windows), allow(dead_code))]
+const RECENT_WINDOW_BYTES: i64 = 64 << 20;
+/// A refused start is retried from the journal's first record only when
+/// the whole journal is at most this long: a journal of many GiB would be a
+/// long read at SYSTEM priority for two minutes of changes.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAX_FULL_REREAD_BYTES: i64 = 256 << 20;
+
+/// Where the re-read of the journal after an MFT read starts: the position
+/// `RECENT_WINDOW_BYTES` before `before` (the journal's next position when
+/// the read began), rounded down to a page so it is a record boundary, and
+/// never before `first` (the oldest record the journal still holds, itself a
+/// record start). A journal longer than the window used to start in the
+/// middle of a record, which `FSCTL_READ_USN_JOURNAL` refuses.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn recent_window_start(first: i64, before: i64) -> i64 {
+    let windowed = before.saturating_sub(RECENT_WINDOW_BYTES).max(0);
+    first.max(windowed - windowed % USN_PAGE)
+}
+
+/// The journal's position after the re-read, and what to tell the user when
+/// the re-read itself failed.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct Reread {
+    next: i64,
+    warning: Option<String>,
+}
+
+/// Re-read the journal for the changes just before an MFT read.
+/// `read(start)` feeds the records from `start` to the caller and returns
+/// the next position; `query()` is the journal's current
+/// `(id, first usn, next usn)`.
+///
+/// - A start that the journal refuses as a bad parameter is retried once
+///   from `first`, when the journal is short enough to read whole.
+/// - A purged start continues from the journal's new beginning (up to three
+///   times); a purge that cannot be followed is an error, as is a journal
+///   that was replaced.
+/// - Any other failure keeps the MFT read when the same journal still holds
+///   every record since `before`: the position stays at `before`, so the
+///   live reader replays every change since the read began, and a warning
+///   says that changes just before the read may be missing. A journal that
+///   is gone, was replaced or was purged past `before` is an error.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reread_journal(
+    journal: (u64, i64, i64),
+    mut read: impl FnMut(i64) -> std::io::Result<i64>,
+    mut query: impl FnMut() -> Option<(u64, i64, i64)>,
+) -> Result<Reread, String> {
+    let (id, first, before) = journal;
+    let mut start = recent_window_start(first, before);
+    let mut purged = 0;
+    let mut from_first = start <= first;
+    loop {
+        let e = match read(start) {
+            Ok(next) => {
+                return Ok(Reread {
+                    next,
+                    warning: None,
+                });
+            }
+            Err(e) => e,
+        };
+        match e.raw_os_error() {
+            // A busy volume with a small journal purges its oldest records
+            // while the MFT is read. Continue from the journal's current
+            // start: the purged records are its oldest ones. Giving up here
+            // used to send the whole volume to the directory walk (minutes,
+            // no live updates).
+            Some(ERROR_JOURNAL_ENTRY_DELETED) => match query() {
+                Some((now_id, now_first, _)) if now_id == id && now_first > start && purged < 3 => {
+                    purged += 1;
+                    start = now_first;
+                    from_first = true;
+                }
+                _ => return Err(format!("read change journal: {e}")),
+            },
+            Some(ERROR_INVALID_PARAMETER)
+                if !from_first && before.saturating_sub(first) <= MAX_FULL_REREAD_BYTES =>
+            {
+                from_first = true;
+                start = first;
+            }
+            _ => {
+                return match query() {
+                    Some((now_id, now_first, _)) if now_id == id && now_first <= before => {
+                        Ok(Reread {
+                            next: before,
+                            warning: Some(format!(
+                                "could not re-check the change journal after reading the MFT ({e}); files changed just before the scan may show their old state until the next scan"
+                            )),
+                        })
+                    }
+                    Some((now_id, _, _)) if now_id != id => Err(format!(
+                        "read change journal: {e}; the journal was replaced during the scan"
+                    )),
+                    Some(_) => Err(format!(
+                        "read change journal: {e}; changes since the scan began were already purged"
+                    )),
+                    None => Err(format!(
+                        "read change journal: {e}; the change journal is no longer available"
+                    )),
+                };
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) use platform::low_io_priority;
 #[cfg(windows)]
@@ -716,7 +843,7 @@ pub use platform::{
 mod platform {
     use super::{
         Parsed, UsnRecord, Volume, VolumeBuilder, apply_fixup, mft_runs, parse_record,
-        parse_usn_records,
+        parse_usn_records, reread_journal,
     };
     use rayon::prelude::*;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -731,9 +858,6 @@ mod platform {
     const NO_BUFFERING: u32 = 0x2000_0000;
     /// Unbuffered reads need sector-aligned memory; 4 KiB covers every disk.
     const ALIGN: usize = 4096;
-    /// `ERROR_JOURNAL_ENTRY_DELETED`: the requested USN was purged.
-    const ERROR_JOURNAL_ENTRY_DELETED: i32 = 1181;
-
     /// Ask the disk stack to serve this handle's reads at low priority
     /// (background rescans). Best effort: on failure reads stay normal.
     pub(crate) fn low_io_priority(volume: &std::fs::File) {
@@ -983,15 +1107,19 @@ mod platform {
                 .map_err(|_| "MFT reader panicked".to_string())??;
             Ok(all)
         })?;
+        let mut warning = None;
         let journal = match journal_before {
             Some(j) => {
-                let next = refresh_recent(&volume, j, read_started, record_size, &mut builder)?;
+                let (next, note) =
+                    refresh_recent(&volume, j, read_started, record_size, &mut builder)?;
+                warning = note;
                 Some((j.0, next))
             }
             None => None,
         };
         let mut out = builder.finish(serial);
         out.journal = journal;
+        out.warning = warning;
         out.record_size = record_size;
         Ok((device, out))
     }
@@ -1242,45 +1370,32 @@ mod platform {
 
     /// Records written in the last two minutes may not have reached the
     /// disk when the raw read ran; re-read them through the file system.
+    /// Returns the journal position to continue from and, when the re-read
+    /// of the journal failed but the MFT read was kept, a warning.
     pub(super) fn refresh_recent(
         volume: &std::fs::File,
         journal: (u64, i64, i64),
         read_started: std::time::SystemTime,
         record_size: usize,
         builder: &mut VolumeBuilder,
-    ) -> Result<i64, String> {
-        const WINDOW_BYTES: i64 = 64 << 20;
-        let (id, first, before) = journal;
+    ) -> Result<(i64, Option<String>), String> {
+        let id = journal.0;
         let since = filetime_now(read_started) - 120 * 10_000_000;
         let mut changed = std::collections::BTreeSet::new();
-        let mut start = first.max(before - WINDOW_BYTES);
-        let mut purged = 0;
-        let next = loop {
-            match read_journal(volume, id, start, |r| {
-                if r.timestamp >= since {
-                    changed.insert(r.record);
-                }
-            }) {
-                Ok(next) => break next,
-                // A busy volume with a small journal purges its oldest
-                // records while the MFT is read. Continue from the
-                // journal's current start: the purged records are its
-                // oldest ones. Giving up here used to send the whole
-                // volume to the directory walk (minutes, no live updates).
-                Err(e) if e.raw_os_error() == Some(ERROR_JOURNAL_ENTRY_DELETED) && purged < 3 => {
-                    purged += 1;
-                    match query_journal(volume) {
-                        Some((now_id, now_first, _)) if now_id == id && now_first > start => {
-                            start = now_first;
-                        }
-                        _ => return Err(format!("read change journal: {e}")),
+        let reread = reread_journal(
+            journal,
+            |start| {
+                read_journal(volume, id, start, |r| {
+                    if r.timestamp >= since {
+                        changed.insert(r.record);
                     }
-                }
-                Err(e) => return Err(format!("read change journal: {e}")),
-            }
-        };
+                })
+            },
+            || query_journal(volume),
+        )?;
+        let (next, warning) = (reread.next, reread.warning);
         if changed.is_empty() {
-            return Ok(next);
+            return Ok((next, warning));
         }
         let mut fresh = Parsed::default();
         for &record in &changed {
@@ -1311,7 +1426,7 @@ mod platform {
             |record| still_used.contains(&record) || !changed.contains(&record),
         );
         builder.push(fresh);
-        Ok(next)
+        Ok((next, warning))
     }
 
     fn filetime_now(time: std::time::SystemTime) -> i64 {
@@ -1801,5 +1916,233 @@ pub(crate) mod tests {
         assert!(!names(20).iter().any(|n| n.contains("31")), "old name gone");
         assert!(!names(5).contains(&"link25".to_string()), "old link gone");
         assert!(v.info(30).is_none() && v.info(31).is_some());
+    }
+
+    const MIB: i64 = 1 << 20;
+
+    #[test]
+    fn the_recent_window_starts_on_a_page_never_before_the_journal() {
+        // A journal shorter than the window is read from its first record.
+        assert_eq!(recent_window_start(0, 30 * MIB), 0);
+        assert_eq!(recent_window_start(4096, 64 * MIB + 4096), 4096);
+        // A longer journal starts a window back, rounded down to a page,
+        // even when the next position is in the middle of a page.
+        let before = 9_000 * MIB + 1234;
+        let start = recent_window_start(100 * MIB + 8, before);
+        assert_eq!(start % USN_PAGE, 0);
+        assert!(start <= before - RECENT_WINDOW_BYTES);
+        assert!(start > before - RECENT_WINDOW_BYTES - USN_PAGE);
+        // A page-aligned position is kept as it is.
+        assert_eq!(
+            recent_window_start(0, 200 * MIB),
+            200 * MIB - RECENT_WINDOW_BYTES
+        );
+        // The journal's first record wins when it lies after the aligned
+        // position, aligned or not.
+        let first = before - 10 * MIB + 77;
+        assert_eq!(recent_window_start(first, before), first);
+        // Nothing underflows near the start of a big counter.
+        assert_eq!(recent_window_start(0, 5), 0);
+        assert_eq!(recent_window_start(0, i64::MIN / 2), 0);
+    }
+
+    fn os(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    /// A journal that only accepts record starts: its first record and the
+    /// starts of 4 KiB pages (as the real one does).
+    fn strict_journal(first: i64, next: i64) -> impl FnMut(i64) -> std::io::Result<i64> {
+        move |start| {
+            if start == first || (start % USN_PAGE == 0 && (first..next).contains(&start)) {
+                Ok(next)
+            } else {
+                Err(os(ERROR_INVALID_PARAMETER))
+            }
+        }
+    }
+
+    #[test]
+    fn a_big_journal_is_re_read_from_an_aligned_window_in_one_try() {
+        // 18 GiB journal, next position inside a page: the old unaligned
+        // start made the first read fail with error 87.
+        let (first, before) = (1_000 * MIB + 16, 18_000 * MIB + 3_333);
+        let mut starts = Vec::new();
+        let mut read = strict_journal(first, before + 500);
+        let out = reread_journal(
+            (7, first, before),
+            |s| {
+                starts.push(s);
+                read(s)
+            },
+            || panic!("no query needed"),
+        )
+        .unwrap();
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_eq!(starts[0] % USN_PAGE, 0);
+        assert_eq!(
+            out,
+            Reread {
+                next: before + 500,
+                warning: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_refused_start_is_retried_once_from_the_first_record() {
+        let (first, before) = (10 * MIB + 8, 200 * MIB + 5);
+        let mut starts = Vec::new();
+        let out = reread_journal(
+            (7, first, before),
+            |s| {
+                starts.push(s);
+                if s == first {
+                    Ok(before + 64)
+                } else {
+                    Err(os(ERROR_INVALID_PARAMETER))
+                }
+            },
+            || panic!("no query needed"),
+        )
+        .unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1], first);
+        assert_eq!(out.next, before + 64);
+        assert_eq!(out.warning, None);
+    }
+
+    #[test]
+    fn a_journal_that_cannot_be_re_read_keeps_the_mft_and_replays_from_before() {
+        let (first, before) = (10 * MIB + 8, 200 * MIB + 5);
+        for code in [ERROR_INVALID_PARAMETER, 5, 1117] {
+            let mut calls = 0;
+            let out = reread_journal(
+                (7, first, before),
+                |_| {
+                    calls += 1;
+                    Err(os(code))
+                },
+                || Some((7, first, before + 4096)),
+            )
+            .unwrap();
+            // The refused start is retried once, other errors are not.
+            assert_eq!(
+                calls,
+                if code == ERROR_INVALID_PARAMETER {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(out.next, before, "replay every change since the read began");
+            let warning = out.warning.expect("a warning for the service");
+            assert!(
+                warning
+                    .starts_with("could not re-check the change journal after reading the MFT ("),
+                "{warning}"
+            );
+            assert!(warning.contains(&os(code).to_string()), "{warning}");
+            assert!(warning.contains("until the next scan"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn a_short_journal_that_refuses_its_first_record_is_not_retried_in_a_loop() {
+        let (first, before) = (0, 20 * MIB);
+        let mut calls = 0;
+        let out = reread_journal(
+            (7, first, before),
+            |_| {
+                calls += 1;
+                Err(os(ERROR_INVALID_PARAMETER))
+            },
+            || Some((7, first, before)),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(out.next, before);
+        assert!(out.warning.is_some());
+    }
+
+    #[test]
+    fn a_big_journal_that_refuses_the_aligned_start_is_not_read_whole() {
+        // 18 GiB journal: a retry from its first record would read all of it.
+        let (first, before) = (1_000 * MIB, 18_000 * MIB + 3_333);
+        let mut starts = Vec::new();
+        let out = reread_journal(
+            (7, first, before),
+            |s| {
+                starts.push(s);
+                Err(os(ERROR_INVALID_PARAMETER))
+            },
+            || Some((7, first, before)),
+        )
+        .unwrap();
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_ne!(starts[0], first);
+        assert_eq!(out.next, before);
+        assert!(out.warning.is_some());
+    }
+
+    #[test]
+    fn a_failed_re_read_of_a_gone_replaced_or_purged_journal_is_an_error() {
+        let (first, before) = (10 * MIB, 200 * MIB + 5);
+        let failing = |_: i64| Err(os(1117));
+        let err = reread_journal((7, first, before), failing, || None).unwrap_err();
+        assert!(err.contains("no longer available"), "{err}");
+        let err = reread_journal((7, first, before), failing, || Some((8, 0, before))).unwrap_err();
+        assert!(err.contains("replaced"), "{err}");
+        let err = reread_journal((7, first, before), failing, || {
+            Some((7, before + 4096, before + 8192))
+        })
+        .unwrap_err();
+        assert!(err.contains("purged"), "{err}");
+    }
+
+    #[test]
+    fn a_purged_start_continues_from_the_journals_new_beginning() {
+        let (first, before) = (0, 500 * MIB + 5);
+        let new_first = 480 * MIB;
+        let mut starts = Vec::new();
+        let out = reread_journal(
+            (7, first, before),
+            |s| {
+                starts.push(s);
+                if s < new_first {
+                    Err(os(ERROR_JOURNAL_ENTRY_DELETED))
+                } else {
+                    Ok(before + 1)
+                }
+            },
+            || Some((7, new_first, before)),
+        )
+        .unwrap();
+        assert_eq!(*starts.last().unwrap(), new_first);
+        assert_eq!(out.next, before + 1);
+        assert_eq!(out.warning, None);
+    }
+
+    #[test]
+    fn a_purge_that_cannot_be_followed_or_a_replaced_journal_is_an_error() {
+        let (first, before) = (0, 500 * MIB + 5);
+        let purged = |_: i64| Err(os(ERROR_JOURNAL_ENTRY_DELETED));
+        // A different journal id: the position means nothing any more.
+        let err = reread_journal((7, first, before), purged, || Some((8, 400 * MIB, before)))
+            .unwrap_err();
+        assert!(err.starts_with("read change journal: "), "{err}");
+        // The journal's start did not move, or it cannot be queried.
+        assert!(reread_journal((7, first, before), purged, || Some((7, first, before))).is_err());
+        assert!(reread_journal((7, first, before), purged, || None).is_err());
+        // A journal purged faster than it is read gives up after three tries.
+        let mut now_first = 450 * MIB;
+        let mut queries = 0;
+        let result = reread_journal((7, first, before), purged, || {
+            queries += 1;
+            now_first += MIB;
+            Some((7, now_first, before))
+        });
+        assert!(result.is_err());
+        assert_eq!(queries, 4);
     }
 }

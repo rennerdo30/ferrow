@@ -110,7 +110,10 @@ fn a_volume_shows_its_mode_its_reason_and_what_it_knows() {
         ("C:\\", Level::Good, "live")
     );
     assert!(detail.starts_with("11.2 M items · journal ok · last scan "));
-    assert!(detail.ends_with("(38.0 s, startup)"));
+    assert!(
+        detail.ends_with(", took 38.0 s, when the service started"),
+        "{detail}"
+    );
 
     let lost = VolumeHealth {
         mode: MODE_UNAVAILABLE.into(),
@@ -272,4 +275,74 @@ fn the_reasons_for_off_buttons_are_said_once_each() {
     );
     // A copy that cannot elevate: the commands below say it.
     assert!(off_reasons(&all(Can::No(NEEDS_INSTALLED)), false).is_empty());
+}
+
+#[test]
+fn the_scan_reason_reads_as_the_end_of_a_sentence() {
+    assert_eq!(scan_reason_text("startup"), "when the service started");
+    assert_eq!(
+        scan_reason_text("50001 live changes"),
+        "after 50,001 live changes"
+    );
+    assert_eq!(
+        scan_reason_text("1234567 replaced entries"),
+        "after 1,234,567 replaced entries"
+    );
+    assert_eq!(
+        scan_reason_text("requested by an administrator"),
+        "requested by an administrator"
+    );
+    assert_eq!(
+        scan_reason_text("a folder moved into an indexed location (too many changes)"),
+        "after a folder moved into an indexed location (too many changes)"
+    );
+    // Text that only looks like a count is not reworded.
+    assert_eq!(
+        scan_reason_text("many live changes"),
+        "after many live changes"
+    );
+}
+
+#[test]
+fn a_volume_line_says_how_long_the_scan_took_and_why_it_ran() {
+    use health::*;
+    let v = VolumeHealth {
+        root: "E:\\".into(),
+        mode: MODE_LIVE.into(),
+        journal: JOURNAL_OK.into(),
+        last_scan: Some(ScanInfo {
+            at_ms: 5_000,
+            reason: "50001 live changes".into(),
+            took_ms: 198_000,
+        }),
+        ..VolumeHealth::default()
+    };
+    let (_, _, _, detail) = volume_lines(&v);
+    assert!(
+        detail.ends_with(", took 3 min 18 s, after 50,001 live changes"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn a_live_volume_that_could_not_re_check_its_journal_shows_the_warning() {
+    use health::*;
+    let warning = "could not re-check the change journal after reading the MFT (x); files changed just before the scan may show their old state until the next scan";
+    let v = VolumeHealth {
+        root: "F:\\".into(),
+        mode: MODE_LIVE.into(),
+        journal: JOURNAL_OK.into(),
+        journal_detail: warning.into(),
+        ..VolumeHealth::default()
+    };
+    let (_, level, mode, detail) = volume_lines(&v);
+    assert_eq!(level, Level::Caution);
+    assert_eq!(mode, "live, with a warning");
+    assert_eq!(detail, format!("journal ok, but {warning}"));
+    // Without a warning the volume stays plainly live.
+    let clean = VolumeHealth {
+        journal_detail: String::new(),
+        ..v
+    };
+    assert_eq!(volume_lines(&clean).1, Level::Good);
 }

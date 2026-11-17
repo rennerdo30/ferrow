@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use ferrow_ipc::health::{self, Health, VolumeHealth};
 
 use super::*;
+use crate::app::group;
 use crate::service::{self, Can, Level, Snapshot, Verb};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -105,9 +106,35 @@ fn event_line(e: &health::EventInfo) -> String {
     format!("{word}{}", e.text)
 }
 
+/// Why a scan ran, as the end of a sentence: `after 50,001 live changes`.
+/// The service words a reason for its log; this words it for reading.
+fn scan_reason_text(reason: &str) -> String {
+    let reason = reason.trim();
+    let counted = |suffix: &str| {
+        let n: u64 = reason.strip_suffix(suffix)?.trim().parse().ok()?;
+        Some(group(n as usize))
+    };
+    if reason == "startup" {
+        "when the service started".to_owned()
+    } else if reason == "requested by an administrator" {
+        reason.to_owned()
+    } else if let Some(n) = counted(" live changes") {
+        format!("after {n} live changes")
+    } else if let Some(n) = counted(" replaced entries") {
+        format!("after {n} replaced entries")
+    } else {
+        format!("after {reason}")
+    }
+}
+
 /// A volume's name, its state and what the service knows about it.
 fn volume_lines(v: &VolumeHealth) -> (String, Level, String, String) {
     let (mode, level) = match v.mode.as_str() {
+        // Live, but the service could not re-check the change journal after
+        // reading the file table: changes just before the scan may be old.
+        health::MODE_LIVE if v.journal == health::JOURNAL_OK && !v.journal_detail.is_empty() => {
+            ("live, with a warning".to_owned(), Level::Caution)
+        }
         health::MODE_LIVE => ("live".to_owned(), Level::Good),
         health::MODE_WALK => ("directory walk, not live".to_owned(), Level::Neutral),
         health::MODE_UNAVAILABLE if v.reason.is_empty() => {
@@ -124,21 +151,22 @@ fn volume_lines(v: &VolumeHealth) -> (String, Level, String, String) {
         parts.push(format!("{} items", service::items_text(n)));
     }
     if v.journal != health::JOURNAL_NONE && !v.journal.is_empty() {
-        let detail = if v.journal_detail.is_empty() {
-            String::new()
+        parts.push(if v.journal_detail.is_empty() {
+            format!("journal {}", v.journal)
+        } else if v.journal == health::JOURNAL_OK {
+            format!("journal ok, but {}", v.journal_detail)
         } else {
-            format!(": {}", v.journal_detail)
-        };
-        parts.push(format!("journal {}{detail}", v.journal));
+            format!("journal {}: {}", v.journal, v.journal_detail)
+        });
     }
     if let Some(scan) = &v.last_scan {
         let why = if scan.reason.is_empty() {
             String::new()
         } else {
-            format!(", {}", scan.reason)
+            format!(", {}", scan_reason_text(&scan.reason))
         };
         parts.push(format!(
-            "last scan {} ({}{why})",
+            "last scan {}, took {}{why}",
             when(scan.at_ms),
             health::format_duration(scan.took_ms)
         ));

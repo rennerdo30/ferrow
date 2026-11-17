@@ -2,6 +2,13 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Fixed: drives with a large change journal were read folder by folder and got no live updates.** On a drive whose change journal is bigger than 64 MiB, the service read the whole file table, then asked the journal for the last few minutes of changes at a position Windows refuses (error 87, "The parameter is incorrect") and threw the finished read away. Service health said the drive was "not NTFS", and a rescan took minutes instead of seconds. The service now asks at a position Windows accepts. If the journal still cannot be re-read, it keeps the finished read, goes live from the moment the read began and shows a warning that files changed just before the scan may show their old state until the next scan.
+- **Service health tells the real reason a drive was walked.** When the fast read fails on a drive that is NTFS, the drive's line now shows the error Windows gave instead of a guess.
+- **Easier to read in Service health.** A scan line reads "last scan today 18:09, took 3 min 18 s, after 50,001 live changes" instead of "(3 min 18 s, 50001 live changes)". A drive that is live but could not re-check its journal is amber and says why.
+- **Long messages in Recent events are no longer cut off silently.** The service keeps up to 600 characters per message (it was 200) and ends a longer one with "…"; the app wraps long messages over several lines.
+
 ## 0.1.0-beta.18
 
 - **Fixed: the service rescanned every drive while git was busy.** When git, git-lfs or another tool moved a folder into an indexed place, the service could not know what was inside it and read every drive again (about 75 seconds of heavy CPU on a large PC, up to every 11 minutes). Now only that folder is read, in the background at low priority, and its files show up in search within moments. A full rescan happens only for a moved folder with more than about 50,000 files, after 30 seconds, or on an error.
