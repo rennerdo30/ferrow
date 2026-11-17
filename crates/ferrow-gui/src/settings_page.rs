@@ -70,9 +70,7 @@ impl FerrowApp {
     fn access_section(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
         let ctx = ui.ctx().clone();
-        if self.access.poll() {
-            self.engine.service_changed();
-        }
+        // The result is polled every frame in `ui()`; this page only draws it.
         if self.access.needs_refresh() {
             let wake = ctx.clone();
             self.access.refresh(move || wake.request_repaint());
@@ -83,9 +81,18 @@ impl FerrowApp {
         let (busy, message) = (self.access.busy, self.access.message.clone());
         let mut confirm = self.access.confirm_everyone;
         let elevate = access::Access::can_elevate();
+        let sandboxed = access::Access::sandboxed();
         let mut action = None;
+        let mut retry = false;
         card(ui, &p, |ui| {
-            row_text(ui, &p, &title, &detail);
+            ui.horizontal(|ui| {
+                row_text(ui, &p, &title, &detail);
+                if matches!(view, access::View::TooOld | access::View::NoService) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        retry = ui.add(std_button(&p, "Retry", 90.0)).clicked();
+                    });
+                }
+            });
             let access::View::Info(info) = &view else {
                 return;
             };
@@ -101,13 +108,20 @@ impl FerrowApp {
                 for user in users {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(name(user)).size(13.0).color(p.text));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let remove =
                                 ui.add_enabled(!busy && elevate, std_button(&p, "Remove", 90.0));
                             if remove.clicked() {
                                 action = Some(access::Action::Remove(user.id.clone()));
                             }
+                            // The name takes the rest of the row, clipped with an
+                            // ellipsis; the full text is in the tooltip.
+                            let full = name(user);
+                            ui.add(
+                                egui::Label::new(RichText::new(&full).size(13.0).color(p.text))
+                                    .truncate(),
+                            )
+                            .on_hover_text(full);
                         });
                     });
                 }
@@ -115,27 +129,30 @@ impl FerrowApp {
             ui.add_space(10.0);
             let allow_me = !info.you_allowed
                 && info.mode != ferrow_ipc::AccessMode::Everyone
-                && !me.is_empty();
+                && !me.is_empty()
+                && !sandboxed;
             let everyone = info.mode != ferrow_ipc::AccessMode::Everyone;
             let admins = info.mode != ferrow_ipc::AccessMode::Admins;
             if busy {
                 row_header(
                     ui,
                     &p,
-                    "Waiting for administrator approval…",
-                    "Approve the prompt to continue.",
+                    "Waiting for the administrator prompt…",
+                    "Approve it to continue. Over remote desktop it can be on the secure desktop or behind this window.",
                 );
-            } else if confirm {
+                ui.add_space(6.0);
+            }
+            if confirm && !busy {
                 row_header(
                     ui,
                     &p,
-                    "Allow every account on this PC?",
-                    "Every account will see every file name on this PC, including other people's folders.",
+                    "Allow every person who signs in to this PC?",
+                    "They will see every file name on this PC, including other people's folders.",
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .add(accent_button(&p, "Allow every user", 140.0, true))
+                        .add(accent_button(&p, "Allow everyone", 140.0, true))
                         .clicked()
                     {
                         action = Some(access::Action::Everyone);
@@ -145,20 +162,26 @@ impl FerrowApp {
                     }
                 });
             } else if elevate {
-                ui.horizontal_wrapped(|ui| {
-                    if allow_me && ui.add(accent_button(&p, "Allow me", 110.0, true)).clicked() {
-                        action = Some(access::Action::AllowMe(me.clone()));
-                    }
-                    if everyone && ui.add(std_button(&p, "Allow every user", 140.0)).clicked() {
-                        confirm = true;
-                    }
-                    if admins
-                        && ui
-                            .add(std_button(&p, "Administrators only", 160.0))
-                            .clicked()
-                    {
-                        action = Some(access::Action::Admins);
-                    }
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if allow_me
+                            && ui
+                                .add(accent_button(&p, "Allow me", 110.0, !busy))
+                                .clicked()
+                        {
+                            action = Some(access::Action::AllowMe(me.clone()));
+                        }
+                        if everyone && ui.add(std_button(&p, "Allow everyone", 140.0)).clicked() {
+                            confirm = true;
+                        }
+                        if admins
+                            && ui
+                                .add(std_button(&p, "Administrators only", 160.0))
+                                .clicked()
+                        {
+                            action = Some(access::Action::Admins);
+                        }
+                    });
                 });
             } else {
                 let rows = [
@@ -191,6 +214,9 @@ impl FerrowApp {
             }
         });
         self.access.confirm_everyone = confirm;
+        if retry {
+            self.access.retry();
+        }
         if let Some(action) = action {
             let wake = ctx.clone();
             self.access.run(action, move || wake.request_repaint());

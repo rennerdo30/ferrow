@@ -1293,6 +1293,11 @@ impl eframe::App for FerrowApp {
         self.auto_rebuild(&ctx);
         self.updates_on_open(&ctx);
         self.updater.poll();
+        // Settings → Service access: results apply whether or not the page is
+        // open, and the engine then looks for the service at once.
+        if self.access.poll() {
+            self.engine.service_changed();
+        }
         if self.page != Page::Settings {
             self.access.invalidate();
         }

@@ -144,8 +144,14 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   **Allow me** passes the standard user's SID explicitly (taken from
   `AccessInfo`), never "the current user". The status query uses a connection
   of its own with an 800 ms deadline, so a service that predates the request
-  shows "older than this app" without delaying the window. Elevated launches
-  only start `ferrow.exe` from the Setup-installed `%ProgramFiles%\Ferrow`.
+  (or is busy) shows "did not answer: older, or busy" with a Retry button
+  without delaying the window. After the elevated command exits, the app asks
+  the service again (at 0, 1.2 and 2.4 seconds, off the UI thread) until the
+  answer shows the change; that answer, not the exit code, decides whether it
+  worked, and it applies even when Settings is not open. Elevated launches
+  only start `ferrow.exe` from the Setup-installed Program Files folder (found
+  with the shell's known-folder API, with that folder as the working
+  directory), never from a portable or development copy.
 - Uninstall keeps `access.json` with the rest of the state (as it keeps
   `index.bin`), so a reinstall picks the choice up again. Delete the folder to
   reset it, or run `ferrow service access admins`.

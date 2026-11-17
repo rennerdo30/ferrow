@@ -26,6 +26,11 @@ const SERVICE_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// up to five times a second, and each report re-runs the search.
 const LIVE_COALESCE: Duration = Duration::from_millis(500);
 
+/// Take the single service-probe slot; false when a probe already runs.
+fn claim_probe(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
 /// The current result set.
 #[derive(Clone)]
 pub enum Hits {
@@ -340,7 +345,7 @@ impl<W: Fn()> Worker<W> {
         let Some(commands) = self.commands.clone() else {
             return;
         };
-        if self.probing.swap(true, Ordering::AcqRel) {
+        if !claim_probe(&self.probing) {
             return;
         }
         let probing = self.probing.clone();
@@ -1010,6 +1015,18 @@ mod tests {
             false,
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_one_service_probe_runs_at_a_time() {
+        let slot = AtomicBool::new(false);
+        assert!(claim_probe(&slot), "the first look takes the slot");
+        // A look that finds the service still missing (for example after a
+        // change in Settings) must not start a second probe thread.
+        assert!(!claim_probe(&slot));
+        assert!(!claim_probe(&slot));
+        slot.store(false, Ordering::Release); // the probe ended
+        assert!(claim_probe(&slot));
     }
 
     #[test]

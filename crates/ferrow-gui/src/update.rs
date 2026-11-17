@@ -54,11 +54,8 @@ pub fn installed_sibling(name: &str) -> Option<std::path::PathBuf> {
     {
         let exe = std::env::current_exe().ok()?;
         let dir = exe.parent()?;
-        let program_files = std::env::var_os("ProgramW6432")
-            .or_else(|| std::env::var_os("ProgramFiles"))
-            .map(std::path::PathBuf::from)?;
         let file = dir.join(name);
-        (dir.eq_ignore_ascii_case_path(&program_files.join("Ferrow")) && file.is_file())
+        (dir.eq_ignore_ascii_case_path(&program_files()?.join("Ferrow")) && file.is_file())
             .then_some(file)
     }
     #[cfg(not(windows))]
@@ -66,6 +63,44 @@ pub fn installed_sibling(name: &str) -> Option<std::path::PathBuf> {
         let _ = name;
         None
     }
+}
+
+/// The Program Files folder from the shell's known-folder API (not an
+/// environment variable the user could change), read once.
+#[cfg(windows)]
+fn program_files() -> Option<&'static std::path::Path> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FOLDER
+        .get_or_init(|| {
+            let mut text = std::ptr::null_mut();
+            // SAFETY: a valid folder id; the API allocates a terminated string.
+            let code = unsafe {
+                SHGetKnownFolderPath(
+                    &FOLDERID_ProgramFiles,
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut text,
+                )
+            };
+            if code < 0 || text.is_null() {
+                return None;
+            }
+            // SAFETY: terminated string, freed once below.
+            let path = unsafe {
+                let mut len = 0;
+                while *text.add(len) != 0 {
+                    len += 1;
+                }
+                let path = std::ffi::OsString::from_wide(std::slice::from_raw_parts(text, len));
+                CoTaskMemFree(text.cast());
+                path
+            };
+            Some(std::path::PathBuf::from(path))
+        })
+        .as_deref()
 }
 
 /// True for a copy installed by setup, which can update itself. Other
