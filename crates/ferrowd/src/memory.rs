@@ -115,18 +115,33 @@ impl ProcessMemory {
     }
 }
 
-/// Read this process's memory counters.
+/// Read this process's memory counters: one `GetProcessMemoryInfo` call on
+/// Windows, one `/proc/self/status` read on Linux. No allocator counters:
+/// those walk or lock the heap, so only measurement code asks for them
+/// ([`process_with_heap`]); the service never does.
 pub fn process() -> ProcessMemory {
+    read(false)
+}
+
+/// [`process`] plus the allocator's own counters (`HeapSummary` on Windows,
+/// `mallinfo2` on glibc). Measurement only: `HeapSummary` walks the heap under
+/// its lock, which must never happen on a service thread.
+pub fn process_with_heap() -> ProcessMemory {
+    read(true)
+}
+
+fn read(with_heap: bool) -> ProcessMemory {
     #[cfg(windows)]
     {
-        windows::process()
+        windows::process(with_heap)
     }
     #[cfg(target_os = "linux")]
     {
-        linux::process()
+        linux::process(with_heap)
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
+        let _ = with_heap;
         let (resident, private) = crate::health::memory();
         ProcessMemory {
             private,
@@ -141,7 +156,9 @@ pub fn process() -> ProcessMemory {
 /// high-water mark. Windows has no reset, so the first call starts a thread
 /// that samples the private bytes every millisecond into the window's maximum;
 /// [`process`] then reports that maximum as `peak`. The service never calls
-/// this: its `peak` stays the whole-run peak commit.
+/// this: its `peak` stays the whole-run peak commit. Windows peaks are lower
+/// bounds: a spike shorter than the sampling interval is missed, and the real
+/// scan's 16 MiB read buffers (a few in flight) are not modelled.
 pub fn reset_peak() {
     #[cfg(target_os = "linux")]
     linux::reset_peak();
@@ -237,7 +254,7 @@ mod windows {
         (ok != 0).then_some(c)
     }
 
-    pub fn process() -> ProcessMemory {
+    pub fn process(with_heap: bool) -> ProcessMemory {
         let Some(c) = counters() else {
             return ProcessMemory::default();
         };
@@ -255,7 +272,7 @@ mod windows {
             private: Some(private),
             resident: c.WorkingSetSize as u64,
             peak: Some(peak),
-            heap: heap(),
+            heap: if with_heap { heap() } else { None },
         }
     }
 
@@ -290,13 +307,18 @@ mod linux {
         Some(kb * 1024)
     }
 
-    pub fn process() -> ProcessMemory {
+    pub fn process(with_heap: bool) -> ProcessMemory {
         let text = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        // `VmHWM` counts file-backed pages too, `private` (RssAnon) does not:
+        // take the file-backed part (the binary, shared libraries) off the
+        // high-water mark so a peak and a private figure compare. Approximate:
+        // it uses the file-backed size now, not at the peak.
+        let file = status_kb(&text, "RssFile:").unwrap_or(0);
         ProcessMemory {
             private: status_kb(&text, "RssAnon:"),
             resident: status_kb(&text, "VmRSS:").unwrap_or(0),
-            peak: status_kb(&text, "VmHWM:"),
-            heap: heap(),
+            peak: status_kb(&text, "VmHWM:").map(|hwm| hwm.saturating_sub(file)),
+            heap: if with_heap { heap() } else { None },
         }
     }
 
@@ -334,12 +356,22 @@ pub struct Breakdown {
 }
 
 impl Breakdown {
+    /// Parts plus the cheap process counters: what the service uses.
     pub fn new(entries: usize, parts: Vec<Part>, baseline: u64) -> Breakdown {
         Breakdown {
             entries: entries as u64,
             parts,
             process: process(),
             baseline,
+        }
+    }
+
+    /// [`Breakdown::new`] with the allocator's counters too; measurement code
+    /// only (see [`process_with_heap`]).
+    pub fn new_with_heap(entries: usize, parts: Vec<Part>, baseline: u64) -> Breakdown {
+        Breakdown {
+            process: process_with_heap(),
+            ..Breakdown::new(entries, parts, baseline)
         }
     }
 
@@ -450,7 +482,7 @@ impl Breakdown {
         }
         let _ = write!(
             summary,
-            ", unattributed {:.1} B/entry",
+            ", unattributed {:.1} B/entry (incl. runtime)",
             self.per_entry(self.unattributed())
         );
         let mut ranked: Vec<&Part> = self
@@ -533,6 +565,12 @@ mod tests {
     fn this_process_reports_its_own_memory() {
         let before = process();
         assert!(before.resident > 0);
+        assert!(
+            before.heap.is_none(),
+            "the service's counters never walk or lock the heap"
+        );
+        #[cfg(any(windows, all(target_os = "linux", target_env = "gnu")))]
+        assert!(process_with_heap().heap.is_some_and(|h| h.in_use > 0));
         let big = vec![1u8; 64 << 20];
         let after = process();
         std::hint::black_box(&big);

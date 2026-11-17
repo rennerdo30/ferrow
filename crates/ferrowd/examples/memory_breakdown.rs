@@ -18,7 +18,8 @@
 //!    each batch (only the last view is kept),
 //! 6. both default metadata sort orders, built on first use,
 //! 7. an index save (the one in-memory file buffer),
-//! 8. a second scan while the first snapshot is still held (a rescan).
+//! 8. a second scan while the old index and its published view are still held
+//!    (a rescan; the old `Live` is dropped first, as `maintain` does).
 //!
 //! Assumptions are printed as `FERROW-MEMORY-CONFIG`: free-record share,
 //! hard-link share, change mix and count. Change them with the environment
@@ -362,7 +363,7 @@ struct Report {
 
 impl Report {
     fn show(&mut self, phase: &str, parts: Vec<Part>) {
-        let mut b = Breakdown::new(0, parts, self.baseline);
+        let mut b = Breakdown::new_with_heap(0, parts, self.baseline);
         b.entries = self.entries;
         for line in b.lines(phase) {
             println!("{line}");
@@ -371,7 +372,9 @@ impl Report {
     }
 
     /// The highest value the process reached during a phase (Linux: since the
-    /// phase's `reset_peak`; Windows: the sampled maximum of private bytes).
+    /// phase's `reset_peak`, high-water resident minus file-backed pages;
+    /// Windows: the 1 ms sampled maximum of private bytes, a lower bound that
+    /// also leaves out the real scan's 16 MiB read buffers).
     fn peak(&mut self, phase: &str, before: u64, peak: Option<u64>, note: &str) {
         let peak = peak.unwrap_or(0);
         println!(
@@ -397,15 +400,24 @@ struct Held {
     view: Arc<LiveView>,
 }
 
+/// What the snapshot store keeps while a rescan runs: the old index and the
+/// last published view. `maintain` drops its `Live` (record maps, delta,
+/// overrides, children index) at the end of the loop iteration, before the next
+/// `scan_with_maps`, so the rescan does not hold it.
+struct Retained {
+    index: Arc<Index>,
+    view: Arc<LiveView>,
+}
+
 /// One scan and live session built like `live_windows::maintain`: scan, build
-/// `Live`, drop the maps, then apply changes. `held` is a previous session
-/// that stays alive during the scan (the rescan case).
+/// `Live`, drop the maps, then apply changes. `held` is the previous snapshot
+/// that stays in the store during the scan (the rescan case).
 fn session(
     round: &str,
     n: usize,
     changes: usize,
     report: &mut Report,
-    held: Option<&Held>,
+    held: Option<&Retained>,
 ) -> Held {
     memory::reset_peak();
     let synth = synth_parsed(n);
@@ -417,9 +429,8 @@ fn session(
     let held_parts = |parts: &mut Vec<Part>| {
         if let Some(h) = held {
             parts.extend(
-                index_parts(h.live.base(), "previous.index")
+                index_parts(&h.index, "previous.index")
                     .into_iter()
-                    .chain(h.live.memory_parts())
                     .chain(h.view.memory_parts()),
             );
         }
@@ -750,18 +761,25 @@ fn main() {
         "growth should equal persist.save_buffer",
     );
 
-    // Round 2: a rescan while the first snapshot is still held.
+    // Round 2: a rescan while the old snapshot (index and view) is still in the
+    // store. The old `Live` is dropped first, as `maintain` does.
+    let Held { live, view } = one;
+    let old = Retained {
+        index: live.base().clone(),
+        view,
+    };
+    drop(live);
     let before = memory::process();
-    let two = session("scan2", n, changes, &mut report, Some(&one));
+    let two = session("scan2", n, changes, &mut report, Some(&old));
     let during = memory::process();
     println!(
-        "FERROW-MEMORY-PEAK phase=rescan_old_and_new_held before_bytes={} now_bytes={} growth_bytes={} growth_per_entry={:.3} note=old snapshot, old live layer and view stay in the store while the scan builds the next",
+        "FERROW-MEMORY-PEAK phase=rescan_old_and_new_held before_bytes={} now_bytes={} growth_bytes={} growth_per_entry={:.3} note=old index and view stay in the store while the scan builds the next; the old live layer is already dropped",
         before.bytes(),
         during.bytes(),
         during.bytes().saturating_sub(before.bytes()),
         during.bytes().saturating_sub(before.bytes()) as f64 / report.entries as f64
     );
-    drop(one);
+    drop(old);
     report.show("scan2.after_swap", steady(&two));
     if memory::release_free_heap() {
         report.show("scan2.after_swap_trimmed", steady(&two));
