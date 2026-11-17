@@ -15,6 +15,7 @@
 
 mod account_rules;
 mod dispatch;
+pub mod health;
 pub mod protocol;
 pub mod transport;
 #[cfg(any(unix, test))]
@@ -516,6 +517,26 @@ impl<S: DeadlineIo> Client<S> {
         match Self::check(self.expect(id)?)? {
             Response::Access(info) => Ok(info),
             _ => Err(io_invalid("expected Access".into())),
+        }
+    }
+
+    /// The service's health report. Like `access_info`, an older service never
+    /// answers it, so use a connection of its own with a short deadline.
+    pub fn health(&mut self) -> std::io::Result<health::Health> {
+        let id = self.send(Request::Health)?;
+        match Self::check(self.expect(id)?)? {
+            Response::Health(report) => Ok(*report),
+            _ => Err(io_invalid("expected Health".into())),
+        }
+    }
+
+    /// Ask for a rescan of every volume now (administrators only):
+    /// `(started, message)`.
+    pub fn rescan(&mut self) -> std::io::Result<(bool, String)> {
+        let id = self.send(Request::Rescan)?;
+        match Self::check(self.expect(id)?)? {
+            Response::Rescan { started, msg } => Ok((started, msg)),
+            _ => Err(io_invalid("expected Rescan".into())),
         }
     }
 

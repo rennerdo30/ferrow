@@ -423,3 +423,37 @@ fn watch_answers_at_once_or_after_the_next_publication() {
     let answer = thread.join().unwrap();
     assert!(matches!(&answer[..], [ferrow_ipc::Response::Error { .. }]));
 }
+
+#[test]
+fn health_is_served_to_the_owner_and_rescan_says_why_it_did_not_start() {
+    let endpoint = Endpoint::named(&format!("fr-health-{}", std::process::id()));
+    let config = DaemonConfig {
+        endpoint: endpoint.clone(),
+        index_path: None,
+        roots: vec![],
+        excludes: vec![],
+        follow_symlinks: false,
+    };
+    let store = SnapshotStore::new(Snapshot::empty());
+    let shutdown = Shutdown::new();
+    let stop = shutdown.clone();
+    let server = std::thread::spawn(move || serve(&config, store, stop));
+    let mut client = connect(&endpoint);
+    let health = client.health().unwrap();
+    assert_eq!(health.pid, std::process::id());
+    assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!((health.entries, health.mode.as_str()), (0, "empty"));
+    assert!(health.working_set > 0 && health.started_ms <= health.now_ms);
+    let listening = format!("listening on {endpoint}");
+    assert!(
+        health.events.iter().any(|e| e.text.contains(&listening)),
+        "{:?}",
+        health.events
+    );
+    // No live maintainer runs here: the answer says so instead of silence.
+    let (started, why) = client.rescan().unwrap();
+    assert!(!started && !why.is_empty(), "{why}");
+    drop(client);
+    shutdown.request(&endpoint);
+    server.join().unwrap().unwrap();
+}

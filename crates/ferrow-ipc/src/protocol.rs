@@ -39,6 +39,10 @@ const KIND_CANCEL: u8 = 5;
 const KIND_PAGE: u8 = 6;
 const KIND_WATCH: u8 = 7;
 const KIND_ACCESS: u8 = 8;
+const KIND_HEALTH: u8 = 9;
+const KIND_RESCAN: u8 = 10;
+const KIND_HEALTH_RESULT: u8 = 109;
+const KIND_RESCAN_RESULT: u8 = 110;
 const KIND_ACCESS_INFO: u8 = 108;
 const KIND_CHANGED: u8 = 107;
 /// Hard cap on users in an `AccessInfo` reply (and in the policy file).
@@ -189,6 +193,12 @@ pub enum Request {
     /// protocol version bump: an older service does not know the kind and never
     /// answers it, so clients ask on a connection of their own with a short deadline.
     AccessInfo,
+    /// The service's health report. Added without a protocol version bump,
+    /// like `AccessInfo`: an older service never answers it.
+    Health,
+    /// Rescan every volume now. Administrators and SYSTEM only, even when the
+    /// access policy lets others search.
+    Rescan,
 }
 
 /// Machine-readable error codes in `Response::Error`.
@@ -236,6 +246,12 @@ pub enum Response {
         msg: String,
     },
     Access(AccessInfo),
+    Health(Box<crate::health::Health>),
+    /// Reply to `Rescan`: whether one was started, and a sentence saying why not.
+    Rescan {
+        started: bool,
+        msg: String,
+    },
 }
 
 /// One message in either direction.
@@ -480,6 +496,17 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             KIND_ERROR
         }
         Message::Request(Request::AccessInfo) => KIND_ACCESS,
+        Message::Request(Request::Health) => KIND_HEALTH,
+        Message::Request(Request::Rescan) => KIND_RESCAN,
+        Message::Response(Response::Health(health)) => {
+            w.str(&health.to_json())?;
+            KIND_HEALTH_RESULT
+        }
+        Message::Response(Response::Rescan { started, msg }) => {
+            w.u8(u8::from(*started));
+            w.str(msg)?;
+            KIND_RESCAN_RESULT
+        }
         Message::Response(Response::Access(info)) => {
             w.u8(info.mode as u8);
             w.u8(u8::from(info.you_allowed));
@@ -789,6 +816,20 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             Message::Response(Response::Error { code, msg })
         }
         KIND_ACCESS => Message::Request(Request::AccessInfo),
+        KIND_HEALTH => Message::Request(Request::Health),
+        KIND_RESCAN => Message::Request(Request::Rescan),
+        KIND_HEALTH_RESULT => {
+            let health = crate::health::Health::from_json(&r.str()?)
+                .map_err(|_| ProtocolError::InvalidValue("health report"))?;
+            Message::Response(Response::Health(Box::new(health)))
+        }
+        KIND_RESCAN_RESULT => {
+            let started = r.flag("rescan flag")?;
+            Message::Response(Response::Rescan {
+                started,
+                msg: r.str()?,
+            })
+        }
         KIND_ACCESS_INFO => {
             let mode = match r.u8()? {
                 0 => AccessMode::Admins,

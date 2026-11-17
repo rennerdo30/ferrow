@@ -518,3 +518,15 @@ is the planned answer if chain opens dominate.
 Unix filtering, live updates (ADR 0005), any cross-request authorization
 cache (only with a freshness mechanism a future review accepts), and the
 fix for gap G1.
+
+## Health and Rescan (FR-34)
+
+`Request::Health` answers a caller the access policy answers, so today it is
+answered to the same callers as searches, unfiltered. Its report carries
+volume roots, entry counts, the snapshot mode and the service's own events
+(texts name no files beyond volume roots and the service's own paths). **When
+per-user filtering (M2c) answers ordinary callers, `Health` for a filtered
+caller must be trimmed exactly like `Status`:** no volume roots, no event texts
+and no counts that reveal what the caller may not see (version, uptime, memory
+and a verdict may stay). `Request::Rescan` stays administrators/SYSTEM/root
+only whatever the policy allows.

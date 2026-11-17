@@ -451,3 +451,57 @@ fn access_info_rejects_oversized_or_malformed_fields() {
 fn adding_access_info_does_not_change_the_protocol_version() {
     assert_eq!(PROTOCOL_VERSION, 4);
 }
+
+#[test]
+fn health_and_rescan_round_trip_and_reject_a_broken_body() {
+    use ferrow_ipc::health::{EventInfo, Health, VolumeHealth};
+    for request in [Request::Health, Request::Rescan] {
+        let message = Message::Request(request);
+        let frame = encode_frame(5, &message).unwrap();
+        assert_eq!(decode_payload(&frame[4..]).unwrap().message, message);
+    }
+    let health = Health {
+        version: "0.1.0".into(),
+        pid: 4242,
+        entries: 1_234_567,
+        working_set: 300 << 20,
+        private_bytes: Some(280 << 20),
+        volumes: vec![VolumeHealth {
+            root: r"C:\".into(),
+            mode: "mft+usn live".into(),
+            ..VolumeHealth::default()
+        }],
+        events: vec![EventInfo {
+            at_ms: 1,
+            level: "warn".into(),
+            text: "journal reset".into(),
+        }],
+        ..Health::default()
+    };
+    for reply in [
+        Response::Health(Box::new(health)),
+        Response::Rescan {
+            started: false,
+            msg: "a scan is already running".into(),
+        },
+    ] {
+        let message = Message::Response(reply);
+        let frame = encode_frame(6, &message).unwrap();
+        assert_eq!(decode_payload(&frame[4..]).unwrap().message, message);
+    }
+    // A body that is not a health report, or a bad flag byte, is refused.
+    let mut frame = encode_frame(7, &Message::Response(Response::Health(Box::default()))).unwrap();
+    let last = frame.len() - 1;
+    frame[last] = b'!'; // breaks the closing brace of the JSON text
+    assert!(decode_payload(&frame[4..]).is_err());
+    let mut rescan = encode_frame(
+        8,
+        &Message::Response(Response::Rescan {
+            started: true,
+            msg: String::new(),
+        }),
+    )
+    .unwrap();
+    rescan[10] = 2;
+    assert!(decode_payload(&rescan[4..]).is_err());
+}

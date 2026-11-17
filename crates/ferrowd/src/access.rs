@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
+use crate::eventlog::Level;
 use arc_swap::{ArcSwap, Guard};
 use ferrow_ipc::protocol::{MAX_ACCESS_USERS, MAX_ACCOUNT_ID, MAX_ACCOUNT_NAME};
 use ferrow_ipc::{AccessInfo, AccessMode, AccessUser, CallerIdentity};
@@ -431,7 +432,7 @@ impl PolicyStore {
         self.policy.load()
     }
 
-    fn claim(&self, now: u64, state: &mut State, logs: &mut Vec<String>) {
+    fn claim(&self, now: u64, state: &mut State, logs: &mut Vec<(Level, String)>) {
         // Another thread may have finished a check while this one waited.
         if now.saturating_sub(self.checked.load(Ordering::Relaxed)) >= self.interval_ms {
             self.checked.store(now, Ordering::Relaxed);
@@ -441,7 +442,7 @@ impl PolicyStore {
 
     /// Validate protection, compare the stamp, reload on change. A failure
     /// changes the policy to the default and is retried at the next check.
-    fn check(&self, state: &mut State, logs: &mut Vec<String>) {
+    fn check(&self, state: &mut State, logs: &mut Vec<(Level, String)>) {
         let stamp = FileStamp::of(&self.path);
         match (self.validate)(&self.path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -478,31 +479,35 @@ impl PolicyStore {
         }
     }
 
-    fn fail(&self, state: &mut State, error: String, logs: &mut Vec<String>) {
+    fn fail(&self, state: &mut State, error: String, logs: &mut Vec<(Level, String)>) {
         self.set(Policy::default(), logs);
         if state.last_error.as_ref() != Some(&error) {
-            logs.push(format!(
-                "ferrowd: access policy ignored (administrators only): {error}"
+            logs.push((
+                Level::Warn,
+                format!("access policy ignored (administrators only): {error}"),
             ));
             state.last_error = Some(error);
         }
     }
 
-    fn set(&self, policy: Policy, logs: &mut Vec<String>) {
+    fn set(&self, policy: Policy, logs: &mut Vec<(Level, String)>) {
         if **self.policy.load() != policy {
-            logs.push(format!(
-                "ferrowd: access policy: {} ({} listed)",
-                policy.mode.as_str(),
-                policy.users.len()
+            logs.push((
+                Level::Info,
+                format!(
+                    "access policy: {} ({} listed)",
+                    policy.mode.as_str(),
+                    policy.users.len()
+                ),
             ));
             self.policy.store(Arc::new(policy));
         }
     }
 }
 
-fn print(logs: Vec<String>) {
-    for line in logs {
-        eprintln!("{line}");
+fn print(logs: Vec<(Level, String)>) {
+    for (level, line) in logs {
+        crate::eventlog::record(level, line);
     }
 }
 
