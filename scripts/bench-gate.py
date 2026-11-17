@@ -67,6 +67,9 @@ def parse(text, require_new=True):
                 raise ValueError("duplicate query measurement")
             target[query] = {key: number(fields[key]) for key in (
                 "first_page_ms", "full_count_ms", "page_hits", "total_hits")}
+            # Optional: the cold first sample (see probe); absent in legacy single-sample files.
+            target[query].update({key: number(fields[key]) for key in (
+                "first_page_cold_ms", "full_count_cold_ms") if key in fields})
     for key in ("entries", "seed", "heap_bytes", "bytes_per_entry", "load_ms_median"):
         if key not in measures:
             raise ValueError(f"missing measurement: {key}")
@@ -120,6 +123,10 @@ def compare(base, head, expected_entries=5_000_000):
             for key in ("first_page_ms", "full_count_ms"):
                 limit = 16.0 if key == "first_page_ms" and query in COMMON_WILDCARDS else None
                 value = readings[query][key]
+                if limit is not None:
+                    # Absolute limits keep their meaning: judged on the cold first sample
+                    # per process, never on the (lower) median of in-process repeats.
+                    value = readings[query].get("first_page_cold_ms", value)
                 rows.append((f"new-language {label} {query!r} {key}", None, value, limit,
                              limit is not None and value > limit))
     if len(rows) != EXPECTED_METRICS:
@@ -131,7 +138,8 @@ def render(rows):
     lines = ["## Paired benchmark regression gate", "",
              "Same runner/job; median of 3 loads and 5 queries per arm, each query sample the median of in-process repeats. "
              "Limit: base + max(10%, 0.1 ms); memory: base + 10%. "
-             "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms. "
+             "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms, "
+             "judged on the cold first sample of each process (not the repeated median). "
              "Section 3 absolute targets remain reported goals.", "",
              "| Metric | Base | Head | Limit | Result |", "|---|---:|---:|---:|---|"]
     def cell(value):
@@ -139,6 +147,36 @@ def render(rows):
     lines += [f"| {name.replace('|', chr(92) + '|')} | {cell(b)} | {h:.6f} | {cell(limit)} | {'FAIL' if bad else 'pass'} |"
               for name, b, h, limit, bad in rows]
     return "\n".join(lines) + "\n"
+
+
+def cold_table(base, head):
+    """Both numbers for every measured row: cold first sample and repeated median.
+
+    Cold = median over processes of one cold timed run (the pre-FR-31 meaning, what
+    absolute limits use); repeated = median over processes of each process's median of
+    in-process repeats (what the paired comparison uses). Empty for legacy files."""
+    lines = []
+    for label, b, h in (("in-process", base[1], head[1]), ("IPC", base[2], head[2])):
+        for query in sorted(QUERIES):
+            for key, cold_key in (("first_page_ms", "first_page_cold_ms"), ("full_count_ms", "full_count_cold_ms")):
+                if cold_key not in b[query] or cold_key not in h[query]:
+                    return ""
+                lines.append(f"| {label} {query!r} {key} | {b[query][cold_key]:.6f} / {b[query][key]:.6f} "
+                             f"| {h[query][cold_key]:.6f} / {h[query][key]:.6f} |")
+    for label, h in (("in-process", head[1]), ("IPC", head[2])):
+        for query in sorted(NEW_QUERIES):
+            for key, cold_key in (("first_page_ms", "first_page_cold_ms"), ("full_count_ms", "full_count_cold_ms")):
+                if cold_key not in h[query]:
+                    return ""
+                limited = key == "first_page_ms" and query in COMMON_WILDCARDS
+                lines.append(f"| new-language {label} {query!r} {key}{' (limit 16 ms judged on cold)' if limited else ''} "
+                             f"| - | {h[query][cold_key]:.6f} / {h[query][key]:.6f} |")
+    return ("\n### Cold first sample / repeated median (ms)\n\n"
+            "Cold: median over processes of one cold timed run, the meaning every number had before FR-31 "
+            "and the one absolute limits use. Repeated: median over processes of each process's median of "
+            "in-process repeats, used only for the paired base-vs-head comparison. Do not compare a repeated "
+            "median with an older cold number.\n\n"
+            "| Metric | Base cold / repeated | Head cold / repeated |\n|---|---:|---:|\n" + "\n".join(lines) + "\n")
 
 
 def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=None):
@@ -261,7 +299,7 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
                     label += f"; C = head-only {observation[1]!r} {observation[2]}"
                 trace[trace_index] = f"| {label.replace('|', chr(92) + '|')} | {' '.join(order)} |"
             sample = measure("head", *observation) if arm == "observation" else measure(arm, kind, query, operation)
-            value, hits, digest, heap, entries = sample
+            value, hits, digest, heap, entries = sample[:5]
             number(value)
             if arm != "observation" and expected is not None and hits != expected:
                 raise ValueError(f"remeasure changed hits: {arm} {kind} {query!r}")
@@ -274,7 +312,10 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
                 raise ValueError("heap changed within one arm")
             if not warmup:
                 samples[arm].append(sample)
-    return {arm: (statistics.median(s[0] for s in values), *values[0][1:]) for arm, values in samples.items()}
+    # (median, hits, digest, heap, entries, median of the cold first samples)
+    return {arm: (statistics.median(s[0] for s in values), *values[0][1:5],
+                  statistics.median(s[5] if len(s) > 5 else s[0] for s in values))
+            for arm, values in samples.items()}
 
 
 def metric_descriptors(base):
@@ -369,7 +410,10 @@ def probe(args, arm, kind, query, operation):
     integers = tuple(int(fields[key]) for key in ("hits", "digest", "heap_bytes", "entries"))
     if any(v < 0 for v in integers) or integers[-1] != args.entries or integers[-2] <= 0:
         raise ValueError("invalid probe count, heap or fixture")
-    return number(fields["value_ms"]), *integers
+    # value_ms: median of the in-process repeats (paired comparison); cold_ms: the single
+    # cold sample per process that absolute limits are judged on. A probe that cannot
+    # print both is refused (KeyError).
+    return number(fields["value_ms"]), *integers, number(fields["cold_ms"])
 
 
 def measure_pair(args, measure, trace):
@@ -377,7 +421,7 @@ def measure_pair(args, measure, trace):
         raise ValueError("interleaved arms require the same fixture file")
     output = {"base": [], "head": []}
     load = interleaved(measure, "load", "", "load", args.entries, trace)
-    for arm, (elapsed, _, _, heap, entries) in load.items():
+    for arm, (elapsed, _, _, heap, entries, _) in load.items():
         output[arm].append(f"FERROW-MEASURE entries={entries} seed=2026 heap_bytes={heap} bytes_per_entry={heap/entries:.9f} load_ms_median={elapsed:.9f}")
     for kind, prefix in (("in-process", "FERROW-QUERY"), ("IPC", "FERROW-SERVICE")):
         new_queries = sorted(NEW_QUERIES)
@@ -392,7 +436,8 @@ def measure_pair(args, measure, trace):
                     raise ValueError("page/count evidence disagrees")
                 target = "head" if arm == "observation" else arm
                 text = new_query if arm == "observation" else query
-                output[target].append(f'{prefix} query="{text}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]}')
+                output[target].append(f'{prefix} query="{text}" first_page_ms={page[arm][0]:.9f} page_hits={page[arm][1]} full_count_ms={full[arm][0]:.9f} total_hits={full[arm][1]} '
+                                      f'first_page_cold_ms={page[arm][5]:.9f} full_count_cold_ms={full[arm][5]:.9f}')
     for arm, lines in output.items():
         getattr(args, arm).write_text("\n".join(lines)+"\n", encoding="utf-8")
 
@@ -475,7 +520,7 @@ def main():
         base = parse(args.base.read_text(encoding="utf-8"), require_new=False)
         head = parse(args.head.read_text(encoding="utf-8"))
         rows = compare(base, head, args.entries)
-        report = render(rows)
+        report = render(rows) + cold_table(base, head)
         # A refused head-only metadata observation must not hide the paired
         # result: finish the paired phase (retry, A/A control), then refuse.
         metadata_error = None

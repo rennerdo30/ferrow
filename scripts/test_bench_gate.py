@@ -274,6 +274,55 @@ class GateTests(unittest.TestCase):
         self.assertEqual((result["base"][0], result["head"][0]), (3, 4))
         self.assertIn("warm A warm B A B B A A B B A A B", trace[0])
 
+    def wildcard_head(self, median, cold):
+        row = 'query="*.log" first_page_ms=0.2 page_hits=2 full_count_ms=10 total_hits=2'
+        text = fixture().replace(row, row.replace("first_page_ms=0.2", f"first_page_ms={median}")
+                                 + (f" first_page_cold_ms={cold}" if cold is not None else ""))
+        return gate.compare(gate.parse(fixture(language=False), require_new=False), gate.parse(text), 16)
+
+    def test_absolute_limits_are_judged_on_the_cold_sample_not_the_repeated_median(self):
+        names = ["new-language in-process '*.log' first_page_ms", "new-language IPC '*.log' first_page_ms"]
+        # The repeated median is far under 16 ms, the cold first sample is over: fail.
+        failing = [r for r in self.wildcard_head(0.2, 17) if r[0] in names]
+        self.assertEqual(len(failing), 2)
+        for row in failing:
+            self.assertEqual((row[2], row[3], row[4]), (17.0, 16.0, True), row)
+        # Cold under the limit passes even when the median is over (the cold sample decides).
+        passing = [r for r in self.wildcard_head(20, 15) if r[0] in names]
+        self.assertEqual(len(passing), 2)
+        for row in passing:
+            self.assertEqual((row[2], row[4]), (15.0, False), row)
+        # Legacy single-sample files carry no cold field: the single value is the cold sample.
+        legacy = [r for r in self.wildcard_head(17, None) if r[0] in names]
+        self.assertEqual(len(legacy), 2)
+        self.assertTrue(all(r[4] for r in legacy))
+        # The paired rows keep using the repeated median.
+        paired = gate.compare(gate.parse(fixture(language=False), require_new=False), gate.parse(fixture()), 16)
+        self.assertEqual([r[2] for r in paired if r[0] == "in-process 'a' first_page_ms"], [0.2])
+
+    def test_gate_output_reports_cold_and_repeated_numbers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = SimpleNamespace(base=Path(folder)/"base.txt", head=Path(folder)/"head.txt",
+                                   base_index=Path(folder)/"fixture", head_index=Path(folder)/"fixture", entries=16)
+            def measure(arm, kind, query, operation):
+                # repeated median 1 ms, cold sample 7 ms
+                return (1, 16, 42, 800, 16) if kind == "load" else (1, 2, 42, 800, 16, 7)
+            gate.measure_pair(args, measure, [])
+            head_text = args.head.read_text(encoding="utf-8")
+            self.assertIn("first_page_cold_ms=7.000000000", head_text)
+            self.assertIn("full_count_cold_ms=7.000000000", head_text)
+            base = gate.parse(args.base.read_text(encoding="utf-8"), require_new=False)
+            head = gate.parse(head_text)
+            table = gate.cold_table(base, head)
+            self.assertIn("| IPC 'a' first_page_ms | 7.000000 / 1.000000 | 7.000000 / 1.000000 |", table)
+            self.assertIn("(limit 16 ms judged on cold)", table)
+            self.assertIn("Do not compare a repeated median with an older cold number", table)
+            # Legacy files without cold fields produce no table instead of a half-empty one.
+            self.assertEqual(gate.cold_table(gate.parse(fixture(language=False), require_new=False), gate.parse(fixture())), "")
+            # interleaved reports the median of the cold samples next to the median of the repeats.
+            result = gate.interleaved(measure, "IPC", "a", "first_page_ms")
+            self.assertEqual((result["base"][0], result["base"][5]), (1, 7))
+
     def test_submillisecond_first_pages_take_ten_balanced_samples(self):
         def run(value, kind="IPC", operation="first_page_ms", head_value=None):
             calls = []
@@ -383,7 +432,7 @@ class GateTests(unittest.TestCase):
 
     def test_probe_enforces_legacy_only_base(self):
         args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
-        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
+        receipt = "FERROW-RETRY value_ms=1 cold_ms=3 hits=2 digest=42 heap_bytes=800 entries=16\n"
         with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt, stderr=REPEATS)) as run:
             gate.probe(args, "base", "IPC", "a", "first_page_ms")
             self.assertEqual(run.call_args.args[0][-1], "--legacy-queries")
@@ -411,10 +460,12 @@ class GateTests(unittest.TestCase):
 
     def test_probe_requests_in_process_repeats_and_proves_they_ran(self):
         args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
-        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
+        receipt = "FERROW-RETRY value_ms=1 cold_ms=3 hits=2 digest=42 heap_bytes=800 entries=16\n"
         with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt, stderr=REPEATS)) as run:
             gate.probe(args, "base", "IPC", "a", "first_page_ms")
             self.assertEqual(run.call_args.kwargs["env"]["FERROW_PROBE_REPEATS"], str(gate.PROBE_REPEATS))
+            # The receipt carries both numbers: repeated median first, cold sample last.
+            self.assertEqual(gate.probe(args, "base", "IPC", "a", "first_page_ms"), (1.0, 2, 42, 800, 16, 3.0))
             # Loads time one process start-up and have no repeats to prove.
             gate.probe(args, "base", "load", "", "load")
         # A probe that ignored the request (old driver) or repeated too little is refused.
@@ -437,8 +488,9 @@ class GateTests(unittest.TestCase):
 
     def test_retry_receipt_must_be_complete_finite_and_unique(self):
         args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
-        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
-        for stdout in ("", receipt*2, receipt.replace("value_ms=1", "value_ms=NaN"), "FERROW-RETRY value_ms=1\n"):
+        receipt = "FERROW-RETRY value_ms=1 cold_ms=3 hits=2 digest=42 heap_bytes=800 entries=16\n"
+        for stdout in ("", receipt*2, receipt.replace("value_ms=1", "value_ms=NaN"), "FERROW-RETRY value_ms=1\n",
+                       receipt.replace("cold_ms=3 ", ""), receipt.replace("cold_ms=3", "cold_ms=-1")):
             with self.subTest(stdout=stdout), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, stderr=REPEATS)):
                 with self.assertRaises((ValueError, KeyError)):
                     gate.probe(args, "base", "IPC", "a", "first_page_ms")

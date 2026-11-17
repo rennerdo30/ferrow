@@ -214,19 +214,21 @@ jobs:
           }
 
           type Sample = (Duration, usize, u64);
+          /// (median of the repeats, cold first sample of this process, hits, digest)
+          type Measured = (Duration, Duration, usize, u64);
           type Failure = Box<dyn std::error::Error>;
 
           /// FERROW_PROBE_REPEATS=N (default 1) repeats the timed operation inside this
           /// process, about 100 ms worth (at least 3, at most N), validates every repeat and
           /// reports the median. One cold sample per process is dominated by scheduling jitter.
-          fn sampled(mut once: impl FnMut() -> Result<Sample, Failure>) -> Result<Sample, Failure> {
+          fn sampled(mut once: impl FnMut() -> Result<Sample, Failure>) -> Result<Measured, Failure> {
               let max: usize = std::env::var("FERROW_PROBE_REPEATS")
                   .ok()
                   .and_then(|value| value.parse().ok())
                   .unwrap_or(1);
               let first = once()?;
               if max <= 1 {
-                  return Ok(first);
+                  return Ok((first.0, first.0, first.1, first.2));
               }
               let wanted = (0.1 / first.0.as_secs_f64().max(1e-6)).ceil() as usize;
               let mut times = vec![first.0];
@@ -245,7 +247,7 @@ jobs:
                   times[times.len() / 2].as_secs_f64() * 1000.0,
                   times[times.len() - 1].as_secs_f64() * 1000.0
               );
-              Ok((times[times.len() / 2], first.1, first.2))
+              Ok((times[times.len() / 2], first.0, first.1, first.2))
           }
 
           fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -276,9 +278,10 @@ jobs:
                   "FERROW-PROBE-ACTIVE pid={} timeout_s=120",
                   std::process::id()
               );
-              let (elapsed, hits, fingerprint, heap, entries) = if args[2] == "load" {
+              let (elapsed, cold, hits, fingerprint, heap, entries) = if args[2] == "load" {
                   let (index, timings) = Index::load_with_timings(path)?;
                   (
+                      timings.total,
                       timings.total,
                       index.len(),
                       0,
@@ -311,7 +314,7 @@ jobs:
                   if cancelled || expected.cancelled {
                       return Err("cancelled warm-up".into());
                   }
-                  let (elapsed, hits, fingerprint) = match args[2].as_str() {
+                  let (elapsed, cold, hits, fingerprint) = match args[2].as_str() {
                       "in-process" => {
                           if page {
                               sampled(|| {
@@ -398,11 +401,14 @@ jobs:
                       }
                       _ => return Err("unknown probe kind".into()),
                   };
-                  (elapsed, hits, fingerprint, index.heap_bytes(), index.len())
+                  (elapsed, cold, hits, fingerprint, index.heap_bytes(), index.len())
               };
+              // value_ms is the median of the in-process repeats; cold_ms is the single cold
+              // sample (the first timed run after one warm-up) that absolute limits are judged on.
               println!(
-                  "FERROW-RETRY value_ms={:.9} hits={hits} digest={fingerprint} heap_bytes={heap} entries={entries}",
-                  elapsed.as_secs_f64() * 1000.0
+                  "FERROW-RETRY value_ms={:.9} cold_ms={:.9} hits={hits} digest={fingerprint} heap_bytes={heap} entries={entries}",
+                  elapsed.as_secs_f64() * 1000.0,
+                  cold.as_secs_f64() * 1000.0
               );
               Ok(())
           }
