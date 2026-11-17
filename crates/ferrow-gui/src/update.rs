@@ -46,9 +46,22 @@ pub fn current_version() -> Version {
     })
 }
 
+/// Screenshot tests show the installed copy's "Install update" button.
+#[cfg(all(test, feature = "screenshots"))]
+static FORCE_CAN_INSTALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, feature = "screenshots"))]
+pub fn test_can_install(on: bool) {
+    FORCE_CAN_INSTALL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// True for a copy installed by setup, which can update itself. Other
 /// builds (development, portable) only link to the release page.
 pub fn can_install() -> bool {
+    #[cfg(all(test, feature = "screenshots"))]
+    if FORCE_CAN_INSTALL.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     #[cfg(windows)]
     {
         let Ok(exe) = std::env::current_exe() else {
