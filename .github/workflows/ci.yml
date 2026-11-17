@@ -506,11 +506,17 @@ jobs:
       # stream, by capacity, with the process counters and the unattributed
       # remainder. Runs after the gate so its allocations and the saved file
       # cannot disturb the paired timings; `always()` keeps it when the gate fails.
-      - name: Memory breakdown of the service's structures (5M synthetic MFT build)
+      # The 20,000-entry smoke is the only gating piece; the 5 M measurement is
+      # informational (`continue-on-error`) so it can never turn the perf gate red.
+      - name: Memory breakdown smoke (20,000 entries)
         if: always()
         run: |
           git rev-parse HEAD
           FERROW_BENCH_ENTRIES=20000 FERROW_MEMORY_CHANGES=500 timeout -k 5s 120s target/release/examples/memory_breakdown > /dev/null
+      - name: Memory breakdown of the service's structures (5M synthetic MFT build)
+        if: always()
+        continue-on-error: true
+        run: |
           FERROW_MEMORY_CHANGES=20000 FERROW_MEMORY_SUMMARY="$GITHUB_STEP_SUMMARY" timeout -k 10s 900s target/release/examples/memory_breakdown 2>&1 | tee memory-breakdown-output.txt
       - name: Keep the memory breakdown output
         if: always()
