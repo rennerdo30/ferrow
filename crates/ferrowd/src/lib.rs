@@ -21,6 +21,7 @@ use ferrow_query::{CancelToken, Query, SearchOptions};
 use ferrow_walk::{ScanReport, WalkOptions};
 
 pub mod access;
+pub mod accounts;
 mod admission;
 #[cfg(any(unix, test))]
 mod definition;
