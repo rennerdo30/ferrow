@@ -122,7 +122,10 @@ impl State {
         self.lock().pending = None;
     }
 
+    /// A scan failed: it still ended, so a requested rescan waits out the same
+    /// gap (an instantly failing scan must not allow back-to-back rescans).
     pub fn scan_failed(&self) {
+        self.lock().last_finished = Some(Instant::now());
         self.scanning.store(false, Ordering::Release);
     }
 
@@ -681,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_scan_also_starts_the_gap() {
+        let state = State::new();
+        state.scan_started();
+        state.scan_failed();
+        assert!(!state.is_scanning());
+        let why = state
+            .claim_rescan(Instant::now() + Duration::from_secs(5))
+            .unwrap_err();
+        assert!(why.contains("a rescan can be requested in"), "{why}");
+        assert!(
+            state
+                .claim_rescan(Instant::now() + MIN_FORCED_GAP + Duration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn a_rescan_right_after_a_scan_is_refused_with_the_time_it_may_run() {
         let state = State::new();
         state.scan_started();
@@ -810,11 +830,17 @@ mod tests {
     #[test]
     fn connection_errors_are_counted_not_logged_and_reach_the_report() {
         let state = State::new();
-        let before = eventlog::global().len();
         for _ in 0..500 {
             state.connection_error();
         }
-        assert_eq!(eventlog::global().len(), before, "no event per error");
+        // Other tests share the global ring, so look at what it holds, not its size.
+        assert!(
+            !eventlog::global()
+                .recent(usize::MAX)
+                .iter()
+                .any(|e| e.text.contains("connection")),
+            "an error became an event"
+        );
         let store = SnapshotStore::new(Snapshot::empty());
         let report = state.report(&store, &Policy::default());
         assert_eq!(report.connection_errors, 500);
