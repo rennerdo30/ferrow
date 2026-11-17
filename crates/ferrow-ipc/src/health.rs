@@ -130,6 +130,32 @@ impl Health {
         while self.to_json().len() > MAX_TEXT_BYTES && self.volumes.pop().is_some() {}
     }
 
+    /// What needs attention, most important first; empty when all is well.
+    /// The CLI and the app show these before any detail.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(save) = self.last_save.as_ref().filter(|s| !s.ok) {
+            out.push(format!("the last index save failed: {}", save.error));
+        }
+        for v in &self.volumes {
+            if v.journal == JOURNAL_ERROR {
+                out.push(format!(
+                    "{}: live updates stopped ({}); restart the service",
+                    v.root, v.journal_detail
+                ));
+            } else if v.journal == JOURNAL_RESET {
+                out.push(format!(
+                    "{}: the change journal was reset; a rescan is due",
+                    v.root
+                ));
+            }
+            if v.mode == MODE_UNAVAILABLE {
+                out.push(format!("{}: no live updates ({})", v.root, v.reason));
+            }
+        }
+        out
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
@@ -164,6 +190,15 @@ fn civil(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + u64::from(m <= 2);
     (y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// `3 min 5 s ago` / `in 2 min 0 s` for `at_ms` seen from `now_ms`.
+pub fn format_ago(now_ms: u64, at_ms: u64) -> String {
+    if at_ms <= now_ms {
+        format!("{} ago", format_duration(now_ms - at_ms))
+    } else {
+        format!("in {}", format_duration(at_ms - now_ms))
+    }
 }
 
 /// A duration in milliseconds as `850 ms`, `4.2 s`, `3 min 5 s` or `2 h 10 min`.

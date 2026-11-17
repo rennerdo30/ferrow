@@ -7,6 +7,7 @@
 //! ferrow status
 //! ferrow service install | uninstall | status | run
 //! ferrow service access show | admins | everyone | add <who> | remove <who>
+//! ferrow service health [--json] | start | stop | restart | rescan | repair
 //! ```
 //!
 //! `search` talks to the `ferrowd` service when one is reachable
@@ -25,6 +26,7 @@ use ferrow_query::{Query, SearchOptions, SortKey, search};
 use ferrow_walk::{WalkOptions, scan};
 
 mod access_cmd;
+mod service_cmd;
 
 const USAGE: &str = "\
 ferrow - find any file by name, as fast as you type
@@ -40,6 +42,7 @@ Usage:
   ferrow status
   ferrow service install | uninstall | status
   ferrow service access show | admins | everyone | add <account-or-SID> | remove <account-or-SID>
+  ferrow service health [--json] | start | stop | restart | rescan | repair
   ferrow service run [<root>...] [--index <file>] [--exclude <path>]... [--follow-symlinks]
   ferrow --help | --version
 
@@ -49,6 +52,12 @@ back to the saved index otherwise; `ferrow status` says which.
 (per-user endpoint) for development. `service access` says who may use
 the system service (administrators only by default); changing it needs
 an elevated terminal / sudo.
+`service health` shows the service's state, memory, volumes and recent events;
+`service repair` re-registers it, checks its state folder and index (an index that
+does not load is moved aside, never deleted), restarts it and waits for it.
+`start`, `stop`, `restart` and `repair` need an elevated terminal / sudo.
+Exit codes: 0 ok, 1 failed, 2 needs administrator/root, 3 service not reachable,
+4 service refused this account, 5 `rescan` did not start.
 
 Build an index first, then search it:
   ferrow index ~/Documents /data
@@ -761,7 +770,7 @@ fn cmd_status() -> Result<(), String> {
 fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
     let Some(sub) = rest.first() else {
         return Err(
-            "service needs a subcommand: install | uninstall | status | access | run".into(),
+            "service needs a subcommand: install | uninstall | status | access | health | start | stop | restart | rescan | repair | run".into(),
         );
     };
     match sub.to_str().unwrap_or("") {
@@ -799,7 +808,16 @@ fn cmd_service(rest: &[std::ffi::OsString]) -> Result<(), String> {
     }
 }
 
-fn run(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
+fn run(argv: Vec<std::ffi::OsString>) -> Result<(), service_cmd::Failure> {
+    if argv.first().and_then(|a| a.to_str()) == Some("service")
+        && let Some(result) = service_cmd::try_run(&argv[1..])
+    {
+        return result;
+    }
+    run_plain(argv).map_err(Into::into)
+}
+
+fn run_plain(argv: Vec<std::ffi::OsString>) -> Result<(), String> {
     let Some(cmd) = argv.first() else {
         return Err("missing subcommand\n\n".to_string() + USAGE);
     };
@@ -831,9 +849,11 @@ fn main() -> ExitCode {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     match run(argv) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            ExitCode::FAILURE
+        Err(failure) => {
+            if !failure.msg.is_empty() {
+                eprintln!("error: {}", failure.msg);
+            }
+            ExitCode::from(failure.code)
         }
     }
 }
