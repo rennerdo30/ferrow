@@ -21,6 +21,31 @@ pub(crate) fn write(path: &std::path::Path, contents: &str) -> io::Result<()> {
     write_owned(path, contents, 0)
 }
 
+/// Whether `path` already holds exactly `contents` as a safe definition: not a
+/// symbolic link, owned by `owner`, mode 0644, a single link, no extra ACL (the
+/// policy `write` enforces). Anything else is not "current", so a repair
+/// rewrites it or refuses it, and never reports it as fine.
+#[cfg(unix)]
+pub(crate) fn is_current(path: &std::path::Path, contents: &str, owner: u32) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return false;
+    };
+    if verify(&file, owner).is_err() {
+        return false;
+    }
+    let mut text = String::new();
+    file.take(contents.len() as u64 + 1)
+        .read_to_string(&mut text)
+        .is_ok()
+        && text == contents
+}
+
 #[cfg(unix)]
 fn verify(file: &std::fs::File, expected: u32) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -94,6 +119,36 @@ mod tests {
                 "accepted an unsafe service definition"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn equal_text_is_current_only_in_a_safe_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!("ferrow-current-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        // SAFETY: credential getter has no preconditions.
+        let owner = unsafe { libc::geteuid() };
+        let path = directory.join("unit");
+        std::fs::write(&path, "exact text").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(is_current(&path, "exact text", owner));
+        assert!(!is_current(&path, "other text", owner), "different text");
+        assert!(!is_current(&path, "exact", owner), "a prefix is not equal");
+        // The same text with a loose mode must be rewritten or refused, never "fine".
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!is_current(&path, "exact text", owner));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Another owner, a second link and a symbolic link are not current either.
+        assert!(!is_current(&path, "exact text", owner.wrapping_add(1)));
+        std::fs::hard_link(&path, directory.join("second-name")).unwrap();
+        assert!(!is_current(&path, "exact text", owner));
+        std::fs::remove_file(directory.join("second-name")).unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(!is_current(&link, "exact text", owner));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[cfg(unix)]

@@ -26,7 +26,7 @@ fn confirm_stopped(
 pub const SERVICE_NAME: &str = "ferrowd";
 /// launchd label / plist base name.
 #[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "com.github.rennerdo30.ferrowd";
+pub(crate) const LAUNCHD_LABEL: &str = "com.github.rennerdo30.ferrowd";
 
 /// The `ferrowd` binary to register: the current executable when
 /// it is `ferrowd`, else a sibling of it.
@@ -62,9 +62,7 @@ fn admin_hint(action: &str, e: &dyn std::fmt::Display) -> String {
 
 #[cfg(windows)]
 pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
-    use windows_service::service::{
-        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
-    };
+    use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     let exe = crate::protection::install_binary(&ferrowd_exe()?).map_err(|e| e.to_string())?;
@@ -85,35 +83,56 @@ pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
             "service {SERVICE_NAME} is already installed; uninstall it before installing the protected executable"
         ));
     }
-    let info = ServiceInfo {
+    let info = service_info(exe, index, roots)?;
+    let service = manager
+        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+        .map_err(|e| admin_hint("install", &e))?;
+    configure(&service).map_err(|e| admin_hint("install", &e))?;
+    Ok(format!(
+        "service {SERVICE_NAME} installed (LocalSystem, automatic start). Start it with: sc start {SERVICE_NAME}"
+    ))
+}
+
+/// The registration `install` creates (and `repair` restores): the fixed
+/// installed binary, LocalSystem (no account named), automatic start.
+#[cfg(windows)]
+pub(crate) fn service_info(
+    exe: PathBuf,
+    index: PathBuf,
+    roots: &[PathBuf],
+) -> Result<windows_service::service::ServiceInfo, String> {
+    use windows_service::service::{
+        ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--run-as-service".into(),
+        "--service-endpoint".into(),
+        "--index".into(),
+        index.into_os_string(),
+    ];
+    // No roots: every local fixed drive (see ferrowd's main).
+    for root in roots {
+        let root = std::path::absolute(root).map_err(|e| e.to_string())?;
+        args.push("--root".into());
+        args.push(root.into_os_string());
+    }
+    Ok(ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: "Ferrow index service".into(),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe,
-        launch_arguments: {
-            let mut args: Vec<std::ffi::OsString> = vec![
-                "--run-as-service".into(),
-                "--service-endpoint".into(),
-                "--index".into(),
-                index.into_os_string(),
-            ];
-            // No roots: every local fixed drive (see ferrowd's main).
-            for root in roots {
-                let root = std::path::absolute(root).map_err(|e| e.to_string())?;
-                args.push("--root".into());
-                args.push(root.into_os_string());
-            }
-            args
-        },
+        launch_arguments: args,
         dependencies: vec![],
         account_name: None, // LocalSystem
         account_password: None,
-    };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .map_err(|e| admin_hint("install", &e))?;
+    })
+}
+
+/// Description and crash-restart actions of a registered service.
+#[cfg(windows)]
+pub(crate) fn configure(service: &windows_service::service::Service) -> Result<(), String> {
     let _ = service
         .set_description("Indexes file names and answers Ferrow searches over a local pipe.");
     // Restart after a crash: 5 s, 15 s, then 60 s; the count resets daily.
@@ -130,10 +149,7 @@ pub fn install(roots: &[std::path::PathBuf]) -> Result<String, String> {
             command: None,
             actions: Some(vec![restart(5), restart(15), restart(60)]),
         })
-        .map_err(|e| admin_hint("install", &e))?;
-    Ok(format!(
-        "service {SERVICE_NAME} installed (LocalSystem, automatic start). Start it with: sc start {SERVICE_NAME}"
-    ))
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
@@ -220,17 +236,41 @@ pub fn uninstall() -> Result<String, String> {
 const SYSTEMD_TEMPLATE: &str = "[Unit]\nDescription=Ferrow file-name index service\nAfter=local-fs.target\nWants=local-fs.target\n\n[Service]\nType=simple\nExecStart=@FERROWD@ --service-endpoint --index /var/lib/ferrow/index.bin\nRestart=on-failure\nRestartSec=2s\n# Only the capabilities the indexer needs: read every directory\n# (live backends in later milestones use CAP_SYS_ADMIN).\nCapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN\nAmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN\nRuntimeDirectory=ferrow\nStateDirectory=ferrow\nStateDirectoryMode=0700\n# Hardening. ProtectHome stays off: indexing home directories is\n# the point. Writes are confined to the state directory.\nProtectSystem=strict\nReadWritePaths=/var/lib/ferrow\nPrivateTmp=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectControlGroups=true\nLockPersonality=true\nRestrictSUIDSGID=true\nRestrictRealtime=true\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(target_os = "linux")]
-fn systemd_unit() -> String {
+pub(crate) fn systemd_unit() -> String {
     SYSTEMD_TEMPLATE.replace("@FERROWD@", "\"/usr/local/libexec/ferrow/ferrowd\"")
 }
 
 #[cfg(target_os = "linux")]
-const UNIT_PATH: &str = "/etc/systemd/system/ferrowd.service";
+pub(crate) const UNIT_PATH: &str = "/etc/systemd/system/ferrowd.service";
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn command(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+pub(crate) fn command(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    command_within(program, args, std::time::Duration::from_secs(10))
+}
+
+/// The manager tool by absolute path: an elevated process never searches PATH.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn manager_tool(name: &str) -> String {
+    let candidates: &[&str] = match name {
+        "systemctl" => &["/usr/bin/systemctl", "/bin/systemctl"],
+        "launchctl" => &["/bin/launchctl", "/usr/bin/launchctl"],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .map_or_else(|| name.to_string(), |path| (*path).to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn command_within(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(program)
+    let program = manager_tool(program);
+    let mut child = std::process::Command::new(&program)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -253,7 +293,7 @@ fn command(program: &str, args: &[&str]) -> Result<std::process::Output, String>
             .read_to_end(&mut bytes)
             .map(|_| bytes)
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
@@ -288,7 +328,7 @@ fn command(program: &str, args: &[&str]) -> Result<std::process::Output, String>
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
+pub(crate) fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
     let out = command(program, args)?;
     if out.status.success() {
         Ok(())
@@ -399,15 +439,15 @@ pub fn uninstall() -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_plist() -> String {
+pub(crate) fn launchd_plist() -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCHD_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--service-endpoint</string>\n\t\t<string>--index</string>\n\t\t<string>/private/var/lib/ferrow/index.bin</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>WorkingDirectory</key>\n\t<string>/private/var/lib/ferrow</string>\n\t<key>StandardOutPath</key>\n\t<string>/var/log/ferrowd.log</string>\n\t<key>StandardErrorPath</key>\n\t<string>/var/log/ferrowd.log</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>Label</key>\n\t<string>{LAUNCHD_LABEL}</string>\n\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{}</string>\n\t\t<string>--service-endpoint</string>\n\t\t<string>--index</string>\n\t\t<string>/private/var/lib/ferrow/index.bin</string>\n\t</array>\n\t<key>RunAtLoad</key>\n\t<true/>\n\t<key>KeepAlive</key>\n\t<true/>\n\t<key>ExitTimeOut</key>\n\t<integer>60</integer>\n\t<key>WorkingDirectory</key>\n\t<string>/private/var/lib/ferrow</string>\n\t<key>StandardOutPath</key>\n\t<string>/var/log/ferrowd.log</string>\n\t<key>StandardErrorPath</key>\n\t<string>/var/log/ferrowd.log</string>\n</dict>\n</plist>\n",
         "/usr/local/libexec/ferrow/ferrowd"
     )
 }
 
 #[cfg(target_os = "macos")]
-fn plist_path() -> String {
+pub(crate) fn plist_path() -> String {
     format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist")
 }
 

@@ -21,7 +21,7 @@ pub use metadata::{
     timestamp_ticks,
 };
 
-pub use persist::{LoadError, LoadTimings, MetadataLoad, SaveError};
+pub use persist::{LoadError, LoadTimings, MetadataLoad, SaveError, VERIFY_BUFFER, Verified};
 
 /// Entry flag bits stored in the `flags` column.
 pub mod flags {
@@ -238,6 +238,13 @@ impl Index {
     /// Load from the versioned binary format. See [`persist`].
     pub fn load(path: &std::path::Path) -> Result<Index, LoadError> {
         persist::load(path)
+    }
+
+    /// Check a saved index without decoding it: header, length and the
+    /// whole-file checksum over bounded reads (memory use is
+    /// [`VERIFY_BUFFER`], not the index). See [`persist::Verified`].
+    pub fn verify_file(path: &std::path::Path) -> Result<Verified, LoadError> {
+        persist::verify_file(path)
     }
 
     /// Load with an additive timing breakdown (read, checksum,
