@@ -652,6 +652,9 @@ pub struct Actions {
     pub repair: Can,
 }
 
+/// Why nothing can be done while the service starts or stops.
+pub const CHANGING: &str = "It is changing state. Wait a moment.";
+
 pub const NEEDS_INSTALLED: &str = "Needs the Setup-installed Ferrow. Use the command below.";
 
 pub fn actions(snap: Option<&Snapshot>, can_elevate: bool, busy: bool) -> Actions {
@@ -689,10 +692,12 @@ pub fn actions(snap: Option<&Snapshot>, can_elevate: bool, busy: bool) -> Action
         restart: match state {
             ScmState::NotInstalled => Can::No("The service isn't installed."),
             _ if stopped => Can::No("It is stopped. Use Start."),
-            _ if transitional => Can::No("It is changing state. Wait a moment."),
+            _ if transitional => Can::No(CHANGING),
             _ => admin(true, ""),
         },
         rescan: match &snap.health {
+            // The manager's word wins over a report that is about to be stale.
+            _ if transitional => Can::No(CHANGING),
             HealthView::Report(h) if h.scanning => Can::No("A scan is running already."),
             HealthView::Report(h) if h.volumes.iter().any(|v| v.rescan_pending.is_some()) => {
                 Can::No("A rescan is queued already (see the volumes).")
@@ -706,7 +711,7 @@ pub fn actions(snap: Option<&Snapshot>, can_elevate: bool, busy: bool) -> Action
             HealthView::NoAnswer => Can::No("The service isn't running."),
         },
         repair: if transitional {
-            Can::No("It is changing state. Wait a moment.")
+            Can::No(CHANGING)
         } else {
             admin(true, "")
         },
