@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrow_index::osname::name_to_bytes;
@@ -83,6 +83,100 @@ impl ScanReport {
             self.errors,
             self.elapsed.as_secs_f64()
         )
+    }
+}
+
+/// Entries a thread counts locally before it publishes them to
+/// [`ScanProgress`]: the shared counter is touched once per 4,096 entries (or
+/// once per directory, whichever comes first), never per entry.
+pub const PROGRESS_BATCH: u32 = 4096;
+/// Every this many directories one of them is recorded as the scan location.
+const LOCATION_EVERY: u64 = 64;
+
+/// What a running scan has done so far, for a progress display. The scan
+/// writes it in batches (see [`PROGRESS_BATCH`]); a reader samples it from
+/// any thread, for example twice a second.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    entries: AtomicU64,
+    dirs: AtomicU64,
+    location: Mutex<PathBuf>,
+}
+
+impl ScanProgress {
+    pub fn new() -> ScanProgress {
+        ScanProgress::default()
+    }
+
+    /// Entries found so far (lags the true count by less than one batch per
+    /// walking thread).
+    pub fn entries(&self) -> u64 {
+        self.entries.load(Ordering::Relaxed)
+    }
+
+    /// A recently scanned directory (empty before the first one).
+    pub fn location(&self) -> PathBuf {
+        self.location
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_location(&self, dir: &Path) {
+        if let Ok(mut l) = self.location.lock() {
+            dir.clone_into(&mut l);
+        }
+    }
+
+    /// One directory entered: only every 64th is recorded, so the lock is
+    /// taken rarely.
+    fn enter_dir(&self, dir: &Path) {
+        if self
+            .dirs
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(LOCATION_EVERY)
+        {
+            self.set_location(dir);
+        }
+    }
+}
+
+/// A thread-local count of new entries, published in batches.
+struct Batch<'a> {
+    progress: Option<&'a ScanProgress>,
+    pending: u32,
+}
+
+impl<'a> Batch<'a> {
+    fn new(progress: Option<&'a ScanProgress>) -> Batch<'a> {
+        Batch {
+            progress,
+            pending: 0,
+        }
+    }
+
+    /// One entry added.
+    #[inline]
+    fn add(&mut self) {
+        self.pending += 1;
+        if self.pending >= PROGRESS_BATCH {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending > 0
+            && let Some(p) = self.progress
+        {
+            p.entries.fetch_add(u64::from(self.pending), Ordering::Relaxed);
+        }
+        self.pending = 0;
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -354,6 +448,7 @@ struct Walker<'a> {
     excludes: &'a ExcludeSet,
     follow_symlinks: bool,
     errors: &'a Errors,
+    progress: Option<&'a ScanProgress>,
 }
 
 impl<'x> Walker<'x> {
@@ -442,6 +537,10 @@ impl<'x> Walker<'x> {
     ) where
         'x: 'scope,
     {
+        if let Some(p) = self.progress {
+            p.enter_dir(&dir);
+        }
+        let mut batch = Batch::new(self.progress);
         let read = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -517,6 +616,7 @@ impl<'x> Walker<'x> {
             let id = self
                 .builder
                 .add_with_metadata(dir_id, &name, ent_flags, metadata);
+            batch.add();
             if is_dir {
                 let mut child_ancestors = ancestors.clone();
                 if self.follow_symlinks {
@@ -590,6 +690,23 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
 /// [`scan`], also returning the record-to-entry maps of every volume
 /// that was read through its MFT.
 pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMap>) {
+    scan_inner(options, None)
+}
+
+/// [`scan`], publishing its progress to `progress` as it runs (read it from
+/// another thread; see [`ScanProgress`]).
+pub fn scan_with_progress(
+    options: &WalkOptions,
+    progress: &ScanProgress,
+) -> (Index, ScanReport) {
+    let (index, report, _) = scan_inner(options, Some(progress));
+    (index, report)
+}
+
+fn scan_inner(
+    options: &WalkOptions,
+    progress: Option<&ScanProgress>,
+) -> (Index, ScanReport, Vec<VolumeMap>) {
     let started = Instant::now();
     let builder = IndexBuilder::with_columns(options.columns);
     let errors = Errors::new();
@@ -618,6 +735,7 @@ pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMa
         excludes: &excludes,
         follow_symlinks: options.follow_symlinks,
         errors: &errors,
+        progress,
     };
 
     // Roots are added sequentially (cheap), their subtrees in parallel.
@@ -956,6 +1074,10 @@ fn emit_mft_subtree(
 ) -> usize {
     let excluding = !walker.excludes.is_empty();
     let mut added = 0usize;
+    let mut batch = Batch::new(walker.progress);
+    if let Some(p) = walker.progress {
+        p.set_location(root_path);
+    }
     // Paths are only needed to resolve link targets against excludes.
     let mut stack: Vec<(u64, u32, Option<PathBuf>)> =
         vec![(record, root_id, excluding.then(|| root_path.to_path_buf()))];
@@ -996,6 +1118,7 @@ fn emit_mft_subtree(
             );
             added += 1;
             pairs.push((name.record, id));
+            batch.add();
             if is_dir {
                 stack.push((name.record, id, child_path));
             }
@@ -1890,5 +2013,69 @@ mod tests {
                 "IGNORED permission-denial assertions: process can read mode-000 directory (privileged execution or filesystem ignores mode bits)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn entries_reach_the_shared_counter_in_batches_not_one_by_one() {
+        let progress = ScanProgress::new();
+        let mut batch = Batch::new(Some(&progress));
+        for _ in 0..PROGRESS_BATCH - 1 {
+            batch.add();
+        }
+        assert_eq!(progress.entries(), 0, "nothing is published mid-batch");
+        batch.add();
+        assert_eq!(progress.entries(), u64::from(PROGRESS_BATCH));
+        for _ in 0..10 {
+            batch.add();
+        }
+        assert_eq!(progress.entries(), u64::from(PROGRESS_BATCH));
+        drop(batch);
+        assert_eq!(
+            progress.entries(),
+            u64::from(PROGRESS_BATCH) + 10,
+            "the rest is published when the directory ends"
+        );
+    }
+
+    #[test]
+    fn only_every_64th_directory_takes_the_location_lock() {
+        let progress = ScanProgress::new();
+        progress.enter_dir(Path::new("first"));
+        assert_eq!(progress.location(), PathBuf::from("first"));
+        for n in 1..LOCATION_EVERY {
+            progress.enter_dir(Path::new(&format!("skipped-{n}")));
+        }
+        assert_eq!(progress.location(), PathBuf::from("first"));
+        progress.enter_dir(Path::new("sixty-fifth"));
+        assert_eq!(progress.location(), PathBuf::from("sixty-fifth"));
+    }
+
+    #[test]
+    fn a_scan_ends_with_the_full_count_and_a_location() {
+        let root = std::env::temp_dir().join(format!("ferrow-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in 0..5 {
+            let dir = root.join(format!("d{d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..7 {
+                std::fs::write(dir.join(format!("f{f}.txt")), b"x").unwrap();
+            }
+        }
+        let progress = ScanProgress::new();
+        let options = WalkOptions {
+            roots: vec![root.clone()],
+            ..WalkOptions::default()
+        };
+        let (index, report) = scan_with_progress(&options, &progress);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(report.entries, index.len());
+        // The root entry itself is added before the walk starts.
+        assert_eq!(progress.entries() as usize, index.len() - 1);
+        assert!(!progress.location().as_os_str().is_empty());
     }
 }

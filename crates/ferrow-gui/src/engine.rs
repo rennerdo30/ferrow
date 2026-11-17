@@ -26,6 +26,38 @@ const SERVICE_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// up to five times a second, and each report re-runs the search.
 const LIVE_COALESCE: Duration = Duration::from_millis(500);
 
+/// The UI hears about a running scan at most this often (and so repaints at
+/// most this often while it runs).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Report the scan's progress twice a second until `done`. The walk itself
+/// only bumps batched counters; this thread does the timing.
+fn spawn_progress_ticker(
+    commands: Sender<Command>,
+    progress: Arc<ferrow_walk::ScanProgress>,
+    done: Arc<AtomicBool>,
+    started: Instant,
+) {
+    let _ = std::thread::Builder::new()
+        .name("ferrow-scan-progress".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(PROGRESS_INTERVAL);
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                let event = Event::ScanProgress {
+                    entries: progress.entries(),
+                    location: progress.location().display().to_string(),
+                    elapsed: started.elapsed(),
+                };
+                if commands.send(Command::Forward(event)).is_err() {
+                    return;
+                }
+            }
+        });
+}
+
 /// Take the single service-probe slot; false when a probe already runs.
 fn claim_probe(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::AcqRel)
@@ -99,11 +131,24 @@ pub enum Event {
         source: String,
     },
     /// No saved index exists yet.
-    NoIndex { path: Option<PathBuf> },
+    NoIndex,
     /// Loading or scanning failed.
     Failed(String),
     /// A scan started (the UI shows progress text).
     Scanning(String),
+    /// How far the running scan is (at most twice a second).
+    ScanProgress {
+        entries: u64,
+        /// A folder recently scanned.
+        location: String,
+        elapsed: Duration,
+    },
+    /// The Ferrow service cannot be used, so the app searches its own
+    /// index: why.
+    ServiceGap(ServiceGap),
+    /// The service answered before and stopped; the engine continues with
+    /// the app's own index. `error` is the raw cause, for a tooltip.
+    ServiceLost { error: String },
     /// Results for query generation `generation`. `complete` is false
     /// for the fast first page that precedes the full list.
     Results {
@@ -161,6 +206,27 @@ enum Command {
     /// The Ferrow service answers now (it started after the app or came
     /// back after a restart): switch to it.
     ServiceUp,
+}
+
+/// Why the Ferrow service is not used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceGap {
+    /// Not installed or not running (nothing answers).
+    NotRunning,
+    /// It runs but does not allow this account.
+    Refused,
+}
+
+/// Tell "the service refuses this account" from "no service" by the error
+/// a connect or status call returned.
+pub fn service_gap(error: &std::io::Error) -> ServiceGap {
+    if ferrow_ipc::error_code(error) == Some(ferrow_ipc::ErrorCode::Unauthorized)
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        ServiceGap::Refused
+    } else {
+        ServiceGap::NotRunning
+    }
 }
 
 /// Handle owned by the UI.
@@ -409,11 +475,11 @@ impl<W: Fn()> Worker<W> {
 
     fn load_default(&mut self) {
         let Some(path) = default_index_path() else {
-            self.send(Event::NoIndex { path: None });
+            self.send(Event::NoIndex);
             return;
         };
         if !path.exists() {
-            self.send(Event::NoIndex { path: Some(path) });
+            self.send(Event::NoIndex);
             return;
         }
         let started = Instant::now();
@@ -453,7 +519,11 @@ impl<W: Fn()> Worker<W> {
             .name("ferrow-scan".into())
             .spawn(move || {
                 let started = Instant::now();
-                let (index, report) = ferrow_walk::scan(&options);
+                let progress = Arc::new(ferrow_walk::ScanProgress::new());
+                let done = Arc::new(AtomicBool::new(false));
+                spawn_progress_ticker(commands.clone(), progress.clone(), done.clone(), started);
+                let (index, report) = ferrow_walk::scan_with_progress(&options, &progress);
+                done.store(true, Ordering::Release);
                 if let Some(fatal) = report.fatal_error {
                     let _ = commands.send(Command::Forward(Event::Failed(fatal)));
                     return;
@@ -491,11 +561,19 @@ impl<W: Fn()> Worker<W> {
             client.clear_deadline();
             std::io::Result::Ok(client)
         };
-        let Ok(mut client) = connect() else {
-            return false;
+        let mut client = match connect() {
+            Ok(client) => client,
+            Err(e) => {
+                self.send(Event::ServiceGap(service_gap(&e)));
+                return false;
+            }
         };
-        let Ok((entries, _mode, report)) = client.status() else {
-            return false;
+        let (entries, _mode, report) = match client.status() {
+            Ok(status) => status,
+            Err(e) => {
+                self.send(Event::ServiceGap(service_gap(&e)));
+                return false;
+            }
         };
         self.remote = Some(Remote {
             client,
@@ -535,9 +613,9 @@ impl<W: Fn()> Worker<W> {
     /// The service stopped answering: continue with the app's own index.
     fn service_lost(&mut self, error: std::io::Error) {
         self.remote = None;
-        self.send(Event::Failed(format!(
-            "The Ferrow service stopped answering ({error}); using this app's own index."
-        )));
+        self.send(Event::ServiceLost {
+            error: error.to_string(),
+        });
         self.load_default();
         self.probe_service();
     }
@@ -1149,5 +1227,37 @@ mod tests {
             Ok(Event::QueryError { generation: 7, .. }) => {}
             _ => panic!("expected a query error"),
         }
+    }
+
+    /// An `Unauthorized` answer to the status request is its own state: the
+    /// service runs but refuses this account. On the base commit it was
+    /// treated exactly like "no service".
+    #[test]
+    fn an_unauthorized_status_means_refused_not_missing() {
+        let refused = ferrow_ipc::server_error(
+            ferrow_ipc::ErrorCode::Unauthorized,
+            "the system service answers SYSTEM and administrators",
+        );
+        assert_eq!(service_gap(&refused), ServiceGap::Refused);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(service_gap(&denied), ServiceGap::Refused);
+    }
+
+    #[test]
+    fn nothing_answering_means_not_running() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert_eq!(
+                service_gap(&std::io::Error::from(kind)),
+                ServiceGap::NotRunning
+            );
+        }
+        // A server error that is not about access is not a refusal.
+        let busy = ferrow_ipc::server_error(ferrow_ipc::ErrorCode::Internal, "busy");
+        assert_eq!(service_gap(&busy), ServiceGap::NotRunning);
     }
 }

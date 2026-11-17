@@ -51,6 +51,43 @@ fn io_invalid(msg: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
+/// An error the server answered with, kept typed inside the `io::Error` a
+/// client call returns (kind `InvalidData`, the same text as before), so a
+/// caller can tell "this account is refused" from "no service".
+#[derive(Debug)]
+struct ServerError {
+    code: ErrorCode,
+    msg: String,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server error ({:?}): {}", self.code, self.msg)
+    }
+}
+
+impl std::error::Error for ServerError {}
+
+/// The `io::Error` a client call returns for a server `Error` response.
+pub fn server_error(code: ErrorCode, msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        ServerError {
+            code,
+            msg: msg.into(),
+        },
+    )
+}
+
+/// The server's error code inside an error returned by a [`Client`] call,
+/// or `None` for transport and protocol errors.
+pub fn error_code(error: &std::io::Error) -> Option<ErrorCode> {
+    error
+        .get_ref()?
+        .downcast_ref::<ServerError>()
+        .map(|e| e.code)
+}
+
 fn version_mismatch(peer: u16) -> Message {
     Message::Response(Response::Error {
         code: ErrorCode::VersionMismatch,
@@ -286,9 +323,7 @@ impl<S: DeadlineIo> Client<S> {
 
     fn check(response: Response) -> std::io::Result<Response> {
         match response {
-            Response::Error { code, msg } => {
-                Err(io_invalid(format!("server error ({code:?}): {msg}")))
-            }
+            Response::Error { code, msg } => Err(server_error(code, msg)),
             other => Ok(other),
         }
     }
@@ -494,5 +529,25 @@ impl<S: DeadlineIo> Client<S> {
     /// The underlying stream (for example to shut it down).
     pub fn into_inner(self) -> S {
         self.stream
+    }
+}
+
+#[cfg(test)]
+mod server_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_server_error_keeps_its_code_and_text() {
+        let e = server_error(ErrorCode::Unauthorized, "not allowed");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(e.to_string(), "server error (Unauthorized): not allowed");
+        assert_eq!(error_code(&e), Some(ErrorCode::Unauthorized));
+    }
+
+    #[test]
+    fn other_errors_have_no_server_code() {
+        assert_eq!(error_code(&io_invalid("bad frame".into())), None);
+        let gone = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(error_code(&gone), None);
     }
 }

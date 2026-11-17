@@ -2,8 +2,8 @@
 //! the system light/dark setting and accent colour.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
-    TextStyle, Visuals,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Margin,
+    Stroke, TextStyle, Visuals,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,6 +77,92 @@ fn load(path: &PathBuf) -> Option<Arc<FontData>> {
     Some(Arc::new(FontData::from_owned(bytes)))
 }
 
+/// A fallback font file (CJK, symbols), with its glyphs moved vertically so
+/// they sit on the same baseline as the UI font's. egui puts a fallback
+/// face's baseline from that face's own ascent and height, so a CJK face
+/// taller than Segoe UI (Yu Gothic) drew its characters raised above the
+/// Latin text next to them.
+fn load_fallback(path: &PathBuf, primary: Option<VerticalMetrics>) -> Option<Arc<FontData>> {
+    let bytes = std::fs::read(path).ok()?;
+    let shift = primary
+        .zip(VerticalMetrics::read(&bytes))
+        .map_or(0.0, |(p, face)| baseline_shift(p, face));
+    let tweak = FontTweak {
+        y_offset_factor: shift,
+        ..FontTweak::default()
+    };
+    Some(Arc::new(FontData::from_owned(bytes).tweak(tweak)))
+}
+
+/// A font's vertical metrics in em: ascent, descent (negative) and line gap,
+/// as egui reads them (the `hhea` table, or the `OS/2` typo metrics when the
+/// font asks for them or has no `hhea` values).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VerticalMetrics {
+    ascent: f32,
+    descent: f32,
+    line_gap: f32,
+}
+
+impl VerticalMetrics {
+    /// From the first face of a `.ttf`, `.otf` or `.ttc` file.
+    fn read(bytes: &[u8]) -> Option<VerticalMetrics> {
+        let u16_at = |at: usize| Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+        let i16_at = |at: usize| u16_at(at).map(|v| v as i16);
+        let u32_at = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+        let start = if bytes.get(..4)? == b"ttcf" {
+            u32_at(12)? as usize
+        } else {
+            0
+        };
+        let table = |tag: &[u8; 4]| {
+            let count = u16_at(start + 4)? as usize;
+            (0..count).find_map(|i| {
+                let record = start + 12 + i * 16;
+                if bytes.get(record..record + 4)? == tag {
+                    u32_at(record + 8).map(|o| o as usize)
+                } else {
+                    None
+                }
+            })
+        };
+        let em = f32::from(u16_at(table(b"head")? + 18)?);
+        if em <= 0.0 {
+            return None;
+        }
+        let (mut asc, mut desc, mut gap) = (0, 0, 0);
+        if let Some(hhea) = table(b"hhea") {
+            (asc, desc, gap) = (i16_at(hhea + 4)?, i16_at(hhea + 6)?, i16_at(hhea + 8)?);
+        }
+        if let Some(os2) = table(b"OS/2") {
+            let use_typo = u16_at(os2 + 62).is_some_and(|f| f & (1 << 7) != 0);
+            if use_typo || (asc == 0 && desc == 0) {
+                (asc, desc, gap) = (i16_at(os2 + 68)?, i16_at(os2 + 70)?, i16_at(os2 + 72)?);
+                if asc == 0 && desc == 0 {
+                    (asc, desc) = (u16_at(os2 + 74)? as i16, -(u16_at(os2 + 76)? as i16));
+                }
+            }
+        }
+        Some(VerticalMetrics {
+            ascent: f32::from(asc) / em,
+            descent: f32::from(desc) / em,
+            line_gap: f32::from(gap) / em,
+        })
+    }
+
+    fn height(self) -> f32 {
+        self.ascent - self.descent + self.line_gap
+    }
+}
+
+/// How far (in em, down is positive) to move a fallback face so its baseline
+/// matches the primary face's. egui puts a face's baseline at its ascent,
+/// plus half the difference between the primary's and the face's height.
+fn baseline_shift(primary: VerticalMetrics, face: VerticalMetrics) -> f32 {
+    let baseline = |m: VerticalMetrics| m.ascent + 0.5 * (primary.height() - m.height());
+    baseline(primary) - baseline(face)
+}
+
 /// Install the OS UI font. Returns an error when no usable font exists;
 /// egui ships no font of its own in this build (licence policy).
 pub fn install_fonts(ctx: &egui::Context) -> Result<(), String> {
@@ -86,10 +172,11 @@ pub fn install_fonts(ctx: &egui::Context) -> Result<(), String> {
         .iter()
         .find_map(load)
         .ok_or_else(|| format!("no UI font found (looked for {})", regular[0].display()))?;
+    let primary = VerticalMetrics::read((*regular_data.font).as_ref());
     defs.font_data.insert("ui".into(), regular_data);
     let mut chain = vec!["ui".to_owned()];
     for (i, path) in fallback.iter().enumerate() {
-        if let Some(data) = load(path) {
+        if let Some(data) = load_fallback(path, primary) {
             let name = format!("fallback-{i}");
             defs.font_data.insert(name.clone(), data);
             chain.push(name);

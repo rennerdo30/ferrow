@@ -512,6 +512,27 @@ impl<'a> Session<'a> {
         self.fix_timing();
     }
 
+    /// The Ferrow service answers and the list shows its results for
+    /// "report" (live, all drives).
+    fn service_results(&mut self) {
+        self.send(Event::Remote {
+            entries: 18_422_907,
+            report: "NTFS journal, 3 volumes".into(),
+        });
+        self.frames(3);
+        self.app().query = "report".into();
+        self.frames(2);
+        self.send(Event::Results {
+            generation: 1,
+            hits: engine::service_hits_for_test(1, 2_413, service_rows()),
+            complete: true,
+            elapsed: Duration::from_micros(900),
+            sort_pending: false,
+            sort_unavailable: false,
+        });
+        self.frames(3);
+    }
+
     /// Search times are the only non-deterministic text; pin them.
     fn fix_timing(&mut self) {
         let app = self.app();
@@ -755,18 +776,20 @@ fn capture_all(out: &Path) {
             let mut s = new(true);
             s.frames(2);
             s.save(1, "loading");
-            s.send(Event::NoIndex {
-                path: Some(PathBuf::from(
-                    r"C:\Users\Alex\AppData\Local\ferrow\index.bin",
-                )),
-            });
+            s.send(Event::NoIndex);
             s.frames(3);
             s.save(2, "first-start");
 
-            // 03 Indexing in progress (no search yet).
+            // 03 Indexing in progress (no search yet), with the engine's
+            // progress report.
             s.send(Event::Scanning(
                 r"Indexing C:\Users\Alex, D:\, \\nas\media\photos…".into(),
             ));
+            s.send(Event::ScanProgress {
+                entries: 1_204_331,
+                location: r"D:\Projects\client-portal\packages\reporting-service\src\internal\platform\windows".into(),
+                elapsed: Duration::from_secs(12),
+            });
             s.frames(3);
             s.save(3, "indexing");
 
@@ -789,45 +812,100 @@ fn capture_all(out: &Path) {
             s.query("zzqx quarterly");
             s.save(7, "no-results");
 
-            // 08 A query that does not parse (unbalanced group).
+            // 08 A query that does not parse (unbalanced group) while typing:
+            // the last results stay, dimmed, and the message is inline.
             let mut s = new(true);
             s.loaded();
+            s.query("report");
             s.query("<report | invoice");
             s.save(8, "query-error");
 
-            // 09 Failed: the service stopped answering, app falls back.
+            // 09 The service stopped answering: the results stay, a notice
+            // bar explains, the app continues with its own index.
             let mut s = new(false);
-            s.send(Event::Remote {
-                entries: 18_422_907,
-                report: "NTFS journal, 3 volumes".into(),
+            s.service_results();
+            s.send(Event::ServiceLost {
+                error: "The pipe has been ended. (os error 109)".into(),
             });
-            s.frames(3);
-            s.send(Event::Failed(
-                "The Ferrow service stopped answering (the pipe has been ended. (os error 109)); using this app's own index."
-                    .into(),
-            ));
             s.frames(3);
             s.save(9, "service-lost");
 
             // 10 Results from the Ferrow service (live, all drives).
             let mut s = new(false);
-            s.send(Event::Remote {
-                entries: 18_422_907,
-                report: "NTFS journal, 3 volumes".into(),
-            });
-            s.frames(3);
-            s.app().query = "report".into();
-            s.frames(2);
-            s.send(Event::Results {
-                generation: 1,
-                hits: engine::service_hits_for_test(1, 2_413, service_rows()),
-                complete: true,
-                elapsed: Duration::from_micros(900),
-                sort_pending: false,
-                sort_unavailable: false,
-            });
-            s.frames(3);
+            s.service_results();
             s.save(10, "service-results");
+
+            // 24 The service refuses this account: own index, with the
+            // reason in the chip.
+            let mut s = new(true);
+            s.send(Event::ServiceGap(engine::ServiceGap::Refused));
+            s.loaded();
+            s.query("report");
+            s.save(24, "service-refused");
+
+            // 25 No results for a search with filters.
+            let mut s = new(true);
+            s.loaded();
+            s.query("zzqx quarterly ext:pdf dm:today");
+            s.save(25, "no-results-filters");
+
+            // 26 Rebuilding while the current index stays searchable:
+            // progress only in the status chip.
+            let mut s = new(true);
+            s.loaded();
+            s.query("report");
+            s.send(Event::Scanning(
+                r"Indexing C:\Users\Alex, D:\, \\nas\media\photos…".into(),
+            ));
+            s.send(Event::ScanProgress {
+                entries: 1_204_331,
+                location: r"D:\Projects\ferrow\crates".into(),
+                elapsed: Duration::from_secs(12),
+            });
+            s.frames(3);
+            s.save(26, "indexing-rebuild");
+
+            // 27 First start when the service refuses this account.
+            let mut s = new(true);
+            s.send(Event::ServiceGap(engine::ServiceGap::Refused));
+            s.send(Event::NoIndex);
+            s.frames(3);
+            s.save(27, "first-start-refused");
+
+            // 28 Japanese text in the Folder and Name columns sits on the
+            // same baseline as the Latin text.
+            let mut s = new(true);
+            s.loaded();
+            s.query("Track 1");
+            s.save(28, "japanese-rows");
+
+            // 29 Long names keep their extension; long paths keep the drive
+            // and the last folders.
+            let mut s = new(true);
+            s.loaded();
+            s.query("Annual report");
+            s.save(29, "long-names-and-paths");
+        }
+    }
+
+    // Menus and panels: both sizes (the syntax panel must fit the narrow
+    // window).
+    for look in Look::BOTH {
+        for size in [WIDE, NARROW] {
+            let new = |with_index| Session::new(look, size, out, &index, with_index);
+
+            // 14 Column chooser (right-click on the header).
+            let mut s = new(true);
+            s.loaded();
+            s.query("report");
+            s.open_column_menu();
+            s.save(14, "column-menu");
+
+            // 15 Search syntax help.
+            let mut s = new(true);
+            s.loaded();
+            s.open_syntax_help();
+            s.save(15, "syntax-help");
         }
     }
 
@@ -851,19 +929,6 @@ fn capture_all(out: &Path) {
         let hover = s.row_center(2);
         s.hover(hover);
         s.save(13, "row-hover");
-
-        // 14 Column chooser (right-click on the header).
-        let mut s = new(true);
-        s.loaded();
-        s.query("report");
-        s.open_column_menu();
-        s.save(14, "column-menu");
-
-        // 15 Search syntax help.
-        let mut s = new(true);
-        s.loaded();
-        s.open_syntax_help();
-        s.save(15, "syntax-help");
 
         // 16..21 Settings, one picture per section.
         let mut s = new(true);
