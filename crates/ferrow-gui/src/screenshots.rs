@@ -41,6 +41,7 @@ use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder, flags};
 use super::*;
 use crate::access;
 use crate::engine::{self, Event};
+use crate::service::{HealthView, Scm, ScmState, Snapshot, Verb};
 use crate::settings::{AutoRebuild, SortChoice, Source, SourceKind, ThemeChoice};
 use crate::update::UpdateState;
 
@@ -987,6 +988,7 @@ fn capture_all(out: &Path) {
     for look in Look::BOTH {
         for size in [WIDE, NARROW] {
             settings_scenes(look, size, out, &index);
+            health_scenes(look, size, out, &index);
         }
     }
 
@@ -1237,6 +1239,284 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
     crate::update::test_can_install(false);
     s.goto("About");
     s.save(34, "settings-about");
+}
+
+/// Service health (50..71): the service in every state, the details, an
+/// action waiting for the administrator prompt, the repair question, the
+/// events expanded, and the Fast index card pointing here.
+fn health_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::Index>) {
+    use ferrow_ipc::health::{
+        EventInfo, Health, JOURNAL_ERROR, JOURNAL_OK, JOURNAL_RESET, LEVEL_ERROR, LEVEL_INFO,
+        LEVEL_WARN, MODE_LIVE, MODE_UNAVAILABLE, MODE_WALK, RescanInfo, SaveInfo, ScanInfo,
+        VolumeHealth,
+    };
+    access::test_can_elevate(true);
+    settings_page::test_set_now(NOW as u64);
+    let ms = |ago_s: i64| (NOW - ago_s) as u64 * 1000;
+    let scan = |ago_s, why: &str, took_ms| {
+        Some(ScanInfo {
+            at_ms: ms(ago_s),
+            reason: why.into(),
+            took_ms,
+        })
+    };
+    let live = |root: &str, items: u64| VolumeHealth {
+        root: root.into(),
+        mode: MODE_LIVE.into(),
+        entries: Some(items),
+        journal: JOURNAL_OK.into(),
+        last_scan: scan(3 * 86_400 + 4_000, "startup", 38_000),
+        ..VolumeHealth::default()
+    };
+    let walked = VolumeHealth {
+        root: r"E:\Archive".into(),
+        mode: MODE_WALK.into(),
+        journal: "none".into(),
+        last_scan: scan(3 * 86_400 + 3_900, "startup", 5_200),
+        ..VolumeHealth::default()
+    };
+    let event = |ago_s, level: &str, text: &str| EventInfo {
+        at_ms: ms(ago_s),
+        level: level.into(),
+        text: text.into(),
+    };
+    let healthy_report = || Health {
+        version: env!("CARGO_PKG_VERSION").into(),
+        pid: 4120,
+        started_ms: ms(3 * 86_400 + 4_100),
+        now_ms: ms(0),
+        uptime_s: 3 * 86_400 + 4_100,
+        working_set: 612 << 20,
+        private_bytes: Some(540 << 20),
+        entries: 18_422_907,
+        mode: "live".into(),
+        access: "admins".into(),
+        last_save: Some(SaveInfo {
+            at_ms: ms(1_800),
+            ok: true,
+            error: String::new(),
+            took_ms: 2_340,
+        }),
+        volumes: vec![
+            live(r"C:\", 11_204_551),
+            live(r"D:\", 7_218_356),
+            walked.clone(),
+        ],
+        events: vec![
+            event(3 * 86_400 + 4_100, LEVEL_INFO, "Service started."),
+            event(
+                3 * 86_400 + 4_060,
+                LEVEL_INFO,
+                r"Scan of C:\ finished: 11.2 M items in 38 s.",
+            ),
+            event(
+                3 * 86_400 + 4_030,
+                LEVEL_INFO,
+                r"Scan of D:\ finished: 7.2 M items in 22 s.",
+            ),
+            event(
+                2 * 86_400,
+                LEVEL_WARN,
+                r"The change journal of D:\ wrapped; a rescan was queued.",
+            ),
+            event(
+                2 * 86_400 - 60,
+                LEVEL_INFO,
+                r"Rescan of D:\ finished in 24 s.",
+            ),
+            event(86_400 + 300, LEVEL_INFO, "Index saved (2.4 s)."),
+            event(86_400 + 100, LEVEL_INFO, "Index saved (2.2 s)."),
+            event(7_200, LEVEL_INFO, "Index saved (2.5 s)."),
+            event(1_800, LEVEL_INFO, "Index saved (2.3 s)."),
+            event(
+                600,
+                LEVEL_WARN,
+                "Client connections ended with an error (counted, not logged one by one).",
+            ),
+            event(300, LEVEL_INFO, r"Live updates on C:\ and D:\ are running."),
+        ],
+        ..Health::default()
+    };
+    // The service keeps its events oldest first.
+    let up = |mut h: Health| {
+        h.events.sort_by_key(|e| e.at_ms);
+        Snapshot {
+            scm: Scm {
+                state: ScmState::Running,
+                pid: Some(h.pid),
+                start_type: Some(2),
+            },
+            health: HealthView::Report(Box::new(h)),
+        }
+    };
+    let down = |state, health| Snapshot {
+        scm: Scm {
+            state,
+            pid: None,
+            start_type: Some(2),
+        },
+        health,
+    };
+    let mut pending = healthy_report();
+    pending.volumes[1].journal = JOURNAL_RESET.into();
+    pending.volumes[1].rescan_pending = Some(RescanInfo {
+        reason: "journal reset".into(),
+        earliest_ms: ms(-40),
+    });
+    pending.events.push(event(
+        120,
+        LEVEL_WARN,
+        r"The change journal of D:\ was reset; a rescan is queued.",
+    ));
+    let mut lost = healthy_report();
+    lost.volumes[1].mode = MODE_UNAVAILABLE.into();
+    lost.volumes[1].reason = "the change journal could not be opened (access denied)".into();
+    lost.volumes[1].journal = JOURNAL_ERROR.into();
+    lost.volumes[1].journal_detail = "reader stopped 12 min ago".into();
+    lost.events.push(event(
+        700,
+        LEVEL_ERROR,
+        r"Live updates for D:\ stopped: the change journal could not be opened (access denied). Searches on D:\ show the state of the last scan until it is fixed.",
+    ));
+    let mut skew = healthy_report();
+    skew.version = "0.1.0-beta.16".into();
+    let mut many = healthy_report();
+    for n in 0..30 {
+        many.events.push(event(
+            200 - n * 6,
+            if n % 9 == 0 { LEVEL_WARN } else { LEVEL_INFO },
+            &format!("Index saved ({:.1} s).", 2.0 + (n % 5) as f64 / 10.0),
+        ));
+    }
+
+    let mut s = Session::new(look, size, out, index, false);
+    s.settings_page();
+    let shot = |s: &mut Session, snap: Snapshot, number, name: &str| {
+        s.app().service_health.show_for_test(Some(snap), None, None);
+        s.goto("Service health");
+        s.save(number, name);
+    };
+    // Below the first screen: the details, then the volumes and the events.
+    let below = |s: &mut Session, first: u32, name: &str| {
+        let steps: &[f32] = if size == NARROW {
+            &[-300.0, -300.0, -300.0]
+        } else {
+            &[-420.0]
+        };
+        for (n, dy) in steps.iter().enumerate() {
+            s.scroll_by(*dy);
+            s.save(first + n as u32, &format!("{name}-{}", n + 1));
+        }
+    };
+    shot(&mut s, up(healthy_report()), 50, "health-healthy");
+    below(&mut s, 51, "health-healthy-more");
+    shot(&mut s, up(pending), 54, "health-rescan-pending");
+    shot(&mut s, up(lost), 55, "health-live-unavailable");
+    below(&mut s, 56, "health-live-unavailable-more");
+    shot(
+        &mut s,
+        down(ScmState::Stopped, HealthView::NoAnswer),
+        59,
+        "health-stopped",
+    );
+    shot(
+        &mut s,
+        down(ScmState::NotInstalled, HealthView::NoAnswer),
+        60,
+        "health-not-installed",
+    );
+    shot(
+        &mut s,
+        down(ScmState::Running, HealthView::Refused),
+        61,
+        "health-refused",
+    );
+    shot(
+        &mut s,
+        down(ScmState::Running, HealthView::Older),
+        62,
+        "health-older",
+    );
+    shot(&mut s, up(skew), 63, "health-version-mismatch");
+
+    // An action waiting for the administrator prompt, and how actions end.
+    let healthy = Some(up(healthy_report()));
+    let show = |s: &mut Session, busy, notice, number, name: &str| {
+        s.app()
+            .service_health
+            .show_for_test(healthy.clone(), busy, notice);
+        s.goto("Service health");
+        s.save(number, name);
+    };
+    show(
+        &mut s,
+        Some((Verb::Restart, true)),
+        None,
+        64,
+        "health-waiting-admin",
+    );
+    show(
+        &mut s,
+        Some((Verb::Restart, false)),
+        None,
+        65,
+        "health-waiting-service",
+    );
+    let notice = |o, t: &str| Some(access::Notice::new(o, t));
+    show(
+        &mut s,
+        None,
+        notice(access::Outcome::Declined, access::DECLINED_TEXT),
+        66,
+        "health-declined",
+    );
+    show(
+        &mut s,
+        None,
+        notice(
+            access::Outcome::Done,
+            "Restarted. The service is running again.",
+        ),
+        67,
+        "health-done",
+    );
+    show(
+        &mut s,
+        None,
+        notice(
+            access::Outcome::NoChange,
+            "Nothing was started: a scan is running already, or one started in the last minute.",
+        ),
+        68,
+        "health-nothing-started",
+    );
+    // Repair asks first.
+    s.app().service_health.confirm_repair = true;
+    show(&mut s, None, None, 69, "health-repair-confirm");
+    s.app().service_health.confirm_repair = false;
+    // A copy that cannot elevate shows the terminal commands.
+    access::test_can_elevate(false);
+    shot(
+        &mut s,
+        down(ScmState::Stopped, HealthView::NoAnswer),
+        70,
+        "health-stopped-terminal",
+    );
+    access::test_can_elevate(true);
+    // Every event, newest first.
+    s.app().service_health.events_open = true;
+    shot(&mut s, up(many), 71, "health-events-expanded");
+    s.scroll_by(-420.0);
+    s.save(72, "health-events-expanded-more");
+    s.app().service_health.events_open = false;
+    // The Fast index card points here when the service is down.
+    s.app().service_health.show_for_test(
+        Some(down(ScmState::Stopped, HealthView::NoAnswer)),
+        None,
+        None,
+    );
+    s.goto("Fast index");
+    s.save(73, "health-fast-index-link");
 }
 
 /// A scroll request made on the very first frame of a freshly opened

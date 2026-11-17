@@ -10,8 +10,6 @@
 //! that need administrator rights run the fixed `ferrow.exe service <verb>`
 //! through the access card's `runas` path; the service's own answer, not the
 //! exit code, decides whether they worked.
-// The Settings section that draws this follows in the next change.
-#![allow(dead_code)]
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -25,6 +23,8 @@ use crate::access::{self, Notice, Outcome, RunError};
 pub const SERVICE_NAME: &str = "ferrowd";
 const HEALTH_DEADLINE: Duration = Duration::from_millis(1000);
 const STATUS_DEADLINE: Duration = Duration::from_millis(800);
+// Test builds never connect, so the real asks below are not compiled in.
+#[cfg_attr(test, allow(dead_code))]
 const RESCAN_DEADLINE: Duration = Duration::from_secs(2);
 /// The longest gap between two periodic asks while Settings is shown.
 pub const REFRESH: Duration = Duration::from_secs(5);
@@ -47,6 +47,7 @@ pub enum ScmState {
     /// Paused, or a state this app does not know.
     Other,
     /// The service manager could not be asked.
+    #[cfg_attr(test, allow(dead_code))]
     Unknown,
     /// This OS has no service manager the app can ask (Linux, macOS).
     Unsupported,
@@ -232,6 +233,7 @@ fn ask_health(endpoint: &Endpoint) -> HealthView {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 mod scm {
     use super::{SERVICE_NAME, Scm, ScmState};
     use windows_sys::Win32::Foundation::{
@@ -329,6 +331,7 @@ mod scm {
 }
 
 #[cfg(not(windows))]
+#[cfg_attr(test, allow(dead_code))]
 mod scm {
     use super::{Scm, ScmState};
     pub fn query() -> Scm {

@@ -58,6 +58,13 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
     };
     rows.push(("Memory", memory, None));
     rows.push(("Items", super::super::group(h.entries as usize), None));
+    if h.connection_errors > 0 {
+        rows.push((
+            "Connection errors",
+            format!("{} since the service started", h.connection_errors),
+            None,
+        ));
+    }
     rows.push(match &h.last_save {
         None => ("Last save", "not saved yet".to_owned(), None),
         Some(s) if s.ok => (
@@ -261,9 +268,13 @@ fn health_ui(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn) -> HealthOut {
     card(ui, p, |ui| {
         for (label, value, level) in details(h, &snap.scm) {
             ui.horizontal_top(|ui| {
-                ui.add_sized(
+                // A fixed column, text on its left edge.
+                ui.allocate_ui_with_layout(
                     vec2(130.0, 18.0),
-                    egui::Label::new(RichText::new(label).size(13.0).color(p.text_secondary)),
+                    Layout::left_to_right(Align::Min),
+                    |ui| {
+                        ui.label(RichText::new(label).size(13.0).color(p.text_secondary));
+                    },
                 );
                 let color = level.map_or(p.text, |l| tone_color(p, tone(l)));
                 ui.add(egui::Label::new(RichText::new(value).size(13.0).color(color)).wrap());
@@ -318,6 +329,11 @@ fn health_ui(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn) -> HealthOut {
                     });
                 });
             }
+            if h.more_volumes > 0 {
+                ui.add_space(8.0);
+                let more = format!("and {} more volumes, not listed here", h.more_volumes);
+                ui.label(RichText::new(more).size(12.0).color(p.text_secondary));
+            }
         });
     }
     events_card(ui, p, h, &mut out);
@@ -357,18 +373,42 @@ fn events_card(ui: &mut egui::Ui, p: &theme::Palette, h: &Health, out: &mut Heal
                 _ => p.text,
             };
             ui.horizontal_top(|ui| {
-                ui.add_sized(
+                ui.allocate_ui_with_layout(
                     vec2(128.0, 18.0),
-                    egui::Label::new(
-                        RichText::new(when(e.at_ms))
-                            .size(12.0)
-                            .color(p.text_tertiary),
-                    ),
+                    Layout::left_to_right(Align::Min),
+                    |ui| {
+                        let time = RichText::new(when(e.at_ms)).size(12.0);
+                        ui.label(time.color(p.text_tertiary));
+                    },
                 );
                 ui.add(egui::Label::new(RichText::new(&e.text).size(13.0).color(color)).wrap());
             });
         }
     });
+}
+
+/// Which buttons stand on which row when `avail` points are free: as many
+/// per row as fit, in order. (A wrapped row cannot hold disabled buttons.)
+fn button_rows(widths: &[f32], avail: f32, gap: f32) -> Vec<Vec<usize>> {
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut used = 0.0;
+    for (n, width) in widths.iter().enumerate() {
+        let next = if used > 0.0 {
+            used + gap + width
+        } else {
+            *width
+        };
+        if used > 0.0 && next > avail {
+            rows.push(Vec::new());
+            used = *width;
+        } else {
+            used = next;
+        }
+        if let Some(row) = rows.last_mut() {
+            row.push(n);
+        }
+    }
+    rows
 }
 
 /// Buttons (disabled with their reason), the repair confirmation, the
@@ -385,22 +425,40 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
         Can::Yes if accent => ui.add(accent_button(p, label, width, true)).clicked(),
         Can::Yes => ui.add(std_button(p, label, width)).clicked(),
     };
-    ui.horizontal_wrapped(|ui| {
-        if button(ui, "Start", 90.0, acts.start, true) {
-            out.run = Some(Verb::Start);
-        }
-        if button(ui, "Restart", 100.0, acts.restart, false) {
-            out.run = Some(Verb::Restart);
-        }
-        if button(ui, "Rescan now", 120.0, acts.rescan, false) {
-            out.run = Some(Verb::Rescan);
-        }
-        if button(ui, "Repair…", 100.0, acts.repair, false) {
-            out.confirm_repair = true;
-        }
-        let diag = ui.add_enabled(i.snap.is_some(), std_button(p, "Copy diagnostics", 150.0));
-        out.copy |= diag.clicked();
-    });
+    // (label, width, state, primary) in the order they stand.
+    let copy = if i.snap.is_some() {
+        Can::Yes
+    } else {
+        Can::No("Checking the service…")
+    };
+    let items = [
+        ("Start", 90.0, acts.start, true),
+        ("Restart", 100.0, acts.restart, false),
+        ("Rescan now", 120.0, acts.rescan, false),
+        ("Repair…", 100.0, acts.repair, false),
+        ("Copy diagnostics", 150.0, copy, false),
+    ];
+    let shown: Vec<usize> = (0..items.len())
+        .filter(|n| items[*n].2 != Can::Hidden)
+        .collect();
+    let widths: Vec<f32> = shown.iter().map(|n| items[*n].1).collect();
+    let gap = ui.spacing().item_spacing.x;
+    for row in button_rows(&widths, ui.available_width(), gap) {
+        ui.horizontal(|ui| {
+            for at in row {
+                let (label, width, can, primary) = items[shown[at]];
+                if button(ui, label, width, can, primary) {
+                    match shown[at] {
+                        0 => out.run = Some(Verb::Start),
+                        1 => out.run = Some(Verb::Restart),
+                        2 => out.run = Some(Verb::Rescan),
+                        3 => out.confirm_repair = true,
+                        _ => out.copy = true,
+                    }
+                }
+            }
+        });
+    }
     // Why a button is off, visible without hovering (remote desktops).
     if i.snap.is_some() && i.busy.is_none() {
         for (label, can) in [
@@ -468,3 +526,7 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
         dot_row(ui, p, tone, filled, &notice.text, "");
     }
 }
+
+#[cfg(test)]
+#[path = "service_section_tests.rs"]
+mod tests;
