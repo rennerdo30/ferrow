@@ -13,6 +13,7 @@
 //! - [`Client`] and [`serve_stream`]: the handshake and
 //!   request/response plumbing over any stream.
 
+mod account_rules;
 mod dispatch;
 pub mod protocol;
 pub mod transport;
@@ -41,8 +42,8 @@ fn operation<S: DeadlineIo>(stream: &mut S) -> std::io::Result<()> {
 }
 
 pub use protocol::{
-    Envelope, ErrorCode, FileRow, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, ProtocolError,
-    Request, Response, Sort, read_message, write_message,
+    AccessInfo, AccessMode, AccessUser, Envelope, ErrorCode, FileRow, MAX_FRAME_BYTES, Message,
+    PROTOCOL_VERSION, ProtocolError, Request, Response, Sort, read_message, write_message,
 };
 pub use transport::{CallerIdentity, Endpoint, Listener, Stream};
 
@@ -468,6 +469,18 @@ impl<S: DeadlineIo> Client<S> {
                 report,
             } => Ok((entries, mode, report)),
             _ => Err(io_invalid("expected Status".into())),
+        }
+    }
+
+    /// Who may use the service and whether this caller may (answered even to
+    /// refused callers). A service from before this request never
+    /// answers it (the connection stays open until the client's deadline), so
+    /// use a connection of its own with a short deadline.
+    pub fn access_info(&mut self) -> std::io::Result<AccessInfo> {
+        let id = self.send(Request::AccessInfo)?;
+        match Self::check(self.expect(id)?)? {
+            Response::Access(info) => Ok(info),
+            _ => Err(io_invalid("expected Access".into())),
         }
     }
 

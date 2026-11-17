@@ -38,7 +38,66 @@ const KIND_STATUS: u8 = 4;
 const KIND_CANCEL: u8 = 5;
 const KIND_PAGE: u8 = 6;
 const KIND_WATCH: u8 = 7;
+const KIND_ACCESS: u8 = 8;
+const KIND_ACCESS_INFO: u8 = 108;
 const KIND_CHANGED: u8 = 107;
+/// Hard cap on users in an `AccessInfo` reply (and in the policy file).
+pub const MAX_ACCESS_USERS: usize = 256;
+/// Hard cap on an account id (SID or uid) and a display name.
+pub const MAX_ACCOUNT_ID: usize = 128;
+pub const MAX_ACCOUNT_NAME: usize = 256;
+
+/// Who the system service answers (policy file `access.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessMode {
+    /// SYSTEM and administrators only (the default).
+    #[default]
+    Admins,
+    /// Every unsandboxed local account.
+    Everyone,
+    /// Administrators plus the listed accounts.
+    Listed,
+}
+
+impl AccessMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessMode::Admins => "admins",
+            AccessMode::Everyone => "everyone",
+            AccessMode::Listed => "listed",
+        }
+    }
+    pub fn parse(text: &str) -> Option<AccessMode> {
+        Some(match text {
+            "admins" => AccessMode::Admins,
+            "everyone" => AccessMode::Everyone,
+            "listed" => AccessMode::Listed,
+            _ => return None,
+        })
+    }
+}
+
+/// An account: `id` is a Windows SID or a Unix uid and is what authorizes;
+/// `name` is for display only and may be empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessUser {
+    pub id: String,
+    pub name: String,
+}
+
+/// Reply to `Request::AccessInfo`, sent to every authenticated caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessInfo {
+    pub mode: AccessMode,
+    /// Whether the service answers this caller's searches.
+    pub you_allowed: bool,
+    /// The caller's own OS identity as the service sees it (`name` is only
+    /// known when the policy lists the caller; the service never does
+    /// account lookups on the request path).
+    pub you: AccessUser,
+    /// The listed users; only sent to allowed administrators.
+    pub users: Option<Vec<AccessUser>>,
+}
 /// Row presence bit: the entry is a folder (no payload; allowed with
 /// any column mask).
 const ROW_DIRECTORY: u8 = 32;
@@ -126,6 +185,10 @@ pub enum Request {
     Watch {
         generation: u64,
     },
+    /// Who may use the service and whether this caller may. Added without a
+    /// protocol version bump: an older service does not know the kind and never
+    /// answers it, so clients ask on a connection of their own with a short deadline.
+    AccessInfo,
 }
 
 /// Machine-readable error codes in `Response::Error`.
@@ -172,6 +235,7 @@ pub enum Response {
         code: ErrorCode,
         msg: String,
     },
+    Access(AccessInfo),
 }
 
 /// One message in either direction.
@@ -262,6 +326,13 @@ impl Writer {
         self.u32(v.len() as u32);
         self.0.extend_from_slice(v);
         Ok(())
+    }
+    fn access_user(&mut self, user: &AccessUser) -> Result<(), ProtocolError> {
+        if user.id.len() > MAX_ACCOUNT_ID || user.name.len() > MAX_ACCOUNT_NAME {
+            return Err(ProtocolError::TooLarge);
+        }
+        self.str(&user.id)?;
+        self.str(&user.name)
     }
 }
 
@@ -408,6 +479,24 @@ fn encode_kind(message: &Message, w: &mut Writer) -> Result<u8, ProtocolError> {
             w.str(msg)?;
             KIND_ERROR
         }
+        Message::Request(Request::AccessInfo) => KIND_ACCESS,
+        Message::Response(Response::Access(info)) => {
+            w.u8(info.mode as u8);
+            w.u8(u8::from(info.you_allowed));
+            w.access_user(&info.you)?;
+            match &info.users {
+                None => w.u8(0),
+                Some(users) if users.len() <= MAX_ACCESS_USERS => {
+                    w.u8(1);
+                    w.u32(users.len() as u32);
+                    for user in users {
+                        w.access_user(user)?;
+                    }
+                }
+                Some(_) => return Err(ProtocolError::TooLarge),
+            }
+            KIND_ACCESS_INFO
+        }
     })
 }
 
@@ -475,6 +564,26 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(raw)
             .map(str::to_owned)
             .map_err(|_| ProtocolError::InvalidUtf8)
+    }
+    fn access_user(&mut self) -> Result<AccessUser, ProtocolError> {
+        let id = self.len_prefixed(MAX_ACCOUNT_ID)?;
+        let name = self.len_prefixed(MAX_ACCOUNT_NAME)?;
+        let text = |raw| {
+            std::str::from_utf8(raw)
+                .map(str::to_owned)
+                .map_err(|_| ProtocolError::InvalidUtf8)
+        };
+        Ok(AccessUser {
+            id: text(id)?,
+            name: text(name)?,
+        })
+    }
+    fn flag(&mut self, what: &'static str) -> Result<bool, ProtocolError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ProtocolError::InvalidValue(what)),
+        }
     }
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.pos == self.bytes.len() {
@@ -678,6 +787,36 @@ pub fn decode_payload(payload: &[u8]) -> Result<Envelope, ProtocolError> {
             let code = error_code(r.u16()?)?;
             let msg = r.str()?;
             Message::Response(Response::Error { code, msg })
+        }
+        KIND_ACCESS => Message::Request(Request::AccessInfo),
+        KIND_ACCESS_INFO => {
+            let mode = match r.u8()? {
+                0 => AccessMode::Admins,
+                1 => AccessMode::Everyone,
+                2 => AccessMode::Listed,
+                _ => return Err(ProtocolError::InvalidValue("access mode")),
+            };
+            let you_allowed = r.flag("allowed flag")?;
+            let you = r.access_user()?;
+            let users = if r.flag("users flag")? {
+                let n = r.u32()? as usize;
+                if n > MAX_ACCESS_USERS {
+                    return Err(ProtocolError::TooLarge);
+                }
+                let mut users = Vec::with_capacity(n);
+                for _ in 0..n {
+                    users.push(r.access_user()?);
+                }
+                Some(users)
+            } else {
+                None
+            };
+            Message::Response(Response::Access(AccessInfo {
+                mode,
+                you_allowed,
+                you,
+                users,
+            }))
         }
         other => return Err(ProtocolError::UnknownKind(other)),
     };
