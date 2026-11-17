@@ -41,6 +41,9 @@ pub enum Action {
     Everyone,
     Admins,
     Remove(String),
+    /// Add an account the user looked up (by the id it resolved to, never by
+    /// the text that was typed).
+    Add(String),
 }
 
 /// A canonical Windows SID (`S-1-<authority>(-<subauthority>)+`) or decimal
@@ -65,6 +68,7 @@ impl Action {
         Some(match self {
             Action::AllowMe(i) => format!("service access add {}", id(i)?),
             Action::Remove(i) => format!("service access remove {}", id(i)?),
+            Action::Add(i) => format!("service access add {}", id(i)?),
             Action::Everyone => "service access everyone".into(),
             Action::Admins => "service access admins".into(),
         })
@@ -84,6 +88,12 @@ impl Action {
     pub fn reflected(&self, info: &AccessInfo) -> bool {
         match self {
             Action::AllowMe(_) => info.you_allowed,
+            Action::Add(id) => match &info.users {
+                Some(users) => users.iter().any(|u| u.id.eq_ignore_ascii_case(id)),
+                // Not an administrator: the list is hidden, so only this
+                // account's own entry can be seen.
+                None => !info.you.id.eq_ignore_ascii_case(id) || info.you_allowed,
+            },
             Action::Everyone => info.mode == AccessMode::Everyone,
             Action::Admins => info.mode == AccessMode::Admins,
             Action::Remove(id) => match &info.users {
@@ -94,6 +104,119 @@ impl Action {
             },
         }
     }
+}
+
+/// How long a name lookup may take. A domain account can wait for a domain
+/// controller; the lookup runs off the UI thread and is abandoned after this.
+const LOOKUP_DEADLINE: Duration = Duration::from_secs(5);
+/// The longest account text accepted (a domain, a backslash and a name).
+const MAX_ACCOUNT_TEXT: usize = 256;
+/// Windows' "no mapping between account names and security IDs".
+const ERROR_NONE_MAPPED: u32 = 1332;
+
+/// An account found by name: its id (a SID on Windows, a uid or user name on
+/// Unix) and the name Windows gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AddState {
+    #[default]
+    Idle,
+    Looking,
+    Found(Resolved),
+    Failed(String),
+}
+
+/// The "Add account" field: what was typed and what came of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddAccount {
+    pub text: String,
+    pub state: AddState,
+}
+
+/// The typed text, cleaned: trimmed, not empty, not long, no control codes.
+fn typed_account(text: &str) -> Result<&str, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        Err(r"Type a name (DOMAIN\user or user) or a SID.".into())
+    } else if text.len() > MAX_ACCOUNT_TEXT || text.chars().any(char::is_control) {
+        Err("That is not a valid account name.".into())
+    } else {
+        Ok(text)
+    }
+}
+
+/// An account argument that is safe to show in a terminal command (Unix):
+/// letters, digits and `. _ - @`, never starting with `-`.
+fn safe_account_arg(text: &str) -> Option<&str> {
+    let ok = !text.is_empty()
+        && text.len() <= 64
+        && !text.starts_with('-')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'));
+    ok.then_some(text)
+}
+
+/// Whether `id` may go on a command line: a canonical SID or uid, or on Unix
+/// a plain user name.
+fn usable_id(id: &str) -> bool {
+    canonical_id(id) || (!cfg!(windows) && safe_account_arg(id).is_some())
+}
+
+/// What a failed name lookup tells the user.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn lookup_error(code: u32, text: &str) -> String {
+    if code == ERROR_NONE_MAPPED {
+        format!("No account named \"{text}\" was found on this PC or its domain.")
+    } else {
+        format!("Windows could not look up \"{text}\" (error {code}).")
+    }
+}
+
+/// Look `text` up with `resolver` on a thread of its own and wait at most
+/// `deadline`: a stalled domain lookup is abandoned, not waited for. The
+/// answer must be an id that can go on a command line.
+fn lookup(
+    text: &str,
+    resolver: impl FnOnce(&str) -> Result<Resolved, String> + Send + 'static,
+    deadline: Duration,
+) -> Result<Resolved, String> {
+    let text = typed_account(text)?.to_owned();
+    let (tx, rx) = channel();
+    let asked = text.clone();
+    std::thread::Builder::new()
+        .name("ferrow-account-lookup".into())
+        .spawn(move || {
+            let _ = tx.send(resolver(&asked));
+        })
+        .map_err(|_| "The lookup could not be started.".to_owned())?;
+    let found = rx.recv_timeout(deadline).map_err(|_| {
+        "Looking up the account took too long. Try again, or type the SID.".to_owned()
+    })??;
+    if usable_id(&found.id) {
+        Ok(found)
+    } else {
+        Err(format!(
+            "\"{text}\" has an account id that can't be used here."
+        ))
+    }
+}
+
+/// The terminal command that adds a looked-up account.
+pub fn add_command(found: &Resolved) -> Option<String> {
+    if !usable_id(&found.id) {
+        return None;
+    }
+    Some(if cfg!(windows) {
+        format!("ferrow service access add {}", found.id)
+    } else {
+        format!("sudo ferrow service access add {}", found.id)
+    })
 }
 
 struct Done {
@@ -110,8 +233,11 @@ pub struct Access {
     pub message: Option<String>,
     /// "Allow everyone" was clicked once and waits for its confirmation.
     pub confirm_everyone: bool,
+    /// The "Add account" field, while it is open.
+    pub add: Option<AddAccount>,
     asked: bool,
     rx: Option<Receiver<Done>>,
+    lookup_rx: Option<Receiver<Result<Resolved, String>>>,
 }
 
 /// Ask the service on a connection of its own.
@@ -181,8 +307,10 @@ impl Access {
             busy: false,
             message: None,
             confirm_everyone: false,
+            add: None,
             asked: false,
             rx: None,
+            lookup_rx: None,
         }
     }
 
@@ -294,6 +422,7 @@ impl Access {
     /// True when a change was attempted: the engine should look for the
     /// service again.
     pub fn poll(&mut self) -> bool {
+        self.poll_lookup();
         let Some(rx) = &self.rx else { return false };
         let Ok(done) = rx.try_recv() else {
             return false;
@@ -301,10 +430,61 @@ impl Access {
         self.rx = None;
         self.busy = false;
         self.view = done.view;
-        if done.message.is_some() {
-            self.message = done.message;
+        if let Some(text) = done.message {
+            // The account was added: the field has done its job.
+            if done.acted && outcome_of(&text) == Outcome::Done {
+                self.add = None;
+            }
+            self.message = Some(text);
         }
         done.acted
+    }
+
+    /// Take a finished lookup. An answer for text that has since been edited
+    /// is dropped (editing the field resets it to idle).
+    fn poll_lookup(&mut self) {
+        let Some(rx) = &self.lookup_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.lookup_rx = None;
+        if let Some(add) = &mut self.add
+            && add.state == AddState::Looking
+        {
+            add.state = match result {
+                Ok(found) => AddState::Found(found),
+                Err(why) => AddState::Failed(why),
+            };
+        }
+    }
+
+    /// Look up the typed account (the Look up button).
+    pub fn look_up(&mut self, wake: impl Fn() + Send + 'static) {
+        self.look_up_with(wake, os_resolve, LOOKUP_DEADLINE);
+    }
+
+    fn look_up_with(
+        &mut self,
+        wake: impl Fn() + Send + 'static,
+        resolver: impl FnOnce(&str) -> Result<Resolved, String> + Send + 'static,
+        deadline: Duration,
+    ) {
+        let Some(add) = &mut self.add else { return };
+        if add.state == AddState::Looking {
+            return;
+        }
+        let text = add.text.clone();
+        let (tx, rx) = channel();
+        let started = std::thread::Builder::new()
+            .name("ferrow-access-lookup".into())
+            .spawn(move || {
+                let _ = tx.send(lookup(&text, resolver, deadline));
+                wake();
+            });
+        if started.is_ok() {
+            add.state = AddState::Looking;
+            self.lookup_rx = Some(rx);
+        } else {
+            add.state = AddState::Failed("The lookup could not be started.".into());
+        }
     }
 
     /// Whether the actions can run from this app (installed Windows copy).
@@ -348,9 +528,10 @@ pub fn rule(info: &AccessInfo) -> String {
                 .to_owned()
         }
         (AccessMode::Listed, Some(users)) => {
+            let n = users.len();
             format!(
-                "Administrators and {} listed account(s) can use it.",
-                users.len()
+                "Administrators and {n} listed {} can use it.",
+                if n == 1 { "account" } else { "accounts" }
             )
         }
         (AccessMode::Listed, None) => {
@@ -402,6 +583,124 @@ pub fn summary(view: &View) -> (String, String) {
                 )
             }
         }
+    }
+}
+
+/// The OS lookup: a name or SID to the account's SID and name (Windows).
+#[cfg(windows)]
+fn os_resolve(text: &str) -> Result<Resolved, String> {
+    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSidToSidW,
+    };
+    use windows_sys::Win32::Security::{LookupAccountNameW, LookupAccountSidW, PSID, SidTypeUser};
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() };
+    let mut sid_buffer = [0usize; 16]; // 128 bytes, above the 68-byte SID maximum
+    let mut owned_sid: PSID = std::ptr::null_mut();
+    let sid: PSID = if text
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("S-1-"))
+    {
+        // SAFETY: NUL-terminated input; the SID is freed below.
+        if unsafe { ConvertStringSidToSidW(wide(text).as_ptr(), &raw mut owned_sid) } == 0 {
+            return Err(format!("\"{text}\" is not a valid SID."));
+        }
+        owned_sid
+    } else {
+        let name = wide(text);
+        let mut sid_len = size_of_val(&sid_buffer) as u32;
+        let mut domain = [0u16; 512];
+        let mut domain_len = domain.len() as u32;
+        let mut kind = 0;
+        // SAFETY: NUL-terminated name and buffers whose lengths are passed in.
+        let ok = unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                name.as_ptr(),
+                sid_buffer.as_mut_ptr().cast(),
+                &raw mut sid_len,
+                domain.as_mut_ptr(),
+                &raw mut domain_len,
+                &raw mut kind,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: reads this thread's last error, right after the call.
+            return Err(lookup_error(unsafe { GetLastError() }, text));
+        }
+        sid_buffer.as_mut_ptr().cast()
+    };
+    let result = (|| {
+        let mut string: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a valid SID; the string is allocated by the call, freed below.
+        if unsafe { ConvertSidToStringSidW(sid, &raw mut string) } == 0 || string.is_null() {
+            return Err("Windows returned an account id that can't be read.".to_owned());
+        }
+        // SAFETY: NUL-terminated string from the call above, freed once.
+        let id = unsafe {
+            let mut len = 0;
+            while *string.add(len) != 0 {
+                len += 1;
+            }
+            let id = String::from_utf16_lossy(std::slice::from_raw_parts(string, len));
+            LocalFree(string.cast());
+            id
+        };
+        let (mut name, mut domain) = ([0u16; 512], [0u16; 512]);
+        let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+        let mut kind = 0;
+        // SAFETY: valid SID and buffers whose lengths are passed in.
+        let named = unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                sid,
+                name.as_mut_ptr(),
+                &raw mut name_len,
+                domain.as_mut_ptr(),
+                &raw mut domain_len,
+                &raw mut kind,
+            )
+        } != 0;
+        if !named {
+            // A SID nobody owns (a deleted account) can still be listed.
+            return Ok(Resolved {
+                name: id.clone(),
+                id,
+            });
+        }
+        if kind != SidTypeUser {
+            return Err(format!(
+                "\"{text}\" is a group. Add individual users, or use Allow everyone."
+            ));
+        }
+        let name = String::from_utf16_lossy(&name[..name_len as usize]);
+        let domain = String::from_utf16_lossy(&domain[..domain_len as usize]);
+        Ok(Resolved {
+            id,
+            name: if domain.is_empty() {
+                name
+            } else {
+                format!("{domain}\\{name}")
+            },
+        })
+    })();
+    if !owned_sid.is_null() {
+        // SAFETY: frees the SID allocated by ConvertStringSidToSidW.
+        unsafe { LocalFree(owned_sid.cast()) };
+    }
+    result
+}
+
+/// Unix: the account is named in a command for the administrator to run;
+/// nothing is looked up here.
+#[cfg(not(windows))]
+fn os_resolve(text: &str) -> Result<Resolved, String> {
+    match safe_account_arg(text) {
+        Some(arg) => Ok(Resolved {
+            id: arg.to_owned(),
+            name: arg.to_owned(),
+        }),
+        None => Err("Use a plain user name (letters, digits and . _ - @) or a numeric id.".into()),
     }
 }
 
@@ -729,6 +1028,234 @@ mod tests {
         // The prompt was declined: its own message is kept.
         let declined = "Administrator approval was declined; nothing was changed.";
         assert_eq!(outcome(false, &stale, Err(declined.into())), declined);
+    }
+
+    #[test]
+    fn the_list_rule_uses_the_right_plural() {
+        for (n, want) in [
+            (0, "0 listed accounts"),
+            (1, "1 listed account can"),
+            (2, "2 listed accounts"),
+        ] {
+            let text = summary(&info(AccessMode::Listed, true, Some(n))).1;
+            assert!(text.contains(want), "{text}");
+        }
+        assert!(
+            !summary(&info(AccessMode::Listed, true, Some(2)))
+                .1
+                .contains("(s)")
+        );
+    }
+
+    fn found(id: &str, name: &str) -> Resolved {
+        Resolved {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    const QUICK: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_lookup_returns_what_the_resolver_found_and_passes_its_errors_on() {
+        let ok = lookup(
+            r"  ALEX-PC\Sam ",
+            |text| {
+                assert_eq!(text, r"ALEX-PC\Sam", "trimmed before it is looked up");
+                Ok(found(SID, r"ALEX-PC\Sam"))
+            },
+            QUICK,
+        );
+        assert_eq!(ok, Ok(found(SID, r"ALEX-PC\Sam")));
+        let unknown = lookup("nobody", |t| Err(lookup_error(ERROR_NONE_MAPPED, t)), QUICK);
+        assert_eq!(
+            unknown.unwrap_err(),
+            "No account named \"nobody\" was found on this PC or its domain."
+        );
+        assert!(lookup_error(5, "x").contains("error 5"));
+    }
+
+    #[test]
+    fn the_typed_text_is_checked_before_anything_looks_it_up() {
+        let never = |_: &str| -> Result<Resolved, String> { panic!("must not look up") };
+        assert!(
+            lookup("   ", never, QUICK)
+                .unwrap_err()
+                .starts_with("Type a name")
+        );
+        assert!(lookup("a\u{1b}[2Jb", never, QUICK).is_err());
+        assert!(lookup(&"x".repeat(MAX_ACCOUNT_TEXT + 1), never, QUICK).is_err());
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_canonical_id_is_refused() {
+        // Whatever the resolver says, only a usable id can be offered for the
+        // elevated command line.
+        for bad in [
+            "1000 & calc",
+            "S-1-5-21-1\" --x",
+            "",
+            "-rf",
+            "a b",
+            "S-2-5-18",
+        ] {
+            let r = lookup("x", move |_| Ok(found(bad, "x")), QUICK);
+            assert!(r.is_err(), "{bad:?}");
+        }
+        assert!(lookup("x", |_| Ok(found(SID, "x")), QUICK).is_ok());
+        assert_eq!(add_command(&found("1000 & calc", "x")), None);
+        assert!(
+            add_command(&found(SID, "x"))
+                .is_some_and(|c| c.ends_with(&format!("service access add {SID}")))
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_stalls_is_abandoned_at_the_deadline() {
+        let started = Instant::now();
+        let r = lookup(
+            "slow",
+            |_| {
+                std::thread::sleep(Duration::from_millis(1500));
+                Ok(found(SID, "slow"))
+            },
+            Duration::from_millis(40),
+        );
+        assert!(r.unwrap_err().contains("took too long"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn only_a_canonical_id_reaches_the_elevated_add_command() {
+        assert_eq!(
+            Action::Add(SID.into()).args().as_deref(),
+            Some("service access add S-1-5-21-1-2-3-1001")
+        );
+        // A typed name, or anything shell-like, never becomes an argument.
+        for typed in [r"ALEX-PC\Sam", "Sam", "1000 & calc", "S-1-5-21-1\" --x", ""] {
+            assert_eq!(Action::Add(typed.into()).args(), None, "{typed:?}");
+        }
+        let mut access = Access::new();
+        access.run_with(
+            Action::Add(r"ALEX-PC\Sam".into()),
+            || {},
+            |_| panic!("must not run"),
+            || View::Checking,
+            |_| {},
+        );
+        assert!(!access.busy && access.rx.is_none());
+    }
+
+    #[test]
+    fn an_added_account_shows_in_the_list_the_service_returns() {
+        let listed = |ids: &[&str]| {
+            info_of(
+                AccessMode::Listed,
+                true,
+                Some(ids.iter().map(|i| user(i)).collect()),
+            )
+        };
+        assert!(!Action::Add("1002".into()).reflected(&listed(&["1001"])));
+        assert!(Action::Add("1002".into()).reflected(&listed(&["1001", "1002"])));
+    }
+
+    fn wait_lookup(access: &mut Access) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while access.lookup_rx.is_some() {
+            access.poll();
+            assert!(Instant::now() < deadline, "lookup did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_add_field_looks_up_once_and_keeps_the_answer_for_its_text() {
+        let mut access = Access::new();
+        access.look_up_with(|| {}, |_| panic!("no field open"), QUICK);
+        assert!(
+            access.lookup_rx.is_none(),
+            "nothing to look up without a field"
+        );
+        access.add = Some(AddAccount {
+            text: "sam".into(),
+            state: AddState::Idle,
+        });
+        access.look_up_with(|| {}, |_| Ok(found(SID, "Sam")), QUICK);
+        assert_eq!(access.add.as_ref().unwrap().state, AddState::Looking);
+        // Pressed again while looking: ignored (the resolver would panic).
+        access.look_up_with(|| {}, |_| panic!("second lookup"), QUICK);
+        wait_lookup(&mut access);
+        assert_eq!(
+            access.add.as_ref().unwrap().state,
+            AddState::Found(found(SID, "Sam"))
+        );
+        // Typing resets the answer; a late answer for old text is dropped.
+        access.add = Some(AddAccount {
+            text: "ghost".into(),
+            state: AddState::Idle,
+        });
+        access.look_up_with(|| {}, |t| Err(lookup_error(ERROR_NONE_MAPPED, t)), QUICK);
+        access.add.as_mut().unwrap().state = AddState::Idle; // the user typed on
+        wait_lookup(&mut access);
+        assert_eq!(access.add.as_ref().unwrap().state, AddState::Idle);
+    }
+
+    #[test]
+    fn a_failed_lookup_is_shown_and_a_finished_change_closes_the_field() {
+        let mut access = Access::new();
+        access.add = Some(AddAccount {
+            text: "ghost".into(),
+            state: AddState::Idle,
+        });
+        access.look_up_with(|| {}, |t| Err(lookup_error(ERROR_NONE_MAPPED, t)), QUICK);
+        wait_lookup(&mut access);
+        assert!(
+            matches!(&access.add.as_ref().unwrap().state, AddState::Failed(m) if m.contains("No account named"))
+        );
+        // A declined prompt keeps the field for another try.
+        let stale = info(AccessMode::Admins, false, Some(0));
+        let (ask, _, _) = scripted(vec![stale]);
+        access.run_with(
+            Action::Add(SID.into()),
+            || {},
+            |_| Err("Administrator approval was declined; nothing was changed.".into()),
+            ask,
+            |_| {},
+        );
+        assert!(access.busy, "no second change while this one runs");
+        assert!(wait_done(&mut access));
+        assert!(access.add.is_some());
+        // A change that shows in the answer closes it.
+        let shown = info_of(AccessMode::Listed, true, Some(vec![user(SID)]));
+        let (ask, _, _) = scripted(vec![View::Info(shown)]);
+        access.run_with(Action::Add(SID.into()), || {}, |_| Ok(()), ask, |_| {});
+        assert!(wait_done(&mut access));
+        assert!(access.add.is_none());
+    }
+
+    #[test]
+    fn unix_account_names_are_safe_to_show_in_a_command() {
+        for ok in ["sam", "sam.k_x-1", "a@b", "1000"] {
+            assert_eq!(safe_account_arg(ok), Some(ok));
+        }
+        for bad in ["", "-x", "a b", "a;b", "a$(b)", "a\nb", "a\"b"] {
+            assert_eq!(safe_account_arg(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The real Windows lookup, on inputs that need no domain controller.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_lookup_refuses_groups_and_malformed_sids() {
+        // BUILTIN\Users: a group grants nobody who signs in.
+        let group = os_resolve("S-1-5-32-545").unwrap_err();
+        assert!(group.contains("is a group"), "{group}");
+        let bad = os_resolve("S-1-banana").unwrap_err();
+        assert!(bad.contains("not a valid SID"), "{bad}");
     }
 
     fn wait_done(access: &mut Access) -> bool {

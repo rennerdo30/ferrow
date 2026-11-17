@@ -623,6 +623,14 @@ impl<'a> Session<'a> {
         let at = pos2(self.size.x / 2.0, self.size.y / 2.0);
         self.hover(at);
         self.wheel(at, dy);
+        // egui spreads a wheel step over several frames; let it finish so it
+        // cannot leak into the next picture.
+        self.frames(40);
+    }
+
+    /// Back to the top of the page (a big wheel step up).
+    fn scroll_top(&mut self) {
+        self.scroll_by(100_000.0);
     }
 
     /// Positive `dy` moves the content down (scrolls towards the top).
@@ -866,7 +874,7 @@ fn capture_all(out: &Path) {
     }
 }
 
-/// Settings (16..35): the fast-index status in every state, who can use the
+/// Settings (16..37): the fast-index status in every state, who can use the
 /// service, the own-index group closed and open, and each section.
 fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::Index>) {
     use ferrow_ipc::{AccessInfo, AccessMode, AccessUser};
@@ -949,11 +957,57 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
     s.app().access.show_for_test(everyone, false, Some(done));
     s.frames(2);
     s.save(27, "settings-access-done");
-    s.app().access.show_for_test(admins, false, None);
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.frames(2);
+
+    // The "Add account" field: empty, looked up, and an unknown name.
+    let add = |s: &mut Session, text: &str, state: access::AddState, number, name| {
+        s.app().access.show_for_test(admins.clone(), false, None);
+        s.app().access.add = Some(access::AddAccount {
+            text: text.into(),
+            state,
+        });
+        s.goto("Fast index");
+        if size == NARROW {
+            s.scroll_top();
+            s.scroll_by(-230.0);
+        }
+        s.save(number, name);
+    };
+    add(
+        &mut s,
+        "",
+        access::AddState::Idle,
+        35,
+        "settings-add-account-empty",
+    );
+    let sam = access::Resolved {
+        id: "S-1-5-21-1-2-3-1002".into(),
+        name: r"ALEX-PC\Sam".into(),
+    };
+    add(
+        &mut s,
+        "sam",
+        access::AddState::Found(sam),
+        36,
+        "settings-add-account-found",
+    );
+    add(
+        &mut s,
+        "samm",
+        access::AddState::Failed(
+            "No account named \"samm\" was found on this PC or its domain.".into(),
+        ),
+        37,
+        "settings-add-account-unknown",
+    );
+    s.app().access.add = None;
+    s.app().access.show_for_test(admins.clone(), false, None);
     s.frames(2);
 
     // The own-index group: closed while the service is live, then opened.
     s.goto("Fast index");
+    s.scroll_top();
     s.scroll_by(-240.0);
     s.save(28, "settings-live-own-index-closed");
     s.goto("Own index");

@@ -487,10 +487,13 @@ impl FerrowApp {
             message: message.as_deref(),
             elevate: access::Access::can_elevate(),
             sandboxed: access::Access::sandboxed(),
+            add: self.access.add.as_ref(),
         };
         let mut out = AccessOut {
             action: None,
             confirm: self.access.confirm_everyone,
+            add: self.access.add.clone(),
+            look_up: false,
         };
         let mut retry = false;
         let color = tone_color(&p, status.tone);
@@ -529,6 +532,11 @@ impl FerrowApp {
             }
         });
         self.access.confirm_everyone = out.confirm;
+        self.access.add = out.add;
+        if out.look_up {
+            let wake = ctx.clone();
+            self.access.look_up(move || wake.request_repaint());
+        }
         if retry {
             self.access.retry();
         }
@@ -1449,12 +1457,17 @@ struct AccessIn<'a> {
     /// This app can start the administrator command itself.
     elevate: bool,
     sandboxed: bool,
+    add: Option<&'a access::AddAccount>,
 }
 
 struct AccessOut {
     action: Option<access::Action>,
     /// "Allow everyone" waits for its confirmation.
     confirm: bool,
+    /// The "Add account" field after this frame (`None`: closed).
+    add: Option<access::AddAccount>,
+    /// Look the typed account up.
+    look_up: bool,
 }
 
 /// "Who can use the service": whether this account is served and under which
@@ -1467,6 +1480,8 @@ fn access_block(
 ) -> AccessOut {
     let (busy, elevate) = (input.busy, input.elevate);
     let mut action = None;
+    let mut add = input.add.cloned();
+    let mut look_up = false;
     if let access::View::Info(info) = input.view {
         ui.label(
             RichText::new("Who can use the service")
@@ -1554,6 +1569,9 @@ fn access_block(
                     {
                         action = Some(access::Action::Admins);
                     }
+                    if add.is_none() && ui.add(std_button(p, "Add account…", 150.0)).clicked() {
+                        add = Some(access::AddAccount::default());
+                    }
                 });
             });
         } else {
@@ -1580,6 +1598,13 @@ fn access_block(
                     }
                 });
             }
+            if add.is_none() && ui.add(std_button(p, "Add account…", 150.0)).clicked() {
+                add = Some(access::AddAccount::default());
+            }
+        }
+        if add.is_some() && !(confirm && !busy) {
+            ui.add_space(12.0);
+            add_account_editor(ui, p, &mut add, &mut look_up, &mut action, busy, elevate);
         }
     }
     if busy {
@@ -1602,7 +1627,125 @@ fn access_block(
         };
         dot_row(ui, p, tone, filled, text, "");
     }
-    AccessOut { action, confirm }
+    AccessOut {
+        action,
+        confirm,
+        add,
+        look_up,
+    }
+}
+
+/// The "Add account" field: type a name or SID, look it up, then add what was
+/// found. Only the looked-up id reaches the administrator command.
+fn add_account_editor(
+    ui: &mut egui::Ui,
+    p: &theme::Palette,
+    add: &mut Option<access::AddAccount>,
+    look_up: &mut bool,
+    action: &mut Option<access::Action>,
+    busy: bool,
+    elevate: bool,
+) {
+    let Some(field) = add.as_mut() else { return };
+    let mut close = false;
+    row_header(
+        ui,
+        p,
+        "Add an account",
+        if cfg!(windows) {
+            r"Type DOMAIN\user, user or a SID. Ferrow looks it up before anything changes."
+        } else {
+            "Type a user name or a numeric id."
+        },
+    );
+    ui.add_space(6.0);
+    let looking = field.state == access::AddState::Looking;
+    let can_look = !busy && !looking && !field.text.trim().is_empty();
+    ui.horizontal_wrapped(|ui| {
+        let hint = if cfg!(windows) {
+            r"DOMAIN\user, user or SID"
+        } else {
+            "user name"
+        };
+        let width = (ui.available_width() - 200.0).clamp(160.0, 340.0);
+        let edit = egui::TextEdit::singleline(&mut field.text)
+            .hint_text(hint)
+            .desired_width(width)
+            .margin(vec2(8.0, 6.0))
+            // The default frame is transparent here; outline it so it reads
+            // as an input.
+            .frame(
+                egui::Frame::new()
+                    .fill(p.control)
+                    .stroke(Stroke::new(1.0, p.control_stroke))
+                    .corner_radius(CornerRadius::same(4)),
+            );
+        let r = ui.add_enabled(!busy, edit);
+        if r.changed() {
+            field.state = access::AddState::Idle;
+        }
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let label = if cfg!(windows) {
+            "Look up"
+        } else {
+            "Show command"
+        };
+        let width = if cfg!(windows) { 90.0 } else { 130.0 };
+        // Once something is found, "Add" is the one primary button.
+        let button = if matches!(field.state, access::AddState::Found(_)) {
+            std_button(p, label, width)
+        } else {
+            accent_button(p, label, width, can_look)
+        };
+        let clicked = ui.add_enabled(can_look, button).clicked();
+        if (clicked || enter) && can_look {
+            *look_up = true;
+        }
+        if ui.add(std_button(p, "Cancel", 80.0)).clicked() {
+            close = true;
+        }
+    });
+    match &field.state {
+        access::AddState::Idle => {}
+        access::AddState::Looking => {
+            ui.add_space(8.0);
+            dot_row(ui, p, Tone::Neutral, false, "Looking up the account…", "");
+        }
+        access::AddState::Failed(why) => {
+            ui.add_space(8.0);
+            dot_row(ui, p, Tone::Caution, true, why, "");
+        }
+        access::AddState::Found(found) => {
+            ui.add_space(8.0);
+            let detail = if found.name == found.id {
+                String::new()
+            } else {
+                format!("Account id: {}", found.id)
+            };
+            dot_row(ui, p, Tone::Good, true, &found.name, &detail);
+            ui.add_space(6.0);
+            if elevate {
+                let can = !busy;
+                if ui
+                    .add_enabled(can, accent_button(p, "Add", 90.0, can))
+                    .clicked()
+                {
+                    *action = Some(access::Action::Add(found.id.clone()));
+                }
+            } else if let Some(command) = access::add_command(found) {
+                row_header(ui, p, "To add it, run in an administrator terminal:", "");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&command).monospace().size(12.0).color(p.text));
+                    if ui.add(std_button(p, "Copy", 70.0)).clicked() {
+                        platform::copy_text(&command);
+                    }
+                });
+            }
+        }
+    }
+    if close {
+        *add = None;
+    }
 }
 
 /// A status dot (filled) or ring, `size` points wide.
