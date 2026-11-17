@@ -162,6 +162,18 @@ fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
 
+/// The saved file's length, which is also the size of the one buffer
+/// [`save`] fills before writing (memory accounting).
+pub(crate) fn serialized_len(index: &Index) -> Result<usize, SaveError> {
+    let c = index.columns();
+    let n32 = u32::try_from(c.parent.len()).map_err(|_| SaveError::TooLarge("entry count"))?;
+    let arena32 = u32::try_from(c.arena.len()).map_err(|_| SaveError::TooLarge("name arena"))?;
+    let metadata_len = u32::try_from(index.metadata.serialized_len())
+        .map_err(|_| SaveError::TooLarge("metadata columns"))?;
+    usize::try_from(expected_len(n32, arena32, metadata_len, HEADER_LEN))
+        .map_err(|_| SaveError::TooLarge("metadata columns"))
+}
+
 pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
     let c = index.columns();
     let n = c.parent.len();
@@ -170,9 +182,7 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
 
     let metadata_len = u32::try_from(index.metadata.serialized_len())
         .map_err(|_| SaveError::TooLarge("metadata columns"))?;
-    let payload_len = usize::try_from(expected_len(n32, arena32, metadata_len, HEADER_LEN))
-        .map_err(|_| SaveError::TooLarge("metadata columns"))?
-        - HEADER_LEN;
+    let payload_len = serialized_len(index)? - HEADER_LEN;
     let mut buf = Vec::with_capacity(HEADER_LEN + payload_len);
     buf.extend_from_slice(&MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());

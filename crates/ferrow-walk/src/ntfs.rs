@@ -161,6 +161,25 @@ impl Parsed {
         self.infos.append(&mut other.infos);
         self.patches.append(&mut other.patches);
     }
+
+    /// Heap held by the parse output, by capacity (memory accounting).
+    pub fn heap_parts(&self) -> [(&'static str, usize); 4] {
+        [
+            (
+                "parsed.infos",
+                self.infos.capacity() * size_of::<(u64, RecordInfo)>(),
+            ),
+            (
+                "parsed.names",
+                self.names.capacity() * size_of::<NameRecord>(),
+            ),
+            ("parsed.arena", self.arena.capacity()),
+            (
+                "parsed.patches",
+                self.patches.capacity() * size_of::<Patch>(),
+            ),
+        ]
+    }
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -514,6 +533,25 @@ impl Volume {
             journal: None,
             record_size: 1024,
         }
+    }
+
+    /// Heap held while the volume is in memory, by capacity (memory
+    /// accounting): the per-record table, the names, their arena and the
+    /// parent grouping.
+    pub fn heap_parts(&self) -> [(&'static str, usize); 5] {
+        [
+            (
+                "volume.infos",
+                self.infos.capacity() * size_of::<RecordInfo>(),
+            ),
+            (
+                "volume.names",
+                self.names.capacity() * size_of::<NameRecord>(),
+            ),
+            ("volume.arena", self.arena.capacity()),
+            ("volume.order", self.order.capacity() * 4),
+            ("volume.first", self.first.capacity() * 4),
+        ]
     }
 
     pub fn info(&self, record: u64) -> Option<&RecordInfo> {

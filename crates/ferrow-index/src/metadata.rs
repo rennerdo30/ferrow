@@ -495,21 +495,34 @@ impl<T: Value> Column<T> {
         self.signal.status()
     }
     fn heap_bytes(&self) -> usize {
-        self.packed.capacity()
-            + self.valid.capacity()
-            + self.overflow_ids.capacity() * 4
-            + self.overflow_values.capacity() * T::RAW
-            + self.order.get().map_or(0, |o| o.bytes.capacity())
-            + std::mem::size_of::<Self>()
-            + std::mem::size_of::<Signal>()
-            + self
-                .signal
-                .requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .capacity()
-                * std::mem::size_of::<Arc<AtomicBool>>()
-            + 4 * std::mem::size_of::<usize>()
+        self.heap_parts().iter().map(|&(_, bytes)| bytes).sum()
+    }
+    /// The parts of [`Self::heap_bytes`], by capacity: packed values,
+    /// validity bitmap, exact overflows, the cached sort order (zero until
+    /// prepared) and the fixed objects.
+    fn heap_parts(&self) -> [(&'static str, usize); 5] {
+        [
+            ("values", self.packed.capacity()),
+            ("validity", self.valid.capacity()),
+            (
+                "overflow",
+                self.overflow_ids.capacity() * 4 + self.overflow_values.capacity() * T::RAW,
+            ),
+            ("order", self.order.get().map_or(0, |o| o.bytes.capacity())),
+            (
+                "objects",
+                std::mem::size_of::<Self>()
+                    + std::mem::size_of::<Signal>()
+                    + self
+                        .signal
+                        .requests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capacity()
+                        * std::mem::size_of::<Arc<AtomicBool>>()
+                    + 4 * std::mem::size_of::<usize>(),
+            ),
+        ]
     }
     fn serialized_len(&self) -> usize {
         4 + self.packed.len() + self.valid.len() + self.overflow_ids.len() * (4 + T::RAW)
@@ -732,6 +745,25 @@ impl MetadataColumns {
             known: ids.known,
         };
         Some(result)
+    }
+    /// Every present column's parts as `("size.values", bytes)`, …
+    pub(crate) fn heap_parts(&self, out: &mut Vec<(String, usize)>) {
+        fn add<T: Value>(
+            out: &mut Vec<(String, usize)>,
+            name: &str,
+            column: &Option<Arc<Column<T>>>,
+        ) {
+            if let Some(c) = column {
+                for (part, bytes) in c.heap_parts() {
+                    out.push((format!("{name}.{part}"), bytes));
+                }
+            }
+        }
+        add(out, "size", &self.size);
+        add(out, "modified", &self.modified);
+        add(out, "created", &self.created);
+        add(out, "accessed", &self.accessed);
+        add(out, "attributes", &self.attributes);
     }
     pub(crate) fn heap_bytes(&self) -> usize {
         self.size.as_ref().map_or(0, |c| c.heap_bytes())
