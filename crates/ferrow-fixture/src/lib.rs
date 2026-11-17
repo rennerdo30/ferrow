@@ -285,9 +285,24 @@ pub fn generate(entries: usize, seed: u64) -> Index {
 /// Fill `builder` with exactly `entries` entries. Exposed so benchmarks
 /// can time the freeze step separately from generation.
 pub fn generate_into(builder: &IndexBuilder, entries: usize, seed: u64) {
+    generate_with(entries, seed, |parent, name, flags, metadata| {
+        builder.add_with_metadata(parent, name, flags, metadata)
+    });
+}
+
+/// The generator behind [`generate_into`], one entry at a time: `add` gets
+/// `(parent id, name, flags, metadata)` in creation order and returns the id
+/// it gave the entry (children name that id as their parent). A caller that
+/// does not keep the tree, such as a memory benchmark that streams records,
+/// numbers entries 0, 1, 2, ... itself.
+pub fn generate_with(
+    entries: usize,
+    seed: u64,
+    mut add: impl FnMut(u32, &[u8], u16, ferrow_index::EntryMetadata) -> u32,
+) {
     assert!(entries >= 1, "fixture needs at least the root entry");
     let mut rng = Rng::new(seed);
-    let root = builder.add_with_metadata(
+    let root = add(
         ferrow_index::ROOT_PARENT,
         b"fixture-root",
         flags::DIR,
@@ -306,7 +321,7 @@ pub fn generate_into(builder: &IndexBuilder, entries: usize, seed: u64) {
         let (parent, depth) = dirs[a.max(b)];
         let make_dir = depth < MAX_DEPTH && rng.chance(12, 100);
         if make_dir {
-            let id = builder.add_with_metadata(
+            let id = add(
                 parent,
                 dir_name(&mut rng).as_bytes(),
                 flags::DIR,
@@ -314,7 +329,7 @@ pub fn generate_into(builder: &IndexBuilder, entries: usize, seed: u64) {
             );
             dirs.push((id, depth + 1));
         } else {
-            builder.add_with_metadata(
+            add(
                 parent,
                 file_name(&mut rng).as_bytes(),
                 0,

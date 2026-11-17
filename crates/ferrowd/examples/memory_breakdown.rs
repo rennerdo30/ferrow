@@ -7,12 +7,14 @@
 //!
 //! The record stream is made from `ferrow-fixture`'s tree: each entry becomes
 //! an MFT record (numbers with gaps for free records, a share of files with a
-//! second hard-link name) and goes through the service's own path, in order:
+//! second hard-link name), generated chunk by chunk so the source adds almost
+//! nothing to the measured peaks, and goes through the service's own path, in
+//! order:
 //!
 //! 1. `Parsed` chunks appended like the parallel MFT parse does,
 //! 2. `ntfs::Volume::from_parsed`,
-//! 3. `ferrow_walk::index_from_parsed_volume` (the scan's emission, then
-//!    `IndexBuilder::freeze`), which also returns the `VolumeMap`,
+//! 3. `ferrow_walk::emit_parsed_volume` (the scan's emission, which also fills
+//!    the `VolumeMap`), then `IndexBuilder::freeze`, each with its own peak,
 //! 4. `live::Live::new` and `drop(maps)`, as `live_windows::maintain` does,
 //! 5. live changes through `Live::apply` in batches, with `Live::view()` after
 //!    each batch (only the last view is kept),
@@ -84,8 +86,8 @@ fn filetime(unix_ticks: i64) -> i64 {
     unix_ticks + FILETIME_UNIX_EPOCH
 }
 
+/// What the record stream turned out to hold.
 struct Synth {
-    parsed: Parsed,
     /// MFT records, used or free.
     records: u64,
     entries: usize,
@@ -93,43 +95,58 @@ struct Synth {
 }
 
 /// A record stream shaped like an MFT read: record numbers ascend with gaps,
-/// names and infos arrive in chunks that are appended to the whole.
-fn synth_parsed(n: usize) -> Synth {
-    let fx = {
-        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
-        ferrow_fixture::generate_into(&b, n, SEED);
-        b.freeze()
-    };
-    let mut rng = Rng::new(SEED ^ 0xF4EE);
-    let mut record_of: Vec<u64> = Vec::with_capacity(n);
+/// names and infos arrive in chunks of a 16 MiB read each. The stream is
+/// generated chunk by chunk and keeps only its table of directories (about
+/// 2 B/entry), so a phase's memory peak is the consumer's, not the source's.
+/// `on_chunk` gets every chunk as the parallel parse would hand it over.
+fn synth_stream(n: usize, mut on_chunk: impl FnMut(Parsed)) -> Synth {
+    // MFT records, used or free: the gaps come from their own stream, run once
+    // for the total (the volume's slot count) and once more as the entries
+    // arrive. The hard-link draws continue the first run's stream.
+    let mut link_rng = Rng::new(SEED ^ 0xF4EE);
     let mut next = 16u64;
-    record_of.push(ntfs::ROOT_RECORD);
     for _ in 1..n {
-        while rng.chance(FREE_RECORD_PER_100, 100) {
+        while link_rng.chance(FREE_RECORD_PER_100, 100) {
             next += 1;
         }
-        record_of.push(next);
         next += 1;
     }
     let records = next + next / 50;
-    let mut dirs: Vec<u32> = vec![0];
-    let mut all = Parsed::default();
+    let mut gap_rng = Rng::new(SEED ^ 0xF4EE);
+    let mut next = 16u64;
+    // Directories by id (ascending), with their record numbers.
+    let mut dirs: Vec<(u32, u64)> = vec![(0, ntfs::ROOT_RECORD)];
+    let record_of_dir = |dirs: &[(u32, u64)], id: u32| {
+        dirs[dirs
+            .binary_search_by_key(&id, |d| d.0)
+            .expect("parents are dirs")]
+        .1
+    };
     let mut part = Parsed::default();
     let mut links = 0usize;
     part.infos.push((ntfs::ROOT_RECORD, dir_info(0)));
-    for id in 1..n as u32 {
-        let record = record_of[id as usize];
-        let meta = fx.metadata(id);
+    let mut id = 0u32;
+    ferrow_fixture::generate_with(n, SEED, |parent, name, entry_flags, meta| {
+        let this = id;
+        id += 1;
+        if this == 0 {
+            return 0;
+        }
+        while gap_rng.chance(FREE_RECORD_PER_100, 100) {
+            next += 1;
+        }
+        let record = next;
+        next += 1;
         let modified = filetime(meta.modified.unwrap_or(0));
-        let is_dir = fx.flags(id) & flags::DIR != 0;
-        let info = if is_dir {
-            dir_info(modified)
-        } else {
-            file_info(meta.size.unwrap_or(0), modified)
-        };
-        part.infos.push((record, info));
-        let parent_record = record_of[fx.parent(id) as usize];
-        let name = fx.name(id);
+        let is_dir = entry_flags & flags::DIR != 0;
+        part.infos.push((
+            record,
+            if is_dir {
+                dir_info(modified)
+            } else {
+                file_info(meta.size.unwrap_or(0), modified)
+            },
+        ));
         let add_name = |part: &mut Parsed, parent_record: u64| {
             let start = part.arena.len() as u32;
             part.arena.extend_from_slice(name);
@@ -141,21 +158,21 @@ fn synth_parsed(n: usize) -> Synth {
                 name_len: name.len() as u16,
             });
         };
-        add_name(&mut part, parent_record);
+        add_name(&mut part, record_of_dir(&dirs, parent));
         if is_dir {
-            dirs.push(id);
-        } else if rng.chance(1, HARD_LINK_ONE_IN) {
-            let other = dirs[rng.below(dirs.len())];
-            add_name(&mut part, record_of[other as usize]);
+            dirs.push((this, record));
+        } else if link_rng.chance(1, HARD_LINK_ONE_IN) {
+            let other = dirs[link_rng.below(dirs.len())].1;
+            add_name(&mut part, other);
             links += 1;
         }
         if part.infos.len() >= CHUNK_RECORDS {
-            all.append(std::mem::take(&mut part));
+            on_chunk(std::mem::take(&mut part));
         }
-    }
-    all.append(part);
+        this
+    });
+    on_chunk(part);
     Synth {
-        parsed: all,
         records,
         entries: n + links,
         links,
@@ -407,9 +424,19 @@ fn session(
     report: &mut Report,
     held: Option<&Held>,
 ) -> Held {
-    memory::reset_peak();
-    let synth = synth_parsed(n);
+    // Parse: chunks appended to the whole, as the parallel MFT parse does. The
+    // source streams, so this phase's peak is the parse structures' own.
     let _ = memory::release_free_heap();
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let mut parsed = Parsed::default();
+    let synth = synth_stream(n, |chunk| parsed.append(chunk));
+    report.peak(
+        &format!("{round}.parse"),
+        before,
+        memory::process().peak,
+        "Parsed chunks appended into one Parsed; peak since this phase began",
+    );
     println!(
         "FERROW-MEMORY-CONFIG round={round} entries={} index_entries={} mft_records={} hard_link_names={} change_count={changes}",
         n, synth.entries, synth.records, synth.links,
@@ -425,7 +452,7 @@ fn session(
         }
     };
     report.entries = synth.entries as u64;
-    let mut parts = transient(&synth.parsed.heap_parts());
+    let mut parts = transient(&parsed.heap_parts());
     held_parts(&mut parts);
     report.show(&format!("{round}.parsed"), parts);
 
@@ -434,7 +461,7 @@ fn session(
     memory::reset_peak();
     let started = Instant::now();
     let records = synth.records;
-    let volume: Volume = Volume::from_parsed(synth.parsed, records, 0xFE77);
+    let volume: Volume = Volume::from_parsed(parsed, records, 0xFE77);
     report.peak(
         &format!("{round}.from_parsed"),
         before,
@@ -449,22 +476,57 @@ fn session(
     held_parts(&mut parts);
     report.show(&format!("{round}.volume"), parts);
 
-    // Emission and freeze. As in the scan, the parsed volume is dropped once it
-    // is emitted and before the freeze: the builder's per-entry records live
-    // beside the volume during emission, then beside the frozen columns.
+    // Emission, then freeze. As in the scan, the parsed volume is dropped once
+    // it is emitted and before the freeze: the builder holds its records beside
+    // the volume during emission, then beside the frozen columns.
+    let builder = IndexBuilder::with_columns(ColumnSet::DEFAULT);
     let before = memory::process().bytes();
     memory::reset_peak();
     let started = Instant::now();
-    let (index, map) =
-        ferrow_walk::index_from_parsed_volume(volume, ntfs::ROOT_RECORD, b"C:", ColumnSet::DEFAULT);
+    let map = ferrow_walk::emit_parsed_volume(
+        &volume,
+        ntfs::ROOT_RECORD,
+        b"C:",
+        &builder,
+        ColumnSet::DEFAULT,
+    );
     report.peak(
-        &format!("{round}.emit_freeze"),
+        &format!("{round}.emit"),
         before,
         memory::process().peak,
-        "volume plus builder records during emission, then builder records plus frozen columns; peak since this phase began",
+        "volume, builder and record map while the subtree is emitted; peak since this phase began",
     );
     println!(
-        "FERROW-MEMORY-TIMING round={round} step=emit_freeze ms={:.1}",
+        "FERROW-MEMORY-TIMING round={round} step=emit ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    let mut parts = transient(&volume.heap_parts());
+    parts.extend(
+        builder
+            .memory_parts()
+            .into_iter()
+            .map(|(name, bytes)| Part::new(name, bytes, Kind::Transient)),
+    );
+    parts.push(Part::new(
+        "scan.volume_map",
+        map.heap_bytes(),
+        Kind::Transient,
+    ));
+    held_parts(&mut parts);
+    report.show(&format!("{round}.emitted"), parts);
+    drop(volume);
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let index = builder.freeze();
+    report.peak(
+        &format!("{round}.freeze"),
+        before,
+        memory::process().peak,
+        "builder records beside the frozen columns; peak since this phase began",
+    );
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=freeze ms={:.1}",
         started.elapsed().as_secs_f64() * 1000.0
     );
     assert_eq!(index.len(), synth.entries, "every name became an entry");

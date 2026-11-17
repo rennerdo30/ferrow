@@ -1170,11 +1170,28 @@ pub fn index_from_parsed_volume(
     columns: ColumnSet,
 ) -> (Index, VolumeMap) {
     let builder = IndexBuilder::with_columns(columns);
+    let map = emit_parsed_volume(&volume, root_record, root_name, &builder, columns);
+    drop(volume);
+    (builder.freeze(), map)
+}
+
+/// The emission half of [`index_from_parsed_volume`]: the root entry and the
+/// subtree below `root_record` go into `builder`, the record map comes back.
+/// Split out so the memory benchmark can measure emission and freeze as
+/// separate phases; the volume stays the caller's to drop before the freeze.
+#[doc(hidden)]
+pub fn emit_parsed_volume(
+    volume: &ntfs::Volume,
+    root_record: u64,
+    root_name: &[u8],
+    builder: &IndexBuilder,
+    columns: ColumnSet,
+) -> VolumeMap {
     let errors = Errors::new();
     let excludes = ExcludeSet::default();
     let walker = Walker {
         columns,
-        builder: &builder,
+        builder,
         excludes: &excludes,
         follow_symlinks: false,
         errors: &errors,
@@ -1191,15 +1208,14 @@ pub fn index_from_parsed_volume(
     map.roots.push((root_record, root_id));
     map.entries.push((root_record, root_id));
     emit_mft_subtree(
-        &volume,
+        volume,
         root_record,
         root_id,
         Path::new(""),
         &walker,
         &mut map.entries,
     );
-    drop(volume);
-    (builder.freeze(), map)
+    map
 }
 
 #[cfg(test)]

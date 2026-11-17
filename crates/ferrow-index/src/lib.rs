@@ -418,6 +418,21 @@ impl IndexBuilder {
         id
     }
 
+    /// Heap the builder holds, by capacity, as named parts (memory
+    /// accounting; locks every shard briefly, so call it between phases).
+    pub fn memory_parts(&self) -> Vec<(String, usize)> {
+        let (mut records, mut names) = (0, 0);
+        for shard in &self.shards {
+            let shard = shard.lock().expect("builder shard poisoned");
+            records += shard.capacity() * size_of::<RawEntry>();
+            names += shard.iter().map(|e| e.name.capacity()).sum::<usize>();
+        }
+        vec![
+            ("builder.records".into(), records),
+            ("builder.names".into(), names),
+        ]
+    }
+
     /// Number of entries added so far.
     pub fn len(&self) -> usize {
         self.next_id.load(Ordering::Relaxed) as usize
