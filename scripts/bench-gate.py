@@ -171,18 +171,7 @@ def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=N
     core_ms, default_ms = scalars["core_load_ms_median"], scalars["load_ms_median"]
     if core_ms <= 0:
         raise ValueError("default-column load target exceeded (core + 15%)")
-    if default_ms > core_ms*1.15:
-        # Timed check: confirm in a second round before failing. Without a
-        # confirmation producer the first round is final (fail closed).
-        if confirm_load is None:
-            raise ValueError("default-column load target exceeded (core + 15%)")
-        core2, default2 = confirm_load()
-        number(core2), number(default2)
-        if core2 <= 0 or default2 > core2*1.15:
-            raise ValueError("default-column load target exceeded (core + 15%), confirmed in a second round "
-                             f"(first {default_ms:.6f}/{core_ms:.6f} ms, second {default2:.6f}/{core2:.6f} ms default/core)")
-        load_note = (f"\nDefault-column load limit core + 15%: first round over limit ({default_ms:.6f}/{core_ms:.6f} ms default/core), "
-                     f"confirmed not over in the second round ({default2:.6f}/{core2:.6f} ms). Single-round spike; passes.\n")
+    load_over = default_ms > core_ms*1.15
     if scalars["sort_during_load"] != 0:
         raise ValueError("metadata sort built during load")
     rows = [("default columns bytes/entry", total), ("default columns load ms", scalars["load_ms_median"])]
@@ -200,6 +189,18 @@ def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=N
         rows.extend((f"filter {query!r} {key}", filters[query][key]) for key in ("first_page_ms", "full_count_ms"))
     if len(rows) != EXPECTED_METADATA_METRICS:
         raise ValueError("incomplete metadata metric inventory")
+    if load_over:
+        # Timed check, decided last: confirm in a second round before failing.
+        # Without a confirmation producer the first round is final (fail closed).
+        if confirm_load is None:
+            raise ValueError("default-column load target exceeded (core + 15%)")
+        core2, default2 = confirm_load()
+        number(core2), number(default2)
+        if core2 <= 0 or default2 > core2*1.15:
+            raise ValueError("default-column load target exceeded (core + 15%), confirmed in a second round "
+                             f"(first {default_ms:.6f}/{core_ms:.6f} ms, second {default2:.6f}/{core2:.6f} ms default/core)")
+        load_note = (f"\nDefault-column load limit core + 15%: first round over limit ({default_ms:.6f}/{core_ms:.6f} ms default/core), "
+                     f"confirmed not over in the second round ({default2:.6f}/{core2:.6f} ms). Single-round spike; passes.\n")
     report = "\n## Required head-only metadata observations\n\nMain cannot measure the new sort. These are observations; the existing paired gate remains strict.\n\n| Metric | Head |\n|---|---:|\n"
     report += "".join(f"| {name} | {value:.6f} |\n" for name, value in rows)
     report += f"\nDeferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
@@ -359,7 +360,8 @@ def metadata_rerun(args):
         prefix, _, body = line.partition(" ")
         if prefix == "FERROW-METADATA":
             scalars = {k: number(v) for k, v in (w.split("=", 1) for w in shlex.split(body))}
-    if scalars.get("entries") != args.entries or scalars.get("seed") != 2026             or not {"load_ms_median", "core_load_ms_median"} <= scalars.keys():
+    if (scalars.get("entries") != args.entries or scalars.get("seed") != 2026
+            or not {"load_ms_median", "core_load_ms_median"} <= scalars.keys()):
         raise ValueError("invalid default-column load confirmation round")
     return scalars["core_load_ms_median"], scalars["load_ms_median"]
 

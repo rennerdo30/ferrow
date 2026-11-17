@@ -461,7 +461,7 @@ class ConfirmationRoundTests(unittest.TestCase):
     def test_single_round_spike_passes_and_is_reported(self):
         code, probe, report = self.run_main(self.spike(), self.steady)
         self.assertEqual(code, 0)
-        self.assertEqual(probe.call_count, 12)  # one confirmation round, only that row
+        self.assertEqual(probe.call_count, 12)  # only that row again: 6 samples per arm
         self.assertIn("first over limit, confirmed not over", report)
         self.assertNotIn("confirmed regression", report)
         self.assertIn("Round 1 base / head", report)
@@ -529,6 +529,25 @@ class ConfirmationRoundTests(unittest.TestCase):
         # Without a confirmation producer the first round stays final.
         with self.assertRaisesRegex(ValueError, "core \\+ 15%"):
             gate.metadata_observations(slow, head, 16)
+
+    def test_main_wires_the_metadata_rerun_flags(self):
+        slow = metadata_fixture().replace("load_ms_median=200 core_load_ms_median=200",
+                                          "load_ms_median=240 core_load_ms_median=200")
+        rerun_ok = metadata_fixture().replace("load_ms_median=200 core_load_ms_median=200",
+                                              "load_ms_median=210 core_load_ms_median=200")
+        rerun_over = slow
+        with tempfile.TemporaryDirectory() as folder:
+            base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
+            base.write_text(fixture(language=False), encoding="utf-8")
+            flags = ["--metadata-rerun-bench", "bench", "--metadata-rerun-index", "idx"]
+            for extra, rerun, expected, runs in ((flags, rerun_ok, 0, 1), (flags, rerun_over, 2, 1), ([], rerun_ok, 2, 0)):
+                with self.subTest(flags=bool(extra), rerun=rerun is rerun_ok):
+                    head.write_text(fixture() + "\n" + slow, encoding="utf-8")
+                    argv = ["bench-gate.py", str(base), str(head), "--entries", "16", "--require-metadata", *extra]
+                    with patch.object(sys, "argv", argv), patch.object(gate, "publish"), patch("sys.stderr"), \
+                            patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=rerun)) as run:
+                        self.assertEqual(gate.main(), expected)
+                        self.assertEqual(run.call_count, runs)
 
     def test_metadata_rerun_parses_and_validates_the_second_round(self):
         args = SimpleNamespace(metadata_rerun_bench=Path("bench"), metadata_rerun_index=Path("idx"), entries=16)

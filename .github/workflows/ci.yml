@@ -441,7 +441,7 @@ jobs:
         run: |
           # 26 legacy pairs use ABBA; 20 head-only observations run between
           # head legacy samples (C), with excluded warm-ups and no base comparison.
-          python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure --require-metadata --head-observations metadata-output.txt \
+          timeout -k 10s 1200s python3 scripts/bench-gate.py base-output.txt bench-output.txt --measure --require-metadata --head-observations metadata-output.txt \
             --base-probe "$RUNNER_TEMP/ferrow-base-target/release/examples/latency_probe" \
             --head-probe "$PWD/target/release/examples/latency_probe" \
             --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
