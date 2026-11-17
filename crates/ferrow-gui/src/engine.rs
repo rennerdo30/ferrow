@@ -26,6 +26,11 @@ const SERVICE_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 /// up to five times a second, and each report re-runs the search.
 const LIVE_COALESCE: Duration = Duration::from_millis(500);
 
+/// Take the single service-probe slot; false when a probe already runs.
+fn claim_probe(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
 /// The current result set.
 #[derive(Clone)]
 pub enum Hits {
@@ -263,6 +268,12 @@ impl Engine {
     pub fn poll(&self) -> Option<Event> {
         self.events.try_recv().ok()
     }
+
+    /// Who may use the service just changed (Settings → Service access):
+    /// look for it now instead of at the next probe.
+    pub fn service_changed(&self) {
+        let _ = self.commands.send(Command::ServiceUp);
+    }
 }
 
 struct Worker<W: Fn()> {
@@ -273,6 +284,8 @@ struct Worker<W: Fn()> {
     remote: Option<Remote>,
     /// Lets scan threads hand their result back to this worker.
     commands: Option<Sender<Command>>,
+    /// A service probe thread is running (one at a time).
+    probing: Arc<AtomicBool>,
 }
 
 impl<W: Fn()> Worker<W> {
@@ -283,6 +296,7 @@ impl<W: Fn()> Worker<W> {
             index: None,
             remote: None,
             commands: None,
+            probing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -367,7 +381,11 @@ impl<W: Fn()> Worker<W> {
         let Some(commands) = self.commands.clone() else {
             return;
         };
-        let _ = std::thread::Builder::new()
+        if !claim_probe(&self.probing) {
+            return;
+        }
+        let probing = self.probing.clone();
+        let started = std::thread::Builder::new()
             .name("ferrow-service-probe".into())
             .spawn(move || {
                 let endpoint = ferrow_ipc::Endpoint::default_service();
@@ -378,11 +396,15 @@ impl<W: Fn()> Worker<W> {
                         .and_then(|mut client| client.status())
                         .is_ok();
                     if answers {
+                        probing.store(false, Ordering::Release);
                         let _ = commands.send(Command::ServiceUp);
                         return;
                     }
                 }
             });
+        if started.is_err() {
+            self.probing.store(false, Ordering::Release);
+        }
     }
 
     fn load_default(&mut self) {
@@ -1099,6 +1121,18 @@ mod tests {
             false,
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_one_service_probe_runs_at_a_time() {
+        let slot = AtomicBool::new(false);
+        assert!(claim_probe(&slot), "the first look takes the slot");
+        // A look that finds the service still missing (for example after a
+        // change in Settings) must not start a second probe thread.
+        assert!(!claim_probe(&slot));
+        assert!(!claim_probe(&slot));
+        slot.store(false, Ordering::Release); // the probe ended
+        assert!(claim_probe(&slot));
     }
 
     #[test]

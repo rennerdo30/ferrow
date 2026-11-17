@@ -136,6 +136,22 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   returns to `admins`. Names resolve with `LookupAccountNameW` /
   `getpwnam_r` in the short-lived administrator process; groups are refused,
   and control characters in names are escaped when printed.
+- **The app** (Settings → Service access) shows in one line whether this
+  account uses the service, and runs the same commands through the installed
+  `ferrow.exe` with a UAC prompt (Windows; elsewhere it shows the `sudo`
+  commands to copy). When a standard user approves it with an
+  administrator's password the command runs as that administrator, so
+  **Allow me** passes the standard user's SID explicitly (taken from
+  `AccessInfo`), never "the current user". The status query uses a connection
+  of its own with an 800 ms deadline, so a service that predates the request
+  (or is busy) shows "did not answer: older, or busy" with a Retry button
+  without delaying the window. After the elevated command exits, the app asks
+  the service again (at 0, 1.2 and 2.4 seconds, off the UI thread) until the
+  answer shows the change; that answer, not the exit code, decides whether it
+  worked, and it applies even when Settings is not open. Elevated launches
+  only start `ferrow.exe` from the Setup-installed Program Files folder (found
+  with the shell's known-folder API, with that folder as the working
+  directory), never from a portable or development copy.
 - Uninstall keeps `access.json` with the rest of the state (as it keeps
   `index.bin`), so a reinstall picks the choice up again. Delete the folder to
   reset it, or run `ferrow service access admins`.

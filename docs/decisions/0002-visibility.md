@@ -18,7 +18,7 @@ is decided with it.
 
 **Interim access policy (owner request 2026-11-17, FR-27):** an administrator
 can allow every account or a list of accounts (`access.json`, `ferrow
-service access`; `docs/service.md`). Those
+service access`, Settings → Service access; `docs/service.md`). Those
 accounts then see every name unfiltered, exactly as an administrator does:
 this is an explicit grant of the visibility the threat model below forbids to
 ordinary callers, so the default stays administrators only, the file is read

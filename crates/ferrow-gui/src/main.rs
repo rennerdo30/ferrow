@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod access;
 mod app;
 #[cfg(windows)]
 mod drag;
