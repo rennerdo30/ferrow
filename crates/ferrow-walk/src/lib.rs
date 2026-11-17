@@ -954,15 +954,22 @@ fn scan_from_mft(
             }
             map.roots.push((record, id));
             map.entries.push((record, id));
+            if record == ntfs::ROOT_RECORD {
+                reserve_for_volume(walker.builder, &volume, &mut map.entries);
+            }
             entries += emit_mft_subtree(&volume, record, id, &dir, walker, &mut map.entries);
         }
         if !map.roots.is_empty() {
             maps.push(map);
         }
+        // The scan's own proof that the columnar builder ran, and what it holds
+        // when the volume's subtree is in (the highest point of the build).
+        let held: usize = walker.builder.memory_parts().iter().map(|p| p.1).sum();
         modes.push(format!(
-            "mft {device} ({} records read in {:.2} s, {entries} entries)",
+            "mft {device} ({} records read in {:.2} s, {entries} entries, builder {:.1} B/entry)",
             volume.infos.len(),
-            read.as_secs_f64()
+            read.as_secs_f64(),
+            held as f64 / walker.builder.len().max(1) as f64
         ));
     }
     walk
@@ -1064,6 +1071,16 @@ fn ntfs_device_of(path: &Path) -> Option<String> {
         device.pop();
     }
     Some(device)
+}
+
+/// A whole volume's root is about to be emitted: every name of the volume is
+/// an upper bound for the entries it adds, so the builder and the record map
+/// get their room at once instead of growing by doubling (a doubling holds up
+/// to twice what it needs while it copies). Only for the volume root; a folder
+/// root emits a part of the names and would reserve far too much.
+fn reserve_for_volume(builder: &IndexBuilder, volume: &ntfs::Volume, pairs: &mut Vec<(u64, u32)>) {
+    builder.reserve(volume.names.len(), volume.arena.len());
+    pairs.reserve_exact(volume.names.len());
 }
 
 /// Add everything below directory `record` (already added as `root_id`)
@@ -1171,11 +1188,28 @@ pub fn index_from_parsed_volume(
     columns: ColumnSet,
 ) -> (Index, VolumeMap) {
     let builder = IndexBuilder::with_columns(columns);
+    let map = emit_parsed_volume(&volume, root_record, root_name, &builder, columns);
+    drop(volume);
+    (builder.freeze(), map)
+}
+
+/// The emission half of [`index_from_parsed_volume`]: the root entry and the
+/// subtree below `root_record` go into `builder`, the record map comes back.
+/// Split out so the memory benchmark can measure emission and freeze as
+/// separate phases; the volume stays the caller's to drop before the freeze.
+#[doc(hidden)]
+pub fn emit_parsed_volume(
+    volume: &ntfs::Volume,
+    root_record: u64,
+    root_name: &[u8],
+    builder: &IndexBuilder,
+    columns: ColumnSet,
+) -> VolumeMap {
     let errors = Errors::new();
     let excludes = ExcludeSet::default();
     let walker = Walker {
         columns,
-        builder: &builder,
+        builder,
         excludes: &excludes,
         follow_symlinks: false,
         errors: &errors,
@@ -1191,16 +1225,18 @@ pub fn index_from_parsed_volume(
     };
     map.roots.push((root_record, root_id));
     map.entries.push((root_record, root_id));
+    if root_record == ntfs::ROOT_RECORD {
+        reserve_for_volume(builder, volume, &mut map.entries);
+    }
     emit_mft_subtree(
-        &volume,
+        volume,
         root_record,
         root_id,
         Path::new(""),
         &walker,
         &mut map.entries,
     );
-    drop(volume);
-    (builder.freeze(), map)
+    map
 }
 
 #[cfg(test)]

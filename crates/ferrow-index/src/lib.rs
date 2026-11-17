@@ -15,11 +15,11 @@ use rayon::prelude::*;
 mod metadata;
 pub mod osname;
 pub mod persist;
-use metadata::MetadataColumns;
 pub use metadata::{
     ColumnSet, EntryMetadata, MetadataOrder, SortKey, SortStatus, SortTicket, metadata_timestamp,
     timestamp_ticks,
 };
+use metadata::{MetadataColumns, ShardMeta};
 
 pub use persist::{LoadError, LoadTimings, MetadataLoad, SaveError, VERIFY_BUFFER, Verified};
 
@@ -336,12 +336,46 @@ pub(crate) struct OwnedColumns {
     pub sorted: Vec<u32>,
 }
 
-struct RawEntry {
-    metadata: EntryMetadata,
-    id: u32,
-    parent: u32,
-    name: Vec<u8>,
-    flags: u16,
+/// What one builder shard has collected, column by column in arrival order:
+/// no record or allocation per entry. Names are appended to one byte arena
+/// (lengths in `name_len`), metadata is packed like the final columns.
+struct Shard {
+    /// The entry id of each arrival (dense ids, handed out in any order).
+    ids: Vec<u32>,
+    parent: Vec<u32>,
+    flags: Vec<u16>,
+    name_len: Vec<u16>,
+    arena: Vec<u8>,
+    meta: ShardMeta,
+}
+
+impl Shard {
+    fn new(columns: ColumnSet) -> Shard {
+        Shard {
+            ids: Vec::new(),
+            parent: Vec::new(),
+            flags: Vec::new(),
+            name_len: Vec::new(),
+            arena: Vec::new(),
+            meta: ShardMeta::new(columns),
+        }
+    }
+
+    fn reserve(&mut self, entries: usize, name_bytes: usize) {
+        self.ids.reserve_exact(entries);
+        self.parent.reserve_exact(entries);
+        self.flags.reserve_exact(entries);
+        self.name_len.reserve_exact(entries);
+        self.arena.reserve_exact(name_bytes);
+        self.meta.reserve(entries);
+    }
+
+    fn columns_bytes(&self) -> usize {
+        self.ids.capacity() * 4
+            + self.parent.capacity() * 4
+            + self.flags.capacity() * 2
+            + self.name_len.capacity() * 2
+    }
 }
 
 const SHARDS: usize = 16;
@@ -360,7 +394,7 @@ pub struct FreezeTimings {
 /// [`IndexBuilder::freeze`].
 pub struct IndexBuilder {
     columns: ColumnSet,
-    shards: Vec<Mutex<Vec<RawEntry>>>,
+    shards: Vec<Mutex<Shard>>,
     next_id: AtomicU32,
     next_shard: AtomicUsize,
 }
@@ -379,7 +413,9 @@ impl IndexBuilder {
     pub fn with_columns(columns: ColumnSet) -> IndexBuilder {
         IndexBuilder {
             columns,
-            shards: (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect(),
+            shards: (0..SHARDS)
+                .map(|_| Mutex::new(Shard::new(columns)))
+                .collect(),
             next_id: AtomicU32::new(0),
             next_shard: AtomicUsize::new(0),
         }
@@ -411,18 +447,48 @@ impl IndexBuilder {
         if std::str::from_utf8(name).is_err() {
             flags |= flags::NAME_NOT_UTF8;
         }
-        let entry = RawEntry {
-            metadata,
-            id,
-            parent,
-            name: name.to_vec(),
-            flags,
-        };
-        self.shards[shard]
-            .lock()
-            .expect("builder shard poisoned")
-            .push(entry);
+        let take = name.len().min(u16::MAX as usize);
+        let mut s = self.shards[shard].lock().expect("builder shard poisoned");
+        s.ids.push(id);
+        s.parent.push(parent);
+        s.flags.push(flags);
+        s.name_len.push(take as u16);
+        s.arena.extend_from_slice(&name[..take]);
+        s.meta.push(&metadata);
         id
+    }
+
+    /// Make room for `entries` more entries with `name_bytes` of names in
+    /// total, spread over the shards, so the build does not grow its columns
+    /// by doubling (which would hold up to twice what it needs). A hint: the
+    /// builder still takes more. Entries go to the shards round-robin, so
+    /// names are shared out evenly up to a small margin.
+    pub fn reserve(&self, entries: usize, name_bytes: usize) {
+        let per_entries = entries.div_ceil(SHARDS);
+        let per_bytes = name_bytes.div_ceil(SHARDS);
+        for shard in &self.shards {
+            shard
+                .lock()
+                .expect("builder shard poisoned")
+                .reserve(per_entries, per_bytes + per_bytes / 32 + 4096);
+        }
+    }
+
+    /// Heap the builder holds, by capacity, as named parts (memory
+    /// accounting; locks every shard briefly, so call it between phases).
+    pub fn memory_parts(&self) -> Vec<(String, usize)> {
+        let (mut columns, mut names, mut metadata) = (0, 0, 0);
+        for shard in &self.shards {
+            let shard = shard.lock().expect("builder shard poisoned");
+            columns += shard.columns_bytes();
+            names += shard.arena.capacity();
+            metadata += shard.meta.heap_bytes();
+        }
+        vec![
+            ("builder.columns".into(), columns),
+            ("builder.names".into(), names),
+            ("builder.metadata".into(), metadata),
+        ]
     }
 
     /// Number of entries added so far.
@@ -444,36 +510,52 @@ impl IndexBuilder {
     pub fn freeze_with_timings(self) -> (Index, FreezeTimings) {
         let started = std::time::Instant::now();
         let n = self.len();
-        let mut raw: Vec<RawEntry> = Vec::with_capacity(n);
-        for shard in self.shards {
-            raw.extend(shard.into_inner().expect("builder shard poisoned"));
-        }
-        raw.sort_unstable_by_key(|e| e.id);
-        debug_assert_eq!(raw.len(), n);
+        let mut shards: Vec<Shard> = self
+            .shards
+            .into_iter()
+            .map(|s| s.into_inner().expect("builder shard poisoned"))
+            .collect();
+        debug_assert_eq!(shards.iter().map(|s| s.ids.len()).sum::<usize>(), n);
 
-        let mut parent = Vec::with_capacity(n);
+        // Ids are dense, so every column is placed by id. Shards hold their
+        // entries in arrival order, which is nearly id order: the writes run
+        // as sixteen mostly sequential streams.
+        let mut parent = vec![0u32; n];
+        let mut ent_flags = vec![0u16; n];
+        let mut name_len = vec![0u16; n];
+        for s in &shards {
+            for (k, &id) in s.ids.iter().enumerate() {
+                let i = id as usize;
+                parent[i] = s.parent[k];
+                ent_flags[i] = s.flags[k];
+                name_len[i] = s.name_len[k];
+            }
+        }
         let mut name_off = Vec::with_capacity(n);
-        let mut name_len = Vec::with_capacity(n);
-        let mut ent_flags = Vec::with_capacity(n);
-        let total_name: usize = raw
-            .iter()
-            .map(|e| e.name.len().min(u16::MAX as usize))
-            .sum();
-        let mut arena = Vec::with_capacity(total_name);
-        for e in &raw {
-            let take = e.name.len().min(u16::MAX as usize);
-            parent.push(e.parent);
-            name_off.push(arena.len() as u32);
-            name_len.push(take as u16);
-            ent_flags.push(e.flags);
-            arena.extend_from_slice(&e.name[..take]);
+        let mut total_name = 0usize;
+        for &len in &name_len {
+            name_off.push(total_name as u32);
+            total_name += len as usize;
         }
-
-        // Release builder entries before folding/sorting the frozen columns.
-        let t = std::time::Instant::now();
-        let metadata = MetadataColumns::build(&raw, self.columns);
-        let metadata_collect = t.elapsed();
-        drop(raw);
+        // Names and metadata move shard by shard; each shard is freed as soon
+        // as it is placed, so the builder's memory drains while the final
+        // columns fill.
+        let mut arena = vec![0u8; total_name];
+        let mut fill = MetadataColumns::fill(n, self.columns);
+        let mut metadata_collect = std::time::Duration::ZERO;
+        for s in shards.drain(..) {
+            let mut at = 0;
+            for (k, &id) in s.ids.iter().enumerate() {
+                let len = s.name_len[k] as usize;
+                let off = name_off[id as usize] as usize;
+                arena[off..off + len].copy_from_slice(&s.arena[at..at + len]);
+                at += len;
+            }
+            let t = std::time::Instant::now();
+            fill.scatter(&s.meta, &s.ids);
+            metadata_collect += t.elapsed();
+        }
+        let metadata = fill.finish();
         // Allocate the final arena once and split it only at entry boundaries.
         // Each worker reuses scratch; no per-name Vec or slice table survives.
         let mut folded_arena = vec![0; arena.len()];
@@ -555,6 +637,308 @@ mod tests {
         b.add(root, "Zebra.md".as_bytes(), 0);
         b.add(root, "Ärger.txt".as_bytes(), 0);
         b.freeze()
+    }
+
+    /// One entry as the scan hands it to the builder.
+    #[derive(Clone)]
+    struct Spec {
+        parent: u32,
+        name: Vec<u8>,
+        flags: u16,
+        meta: EntryMetadata,
+    }
+
+    /// The columns the format defines for entries in id order, computed with
+    /// no builder code (the layout of ADR 0001: names packed in id order,
+    /// folded arena at the same offsets, sort by folded, raw, id).
+    struct Reference {
+        parent: Vec<u32>,
+        name_off: Vec<u32>,
+        name_len: Vec<u16>,
+        flags: Vec<u16>,
+        arena: Vec<u8>,
+        folded: Vec<u8>,
+        sorted: Vec<u32>,
+    }
+
+    fn reference(specs: &[Spec]) -> Reference {
+        let mut r = Reference {
+            parent: vec![],
+            name_off: vec![],
+            name_len: vec![],
+            flags: vec![],
+            arena: vec![],
+            folded: vec![],
+            sorted: vec![],
+        };
+        let mut scratch = Vec::new();
+        for s in specs {
+            let take = s.name.len().min(u16::MAX as usize);
+            r.parent.push(s.parent);
+            r.name_off.push(r.arena.len() as u32);
+            r.name_len.push(take as u16);
+            let bad = std::str::from_utf8(&s.name).is_err();
+            r.flags
+                .push(s.flags | if bad { flags::NAME_NOT_UTF8 } else { 0 });
+            r.arena.extend_from_slice(&s.name[..take]);
+            fold_name(&s.name[..take], &mut scratch);
+            r.folded.extend_from_slice(&scratch);
+        }
+        let name = |i: u32| {
+            let off = r.name_off[i as usize] as usize;
+            off..off + r.name_len[i as usize] as usize
+        };
+        let mut sorted: Vec<u32> = (0..specs.len() as u32).collect();
+        sorted.sort_by(|&a, &b| {
+            r.folded[name(a)]
+                .cmp(&r.folded[name(b)])
+                .then_with(|| r.arena[name(a)].cmp(&r.arena[name(b)]))
+                .then(a.cmp(&b))
+        });
+        r.sorted = sorted;
+        r
+    }
+
+    /// What a packed column keeps of a time: whole seconds when they fit the
+    /// packed range, else the exact value (an overflow).
+    fn kept_time(ticks: Option<i64>) -> Option<i64> {
+        ticks.map(|t| {
+            let seconds = t.div_euclid(10_000_000);
+            if (0..=u32::MAX as i64).contains(&seconds) {
+                seconds * 10_000_000
+            } else {
+                t
+            }
+        })
+    }
+
+    /// Check an index against the specs (entry i of `specs` has id i).
+    fn assert_matches(idx: &Index, specs: &[Spec], set: ColumnSet) {
+        let r = reference(specs);
+        let c = idx.columns();
+        assert_eq!(c.parent, r.parent.as_slice(), "parent");
+        assert_eq!(c.name_off, r.name_off.as_slice(), "name_off");
+        assert_eq!(c.name_len, r.name_len.as_slice(), "name_len");
+        assert_eq!(c.flags, r.flags.as_slice(), "flags");
+        assert_eq!(c.arena, r.arena.as_slice(), "arena");
+        assert_eq!(c.folded_arena, r.folded.as_slice(), "folded arena");
+        assert_eq!(c.sorted, r.sorted.as_slice(), "sorted");
+        assert_eq!(idx.columns_present().bits(), set.bits());
+        for (i, s) in specs.iter().enumerate() {
+            let got = idx.metadata(i as u32);
+            let has = |bit| set.contains(bit);
+            let want = EntryMetadata {
+                size: s.meta.size.filter(|_| has(ColumnSet::SIZE)),
+                modified: kept_time(s.meta.modified).filter(|_| has(ColumnSet::MODIFIED)),
+                created: kept_time(s.meta.created).filter(|_| has(ColumnSet::CREATED)),
+                accessed: kept_time(s.meta.accessed).filter(|_| has(ColumnSet::ACCESSED)),
+                attributes: s.meta.attributes.filter(|_| has(ColumnSet::ATTRIBUTES)),
+            };
+            assert_eq!(got, want, "metadata of entry {i}");
+        }
+    }
+
+    /// Entries of every awkward kind, from a fixed generator: a deep chain,
+    /// non-ASCII and invalid UTF-8 names, an over-long name, empty names,
+    /// duplicates, and metadata that overflows the packed widths.
+    fn awkward_specs(n: usize) -> Vec<Spec> {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut specs = vec![Spec {
+            parent: ROOT_PARENT,
+            name: b"C:".to_vec(),
+            flags: flags::DIR,
+            meta: EntryMetadata::default(),
+        }];
+        let words: [&[u8]; 8] = [
+            b"report",
+            b"Report",
+            "Ärger".as_bytes(),
+            "写真".as_bytes(),
+            "Σίσυφος".as_bytes(),
+            b"\xFF\xFEraw",
+            b"",
+            b"a",
+        ];
+        for i in 1..n {
+            // The first 300 entries chain: each is the previous one's child.
+            let parent = if i < 300 {
+                i as u32 - 1
+            } else {
+                (next() % i as u64) as u32
+            };
+            let mut name = words[(next() % 8) as usize].to_vec();
+            name.extend_from_slice(format!("-{}", next() % 50).as_bytes());
+            if i == 777 {
+                name = vec![b'L'; 70_000];
+            }
+            let big = next() % 7 == 0;
+            specs.push(Spec {
+                parent,
+                name,
+                flags: if next() % 5 == 0 { flags::DIR } else { 0 }
+                    | ((next() % 3 == 0) as u16 * 2),
+                meta: EntryMetadata {
+                    size: (next() % 4 != 0).then(|| {
+                        if big {
+                            u64::MAX - i as u64
+                        } else {
+                            next() % (1 << 33)
+                        }
+                    }),
+                    modified: (next() % 4 != 0).then(|| {
+                        if big {
+                            -(next() as i64 >> 20)
+                        } else {
+                            (next() % 4_000_000_000) as i64 * 10_000_000 + 123
+                        }
+                    }),
+                    created: (next() % 3 == 0).then(|| (next() % 1_000_000) as i64 * 10_000_000),
+                    accessed: (next() % 3 == 0).then(|| i64::MAX - (next() % 99) as i64),
+                    attributes: (next() % 2 == 0).then(|| next() as u32),
+                },
+            });
+        }
+        specs
+    }
+
+    fn build(specs: &[Spec], set: ColumnSet, hint: Option<(usize, usize)>) -> Index {
+        let b = IndexBuilder::with_columns(set);
+        if let Some((entries, bytes)) = hint {
+            b.reserve(entries, bytes);
+        }
+        for (i, s) in specs.iter().enumerate() {
+            let id = b.add_with_metadata(s.parent, &s.name, s.flags, s.meta);
+            assert_eq!(id as usize, i, "ids are handed out in order");
+        }
+        b.freeze()
+    }
+
+    #[test]
+    fn built_index_equals_the_format_reference_for_every_column_set() {
+        let specs = awkward_specs(4_000);
+        let total: usize = specs.iter().map(|s| s.name.len().min(65_535)).sum();
+        for set in [
+            ColumnSet::NONE,
+            ColumnSet::DEFAULT,
+            ColumnSet::ALL,
+            ColumnSet::ATTRIBUTES,
+        ] {
+            assert_matches(&build(&specs, set, None), &specs, set);
+            // A hint that is too small, exact or far too large changes
+            // nothing but capacity.
+            for hint in [(10, 10), (specs.len(), total), (100_000, 10_000_000)] {
+                assert_matches(&build(&specs, set, Some(hint)), &specs, set);
+            }
+        }
+    }
+
+    #[test]
+    fn built_index_survives_a_save_and_load_unchanged() {
+        let specs = awkward_specs(3_000);
+        let idx = build(&specs, ColumnSet::ALL, None);
+        let dir = std::env::temp_dir().join(format!("ferrow-build-eq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.bin");
+        idx.save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_matches(&loaded, &specs, ColumnSet::ALL);
+        let again = dir.join("again.bin");
+        loaded.save(&again).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&again).unwrap(),
+            "the saved file is byte-identical after a round trip"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_added_from_many_threads_land_at_their_ids() {
+        let b = IndexBuilder::with_columns(ColumnSet::ALL);
+        let root = b.add_root(b"r", flags::DIR);
+        let mut all: Vec<(u32, Spec)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..6)
+                .map(|t| {
+                    let b = &b;
+                    s.spawn(move || {
+                        (0..700)
+                            .map(|i| {
+                                let spec = Spec {
+                                    parent: root,
+                                    name: format!("t{t}-{i}-Ä").into_bytes(),
+                                    flags: 0,
+                                    meta: EntryMetadata {
+                                        size: Some((t * 1000 + i) as u64),
+                                        modified: Some(((t * 1000 + i) as i64) * 10_000_000),
+                                        created: None,
+                                        accessed: (i % 2 == 0).then_some(i64::MAX),
+                                        attributes: Some(i as u32),
+                                    },
+                                };
+                                let id = b.add_with_metadata(
+                                    spec.parent,
+                                    &spec.name,
+                                    spec.flags,
+                                    spec.meta,
+                                );
+                                (id, spec)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let idx = b.freeze();
+        all.sort_by_key(|(id, _)| *id);
+        let mut specs = vec![Spec {
+            parent: ROOT_PARENT,
+            name: b"r".to_vec(),
+            flags: flags::DIR,
+            meta: EntryMetadata::default(),
+        }];
+        for (i, (id, spec)) in all.into_iter().enumerate() {
+            assert_eq!(id as usize, i + 1, "ids are dense");
+            specs.push(spec);
+        }
+        assert_matches(&idx, &specs, ColumnSet::ALL);
+    }
+
+    #[test]
+    fn empty_and_single_entry_builders_freeze() {
+        let idx = IndexBuilder::with_columns(ColumnSet::ALL).freeze();
+        assert!(idx.is_empty());
+        let one = [Spec {
+            parent: ROOT_PARENT,
+            name: b"x".to_vec(),
+            flags: flags::DIR,
+            meta: EntryMetadata::default(),
+        }];
+        assert_matches(&build(&one, ColumnSet::ALL, None), &one, ColumnSet::ALL);
+    }
+
+    #[test]
+    fn builder_memory_parts_cover_its_columns_names_and_metadata() {
+        let specs = awkward_specs(2_000);
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        b.reserve(specs.len(), 40_000);
+        for s in &specs {
+            b.add_with_metadata(s.parent, &s.name, s.flags, s.meta);
+        }
+        let parts: std::collections::HashMap<_, _> = b.memory_parts().into_iter().collect();
+        let names: usize = specs.iter().map(|s| s.name.len().min(65_535)).sum();
+        assert!(parts["builder.names"] >= names);
+        assert!(parts["builder.columns"] >= specs.len() * 12);
+        assert!(parts["builder.metadata"] >= specs.len() * 9);
     }
 
     #[test]

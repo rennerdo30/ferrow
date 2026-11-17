@@ -1,5 +1,5 @@
 //! Packed optional metadata, exact overflows and background sort preparation.
-use crate::{LoadError, RawEntry};
+use crate::LoadError;
 use std::cmp::Ordering;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
@@ -250,6 +250,138 @@ struct Column<T> {
     order: OnceLock<PackedIds>,
     signal: Arc<Signal>,
 }
+/// One column's values as a builder shard collects them, in arrival order,
+/// already packed like the final column (same width, absent as zero, overflow
+/// values beside by arrival index).
+struct ShardColumn<T> {
+    packed: Vec<u8>,
+    valid: Vec<u8>,
+    overflow: Vec<(u32, T)>,
+    len: usize,
+}
+impl<T: Value> ShardColumn<T> {
+    fn new() -> Self {
+        Self {
+            packed: Vec::new(),
+            valid: Vec::new(),
+            overflow: Vec::new(),
+            len: 0,
+        }
+    }
+    fn push(&mut self, value: Option<T>) {
+        let k = self.len;
+        self.len += 1;
+        if k.is_multiple_of(8) {
+            self.valid.push(0);
+        }
+        let (code, overflow) = value.map_or((0, None), |value| {
+            self.valid[k / 8] |= 1 << (k % 8);
+            value.pack()
+        });
+        self.packed
+            .extend_from_slice(&code.to_le_bytes()[..T::WIDTH]);
+        if let Some(value) = overflow {
+            self.overflow.push((k as u32, value));
+        }
+    }
+    fn heap_bytes(&self) -> usize {
+        self.packed.capacity()
+            + self.valid.capacity()
+            + self.overflow.capacity() * size_of::<(u32, T)>()
+    }
+}
+
+/// The selected metadata columns of one builder shard.
+pub(crate) struct ShardMeta {
+    size: Option<ShardColumn<u64>>,
+    modified: Option<ShardColumn<i64>>,
+    created: Option<ShardColumn<i64>>,
+    accessed: Option<ShardColumn<i64>>,
+    attributes: Option<ShardColumn<u32>>,
+}
+impl ShardMeta {
+    pub(crate) fn new(set: ColumnSet) -> Self {
+        let col = |bit| set.contains(bit);
+        Self {
+            size: col(ColumnSet::SIZE).then(ShardColumn::new),
+            modified: col(ColumnSet::MODIFIED).then(ShardColumn::new),
+            created: col(ColumnSet::CREATED).then(ShardColumn::new),
+            accessed: col(ColumnSet::ACCESSED).then(ShardColumn::new),
+            attributes: col(ColumnSet::ATTRIBUTES).then(ShardColumn::new),
+        }
+    }
+    pub(crate) fn push(&mut self, m: &EntryMetadata) {
+        if let Some(c) = &mut self.size {
+            c.push(m.size);
+        }
+        if let Some(c) = &mut self.modified {
+            c.push(m.modified);
+        }
+        if let Some(c) = &mut self.created {
+            c.push(m.created);
+        }
+        if let Some(c) = &mut self.accessed {
+            c.push(m.accessed);
+        }
+        if let Some(c) = &mut self.attributes {
+            c.push(m.attributes);
+        }
+    }
+    pub(crate) fn reserve(&mut self, n: usize) {
+        fn grow<T: Value>(c: &mut Option<ShardColumn<T>>, n: usize) {
+            if let Some(c) = c {
+                c.packed.reserve_exact(n * T::WIDTH);
+                c.valid.reserve_exact(n / 8 + 1);
+            }
+        }
+        grow(&mut self.size, n);
+        grow(&mut self.modified, n);
+        grow(&mut self.created, n);
+        grow(&mut self.accessed, n);
+        grow(&mut self.attributes, n);
+    }
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.size.as_ref().map_or(0, ShardColumn::heap_bytes)
+            + self.modified.as_ref().map_or(0, ShardColumn::heap_bytes)
+            + self.created.as_ref().map_or(0, ShardColumn::heap_bytes)
+            + self.accessed.as_ref().map_or(0, ShardColumn::heap_bytes)
+            + self.attributes.as_ref().map_or(0, ShardColumn::heap_bytes)
+    }
+}
+
+/// The final columns while the freeze places the shards' values in them.
+pub(crate) struct MetadataFill {
+    size: Option<Column<u64>>,
+    modified: Option<Column<i64>>,
+    created: Option<Column<i64>>,
+    accessed: Option<Column<i64>>,
+    attributes: Option<Column<u32>>,
+}
+impl MetadataFill {
+    /// Place one shard's values; `ids[k]` is the entry its k-th value is for.
+    pub(crate) fn scatter(&mut self, shard: &ShardMeta, ids: &[u32]) {
+        fn put<T: Value>(to: &mut Option<Column<T>>, from: &Option<ShardColumn<T>>, ids: &[u32]) {
+            if let (Some(to), Some(from)) = (to, from) {
+                to.scatter(from, ids);
+            }
+        }
+        put(&mut self.size, &shard.size, ids);
+        put(&mut self.modified, &shard.modified, ids);
+        put(&mut self.created, &shard.created, ids);
+        put(&mut self.accessed, &shard.accessed, ids);
+        put(&mut self.attributes, &shard.attributes, ids);
+    }
+    pub(crate) fn finish(self) -> MetadataColumns {
+        MetadataColumns {
+            size: self.size.map(Column::seal),
+            modified: self.modified.map(Column::seal),
+            created: self.created.map(Column::seal),
+            accessed: self.accessed.map(Column::seal),
+            attributes: self.attributes.map(Column::seal),
+        }
+    }
+}
+
 fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], LoadError> {
     let end = at
         .checked_add(n)
@@ -316,30 +448,48 @@ impl<T: Value> Column<T> {
         }
         check()
     }
-    fn build(raw: &[RawEntry], get: impl Fn(&EntryMetadata) -> Option<T>) -> Arc<Self> {
-        let mut c = Self {
-            packed: Vec::with_capacity(raw.len() * T::WIDTH),
-            valid: vec![0; raw.len().div_ceil(8)],
+    /// An all-absent column of `n` entries, filled by [`Column::scatter`].
+    fn with_len(n: usize) -> Self {
+        Self {
+            packed: vec![0; n * T::WIDTH],
+            valid: vec![0; n.div_ceil(8)],
             overflow_ids: Vec::new(),
             overflow_values: Vec::new(),
             order: OnceLock::new(),
             signal: Arc::default(),
-        };
-        for (i, e) in raw.iter().enumerate() {
-            let (packed, overflow) = get(&e.metadata).map_or((0, None), |value| {
-                c.valid[i / 8] |= 1 << (i % 8);
-                value.pack()
-            });
-            c.packed
-                .extend_from_slice(&packed.to_le_bytes()[..T::WIDTH]);
-            if let Some(value) = overflow {
-                c.overflow_ids.push(i as u32);
-                c.overflow_values.push(value);
+        }
+    }
+    /// Place a shard's values at their entry ids (`ids[k]` is the entry the
+    /// shard's k-th value belongs to).
+    fn scatter(&mut self, part: &ShardColumn<T>, ids: &[u32]) {
+        for (k, &id) in ids.iter().enumerate() {
+            let i = id as usize;
+            self.packed[i * T::WIDTH..(i + 1) * T::WIDTH]
+                .copy_from_slice(&part.packed[k * T::WIDTH..(k + 1) * T::WIDTH]);
+            if part.valid[k / 8] & (1 << (k % 8)) != 0 {
+                self.valid[i / 8] |= 1 << (i % 8);
             }
         }
-        c.overflow_ids.shrink_to_fit();
-        c.overflow_values.shrink_to_fit();
-        Arc::new(c)
+        for &(k, value) in &part.overflow {
+            self.overflow_ids.push(ids[k as usize]);
+            self.overflow_values.push(value);
+        }
+    }
+    /// Overflows arrive shard by shard; the column keeps them in id order.
+    fn seal(mut self) -> Arc<Self> {
+        let mut pairs: Vec<(u32, T)> = self
+            .overflow_ids
+            .drain(..)
+            .zip(self.overflow_values.drain(..))
+            .collect();
+        pairs.sort_unstable_by_key(|p| p.0);
+        for (id, value) in pairs {
+            self.overflow_ids.push(id);
+            self.overflow_values.push(value);
+        }
+        self.overflow_ids.shrink_to_fit();
+        self.overflow_values.shrink_to_fit();
+        Arc::new(self)
     }
     fn code(&self, id: usize) -> u64 {
         let mut bytes = [0; 8];
@@ -636,23 +786,16 @@ impl MetadataColumns {
             }),
         }
     }
-    pub(crate) fn build(raw: &[RawEntry], set: ColumnSet) -> Self {
-        Self {
-            size: set
-                .contains(ColumnSet::SIZE)
-                .then(|| Column::build(raw, |m| m.size)),
-            modified: set
-                .contains(ColumnSet::MODIFIED)
-                .then(|| Column::build(raw, |m| m.modified)),
-            created: set
-                .contains(ColumnSet::CREATED)
-                .then(|| Column::build(raw, |m| m.created)),
-            accessed: set
-                .contains(ColumnSet::ACCESSED)
-                .then(|| Column::build(raw, |m| m.accessed)),
-            attributes: set
-                .contains(ColumnSet::ATTRIBUTES)
-                .then(|| Column::build(raw, |m| m.attributes)),
+    /// Empty columns of `n` entries (the selected ones) for the freeze to fill
+    /// shard by shard, so a shard can be freed as soon as it is placed.
+    pub(crate) fn fill(n: usize, set: ColumnSet) -> MetadataFill {
+        let col = |bit| set.contains(bit);
+        MetadataFill {
+            size: col(ColumnSet::SIZE).then(|| Column::with_len(n)),
+            modified: col(ColumnSet::MODIFIED).then(|| Column::with_len(n)),
+            created: col(ColumnSet::CREATED).then(|| Column::with_len(n)),
+            accessed: col(ColumnSet::ACCESSED).then(|| Column::with_len(n)),
+            attributes: col(ColumnSet::ATTRIBUTES).then(|| Column::with_len(n)),
         }
     }
     pub(crate) fn present(&self) -> ColumnSet {
@@ -1136,7 +1279,7 @@ mod tests {
     }
     #[test]
     fn failed_preparation_is_explicit_and_not_retried() {
-        let column = Column::<u64>::build(&[], |m| m.size);
+        let column = Arc::new(Column::<u64>::with_len(0));
         column.request_using(Arc::new(Vec::new()), || panic!("mock sort failure"));
         let ticket = SortTicket(column.signal.clone());
         assert_eq!(
