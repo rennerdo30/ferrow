@@ -515,8 +515,10 @@ jobs:
           git rev-parse HEAD
           FERROW_BENCH_ENTRIES=20000 FERROW_MEMORY_CHANGES=500 timeout -k 5s 120s target/release/examples/memory_breakdown > /dev/null
       # What a large live delta costs (FR-42): view build, publish duty, search
-      # with a delta, bytes per delta entry, and that a rewritten file keeps one
-      # delta entry. Informational: a small synthetic index, two checkpoints, so
+      # with a delta, bytes per delta entry, that a rewritten file keeps one
+      # delta entry, and the in-memory compaction that replaces the disk rescan
+      # (`DELTA-COMPACT` rows: time, peak bytes per entry, searches afterwards).
+      # Informational: a small synthetic index, two checkpoints, so
       # it never turns the perf gate red; `continue-on-error` keeps it so.
       - name: Live delta cost (20,000 entries, informational)
         if: always()
@@ -560,13 +562,14 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - run: cargo build --release --locked -p ferrowd --example memory_breakdown
       - run: cargo build --release --locked -p ferrowd --example delta_limit_bench
-      # The live delta's cost at its limit and at four times it on a 1 M entry
-      # index (about 20 s; FR-42): informational, the job is not required.
-      - name: Live delta cost (1M entries, 50k and 200k delta)
+      # The live delta's cost at its limit and at five times it on a 1 M entry
+      # index, with the in-memory compaction at each (about 30 s; FR-42):
+      # informational, the job is not required.
+      - name: Live delta cost and compaction (1M entries, 50k and 250k delta)
         continue-on-error: true
         run: |
           FERROW_DELTA_BASE=20000 FERROW_DELTA_CHECKPOINTS=2000,8000 timeout -k 5s 120s target/release/examples/delta_limit_bench > /dev/null
-          FERROW_DELTA_BASE=1000000 FERROW_DELTA_CHECKPOINTS=50000,200000 timeout -k 10s 300s target/release/examples/delta_limit_bench 2>&1 | tee delta-limit-windows-output.txt
+          FERROW_DELTA_BASE=1000000 FERROW_DELTA_CHECKPOINTS=50000,250000 timeout -k 10s 420s target/release/examples/delta_limit_bench 2>&1 | tee delta-limit-windows-output.txt
       - name: Memory breakdown of the service's structures (5M synthetic MFT build)
         run: |
           git rev-parse HEAD

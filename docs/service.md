@@ -22,18 +22,60 @@ Windows MFT/USN journal).
   0 % CPU while nothing changes). Changes are applied in 200 ms batches
   and searches see them within a second. The frozen index is never
   rebuilt for a change: replaced entries are hidden, new ones live in a
-  small second index (the delta), and a background rescan folds them in
-  once that grows large or the journal is reset.
-  - **The limit follows the index:** a rescan is asked for when more than
+  small second index (the delta), and the service merges them into a new
+  frozen index in memory once that grows large (a rescan of the drives only
+  when the journal is reset or a change cannot be applied; see below).
+  - **The limit follows the index:** a compaction is asked for when more than
     1 % of the index's entries are live delta entries, at least 50,000 and
     at most 250,000 (1 million entries: 50,000; 18.6 million: 186,000;
     27 million and more: 250,000), or when dead delta entries (replaced or
-    deleted again, kept until the next rescan) outnumber twice that limit,
-    or at once when the delta with its dead entries grows past 3 times the
-    limit (at least 400,000, at most 750,000) while a rescan is waiting for
-    its rate limit. A file that is
+    deleted again, kept until the next compaction) outnumber twice that limit,
+    or when more than a tenth of the frozen entries are hidden; it starts at
+    once when the delta with its dead entries grows past 3 times the
+    limit (at least 400,000, at most 750,000), without waiting for its rate
+    limit. A file that is
     written again and again keeps one delta entry, so a busy log or
-    database file is no reason to rescan.
+    database file is no reason to compact.
+  - **Compaction instead of a rescan (FR-42, part 2).** For the three size
+    reasons (`too many live changes`, `too many replaced entries`,
+    `too many superseded entries`) the maintainer thread runs
+    `Live::compact` on the low-priority rescan pool: a new frozen index from
+    the frozen entries still shown (folder dates folded in) plus the live
+    entries, and a new live layer over it with the same volumes, roots,
+    excluded records and hard links. It reads no disk and no file table. A
+    search never waits: it uses the snapshot published before, and one
+    `SnapshotStore::swap` publishes the new index with no delta. The old
+    index and live layer are freed when the last search that holds the old
+    snapshot ends. Journal changes that arrive meanwhile wait in the
+    maintainer's channel (the single writer; no replay log) and are applied
+    right after, so a compaction delays only how soon a change shows, never
+    a search. It starts only when no folder read is outstanding (a read's
+    result is merged by entry id) and no index save is running (the saver
+    holds the old index; it is looked at again every 2 s), at least 60 s
+    after the last scan or compaction and 5 times the last compaction's
+    duration (at most 10 min) after the last compaction; past the hard delta
+    limit it does not wait for its gap. The hard limit stays a cap: a delta
+    past it that has waited 40 s (the longest a folder read lasts) for reads
+    or a save, or past twice the limit, is not held back by a save, and if
+    folder reads still keep arriving the volumes are rescanned instead, as
+    before compactions existed. What answers a reason is carried with the
+    reason (not read from its text). A pending real rescan covers a pending
+    compaction. These still read the
+    drives again: a journal reset or overrun, a moved-in folder that could not
+    be read, a large folder move, a request by an administrator, and the start
+    of the service. Memory: the builder and the new tables add about 85 bytes
+    per entry on top of the old index while it runs (a rescan adds about
+    161). The new index starts without its cached metadata sort orders (size,
+    dates); right after the swap the ones that were ready on the old index
+    are prepared again in the background, one thread each at the lowest
+    priority (about 0.13 s at 1 million entries), and a sorted search
+    answers in name order until then. The saved index file is written as
+    before, at most every 30 minutes, when a new index exists. Health keeps
+    it apart from the scans: `live_stats` has `compactions`, `compaction_ms`
+    and `last_compaction` (when, how long; a later scan clears it), and it is
+    not in `scans_by_reason`, and never shows "scanning". The log carries
+    "memory before compaction" and "memory after compaction" tables like the
+    rescan's, and a line with the duration.
   - **The delta's view is built cheaply:** after a batch the delta is
     published as a small searchable index on the low-priority background
     pool the rescans use (never on the cores searches use), at most about
@@ -49,7 +91,8 @@ Windows MFT/USN journal).
   50,000 to 250,000 entries, and 30 s). Changes the journal reports while it is listed are read
   again after the result is merged, so none is lost or doubled. Only a
   folder too large or too slow to list, or a failed read, asks for the
-  full rescan. The health report counts scans by reason and the
+  full rescan (the size of the live layer alone no longer does: it is
+  compacted). The health report counts scans by reason and the
   folder reads (`live_stats`); each fallback and each read of a second or
   more is an event in the service log.
 - **Start.** The service answers from its saved index at once (or an
@@ -213,7 +256,9 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   duration) and per volume its root, mode (`mft+usn live`, `walk` or
   `live unavailable` with the reason), entries, journal state (`ok`, `reset`,
   `reader error` with the text), last scan (time, why, duration) and a pending
-  rescan (why, earliest time), then the last 50 events. It is answered to the
+  rescan (why, earliest time); and, once for the service, the last merge of
+  live changes into the index in memory (time, why, duration; not a scan),
+  then the last 50 events. It is answered to the
   same callers as searches; a refused caller gets `Unauthorized`. The human
   output starts with `OK` or `ATTENTION` and the list of problems. `--json` is
   the report on one line (`ferrow_ipc::health::Health`; readers ignore unknown

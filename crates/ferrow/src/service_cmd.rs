@@ -268,6 +268,16 @@ pub fn render(h: &Health, json: bool) -> String {
         "live changes applied: {}; connection errors: {}\n",
         h.live_changes, h.connection_errors
     ));
+    // Not a scan, and not per volume: the live changes were merged into a new
+    // index in memory (no disk read).
+    if let Some(c) = &h.live_stats.last_compaction {
+        out.push_str(&format!(
+            "live changes merged in memory: {} ({}, {})\n",
+            ago(c.at_ms),
+            p(&c.reason),
+            format_duration(c.took_ms)
+        ));
+    }
     match &h.last_save {
         Some(s) if s.ok => out.push_str(&format!(
             "last save: ok, {} ({}, {})\n",
@@ -642,6 +652,23 @@ mod tests {
         let text = render(&bad, false);
         assert!(text.starts_with("ATTENTION: 2 problem(s)\n"), "{text}");
         assert!(text.contains("disk full") && text.contains("live updates stopped"));
+
+        // A merge of the live changes in memory is shown once, among the
+        // service's own lines, not under a volume.
+        let mut merged = sample();
+        merged.live_stats.last_compaction = Some(ScanInfo {
+            at_ms: 1_709_219_000_000,
+            reason: "50001 live changes".into(),
+            took_ms: 12_400,
+        });
+        let text = render(&merged, false);
+        assert!(
+            text.contains("\nlive changes merged in memory: ")
+                && text.contains("(50001 live changes, "),
+            "{text}"
+        );
+        assert_eq!(text.matches("merged in memory").count(), 1, "{text}");
+        assert!(!render(&sample(), false).contains("merged in memory"));
 
         // A live volume's warning is shown under it, but is not a problem.
         let mut warned = sample();

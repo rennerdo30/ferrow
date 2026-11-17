@@ -73,11 +73,25 @@ struct Inner {
     last_finished: Option<Instant>,
     /// Scans started, by kind of reason.
     scans_by_reason: BTreeMap<String, u64>,
+    /// The last in-memory compaction since the last scan, how many there were
+    /// and their total time.
+    compaction: Option<ScanInfo>,
+    compactions: u64,
+    compaction_ms: u64,
 }
 
 /// Least time between the end of one scan and a requested rescan: an
 /// administrator's own repeated requests must not keep the service scanning.
 pub const MIN_FORCED_GAP: Duration = Duration::from_secs(60);
+
+/// An index save in flight (see [`State::saving`]).
+pub struct SavingGuard<'a>(&'a AtomicBool);
+
+impl Drop for SavingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 pub struct State {
     inner: Mutex<Inner>,
@@ -92,6 +106,8 @@ pub struct State {
     scanning: AtomicBool,
     /// A requested rescan was sent and has not started yet.
     forced: AtomicBool,
+    /// The index is being written to disk (the saver holds it alive).
+    saving: AtomicBool,
 }
 
 impl State {
@@ -104,6 +120,9 @@ impl State {
                 volumes: Vec::new(),
                 last_finished: None,
                 scans_by_reason: BTreeMap::new(),
+                compaction: None,
+                compactions: 0,
+                compaction_ms: 0,
             }),
             started: Mutex::new(None),
             live_changes: AtomicU64::new(0),
@@ -115,6 +134,7 @@ impl State {
             connection_errors: AtomicU64::new(0),
             scanning: AtomicBool::new(false),
             forced: AtomicBool::new(false),
+            saving: AtomicBool::new(false),
         }
     }
 
@@ -158,6 +178,9 @@ impl State {
         }
         inner.volumes = volumes;
         inner.last_finished = Some(Instant::now());
+        // The index was built from the disks again: an earlier merge of live
+        // changes says nothing about it.
+        inner.compaction = None;
         inner.scan = Some(ScanInfo {
             at_ms: now_ms(),
             reason: reason.into(),
@@ -212,6 +235,20 @@ impl State {
             .or_default() += 1;
     }
 
+    /// A compaction finished: the live layer grown past `reason`'s limit was
+    /// folded into a new index in memory in `took`. Not a scan (no disk was
+    /// read, [`State::is_scanning`] never said so): it has its own counters.
+    pub fn compaction_done(&self, reason: &str, took: Duration) {
+        let mut inner = self.lock();
+        inner.compactions += 1;
+        inner.compaction_ms += took.as_millis() as u64;
+        inner.compaction = Some(ScanInfo {
+            at_ms: now_ms(),
+            reason: reason.into(),
+            took_ms: took.as_millis() as u64,
+        });
+    }
+
     /// A background read of a moved-in folder finished with `entries`,
     /// `skipped` subfolders having vanished meanwhile.
     pub fn folder_read(&self, entries: usize, skipped: usize, took: Duration) {
@@ -227,6 +264,19 @@ impl State {
     /// A background read failed or was too large: a rescan is asked for.
     pub fn folder_read_fell_back(&self) {
         self.folder_read_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The index save starts; it is in flight until the guard is dropped (on
+    /// success, failure or panic). The maintainer holds back an in-memory
+    /// compaction meanwhile: the saver keeps the old index alive.
+    pub fn saving(&self) -> SavingGuard<'_> {
+        self.saving.store(true, Ordering::Release);
+        SavingGuard(&self.saving)
+    }
+
+    /// Whether an index save is in flight.
+    pub fn is_saving(&self) -> bool {
+        self.saving.load(Ordering::Acquire)
     }
 
     pub fn save_done(&self, took: Duration, error: Option<String>) {
@@ -320,6 +370,9 @@ impl State {
                 folder_read_skipped: self.folder_read_skipped.load(Ordering::Relaxed),
                 folder_read_fallbacks: self.folder_read_fallbacks.load(Ordering::Relaxed),
                 scans_by_reason: inner.scans_by_reason.clone(),
+                compactions: inner.compactions,
+                compaction_ms: inner.compaction_ms,
+                last_compaction: inner.compaction.clone(),
             },
             events,
             ..Health::default()
@@ -572,6 +625,76 @@ mod tests {
         assert!(json.contains("\"scans_by_reason\""), "{json}");
         let old = ferrow_ipc::health::Health::from_json(r#"{"version":"1"}"#).unwrap();
         assert_eq!(old.live_stats, LiveStats::default());
+    }
+
+    #[test]
+    fn a_merge_in_memory_has_its_own_counters_and_is_not_a_scan() {
+        let state = State::new();
+        state.scan_started();
+        state.scan_finished("startup", Duration::from_secs(70), vec![live_volume()]);
+        state.count_scan("startup");
+        state.compaction_done("50001 live changes", Duration::from_millis(12_400));
+        state.compaction_done("60000 live changes", Duration::from_millis(600));
+        assert!(!state.is_scanning(), "folding in memory reads no disk");
+        let store = SnapshotStore::new(Snapshot::empty());
+        let policy = Policy {
+            mode: AccessMode::Everyone,
+            users: vec![],
+        };
+        let report = state.report(&store, &policy);
+        let stats = &report.live_stats;
+        // Counted beside the scans, never among them.
+        assert_eq!(stats.scans_by_reason.len(), 1);
+        assert_eq!(stats.scans_by_reason["startup"], 1);
+        assert_eq!((stats.compactions, stats.compaction_ms), (2, 13_000));
+        // The volume still reports its last real scan; the last merge is one
+        // service-level fact, not repeated on every volume.
+        assert_eq!(
+            report.volumes[0].last_scan.as_ref().unwrap().reason,
+            "startup"
+        );
+        let last = stats.last_compaction.as_ref().unwrap();
+        assert_eq!(
+            (last.reason.as_str(), last.took_ms),
+            ("60000 live changes", 600)
+        );
+        assert!(last.at_ms > 0);
+        // Additive on the wire: a report of an older service has none.
+        let json = report.to_json();
+        assert!(json.contains("\"last_compaction\"") && json.contains("\"compactions\":2"));
+        let old = ferrow_ipc::health::Health::from_json(
+            r#"{"live_stats":{"folder_reads":1},"volumes":[{"root":"C:\\"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.live_stats.compactions, 0);
+        assert_eq!(old.live_stats.last_compaction, None);
+        // A later scan builds the index from the disks again: the earlier
+        // merge no longer says anything about it, the totals stay.
+        state.scan_started();
+        state.scan_finished("journal", Duration::from_secs(60), vec![live_volume()]);
+        let report = state.report(&store, &policy);
+        assert_eq!(report.live_stats.last_compaction, None);
+        assert_eq!(report.live_stats.compactions, 2);
+    }
+
+    #[test]
+    fn an_index_save_in_flight_is_visible_until_its_guard_ends() {
+        let state = State::new();
+        assert!(!state.is_saving());
+        {
+            let _saving = state.saving();
+            assert!(state.is_saving());
+        }
+        assert!(!state.is_saving());
+        // Also when the save panics.
+        let state = std::sync::Arc::new(State::new());
+        let s = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _saving = s.saving();
+            panic!("save failed");
+        })
+        .join();
+        assert!(!state.is_saving(), "a panic does not leave it set");
     }
 
     #[test]

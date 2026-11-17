@@ -113,8 +113,17 @@ pub struct LiveStats {
     pub folder_read_fallbacks: u64,
     /// Scans started, by why: `startup`, `moved-in folder`, `large folder
     /// move`, `too many live changes`, `too many replaced entries`,
-    /// `too many superseded entries`, `journal`, `administrator`.
+    /// `too many superseded entries`, `journal`, `administrator`. A merge of
+    /// the live changes in memory is not a scan and is not counted here.
     pub scans_by_reason: BTreeMap<String, u64>,
+    /// Merges of the live changes into a new index in memory (no disk read)
+    /// finished since the service started…
+    pub compactions: u64,
+    /// …the milliseconds they took in total…
+    pub compaction_ms: u64,
+    /// …and the last one since the last scan (a scan starts from the disks
+    /// and clears it); its `reason` is the size limit that asked for it.
+    pub last_compaction: Option<ScanInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -114,6 +114,18 @@ impl Index {
     pub fn request_sort(&self, key: SortKey) -> SortStatus {
         self.metadata.request(key, self.sorted.clone(), None)
     }
+    /// [`Index::request_sort`], with `start` run first on the preparing
+    /// thread (not at all when the order is ready or already being prepared).
+    /// For a background warm-up that must not compete with searches: the
+    /// caller passes a function that lowers the thread's priority.
+    pub fn request_sort_starting(
+        &self,
+        key: SortKey,
+        start: impl FnOnce() + Send + 'static,
+    ) -> SortStatus {
+        self.metadata
+            .request_starting(key, self.sorted.clone(), start)
+    }
     /// Share preparation until every requesting token is cancelled. An
     /// uncancelled request continues warming the cache after search returns.
     /// Explicit `request_sort` calls keep it alive until ready or retirement.

@@ -22,7 +22,15 @@
 //!   same base with no live view as the reference;
 //! - `memory`: capacity-counted bytes of the live layer and of the published
 //!   view per delta entry, plus the process private-bytes growth and the
-//!   peak while the view was built.
+//!   peak while the view was built;
+//! - `compact` (FR-42 part 2): `Live::compact`, which folds the delta into a
+//!   new frozen index in memory instead of a disk rescan: wall time on the
+//!   service's pool, on one thread (a CPU proxy) and on the default pool, the
+//!   private-byte peak per entry, the new live layer's bytes per entry, and
+//!   the same searches against the compacted index, and `DELTA-SORT-READY`:
+//!   the time until the size and the date sort orders (the ones a compaction
+//!   asks the new index to prepare, as the service does) are ready, alone and
+//!   both at once.
 //!
 //! Change mix per batch: 70 % new file (into one of 2000 "build output"
 //! folders), 25 % modified existing file (base entry hidden, delta entry
@@ -40,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrow_fixture::Rng;
-use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags};
+use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, SortKey, SortStatus, flags};
 use ferrow_ipc::{Request, Response, Sort};
 use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
@@ -280,6 +288,119 @@ fn live_bytes(live: &Live) -> (u64, u64) {
 fn view_bytes(view: &LiveView) -> u64 {
     view.memory_parts().iter().map(|p| p.bytes).sum()
 }
+
+// NEW-API-BEGIN
+/// Milliseconds until each sort order is ready, from one request of all of
+/// them at once, as the service asks (`request_sort_starting` with the
+/// background priority); polled every millisecond.
+fn sort_ready_ms(index: &Index, keys: &[SortKey]) -> Vec<f64> {
+    let t = Instant::now();
+    for &key in keys {
+        index.request_sort_starting(key, ferrow_walk::priority::enter_background);
+    }
+    let mut ready: Vec<Option<f64>> = vec![None; keys.len()];
+    while ready.iter().any(Option::is_none) {
+        for (&key, at) in keys.iter().zip(ready.iter_mut()) {
+            if at.is_none() && index.request_sort(key) == SortStatus::Ready {
+                *at = Some(ms(t.elapsed()));
+            }
+        }
+        assert!(t.elapsed() < Duration::from_secs(120), "sort never ready");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    ready.into_iter().flatten().collect()
+}
+
+/// What folding the live layer into a new frozen index in memory costs
+/// (FR-42, part 2: `Live::compact`, which the service runs instead of a disk
+/// rescan when the delta outgrows its limit), at this checkpoint's delta:
+///
+/// - `wall_service_pool`: on a pool like the service's low-priority one (what
+///   the maintainer waits for; journal changes queue meanwhile), `one_thread`
+///   (a CPU-time proxy: nothing runs in parallel) and `default_pool`;
+/// - `peak_growth_B_per_entry`: the process's private-byte peak during the
+///   service-pool run, above what was held before it (the old index, the live
+///   layer and the published view stay alive meanwhile), per entry of the new
+///   index; a disk rescan peaks at about 161 B/entry (`memory_breakdown`);
+/// - `new_live_B_per_entry`: what the new live layer's tables hold;
+/// - the same searches against the compacted index as `DELTA-SEARCH` rows,
+///   to show a search is no slower afterwards (it merges no delta any more).
+fn compaction_row(
+    target: usize,
+    live: &mut Live,
+    base: &Arc<Index>,
+    svc: &rayon::ThreadPool,
+    one: &rayon::ThreadPool,
+    svc_threads: usize,
+) {
+    let old_len = base.len();
+    let delta = live.delta_len();
+    let _ = memory::release_free_heap();
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let t = Instant::now();
+    let new = svc
+        .install(|| live.compact())
+        .expect("no folder is being read");
+    let wall_svc = t.elapsed();
+    let peak = memory::process().peak.unwrap_or(0);
+    let held = memory::process().bytes();
+    let entries = new.base().len();
+    let new_live: u64 = new.memory_parts().iter().map(|p| p.bytes).sum();
+    let new_base = new.base().clone();
+    drop(new);
+    let t = Instant::now();
+    let again = one
+        .install(|| live.compact())
+        .expect("no folder is being read");
+    let wall_one = t.elapsed();
+    let single_size = again.base().clone();
+    drop(again);
+    let t = Instant::now();
+    let again = live.compact().expect("no folder is being read");
+    let wall_default = t.elapsed();
+    let single_modified = again.base().clone();
+    drop(again);
+    println!(
+        "DELTA-COMPACT checkpoint={target} base_entries={old_len} delta_len={delta} new_entries={entries} compact_ms_service_pool_{svc_threads}_threads={:.0} compact_ms_one_thread={:.0} compact_ms_default_pool={:.0} peak_growth_mb={:.0} compact_peak_B_per_entry={:.1} held_growth_mb={:.0} new_live_B_per_entry={:.1}",
+        ms(wall_svc),
+        ms(wall_one),
+        ms(wall_default),
+        peak.saturating_sub(before) as f64 / 1e6,
+        peak.saturating_sub(before) as f64 / entries as f64,
+        held.saturating_sub(before) as f64 / 1e6,
+        new_live as f64 / entries as f64,
+    );
+    // The sort orders the service asks the new index for right after the swap
+    // (the ones that were ready before): each on its own thread at the lowest
+    // priority, both at once as the service does, then each alone.
+    let both = sort_ready_ms(&new_base, &[SortKey::Size, SortKey::Modified]);
+    let size = sort_ready_ms(&single_size, &[SortKey::Size]);
+    let modified = sort_ready_ms(&single_modified, &[SortKey::Modified]);
+    println!(
+        "DELTA-SORT-READY checkpoint={target} entries={entries} size_ms_alone={:.0} modified_ms_alone={:.0} size_ms_with_both={:.0} modified_ms_with_both={:.0}",
+        size[0], modified[0], both[0], both[1]
+    );
+    // The searches the service would answer right after the swap, and the
+    // same ones against the old base with its delta (printed above).
+    let store = SnapshotStore::new(Snapshot {
+        index: new_base,
+        live: None,
+        mode: "live".into(),
+        report: String::new(),
+    });
+    for (q, t, rows) in search_times(&store) {
+        println!(
+            "DELTA-SEARCH checkpoint={target} after_compaction query=\"{q}\" ms={:.2} rows={rows}",
+            ms(t)
+        );
+    }
+    println!(
+        "DELTA-COUNT checkpoint={target} after_compaction query=\"report\" ms={:.2}",
+        ms(count_time(&store, "report"))
+    );
+}
+// NEW-API-END
 
 fn main() {
     let n = env_usize("FERROW_DELTA_BASE", 1_000_000);
@@ -524,9 +645,9 @@ fn main() {
             batch_times.push(took);
             if let Some(why) = out.rescan {
                 if why.ends_with("live changes") {
-                    asked.get_or_insert((live.delta_len(), why));
+                    asked.get_or_insert((live.delta_len(), why.to_string()));
                 } else {
-                    asked_removed.get_or_insert((live.delta_len(), why));
+                    asked_removed.get_or_insert((live.delta_len(), why.to_string()));
                 }
             }
         }
@@ -650,6 +771,9 @@ fn main() {
             ms(count_time(&store, "report")),
             ms(count_time(&store, ".o")),
         );
+        // NEW-API-BEGIN
+        compaction_row(target, &mut live, &base, &svc, &one, svc_threads);
+        // NEW-API-END
     }
     println!(
         "DELTA-ASKS first_delta_rescan_ask={:?} first_removed_rescan_ask={:?} base_removed_limit={}",

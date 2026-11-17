@@ -786,6 +786,32 @@ impl MetadataColumns {
             }),
         }
     }
+    /// [`Self::request`] for a worker that runs `start` first, on its own
+    /// thread (the service lowers that thread's priority with it). `start`
+    /// is dropped unrun when the order is ready or another request started
+    /// the worker.
+    pub(crate) fn request_starting(
+        &self,
+        key: SortKey,
+        names: Arc<Vec<u32>>,
+        start: impl FnOnce() + Send + 'static,
+    ) -> SortStatus {
+        match key {
+            SortKey::Name => SortStatus::Ready,
+            SortKey::Size => self.size.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, None, start)
+            }),
+            SortKey::Modified => self.modified.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, None, start)
+            }),
+            SortKey::Created => self.created.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, None, start)
+            }),
+            SortKey::Accessed => self.accessed.as_ref().map_or(SortStatus::Unavailable, |c| {
+                c.request_for(names, None, start)
+            }),
+        }
+    }
     /// Empty columns of `n` entries (the selected ones) for the freeze to fill
     /// shard by shard, so a shard can be freed as soon as it is placed.
     pub(crate) fn fill(n: usize, set: ColumnSet) -> MetadataFill {

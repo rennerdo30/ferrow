@@ -60,7 +60,12 @@ impl Persistence {
                 }
                 let index = Arc::downgrade(&snapshot.index);
                 let started = Instant::now();
-                let result = save(config, snapshot);
+                // The maintainer holds an in-memory compaction back while the
+                // saver keeps the index it writes alive.
+                let result = {
+                    let _saving = crate::health::STATE.saving();
+                    save(config, snapshot)
+                };
                 let took = started.elapsed();
                 crate::health::STATE.save_done(took, result.as_ref().err().map(|e| e.to_string()));
                 // A failure is logged once, by the worker that stops on it.

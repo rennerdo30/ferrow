@@ -595,7 +595,7 @@ fn session(
         plan.changes.len(),
         live.delta_len(),
         started.elapsed().as_secs_f64() * 1000.0,
-        rescan_asked.unwrap_or_else(|| "no".into())
+        rescan_asked.map_or_else(|| "no".into(), |why| why.to_string())
     );
     let mut parts = live.breakdown(Some(view.as_ref()), 0).parts;
     held_parts(&mut parts);
