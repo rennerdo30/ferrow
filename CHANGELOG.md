@@ -4,7 +4,7 @@ Release notes for each version. The release workflow copies a version's section 
 
 ## Unreleased
 
-- **Fixed: renaming or moving a large folder still rescanned every drive.** When a folder with more than about 100,000 files and folders below it was renamed or moved (a tool that swaps or cleans up a large folder does this often), the service read every drive again: on the owner's PC about 55 s of heavy CPU and disk, six times in 90 minutes. It now merges the move into the index in memory instead, with no disk reads. The folder shows up under its new name at once. The files inside show up under the new path once the merge is done, and are never shown under the old path meanwhile. The merge waits at most 40 s for other work (a save, folders being read), then takes a few seconds on a PC with tens of millions of files (estimated, not yet measured there).
+- **Fixed: renaming or moving a large folder still rescanned every drive.** When a folder with more than about 100,000 files and folders below it was renamed or moved (a tool that swaps or cleans up a large folder does this often), the service read every drive again: on the owner's PC about 55 s of heavy CPU and disk, six times in 90 minutes. It now merges the move into the index in memory instead, with no disk reads. The folder shows up under its new name at once. The files inside show up under the new path once the merge is done, and are never shown under the old path meanwhile. The merge usually starts at once and takes a few seconds on a PC with tens of millions of files (estimated, not yet measured there); right after another merge, or while the index is being saved or moved-in folders are being read, it can take longer.
 
 ## 0.1.0-beta.19
 

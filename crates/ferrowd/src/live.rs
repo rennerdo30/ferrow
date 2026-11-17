@@ -466,16 +466,24 @@ impl Maintenance {
     /// Whether an overgrown delta, or entries hidden by a large folder
     /// move, have waited as long as they may.
     fn overdue(&self, now: Instant, load: Load) -> bool {
-        load.severe || self.patience().is_some_and(|end| now >= end)
+        self.urgent_overdue(now, load) || self.prompt_patience().is_some_and(|end| now >= end)
     }
 
-    /// When the patience of an overgrown delta or of hidden entries ends.
-    fn patience(&self) -> Option<Instant> {
-        [self.urgent_since, self.prompt_since]
-            .into_iter()
-            .flatten()
-            .min()
-            .map(|since| since + URGENT_PATIENCE)
+    /// Whether an overgrown delta has waited as long as it may.
+    fn urgent_overdue(&self, now: Instant, load: Load) -> bool {
+        load.severe || self.urgent_patience().is_some_and(|end| now >= end)
+    }
+
+    /// When the patience of an overgrown delta ends.
+    fn urgent_patience(&self) -> Option<Instant> {
+        self.urgent_since.map(|since| since + URGENT_PATIENCE)
+    }
+
+    /// When the patience of entries hidden by a large folder move ends. It
+    /// only runs while their compaction is otherwise allowed (its duty share
+    /// is used up): the time it is actually held back.
+    fn prompt_patience(&self) -> Option<Instant> {
+        self.prompt_since.map(|since| since + URGENT_PATIENCE)
     }
 
     /// What to do now, if anything. A compaction waits for folder reads (their
@@ -485,14 +493,16 @@ impl Maintenance {
     /// waited [`URGENT_PATIENCE`], or a [`Load::severe`] one, is not held
     /// back by a save, and when folders keep being read the volumes are
     /// rescanned, as before compactions existed. Entries hidden by a large
-    /// folder move ([`Load::prompt`]) have the same patience.
+    /// folder move ([`Load::prompt`]) wait for a save no longer either; past
+    /// their patience, folder reads that keep coming ask for a rescan within
+    /// the usual rescan gap (they hold no extra memory).
     pub fn due(&mut self, now: Instant, load: Load) -> Option<Due> {
         self.urgent_since = if load.urgent {
             self.urgent_since.or(Some(now))
         } else {
             None
         };
-        self.prompt_since = if load.prompt {
+        self.prompt_since = if load.prompt && now >= self.duty_earliest.min(self.compact_earliest) {
             self.prompt_since.or(Some(now))
         } else {
             None
@@ -510,11 +520,17 @@ impl Maintenance {
         }
         let overdue = self.overdue(now, load);
         if load.walks {
-            return if overdue {
-                self.compact.take().map(Due::Rescan)
-            } else {
-                None
-            };
+            if self.urgent_overdue(now, load) {
+                return self.compact.take().map(Due::Rescan);
+            }
+            // Hidden entries cost no memory: while folder reads keep coming,
+            // they wait for the rescan the ordinary rescan gap allows (or
+            // for the reads to end), and the patience timer stops.
+            if overdue && let Some(why) = &self.compact {
+                self.rescan.request(why.clone());
+                self.prompt_since = None;
+            }
+            return None;
         }
         if load.saving && !overdue {
             return None;
@@ -539,7 +555,10 @@ impl Maintenance {
     pub fn wake_at(&self, now: Instant, load: Load) -> Option<Instant> {
         let compact = (self.compact.is_some() && (load.prompt || !self.rescan_waiting()))
             .then(|| {
-                let patience = self.patience();
+                let patience = [self.urgent_patience(), self.prompt_patience()]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 let earliest = if load.prompt {
                     self.compact_earliest.min(self.duty_earliest)
                 } else {
@@ -1409,6 +1428,9 @@ impl Live {
                         if at.is_empty() {
                             return true;
                         }
+                        if !s.info.is_dir {
+                            return false;
+                        }
                         let own = self.locations(change.volume, change.record);
                         !own.is_empty() && at.iter().any(|&p| self.at_or_below(p, &own))
                     })
@@ -1546,9 +1568,6 @@ impl Live {
         out
     }
 
-    /// The walk of a folder that `record`'s parent chain runs through: it
-    /// lists the record, or (if it listed the parent already) the record is
-    /// looked at again and found missing when the walk is merged.
     /// Whether `loc` is one of `dirs` or (still, in this index) below one
     /// of them. A chain longer than any real path counts as below.
     fn at_or_below(&self, loc: Loc, dirs: &[Loc]) -> bool {
@@ -1563,6 +1582,9 @@ impl Live {
         true
     }
 
+    /// The walk of a folder that `record`'s parent chain runs through: it
+    /// lists the record, or (if it listed the parent already) the record is
+    /// looked at again and found missing when the walk is merged.
     fn walk_above(&self, volume: usize, record: u64) -> Option<usize> {
         self.locations(volume, record).into_iter().find_map(|loc| {
             let mut at = self.parent_of(loc);
@@ -3850,8 +3872,9 @@ mod tests {
         rng: u64,
         tick: i64,
         /// A folder was moved or deleted in the batch being built. Two in one
-        /// batch can reverse their nesting (each is applied against the
-        /// other's old place), which the live layer answers with a rescan.
+        /// batch can reverse their nesting in ways no real sequence of moves
+        /// reported in one batch does (each is applied against the other's
+        /// old place); the real swaps are tested on their own.
         folder_op: bool,
     }
 
@@ -5148,9 +5171,51 @@ mod tests {
         let t1 = t0 + s(100);
         assert_eq!(m.due(t1, reading), None);
         assert_eq!(m.wake_at(t1, reading), Some(t1 + URGENT_PATIENCE));
+        // Past its patience it asks for a rescan within the usual gap
+        // (hidden entries hold no memory), not at once.
+        assert_eq!(m.due(t1 + URGENT_PATIENCE, reading), None);
+        assert!(m.rescan_waiting());
+        let later = t1 + URGENT_PATIENCE + s(1);
+        assert!(
+            m.wake_at(later, reading).is_some_and(|t| t > later),
+            "no spin"
+        );
+        // The reads end: the merge runs (the rescan still follows).
+        assert!(matches!(m.due(later, prompt_only()), Some(Due::Compact(_))));
+    }
+
+    fn prompt_only() -> Load {
+        Load {
+            prompt: true,
+            ..Load::default()
+        }
+    }
+
+    #[test]
+    fn hidden_entries_are_not_impatient_while_their_merge_may_not_run_yet() {
+        let s = Duration::from_secs;
+        let t = Instant::now();
+        let mut m = Maintenance::after_scan(t - s(600), s(60));
+        // A 20 s merge: the next prompt one may start 100 s later.
+        m.compacted(t, s(20));
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert_eq!(m.due(t + s(10), prompt_only()), None);
+        let reading = Load {
+            walks: true,
+            ..prompt_only()
+        };
+        assert_eq!(m.due(t + s(60), reading), None);
+        assert!(
+            m.wake_at(t + s(60), reading).is_none_or(|w| w > t + s(60)),
+            "no wake-up in the past (a spinning maintainer)"
+        );
+        // When the gap has passed and a read is still out, it waits for it
+        // instead of rescanning.
+        assert_eq!(m.due(t + s(101), reading), None);
+        assert!(!m.rescan_waiting());
         assert!(matches!(
-            m.due(t1 + URGENT_PATIENCE, reading),
-            Some(Due::Rescan(_))
+            m.due(t + s(102), prompt_only()),
+            Some(Due::Compact(_))
         ));
     }
 }
