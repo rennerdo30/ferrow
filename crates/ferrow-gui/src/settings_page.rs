@@ -1780,6 +1780,8 @@ fn access_block(
             access::Outcome::Done => (Tone::Good, true),
             // The command succeeded but this account cannot see the result.
             access::Outcome::Unconfirmed => (Tone::Neutral, true),
+            // The command ran and there was nothing to do (Service health).
+            access::Outcome::NoChange => (Tone::Neutral, true),
             access::Outcome::Declined => (Tone::Neutral, false),
             access::Outcome::Problem => (Tone::Caution, true),
         };

@@ -16,6 +16,7 @@ mod engine;
 mod frame;
 mod logo;
 mod platform;
+mod service;
 mod settings;
 #[cfg(windows)]
 mod shell_menu;
