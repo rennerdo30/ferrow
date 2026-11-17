@@ -24,9 +24,11 @@
 //! go through one buffer), checks the checksum, validates every offset and
 //! never panics on bad input.
 
+use std::cell::Cell;
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -316,6 +318,66 @@ pub struct LoadTimings {
     /// Disjoint subspans of `derived`; do not add the parent again.
     pub derived_fold: Duration,
     pub derived_sort: Duration,
+    /// Work spent on the optional metadata payload; zero for a core-only
+    /// file. In [`MetadataLoad::Overlapped`] mode this ran on the metadata
+    /// thread, beside the core sections, and is in none of the parts
+    /// above. In the serial modes these are disjoint subspans of `read`,
+    /// `checksum` and `decode`: do not add the parents again.
+    pub metadata_read: Duration,
+    pub metadata_checksum: Duration,
+    pub metadata_decode: Duration,
+    /// Time the loading thread waited for the metadata thread after
+    /// the last core section (a named part of the total).
+    pub metadata_wait: Duration,
+    /// Which metadata loading path ran, for the active-path log line.
+    pub metadata_load: MetadataLoad,
+    /// Core read throughput measured over the first bytes of the core
+    /// sections, in MB/s (10^6 bytes); 0 when no probe ran.
+    pub core_read_mb_s: f64,
+}
+
+/// How the optional metadata payload was loaded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataLoad {
+    /// No optional column in the file.
+    #[default]
+    Absent,
+    /// Read, checksummed and decoded on a second thread while the loading
+    /// thread streamed the core sections.
+    Overlapped,
+    /// Serial: the payload, or the core sections before it, are too small
+    /// for a thread to pay off.
+    SerialSmall,
+    /// Serial: the source is not a path (a reader or bytes).
+    SerialReader,
+    /// Serial: the first core bytes read slower than 500 MB/s (a cold disk
+    /// or a network volume), where a second stream on another region of
+    /// the file can add seeks for no gain; this is the previous serial path.
+    SerialSlowVolume,
+    /// Serial: the second file handle could not be opened or is a file of
+    /// a different size.
+    SerialReopenFailed,
+    /// Serial: the second handle opened a file whose header differs from
+    /// the one being loaded (the index was replaced during the load).
+    SerialReopenMismatch,
+    /// Serial: the operating system refused to start the metadata thread.
+    SerialSpawnFailed,
+}
+
+impl MetadataLoad {
+    /// Stable label for the active-path log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Overlapped => "overlapped-thread",
+            Self::SerialSmall => "serial-small",
+            Self::SerialReader => "serial-reader",
+            Self::SerialSlowVolume => "serial-slow-volume",
+            Self::SerialReopenFailed => "serial-reopen-failed",
+            Self::SerialReopenMismatch => "serial-reopen-mismatch",
+            Self::SerialSpawnFailed => "serial-spawn-failed",
+        }
+    }
 }
 
 impl LoadTimings {
@@ -328,7 +390,8 @@ impl LoadTimings {
                 + self.checksum
                 + self.decode
                 + self.structure
-                + self.derived,
+                + self.derived
+                + self.metadata_wait,
         )
     }
 }
@@ -341,7 +404,7 @@ pub(crate) fn load_with_timings(path: &Path) -> Result<(Index, LoadTimings), Loa
     let started = Instant::now();
     let mut file = std::fs::File::open(path).map_err(LoadError::Io)?;
     let file_len = file.metadata().map_err(LoadError::Io)?.len();
-    let (index, mut timings) = load_from(&mut file, file_len)?;
+    let (index, mut timings) = load_from(&mut file, file_len, &Overlap::new(Some(path)))?;
     drop(file);
     // Include open/metadata, temporary payload disposal and file close in
     // the API wall interval; the named parts remain disjoint subsets.
@@ -353,9 +416,14 @@ pub(crate) fn load_with_timings(path: &Path) -> Result<(Index, LoadTimings), Loa
 /// length. Only the bounded header is read before the expected total
 /// length is validated against `file_len`, so a hostile header never
 /// triggers a payload read or a large allocation.
+///
+/// `overlap` names the path `reader` reads, when there is one, and the
+/// thresholds for reading a large metadata payload through a second handle
+/// on a second thread (see [`stream_sections`]).
 fn load_from<R: std::io::Read>(
     reader: &mut R,
     file_len: u64,
+    overlap: &Overlap,
 ) -> Result<(Index, LoadTimings), LoadError> {
     let started = Instant::now();
     let mut timings = LoadTimings::default();
@@ -382,7 +450,7 @@ fn load_from<R: std::io::Read>(
     let total = usize::try_from(expected).map_err(|_| LoadError::Corrupt("size overflow"))?;
     if header.header_len == HEADER_LEN && head_len == HEADER_LEN {
         // v3: read every section straight into its final column.
-        let index = stream_sections(reader, &data, &header, &mut timings)?;
+        let index = stream_sections(reader, &data, &header, expected, overlap, &mut timings)?;
         timings.total = started.elapsed();
         return Ok((index, timings));
     }
@@ -408,6 +476,17 @@ fn load_from<R: std::io::Read>(
 /// that the CRC and the little-endian decode see each chunk in cache.
 const STREAM_CHUNK: usize = 1 << 20;
 
+/// Called once, with the bytes and read time so far, when the core
+/// sections have been read past the probe threshold.
+type Probe<'a> = (u64, &'a mut dyn FnMut(u64, Duration));
+
+fn cancelled() -> LoadError {
+    LoadError::Io(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "index load cancelled",
+    ))
+}
+
 /// Sequential section reader for [`stream_sections`]: every byte goes
 /// through the CRC exactly once, straight after it is read.
 struct Stream<'a, R> {
@@ -415,11 +494,37 @@ struct Stream<'a, R> {
     crc: crc32fast::Hasher,
     chunk: Vec<u8>,
     timings: &'a mut LoadTimings,
+    /// Checked before every chunk: set when the other side has failed.
+    stop: Option<&'a AtomicBool>,
+    /// Bytes read so far, for the probe.
+    bytes_read: u64,
+    probe: Option<Probe<'a>>,
 }
 
 impl<R: std::io::Read> Stream<'_, R> {
+    fn check_stop(&self) -> Result<(), LoadError> {
+        match self.stop {
+            Some(stop) if stop.load(AtomicOrdering::Relaxed) => Err(cancelled()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Account `len` freshly read bytes and run the probe once it is due.
+    fn note_read(&mut self, len: usize) {
+        self.bytes_read += len as u64;
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|(limit, _)| self.bytes_read >= *limit)
+            && let Some((_, probe)) = self.probe.take()
+        {
+            probe(self.bytes_read, self.timings.read);
+        }
+    }
+
     /// Read exactly `len` (at most one chunk) bytes into `self.chunk`.
     fn fill(&mut self, len: usize) -> Result<(), LoadError> {
+        self.check_stop()?;
         self.chunk.resize(len, 0);
         let t = Instant::now();
         self.reader
@@ -432,6 +537,7 @@ impl<R: std::io::Read> Stream<'_, R> {
         let t = Instant::now();
         self.crc.update(&self.chunk);
         self.timings.checksum += t.elapsed();
+        self.note_read(len);
         Ok(())
     }
 
@@ -471,6 +577,7 @@ impl<R: std::io::Read> Stream<'_, R> {
         use std::io::Read;
         let mut out: Vec<u8> = self.reserve(len)?;
         while out.len() < len {
+            self.check_stop()?;
             let start = out.len();
             let want = (len - start).min(STREAM_CHUNK);
             let t = Instant::now();
@@ -485,67 +592,334 @@ impl<R: std::io::Read> Stream<'_, R> {
             let t = Instant::now();
             self.crc.update(&out[start..]);
             self.timings.checksum += t.elapsed();
+            self.note_read(want);
         }
         Ok(out)
     }
 }
 
-/// Load a v3 index whose 32-byte header is already in `head`: each
-/// section is read directly into the column that keeps it, with no
-/// whole-file staging buffer (which would cost a second page-fault and
-/// zeroing pass over the file size, a copy per column and a large free).
-/// The checksum is verified before any structural validation, as in
-/// [`from_bytes`]; validation is shared with it.
+/// When and how the metadata payload may be read on a second thread.
+struct Overlap<'a> {
+    /// The path the loading reader reads, if it is a file.
+    source: Option<&'a Path>,
+    /// Smallest metadata payload worth a thread.
+    min_payload: usize,
+    /// Core bytes to read, timed, before deciding whether to start it.
+    probe_bytes: u64,
+    /// Slowest core read, in bytes per second, that still starts it.
+    min_bytes_per_sec: f64,
+    /// Test seams: injected throughput, a refused thread spawn, and a hook
+    /// run after the second handle is open.
+    #[cfg(test)]
+    throughput: Option<f64>,
+    #[cfg(test)]
+    fail_spawn: bool,
+    #[cfg(test)]
+    after_reopen: Option<&'a dyn Fn()>,
+}
+
+/// A metadata payload at least this large is read on a second thread.
+/// Below it (about 100k entries with the default columns) a thread costs
+/// more than the few milliseconds it hides.
+const OVERLAP_MIN_BYTES: usize = 1 << 20;
+/// Core bytes read and timed on the loading thread before the second
+/// thread is started.
+const PROBE_BYTES: u64 = 4 << 20;
+/// A page cache or an NVMe drive reads the core sections well above this;
+/// a cold hard disk or a network volume well below it.
+const MIN_PROBE_BYTES_PER_SEC: f64 = 500e6;
+
+impl<'a> Overlap<'a> {
+    fn new(source: Option<&'a Path>) -> Self {
+        Self {
+            source,
+            min_payload: OVERLAP_MIN_BYTES,
+            probe_bytes: PROBE_BYTES,
+            min_bytes_per_sec: MIN_PROBE_BYTES_PER_SEC,
+            #[cfg(test)]
+            throughput: None,
+            #[cfg(test)]
+            fail_spawn: false,
+            #[cfg(test)]
+            after_reopen: None,
+        }
+    }
+
+    fn spawn_refused(&self) -> bool {
+        #[cfg(test)]
+        return self.fail_spawn;
+        #[cfg(not(test))]
+        false
+    }
+
+    fn after_reopen(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.after_reopen {
+            hook();
+        }
+    }
+}
+
+/// Core read throughput in bytes per second; a zero read time is as fast
+/// as it gets.
+fn bytes_per_sec(bytes: u64, read: Duration) -> f64 {
+    if read.is_zero() {
+        f64::INFINITY
+    } else {
+        bytes as f64 / read.as_secs_f64()
+    }
+}
+
+/// What the metadata thread hands back: the CRC state of the payload bytes
+/// (so the loading thread can combine it into the whole-file checksum) and
+/// the decoded columns. A decode error is kept apart from the read result
+/// because a checksum mismatch must be reported ahead of it, as in the
+/// serial path.
+struct MetadataRead {
+    crc: crc32fast::Hasher,
+    columns: Result<MetadataColumns, LoadError>,
+    timings: LoadTimings,
+}
+
+/// Read, checksum and decode the metadata payload from `file`, already
+/// positioned at its first byte. Runs on the metadata thread; `stop` is
+/// set when the loading thread has failed, and is checked per chunk.
+fn read_metadata(
+    mut file: std::fs::File,
+    len: usize,
+    n: usize,
+    set: ColumnSet,
+    stop: &AtomicBool,
+) -> Result<MetadataRead, LoadError> {
+    let mut timings = LoadTimings::default();
+    let mut s = Stream {
+        reader: &mut file,
+        crc: crc32fast::Hasher::new(),
+        chunk: Vec::with_capacity(STREAM_CHUNK),
+        timings: &mut timings,
+        stop: Some(stop),
+        bytes_read: 0,
+        probe: None,
+    };
+    let bytes = s.bytes(len)?;
+    s.check_stop()?;
+    let crc = s.crc;
+    timings.metadata_read = timings.read;
+    timings.metadata_checksum = timings.checksum;
+    let t = Instant::now();
+    let mut at = 0;
+    let columns = MetadataColumns::read(&bytes, &mut at, n, set).and_then(|columns| {
+        if at == bytes.len() {
+            Ok(columns)
+        } else {
+            Err(LoadError::Corrupt("unexpected metadata bytes"))
+        }
+    });
+    drop(bytes);
+    timings.metadata_decode = t.elapsed();
+    Ok(MetadataRead {
+        crc,
+        columns,
+        timings,
+    })
+}
+
+/// A second handle on `path` positioned at `offset`. It must be a file of
+/// `file_len` bytes that starts with the same header as the one being
+/// loaded: the header holds the whole-file checksum, so a newly saved index
+/// of the same size (an atomic replace between the two opens) is refused
+/// and the load stays serial instead of failing its checksum.
+fn reopen_at(
+    path: &Path,
+    offset: u64,
+    file_len: u64,
+    head: &[u8],
+) -> Result<std::fs::File, MetadataLoad> {
+    use std::io::{Read, Seek};
+    let failed = |_: std::io::Error| MetadataLoad::SerialReopenFailed;
+    let mut file = std::fs::File::open(path).map_err(failed)?;
+    if file.metadata().map_err(failed)?.len() != file_len {
+        return Err(MetadataLoad::SerialReopenFailed);
+    }
+    let mut again = vec![0u8; head.len()];
+    file.read_exact(&mut again).map_err(failed)?;
+    if again != head {
+        return Err(MetadataLoad::SerialReopenMismatch);
+    }
+    file.seek(std::io::SeekFrom::Start(offset))
+        .map_err(failed)?;
+    Ok(file)
+}
+
+/// Load a v3 index whose 32-byte header is already in `head` and whose
+/// validated total length is `expected`: each section is read directly into
+/// the column that keeps it, with no whole-file staging buffer (which would
+/// cost a second page-fault and zeroing pass over the file size, a copy per
+/// column and a large free). The checksum is verified before any structural
+/// validation, as in [`from_bytes`]; validation is shared with it.
+///
+/// The metadata payload is the last section and is independent of the core
+/// sections, so when it is large and the source is a file it can be read,
+/// checksummed and decoded on a second thread while this thread streams the
+/// core sections (a single serial stage). The thread is started only after
+/// the first core bytes were read and timed here at a rate that says the
+/// file is in the page cache or on a fast drive; a slow volume stays on the
+/// serial path, where one sequential stream is best. The CRC states are
+/// combined, so the whole-file checksum is still verified before any
+/// validation, and the returned index is complete: nothing is pending for a
+/// later query. A failure on this thread stops the other one, and its error
+/// is the one reported.
 fn stream_sections<R: std::io::Read>(
     reader: &mut R,
     head: &[u8],
     header: &Header,
+    expected: u64,
+    overlap: &Overlap,
     timings: &mut LoadTimings,
 ) -> Result<Index, LoadError> {
     let n = header.entry_count as usize;
     let arena_len = header.arena_len as usize;
-    let mut crc = crc32fast::Hasher::new();
-    crc.update(&head[CHECKSUM_START..HEADER_LEN]);
-    let mut s = Stream {
-        reader,
-        crc,
-        chunk: Vec::with_capacity(STREAM_CHUNK),
-        timings,
-    };
-    let parent = s.values(n, u32::from_le_bytes)?;
-    let name_off = s.values(n, u32::from_le_bytes)?;
-    let name_len = s.values(n, u16::from_le_bytes)?;
-    let flags = s.values(n, u16::from_le_bytes)?;
-    let arena = s.bytes(arena_len)?;
-    let folded_arena = s.bytes(arena_len)?;
-    let sorted = s.values(n, u32::from_le_bytes)?;
-    let metadata_bytes = s.bytes(header.metadata_len as usize)?;
-    let sum = s.crc.finalize();
-    drop(s.chunk);
-    if sum != header.checksum {
-        return Err(LoadError::ChecksumMismatch);
-    }
-    let t = Instant::now();
-    let mut at = 0;
-    let metadata = MetadataColumns::read(&metadata_bytes, &mut at, n, header.columns)?;
-    if at != metadata_bytes.len() {
-        return Err(LoadError::Corrupt("unexpected metadata bytes"));
-    }
-    drop(metadata_bytes);
-    timings.decode += t.elapsed();
-    validate(
-        Parts {
-            parent,
-            name_off,
-            name_len,
-            flags,
-            arena,
-            folded_arena,
-            sorted,
-            metadata,
-        },
-        timings,
-    )
+    let metadata_len = header.metadata_len as usize;
+    let metadata_at = expected - u64::from(header.metadata_len);
+    debug_assert_eq!(
+        metadata_at,
+        HEADER_LEN as u64 + n as u64 * 16 + arena_len as u64 * 2
+    );
+    // Provisional mode: replaced when the probe decides. If the core ends
+    // before the probe fires, the payload stays serial and small.
+    let mode = Cell::new(match overlap.source {
+        _ if metadata_len == 0 => MetadataLoad::Absent,
+        None => MetadataLoad::SerialReader,
+        Some(_) => MetadataLoad::SerialSmall,
+    });
+    let probing = overlap.source.is_some()
+        && metadata_len >= overlap.min_payload
+        && metadata_at > overlap.probe_bytes;
+    let stop = AtomicBool::new(false);
+    let core_read_mb_s = Cell::new(0.0);
+    let parts = std::thread::scope(|scope| {
+        let built = (|| -> Result<Parts, LoadError> {
+            let worker = Cell::new(None);
+            let mut decide = |bytes: u64, read: Duration| {
+                let Some(path) = overlap.source else { return };
+                let rate = bytes_per_sec(bytes, read);
+                #[cfg(test)]
+                let rate = overlap.throughput.unwrap_or(rate);
+                core_read_mb_s.set(rate / 1e6);
+                if rate < overlap.min_bytes_per_sec {
+                    mode.set(MetadataLoad::SerialSlowVolume);
+                    return;
+                }
+                let file = match reopen_at(path, metadata_at, expected, head) {
+                    Ok(file) => file,
+                    Err(refused) => {
+                        mode.set(refused);
+                        return;
+                    }
+                };
+                overlap.after_reopen();
+                let (set, stop) = (header.columns, &stop);
+                let spawned = if overlap.spawn_refused() {
+                    None
+                } else {
+                    std::thread::Builder::new()
+                        .name("ferrow-metadata-load".into())
+                        .spawn_scoped(scope, move || {
+                            read_metadata(file, metadata_len, n, set, stop)
+                        })
+                        .ok()
+                };
+                mode.set(if spawned.is_some() {
+                    MetadataLoad::Overlapped
+                } else {
+                    MetadataLoad::SerialSpawnFailed
+                });
+                worker.set(spawned);
+            };
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&head[CHECKSUM_START..HEADER_LEN]);
+            let mut s = Stream {
+                reader,
+                crc,
+                chunk: Vec::with_capacity(STREAM_CHUNK),
+                timings,
+                stop: None,
+                bytes_read: 0,
+                probe: probing.then_some((overlap.probe_bytes, &mut decide as _)),
+            };
+            let parent = s.values(n, u32::from_le_bytes)?;
+            let name_off = s.values(n, u32::from_le_bytes)?;
+            let name_len = s.values(n, u16::from_le_bytes)?;
+            let flags = s.values(n, u16::from_le_bytes)?;
+            let arena = s.bytes(arena_len)?;
+            let folded_arena = s.bytes(arena_len)?;
+            let sorted = s.values(n, u32::from_le_bytes)?;
+            let worker = worker.take();
+            let serial = if worker.is_none() {
+                let (read, checksum) = (s.timings.read, s.timings.checksum);
+                let bytes = s.bytes(metadata_len)?;
+                s.timings.metadata_read = s.timings.read - read;
+                s.timings.metadata_checksum = s.timings.checksum - checksum;
+                Some(bytes)
+            } else {
+                None
+            };
+            let mut crc = s.crc;
+            drop(s.chunk);
+            timings.metadata_load = mode.get();
+            timings.core_read_mb_s = core_read_mb_s.get();
+            let metadata = match worker {
+                Some(worker) => {
+                    let t = Instant::now();
+                    let done = worker.join().map_err(|_| {
+                        LoadError::Io(std::io::Error::other("metadata reader panicked"))
+                    })??;
+                    timings.metadata_wait = t.elapsed();
+                    crc.combine(&done.crc);
+                    timings.metadata_read = done.timings.metadata_read;
+                    timings.metadata_checksum = done.timings.metadata_checksum;
+                    timings.metadata_decode = done.timings.metadata_decode;
+                    if crc.finalize() != header.checksum {
+                        return Err(LoadError::ChecksumMismatch);
+                    }
+                    done.columns?
+                }
+                None => {
+                    if crc.finalize() != header.checksum {
+                        return Err(LoadError::ChecksumMismatch);
+                    }
+                    let bytes = serial.unwrap_or_default();
+                    let t = Instant::now();
+                    let mut at = 0;
+                    let metadata = MetadataColumns::read(&bytes, &mut at, n, header.columns)?;
+                    if at != bytes.len() {
+                        return Err(LoadError::Corrupt("unexpected metadata bytes"));
+                    }
+                    drop(bytes);
+                    timings.metadata_decode = t.elapsed();
+                    timings.decode += timings.metadata_decode;
+                    metadata
+                }
+            };
+            Ok(Parts {
+                parent,
+                name_off,
+                name_len,
+                flags,
+                arena,
+                folded_arena,
+                sorted,
+                metadata,
+            })
+        })();
+        // The scope joins a running metadata thread on exit; tell it to
+        // stop first so a failed load does not wait for its payload.
+        if built.is_err() {
+            stop.store(true, AtomicOrdering::Relaxed);
+        }
+        built
+    })?;
+    validate(parts, timings)
 }
 
 /// Decoded sections, not yet validated.
@@ -581,6 +955,11 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     if (data.len() as u64) > expected {
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
+    timings.metadata_load = if header.metadata_len == 0 {
+        MetadataLoad::Absent
+    } else {
+        MetadataLoad::SerialReader
+    };
     let t = Instant::now();
     let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
     timings.checksum += t.elapsed();
@@ -958,7 +1337,7 @@ mod tests {
             inner: &bytes,
             read: 0,
         };
-        let result = load_from(&mut reader, bytes.len() as u64);
+        let result = load_from(&mut reader, bytes.len() as u64, &Overlap::new(None));
         assert!(matches!(result, Err(LoadError::Corrupt(_))), "{result:?}");
         assert_eq!(reader.read, HEADER_LEN, "payload was read before rejection");
 
@@ -968,7 +1347,7 @@ mod tests {
             inner: &bytes,
             read: 0,
         };
-        let result = load_from(&mut reader, bytes.len() as u64 + 4096);
+        let result = load_from(&mut reader, bytes.len() as u64 + 4096, &Overlap::new(None));
         assert!(matches!(result, Err(LoadError::Corrupt(_))), "{result:?}");
         assert_eq!(reader.read, HEADER_LEN, "payload was read before rejection");
     }
@@ -1472,6 +1851,336 @@ mod tests {
             t.total
         );
         assert_eq!(t.unattributed(), t.total - parts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Default-column index with unknown, packed and overflow values, and a
+    /// metadata payload past `OVERLAP_MIN_BYTES`. `bump` changes one
+    /// modified value by that many seconds without changing the file size.
+    fn default_columns_file(
+        tag: &str,
+        bump: i64,
+    ) -> (std::path::PathBuf, std::path::PathBuf, Index) {
+        let dir = test_dir(tag);
+        let path = dir.join("index.bin");
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let root = b.add_root(b"root", flags::DIR);
+        for i in 0..130_000u64 {
+            let meta = crate::EntryMetadata {
+                size: match i % 1000 {
+                    0 => None,
+                    1 => Some(u64::MAX),
+                    _ => Some(i * 977),
+                },
+                modified: match i % 997 {
+                    0 => None,
+                    1 => Some(i64::MIN),
+                    _ => Some(
+                        1_700_000_000 * 10_000_000
+                            + i as i64 * 10_000_000
+                            + if i == 5 { bump * 10_000_000 } else { 0 },
+                    ),
+                },
+                ..Default::default()
+            };
+            let name = format!("file-{:06}", i * 7919 % 130_000);
+            b.add_with_metadata(root, name.as_bytes(), 0, meta);
+        }
+        let index = b.freeze();
+        index.save(&path).unwrap();
+        (dir, path, index)
+    }
+
+    /// Overlap settings for the test files (about 5 MB of core sections):
+    /// probe after 1 MiB and report a fast volume, whatever this machine's
+    /// disk does.
+    fn fast_overlap(path: &Path) -> Overlap<'_> {
+        let mut overlap = Overlap::new(Some(path));
+        overlap.probe_bytes = 1 << 20;
+        overlap.throughput = Some(1e9);
+        overlap
+    }
+
+    fn load_with(path: &Path, overlap: &Overlap) -> Result<(Index, LoadTimings), LoadError> {
+        let mut file = std::fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        load_from(&mut file, len, overlap)
+    }
+
+    fn assert_same_metadata(a: &Index, b: &Index) {
+        assert_eq!(a.columns_present(), b.columns_present());
+        assert_eq!(a.heap_bytes(), b.heap_bytes());
+        for id in (0..b.len() as u32)
+            .step_by(7)
+            .chain([1, 2, 6, 1000, 129_999])
+        {
+            assert_eq!(a.metadata(id), b.metadata(id), "entry {id}");
+        }
+        // Complete on return: no sort was started or is pending.
+        assert!(a.metadata_order(crate::SortKey::Modified, false).is_none());
+    }
+
+    /// The overlapped metadata load returns exactly what the serial parse
+    /// does, complete on return (nothing pending for a query), and reports
+    /// which path ran and the throughput it decided on.
+    #[test]
+    fn overlapped_metadata_load_matches_serial_parse() {
+        let (dir, path, saved) = default_columns_file("overlap", 0);
+        let bytes = std::fs::read(&path).unwrap();
+        let (loaded, t) = load_with(&path, &fast_overlap(&path)).unwrap();
+        assert_eq!(t.metadata_load, MetadataLoad::Overlapped);
+        assert_eq!(t.core_read_mb_s, 1000.0);
+        assert!(t.metadata_read > Duration::ZERO && t.metadata_decode > Duration::ZERO);
+        assert!(t.metadata_wait <= t.total && t.unattributed() <= t.total);
+        let mut timings = LoadTimings::default();
+        let parsed = from_bytes_inner(&bytes, &mut timings).unwrap();
+        assert_eq!(timings.metadata_load, MetadataLoad::SerialReader);
+        assert_same_metadata(&loaded, &saved);
+        assert_same_metadata(&parsed, &saved);
+        // The public path, with the real probe, loads the same index
+        // whichever mode this machine's read speed picks.
+        assert_same_metadata(&Index::load(&path).unwrap(), &saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every way the overlapped load can see bad bytes fails closed, with
+    /// the same error as the serial parse: a flipped byte in the metadata
+    /// payload or in a core section is a checksum mismatch (also when the
+    /// flipped metadata would not decode); checksum-valid metadata that
+    /// does not decode is `Corrupt`.
+    #[test]
+    fn overlapped_metadata_load_fails_closed() {
+        let (dir, path, _) = default_columns_file("overlap-bad", 0);
+        let bytes = std::fs::read(&path).unwrap();
+        let n = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let metadata_at = HEADER_LEN + n * 16 + arena_len * 2;
+        let load = |bad: &[u8]| {
+            std::fs::write(&path, bad).unwrap();
+            let result = load_with(&path, &fast_overlap(&path));
+            if let Ok((_, t)) = &result {
+                assert_eq!(t.metadata_load, MetadataLoad::Overlapped);
+            }
+            result.map(|(index, _)| index)
+        };
+        for at in [
+            HEADER_LEN + 9,
+            metadata_at - 1,
+            metadata_at + 100,
+            bytes.len() - 1,
+        ] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0x10;
+            assert!(
+                matches!(load(&bad), Err(LoadError::ChecksumMismatch)),
+                "flip at {at}"
+            );
+        }
+        // Overflow count beyond the entry count: not decodable. With the
+        // checksum fixed it is Corrupt; with a stale checksum the
+        // mismatch is reported first.
+        let mut bad = bytes.clone();
+        bad[metadata_at..metadata_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(load(&bad), Err(LoadError::ChecksumMismatch)));
+        fix_checksum(&mut bad);
+        assert!(matches!(load(&bad), Err(LoadError::Corrupt(_))));
+        // The unmodified file still loads after the failures.
+        assert!(load(&bytes).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every reason the load stays serial is reported, never overlapped,
+    /// and the index is identical and still checked: a reader with no path,
+    /// a missing or differently sized file, a same-sized file with another
+    /// header (an atomic save replaced the index between the two opens), a
+    /// refused thread spawn, a slow volume, and sizes too small to bother.
+    #[test]
+    fn metadata_load_falls_back_to_serial_and_reports_why() {
+        let (dir, path, saved) = default_columns_file("overlap-fallback", 0);
+        let bytes = std::fs::read(&path).unwrap();
+        let other = dir.join("other.bin");
+        std::fs::write(&other, b"not the index").unwrap();
+        let missing = dir.join("missing.bin");
+        // Same shape and size as `path`, one modified value differs: only
+        // the header checksum tells them apart.
+        let (newer_dir, newer, newer_index) = default_columns_file("overlap-newer", 3);
+        assert_eq!(
+            std::fs::metadata(&newer).unwrap().len(),
+            bytes.len() as u64,
+            "same size"
+        );
+        assert_ne!(saved.metadata(6), newer_index.metadata(6));
+        let mut cases: Vec<(Overlap, MetadataLoad)> = Vec::new();
+        cases.push((Overlap::new(None), MetadataLoad::SerialReader));
+        for source in [other.as_path(), missing.as_path()] {
+            cases.push((fast_overlap(source), MetadataLoad::SerialReopenFailed));
+        }
+        cases.push((fast_overlap(&newer), MetadataLoad::SerialReopenMismatch));
+        let mut refused = fast_overlap(&path);
+        refused.fail_spawn = true;
+        cases.push((refused, MetadataLoad::SerialSpawnFailed));
+        let mut slow = fast_overlap(&path);
+        slow.throughput = Some(1e6);
+        cases.push((slow, MetadataLoad::SerialSlowVolume));
+        let mut short = fast_overlap(&path);
+        short.probe_bytes = 1 << 40;
+        cases.push((short, MetadataLoad::SerialSmall));
+        let mut small = fast_overlap(&path);
+        small.min_payload = 1 << 40;
+        cases.push((small, MetadataLoad::SerialSmall));
+        for (overlap, mode) in &cases {
+            let mut reader = std::io::Cursor::new(&bytes);
+            let (index, t) = load_from(&mut reader, bytes.len() as u64, overlap).unwrap();
+            assert_eq!(t.metadata_load, *mode);
+            assert_eq!(t.metadata_wait, Duration::ZERO);
+            assert_same_metadata(&index, &saved);
+            let mut bad = bytes.clone();
+            let last = bad.len() - 1;
+            bad[last] ^= 1;
+            let mut reader = std::io::Cursor::new(&bad);
+            assert!(
+                matches!(
+                    load_from(&mut reader, bad.len() as u64, overlap),
+                    Err(LoadError::ChecksumMismatch)
+                ),
+                "{mode:?}"
+            );
+        }
+        // A core-only file has no metadata to place.
+        tiny_index(b"a.txt").save(&path).unwrap();
+        assert_eq!(
+            load_with(&path, &fast_overlap(&path))
+                .unwrap()
+                .1
+                .metadata_load,
+            MetadataLoad::Absent
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&newer_dir);
+    }
+
+    /// The decision to start the thread is a pure function of the bytes
+    /// read and the time they took.
+    #[test]
+    fn probe_decision_follows_measured_throughput() {
+        let min = Overlap::new(None).min_bytes_per_sec;
+        assert_eq!(min, 500e6);
+        let probe = PROBE_BYTES;
+        let ms = Duration::from_millis;
+        // 4 MiB in 4 ms is about 1 GB/s (page cache, NVMe): start.
+        assert!(bytes_per_sec(probe, ms(4)) >= min);
+        // 4 MiB in 8.4 ms is the limit; slower is a cold disk or network.
+        assert!(bytes_per_sec(probe, ms(8)) >= min);
+        assert!(bytes_per_sec(probe, ms(9)) < min);
+        assert!(bytes_per_sec(probe, ms(40)) < min);
+        assert_eq!(bytes_per_sec(probe, Duration::ZERO), f64::INFINITY);
+    }
+
+    /// A reader that fails after `fail_at` bytes.
+    struct FailingReader<'a> {
+        data: &'a [u8],
+        at: usize,
+        fail_at: usize,
+    }
+
+    impl std::io::Read for FailingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.fail_at {
+                return Err(std::io::Error::other("disk gone"));
+            }
+            let n = buf.len().min(self.fail_at - self.at).min(64 << 10);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    /// A core read error after the thread started is the error reported,
+    /// ahead of whatever the thread does, and the thread is told to stop.
+    #[test]
+    fn core_read_error_while_the_thread_runs_is_reported_and_stops_it() {
+        let (dir, path, _) = default_columns_file("overlap-core-error", 0);
+        let bytes = std::fs::read(&path).unwrap();
+        // The thread is running by 1 MiB (probe) and the read fails at 2 MiB.
+        for truncate_second_handle in [false, true] {
+            let hook = || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(HEADER_LEN as u64 + 100)
+                    .unwrap();
+            };
+            let mut overlap = fast_overlap(&path);
+            if truncate_second_handle {
+                overlap.after_reopen = Some(&hook);
+            }
+            let mut reader = FailingReader {
+                data: &bytes,
+                at: 0,
+                fail_at: 2 << 20,
+            };
+            let started = Instant::now();
+            let result = load_from(&mut reader, bytes.len() as u64, &overlap);
+            match result {
+                Err(LoadError::Io(e)) => assert_eq!(e.to_string(), "disk gone"),
+                other => panic!("expected the core read error, got {:?}", other.map(|_| ())),
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        // The thread side: a set stop flag ends the read at once; a clear
+        // one decodes the payload.
+        let n = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let at = (HEADER_LEN + n * 16 + arena_len * 2) as u64;
+        let open_at = || {
+            use std::io::Seek;
+            let mut file = std::fs::File::open(&path).unwrap();
+            file.seek(std::io::SeekFrom::Start(at)).unwrap();
+            file
+        };
+        let len = bytes.len() - at as usize;
+        let stop = AtomicBool::new(true);
+        let stopped = read_metadata(open_at(), len, n, ColumnSet::DEFAULT, &stop);
+        match stopped {
+            Err(LoadError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Interrupted),
+            other => panic!("expected a cancelled read, got {:?}", other.map(|_| ())),
+        }
+        let go = AtomicBool::new(false);
+        let done = read_metadata(open_at(), len, n, ColumnSet::DEFAULT, &go).unwrap();
+        assert!(done.columns.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The second handle failing mid-read (the file shrank after it was
+    /// opened) is an error, never a partial index.
+    #[test]
+    fn metadata_thread_read_failure_fails_the_load() {
+        let (dir, path, _) = default_columns_file("overlap-shrink", 0);
+        let bytes = std::fs::read(&path).unwrap();
+        let n = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let arena_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let at = (HEADER_LEN + n * 16 + arena_len * 2) as u64;
+        let hook = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(at + 100)
+                .unwrap();
+        };
+        let mut overlap = fast_overlap(&path);
+        overlap.after_reopen = Some(&hook);
+        // The loading thread reads an intact copy; only the second handle
+        // sees the shrunken file.
+        let mut reader = std::io::Cursor::new(&bytes);
+        let result = load_from(&mut reader, bytes.len() as u64, &overlap);
+        assert!(
+            matches!(result, Err(LoadError::Truncated)),
+            "{:?}",
+            result.map(|_| ())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
