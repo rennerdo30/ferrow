@@ -240,7 +240,9 @@ class GateTests(unittest.TestCase):
             return (1 if args[0] == "base" else 1.05), 2, 42, 800, 16
         rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
         self.assertFalse(any(row[-1] for row in rows))
-        self.assertEqual([call[0] for call in calls], ["base", "head", "base", "head", "head", "base", "base", "head", "head", "base", "base", "head"])
+        # Sub-millisecond first pages collect 10 balanced samples (FR-31).
+        expected = ["base", "head"] + [arm for i in range(10) for arm in (("base", "head") if i % 2 == 0 else ("head", "base"))]
+        self.assertEqual([call[0] for call in calls], expected)
         self.assertTrue(all(call[1:] == ("IPC", "report 2024", "first_page_ms") for call in calls))
         calls.clear()
         self.head[0]["heap_bytes"] = 1000
@@ -272,6 +274,28 @@ class GateTests(unittest.TestCase):
         self.assertEqual((result["base"][0], result["head"][0]), (3, 4))
         self.assertIn("warm A warm B A B B A A B B A A B", trace[0])
 
+    def test_submillisecond_first_pages_take_ten_balanced_samples(self):
+        def run(value, kind="IPC", operation="first_page_ms", head_value=None):
+            calls = []
+            def measure(arm, *_):
+                calls.append(arm)
+                return (head_value if arm == "head" and head_value is not None else value), 2, 42, 800, 16
+            result = gate.interleaved(measure, kind, "a", operation)
+            return calls, result
+        calls, result = run(0.5)
+        samples = calls[2:]
+        self.assertEqual(len(samples), 20)
+        self.assertEqual((samples.count("base"), samples.count("head")), (10, 10))
+        # Every arm is first in half of the pairs and second in the other half.
+        self.assertEqual([samples[i] for i in range(0, 20, 2)].count("base"), 5)
+        self.assertEqual(result["base"][0], 0.5)
+        # Above the sub-millisecond regime, for full counts, for loads, or when only one arm
+        # is sub-millisecond, the existing 5 (3 for loads) samples stay.
+        self.assertEqual(len(run(2.5)[0]), 2 + 10)
+        self.assertEqual(len(run(0.5, operation="full_count_ms")[0]), 2 + 10)
+        self.assertEqual(len(run(0.5, kind="load", operation="load")[0]), 2 + 6)
+        self.assertEqual(len(run(0.5, head_value=2.5)[0]), 2 + 10)
+
     def test_every_interleaved_sample_must_keep_counts_and_content(self):
         for slot in (1, 2, 4):
             calls = 0
@@ -299,13 +323,16 @@ class GateTests(unittest.TestCase):
             self.assertEqual(len(rows), 50)
             self.assertFalse(any(row[-1] for row in rows))
             self.assertEqual(len(trace), 25)
-            self.assertEqual(len(calls), 8 + 24*12 + 24*6)
+            # load: 2 warm-ups + 3 samples per arm; sub-ms first pages (12 pairs) take 10 samples
+            # per arm, full counts (12 pairs) 5; the 24 head-only observations follow their pair.
+            self.assertEqual(len(calls), 8 + 12*(2 + 10*2) + 12*(2 + 5*2) + 12*(1 + 10) + 12*(1 + 5))
             self.assertTrue(all(arm == "head" or kind == "load" or query in gate.QUERIES
                                 for arm, kind, query, _ in calls))
             for query in gate.NEW_QUERIES:
                 for kind in ("IPC", "in-process"):
                     for operation in ("first_page_ms", "full_count_ms"):
-                        self.assertEqual(calls.count(("head", kind, query, operation)), 6)
+                        self.assertEqual(calls.count(("head", kind, query, operation)),
+                                         11 if operation == "first_page_ms" else 6)
             args.head_index = Path(folder)/"different-fixture"
             with self.assertRaises(ValueError):
                 gate.measure_pair(args, measure, trace)
@@ -315,7 +342,7 @@ class GateTests(unittest.TestCase):
         values = iter([999, 1, 50, 2, 100, 3])
         def measure(arm, kind, query, operation):
             calls.append((arm, query))
-            return (next(values), 3, 99, 800, 16) if query == "*.log" else (1, 2, 42, 800, 16)
+            return (next(values), 3, 99, 800, 16) if query == "*.log" else (5, 2, 42, 800, 16)
         result = gate.interleaved(measure, "IPC", "a", "first_page_ms",
                                   observation=("IPC", "*.log", "first_page_ms"))
         a, b, c = ("base", "a"), ("head", "a"), ("head", "*.log")
@@ -349,7 +376,7 @@ class GateTests(unittest.TestCase):
             return 1, 2, 42, 800, 16
         rows = gate.retry_failures(self.rows(), self.base, self.head, measure)
         self.assertTrue(any(row[-1] for row in rows))
-        self.assertEqual(len(calls), 12)
+        self.assertEqual(len(calls), 22)  # 1 ms first page: 2 warm-ups + 10 samples per arm
         self.assertTrue(all(call[2] == "a" for call in calls))
         self.assertEqual([row for row in rows if row[1] is None],
                          [row for row in original if row[1] is None])
@@ -480,7 +507,7 @@ class ConfirmationRoundTests(unittest.TestCase):
     def test_single_round_spike_passes_and_is_reported(self):
         code, probe, report = self.run_main(self.spike(), self.steady)
         self.assertEqual(code, 0)
-        self.assertEqual(probe.call_count, 12)  # only that row again: 6 samples per arm
+        self.assertEqual(probe.call_count, 22)  # only that row again: sub-ms, so 10 samples + 1 warm-up per arm
         self.assertIn("first over limit, confirmed not over", report)
         self.assertNotIn("confirmed regression", report)
         self.assertIn("Round 1 base / head", report)
@@ -531,6 +558,23 @@ class ConfirmationRoundTests(unittest.TestCase):
         with patch.object(gate, "control_rows", side_effect=control):
             code, _, report = self.run_main(two, lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
         self.assertEqual(code, 1)
+        self.assertNotIn("Benchmark harness biased", report)
+
+    def test_metadata_refusal_does_not_hide_the_paired_result(self):
+        # FR-30 (core + 15% load) is a separate, known failure; the paired rows are still
+        # re-measured, controlled and reported before the gate refuses.
+        def refuse(*_):
+            raise ValueError("default-column load target exceeded (core + 15%)")
+        control = lambda names, base, measure: [(n, 0.2, 4, False) for n in names]
+        regression = lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16)
+        with patch.object(gate, "metadata_observations", side_effect=refuse), \
+                patch.object(gate, "control_rows", side_effect=control):
+            code, probe, report = self.run_main(self.spike(), regression, extra=("--require-metadata",))
+        self.assertEqual(code, 2)
+        self.assertGreater(probe.call_count, 0)
+        self.assertIn("One paired latency remeasurement", report)
+        self.assertIn("A/A control", report)
+        self.assertIn("default-column load target exceeded", report)
         self.assertNotIn("Benchmark harness biased", report)
 
     def test_control_never_runs_for_a_passing_gate_or_a_memory_failure(self):

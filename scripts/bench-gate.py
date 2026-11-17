@@ -34,6 +34,12 @@ EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
 # 100 ms of repeats, never below MIN_PROBE_REPEATS). The probe proves it ran.
 PROBE_REPEATS = 31
 MIN_PROBE_REPEATS = 3
+# Process-to-process variance (which CPUs the client and service threads land
+# on) moves one IPC first-page sample by ~0.15 ms; a median of 5 can flip
+# between those modes. When both arms are in the sub-millisecond regime,
+# where the 0.1 ms absolute tolerance dominates, collect 10 balanced samples.
+SUBMS_LIMIT_MS = 2.0
+SUBMS_SAMPLES = 10
 
 
 def number(value):
@@ -236,8 +242,17 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
         trace.append("")
     count = 3 if kind == "load" else 5
     forward = tuple(samples)
-    for warmup, arms in [(True, forward)] + [
-            (False, forward if i % 2 == 0 else forward[::-1]) for i in range(count)]:
+    extendable = kind != "load" and operation == "first_page_ms"
+    round_index = -1  # -1 is the warm-up round
+    while True:
+        if round_index == count and extendable and count < SUBMS_SAMPLES and all(
+                statistics.median(s[0] for s in samples[arm]) < SUBMS_LIMIT_MS for arm in ("base", "head")):
+            count = SUBMS_SAMPLES
+        if round_index >= count:
+            break
+        warmup = round_index < 0
+        arms = forward if warmup or round_index % 2 == 0 else forward[::-1]
+        round_index += 1
         for arm in arms:
             order.append(("warm " if warmup else "") + {"base": "A", "head": "B", "observation": "C"}[arm])
             if trace is not None:
@@ -461,14 +476,21 @@ def main():
         head = parse(args.head.read_text(encoding="utf-8"))
         rows = compare(base, head, args.entries)
         report = render(rows)
+        # A refused head-only metadata observation must not hide the paired
+        # result: finish the paired phase (retry, A/A control), then refuse.
+        metadata_error = None
         if args.require_metadata:
             observations = args.head.read_text(encoding="utf-8")
-            metadata_rows, metadata_report = metadata_observations(
-                observations, head, args.entries,
-                (lambda: metadata_rerun(args)) if args.metadata_rerun_bench and args.metadata_rerun_index else None)
-            if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
-                raise ValueError("incomplete combined metric inventory")
-            report += metadata_report
+            try:
+                metadata_rows, metadata_report = metadata_observations(
+                    observations, head, args.entries,
+                    (lambda: metadata_rerun(args)) if args.metadata_rerun_bench and args.metadata_rerun_index else None)
+            except ValueError as error:
+                metadata_error = error
+            else:
+                if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
+                    raise ValueError("incomplete combined metric inventory")
+                report += metadata_report
         if any(retry_paths):
             if not all(retry_paths):
                 raise ValueError("all paired retry paths are required")
@@ -486,12 +508,14 @@ def main():
                 control = control_rows(timed_failures, base, lambda arm, *metric: probe(args, "head", *metric))
                 report += control_table(control)
                 biased = {name for name, _, _, bad in control if bad}
-                if all(row[0] in biased for row in rows if row[-1]):
+                if metadata_error is None and all(row[0] in biased for row in rows if row[-1]):
                     note = ("Benchmark harness biased: identical head binaries in both arms differ beyond the limit on "
                             + ", ".join(sorted(biased)) + "; the paired result for these rows is not evidence of a regression.")
                     print(note, file=sys.stderr)
                     publish(report + f"\n{note}\n" + sample_order(trace))
                     return 3
+        if metadata_error is not None:
+            raise metadata_error
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"benchmark gate refused incomplete evidence: {error}", file=sys.stderr)
         publish(report + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))
