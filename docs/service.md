@@ -217,19 +217,33 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   Windows Service Control Manager, `systemctl`, or `launchctl`. Waits are
   bounded (30 s; a service that does not stop in time is reported, never
   killed), and every manager command runs with a timeout and its PID is printed.
-- **`ferrow service repair`** (elevated / sudo) runs, in order, and prints one
-  line per step: (1) the installed binary exists at its fixed path and passes
-  the binary protection check (it never copies a binary, and never takes a path
-  from the user), and the registration (Windows service entry, systemd unit or
-  launchd plist) runs exactly that binary, otherwise it is re-registered from
-  that path (a Windows registration keeps its `--root` list); (2) stop the
-  service; (3) the state folder passes its protection check (a missing one is
-  created; one that fails cannot be repaired automatically and the repair stops
-  with the reason) and a log file that fails its check is moved aside; (4) the
-  saved index passes the protection check and loads: if not, it is renamed to
-  `index.bin.bad-<UTC time>` (never deleted or overwritten) and the service
-  rebuilds it at start; (5) start the service; (6) wait up to 30 s until it
-  answers. The first failing step ends the repair and says what is left.
+- **`ferrow service repair`** (elevated / sudo) first runs read-only checks
+  (registration, state folder, saved index, and whether the service answers a
+  `Health` request, or `Status` for an installed service older than `Health`).
+  When all pass it prints `Nothing to repair` and leaves the service running
+  (exit 0; the index check reads the whole file, so it briefly needs memory for
+  a second copy). Otherwise it runs, in order, and prints one line per step:
+  (1) the installed binary exists at its fixed path and passes the binary
+  protection check (it never copies a binary, and never takes a path from the
+  user; if it is missing, reinstall with Setup, or `sudo ferrow service install`
+  on Linux and macOS), and the registration (Windows service entry, systemd
+  unit or launchd plist) runs exactly that binary. A service whose binary is
+  still installed is re-registered from that path when its registration is
+  missing or points elsewhere (a Windows registration keeps its `--root` list;
+  a unit or plist is only trusted when it is a root-owned, single-link regular
+  file with the exact text, otherwise it is rewritten or refused); (2) stop
+  the service; (3) the state folder passes its protection check (a missing one
+  is created; one that fails cannot be repaired automatically and the repair
+  stops with the reason) and a log file that fails its check is moved aside;
+  (4) the saved index passes the protection check and loads. Only an index
+  whose content is damaged (wrong magic, truncated, checksum mismatch, corrupt)
+  is renamed to `index.bin.bad-<UTC time>` (a new name is made first, so an
+  existing file is never overwritten, and nothing is deleted) and the service
+  rebuilds it at start. A read error, an index version this build does not read
+  or a protection failure is reported and the repair stops without moving the
+  file; (5) start the service; (6) wait up to 30 s until it answers. The first
+  failing step ends the repair and says what is left; after the stop it also
+  says that the service is stopped.
 - **Exit codes** of the `service` verbs (the app relies on them): `0` done,
   `1` failed, `2` needs administrator/root (nothing changed), `3` no service
   reachable or no answer within 2 s, `4` the service refused this account,

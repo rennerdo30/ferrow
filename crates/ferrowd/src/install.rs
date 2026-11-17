@@ -248,6 +248,20 @@ pub(crate) fn command(program: &str, args: &[&str]) -> Result<std::process::Outp
     command_within(program, args, std::time::Duration::from_secs(10))
 }
 
+/// The manager tool by absolute path: an elevated process never searches PATH.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn manager_tool(name: &str) -> String {
+    let candidates: &[&str] = match name {
+        "systemctl" => &["/usr/bin/systemctl", "/bin/systemctl"],
+        "launchctl" => &["/bin/launchctl", "/usr/bin/launchctl"],
+        _ => &[],
+    };
+    candidates
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .map_or_else(|| name.to_string(), |path| (*path).to_string())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn command_within(
     program: &str,
@@ -255,7 +269,8 @@ pub(crate) fn command_within(
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(program)
+    let program = manager_tool(program);
+    let mut child = std::process::Command::new(&program)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

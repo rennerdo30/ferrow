@@ -46,16 +46,22 @@ pub fn wait_until(limit: Duration, step: Duration, mut probe: impl FnMut() -> bo
     }
 }
 
-/// Whether the service at `endpoint` answers a request (a refusal counts: it
-/// is up). One connection, a one-second budget.
+/// Whether the service at `endpoint` answers: a `Health` request, or `Status`
+/// for an installed service older than `Health` (it never answers that kind). A
+/// refusal counts: the service is up. One connection each, a one-second budget.
 pub fn answers(endpoint: &ferrow_ipc::Endpoint) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let result = ferrow_ipc::Client::connect_deadline(endpoint, deadline)
-        .and_then(|mut client| client.health());
-    match result {
-        Ok(_) => true,
-        Err(error) => ferrow_ipc::error_code(&error).is_some(),
+    fn up<T>(
+        endpoint: &ferrow_ipc::Endpoint,
+        ask: impl FnOnce(&mut ferrow_ipc::Client<ferrow_ipc::Stream>) -> io::Result<T>,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        match ferrow_ipc::Client::connect_deadline(endpoint, deadline).and_then(|mut c| ask(&mut c))
+        {
+            Ok(_) => true,
+            Err(error) => ferrow_ipc::error_code(&error).is_some(),
+        }
     }
+    up(endpoint, |c| c.health()) || up(endpoint, |c| c.status())
 }
 
 // ---- start, stop, restart ---------------------------------------------------
@@ -121,7 +127,8 @@ pub fn control(action: Action) -> Result<String, String> {
 }
 
 /// Run the platform manager command; stop and restart may wait for the final
-/// index save, so they get longer than a start.
+/// index save, so they get longer than a start. (`command_within` resolves the
+/// tool to its absolute path.)
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn manage(args: &[&str], timeout: Duration) -> Result<std::process::Output, String> {
     let program = if cfg!(target_os = "linux") {
@@ -157,53 +164,64 @@ pub fn control(action: Action) -> Result<String, String> {
     Ok(format!("service {SERVICE_NAME} {done}"))
 }
 
+/// launchd: stop is `bootout` (SIGTERM, so the service saves its index) and
+/// start is `bootstrap` (or `kickstart` when still loaded). A restart is both;
+/// `kickstart -k` would SIGKILL and skip the final save.
 #[cfg(target_os = "macos")]
 pub fn control(action: Action) -> Result<String, String> {
     use crate::install::{LAUNCHD_LABEL, plist_path};
     let target = format!("system/{LAUNCHD_LABEL}");
-    let loaded = manage(&["print", &target], Duration::from_secs(10))?
-        .status
-        .success();
+    let loaded =
+        || manage(&["print", &target], Duration::from_secs(10)).is_ok_and(|o| o.status.success());
     let long = Duration::from_secs(45);
-    let done = match action {
-        Action::Stop => {
-            if loaded {
-                manager_ok(&["bootout", &target], long)?;
-            }
-            "stopped"
+    if matches!(action, Action::Stop | Action::Restart) && loaded() {
+        manager_ok(&["bootout", &target], long)?;
+        if !wait_until(WAIT, Duration::from_millis(200), || !loaded()) {
+            return Err(format!(
+                "service {SERVICE_NAME} did not stop within {} s (it saves the index first); it was not killed",
+                WAIT.as_secs()
+            ));
         }
-        Action::Start | Action::Restart if !loaded => {
-            manager_ok(&["bootstrap", "system", &plist_path()], long)?;
-            "started"
-        }
-        Action::Start => {
+    }
+    if matches!(action, Action::Start | Action::Restart) {
+        if loaded() {
             manager_ok(&["kickstart", &target], long)?;
-            "started"
+        } else {
+            manager_ok(&["bootstrap", "system", &plist_path()], long)?;
         }
-        Action::Restart => {
-            manager_ok(&["kickstart", "-k", &target], long)?;
-            "restarted"
-        }
+    }
+    let done = match action {
+        Action::Start => "started",
+        Action::Stop => "stopped",
+        Action::Restart => "restarted",
     };
     Ok(format!("service {SERVICE_NAME} {done}"))
 }
 
 // ---- registration -----------------------------------------------------------
 
+/// How to get the service binary back where repair needs it.
+fn reinstall_advice() -> &'static str {
+    if cfg!(windows) {
+        "reinstall Ferrow with its Setup (repair never copies a binary from anywhere else)"
+    } else {
+        "run `sudo ferrow service install` from the Ferrow package (repair never copies a binary from anywhere else)"
+    }
+}
+
 /// The installed service binary: it must exist and pass the binary
 /// protection check. Repair never copies one in.
 fn installed_binary() -> Result<std::path::PathBuf, String> {
     let exe = protection::binary_path().map_err(|e| e.to_string())?;
-    let reinstall =
-        "reinstall Ferrow with its Setup (repair never copies a binary from anywhere else)";
     if !exe.try_exists().map_err(|e| e.to_string())? {
         return Err(format!(
-            "the installed service binary is missing at {}; {reinstall}",
-            exe.display()
+            "the installed service binary is missing at {}; {}",
+            exe.display(),
+            reinstall_advice()
         ));
     }
     protection::validate_binary(&exe)
-        .map_err(|e| format!("{}: {e}; {reinstall}", exe.display()))?;
+        .map_err(|e| format!("{}: {e}; {}", exe.display(), reinstall_advice()))?;
     Ok(exe)
 }
 
@@ -260,10 +278,31 @@ fn registered_roots(words: &[String]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Check the registration and restore it from the fixed installed path when it
-/// is missing or points elsewhere.
+/// What checking (or repairing) the registration found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Registration {
+    /// Registered exactly for the installed binary.
+    Fine(String),
+    /// Missing or pointing elsewhere (only when not asked to fix it).
+    Needed(String),
+    /// Missing or pointing elsewhere; now restored.
+    Fixed(String),
+}
+
+/// Check the registration without changing anything.
+pub fn check_registration() -> Result<Registration, String> {
+    registration(false)
+}
+
+/// Restore the registration from the fixed installed path when it is missing
+/// or points elsewhere. A service whose binary is still installed is
+/// re-registered; one whose binary is gone cannot be repaired.
+pub fn repair_registration() -> Result<Registration, String> {
+    registration(true)
+}
+
 #[cfg(windows)]
-pub fn repair_registration() -> Result<String, String> {
+fn registration(fix: bool) -> Result<Registration, String> {
     use windows_service::service::{ServiceAccess, ServiceStartType, ServiceType};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
@@ -282,15 +321,19 @@ pub fn repair_registration() -> Result<String, String> {
         Err(windows_service::Error::Winapi(e))
             if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
         {
+            let text = format!(
+                "the service was not registered; registering it from {} (every local fixed drive)",
+                exe.display()
+            );
+            if !fix {
+                return Ok(Registration::Needed(text));
+            }
             let info = crate::install::service_info(exe.clone(), index, &[])?;
             let service = manager
                 .create_service(&info, ServiceAccess::CHANGE_CONFIG)
                 .map_err(|e| e.to_string())?;
             crate::install::configure(&service)?;
-            return Ok(format!(
-                "the service was not registered; registered it from {} (every local fixed drive)",
-                exe.display()
-            ));
+            return Ok(Registration::Fixed(text));
         }
         Err(e) => return Err(e.to_string()),
     };
@@ -305,21 +348,28 @@ pub fn repair_registration() -> Result<String, String> {
         && config.service_type == ServiceType::OWN_PROCESS
         && system
     {
-        return Ok(format!("registered from {}", exe.display()));
+        return Ok(Registration::Fine(format!(
+            "registered from {}",
+            exe.display()
+        )));
+    }
+    let text = format!(
+        "registration pointed at {} (it was {})",
+        exe.display(),
+        words.first().map_or("empty", String::as_str)
+    );
+    if !fix {
+        return Ok(Registration::Needed(text));
     }
     let mut info = crate::install::service_info(exe.clone(), index, &registered_roots(&words))?;
     info.account_name = Some("LocalSystem".into());
     service.change_config(&info).map_err(|e| e.to_string())?;
     crate::install::configure(&service)?;
-    Ok(format!(
-        "registration pointed at {} (it was {})",
-        exe.display(),
-        words.first().map_or("empty", String::as_str)
-    ))
+    Ok(Registration::Fixed(text))
 }
 
 #[cfg(unix)]
-pub fn repair_registration() -> Result<String, String> {
+fn registration(fix: bool) -> Result<Registration, String> {
     let exe = installed_binary()?;
     #[cfg(target_os = "linux")]
     let (path, text) = (
@@ -331,8 +381,14 @@ pub fn repair_registration() -> Result<String, String> {
         crate::install::plist_path(),
         crate::install::launchd_plist(),
     );
-    if std::fs::read_to_string(&path).is_ok_and(|current| current == text) {
-        return Ok(format!("{path} runs {}", exe.display()));
+    // Equal text only counts from a root-owned, single-link regular file that
+    // is not a symbolic link and has no extra ACL: the same policy `write` uses.
+    if crate::definition::is_current(Path::new(&path), &text, 0) {
+        return Ok(Registration::Fine(format!("{path} runs {}", exe.display())));
+    }
+    let note = format!("{path} must be rewritten to run {}", exe.display());
+    if !fix {
+        return Ok(Registration::Needed(note));
     }
     // `definition::write` refuses an unsafe existing definition.
     crate::definition::write(Path::new(&path), &text).map_err(|e| format!("{path}: {e}"))?;
@@ -341,58 +397,111 @@ pub fn repair_registration() -> Result<String, String> {
         crate::install::run_cmd("systemctl", &["daemon-reload"])?;
         crate::install::run_cmd("systemctl", &["enable", SERVICE_NAME])?;
     }
-    Ok(format!("rewrote {path} to run {}", exe.display()))
+    Ok(Registration::Fixed(format!(
+        "rewrote {path} to run {}",
+        exe.display()
+    )))
 }
 
 // ---- state folder and index -------------------------------------------------
 
 /// Rename `path` to `<name>.bad-<time>` (a numbered variant when that exists)
-/// in the same folder. The file is never deleted or overwritten.
+/// in the same folder. The file is never deleted or overwritten: the new name
+/// is made with a hard link, which fails when the name exists, and only then
+/// is the old name removed.
 pub fn move_aside(path: &Path, now_ms: u64) -> io::Result<std::path::PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("no file name"))?
         .to_string_lossy();
     let base = format!("{name}.bad-{}", ferrow_ipc::health::compact_utc(now_ms));
-    let mut target = path.with_file_name(&base);
     let mut n = 1;
-    while target.try_exists()? {
-        n += 1;
-        target = path.with_file_name(format!("{base}-{n}"));
+    loop {
+        let target = if n == 1 {
+            path.with_file_name(&base)
+        } else {
+            path.with_file_name(format!("{base}-{n}"))
+        };
+        match std::fs::hard_link(path, &target) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(path) {
+                    // Two names for one file: take back our new one.
+                    let _ = std::fs::remove_file(&target);
+                    return Err(e);
+                }
+                return Ok(target);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
     }
-    std::fs::rename(path, &target)?;
-    Ok(target)
 }
 
-/// The state folder (created with its protection when missing) and the files
-/// in it. The folder must pass the protection check; a log file that does not
-/// is moved aside so logging resumes; `access.json` is only reported (the
-/// service already ignores one that fails, which means administrators only).
-pub fn check_state_folder(now_ms: u64) -> Result<String, String> {
-    let index = crate::default_service_index_path().map_err(|e| e.to_string())?;
-    let dir = index.parent().ok_or("the index has no folder")?;
-    protection::state_directory(dir).map_err(|e| {
+/// The protection rules for the state folder and the files in it.
+pub struct Rules {
+    /// Validates the folder; production also creates it when missing.
+    pub directory: fn(&Path) -> io::Result<()>,
+    pub file: fn(&Path) -> io::Result<()>,
+}
+
+pub const PROTECTION: Rules = Rules {
+    directory: protection::state_directory,
+    file: protection::state_file,
+};
+
+/// What the state folder check found.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StateCheck {
+    /// Nothing needs repair (or, when fixing, nothing is left).
+    pub clean: bool,
+    pub text: String,
+}
+
+/// The state folder `dir` and the files in it. The folder must pass the
+/// protection check (it cannot be repaired automatically; a missing one is
+/// created only when `fix`). A log file that fails is moved aside when `fix`
+/// (so logging resumes); `access.json` is only reported (the service already
+/// ignores one that fails, which means administrators only).
+pub fn state_folder_in(
+    dir: &Path,
+    now_ms: u64,
+    fix: bool,
+    rules: &Rules,
+) -> Result<StateCheck, String> {
+    let exists = dir.try_exists().unwrap_or(false);
+    if !exists && !fix {
+        return Ok(StateCheck {
+            clean: false,
+            text: format!("{} does not exist yet", dir.display()),
+        });
+    }
+    (rules.directory)(dir).map_err(|e| {
         format!(
             "{}: {e}; its protection cannot be repaired automatically (it must be owned by SYSTEM/root with only administrator access)",
             dir.display()
         )
     })?;
-    let mut notes = Vec::new();
+    let (mut clean, mut notes) = (true, Vec::new());
     for name in [eventlog::FILE_NAME, eventlog::ROTATED_NAME] {
         let path = dir.join(name);
         if path.try_exists().unwrap_or(false)
-            && let Err(e) = protection::state_file(&path)
+            && let Err(e) = (rules.file)(&path)
         {
-            let to = move_aside(&path, now_ms).map_err(|m| format!("{name}: {e}; and {m}"))?;
-            notes.push(format!(
-                "{name} failed its check ({e}); moved to {}",
-                to.display()
-            ));
+            if fix {
+                let to = move_aside(&path, now_ms).map_err(|m| format!("{name}: {e}; and {m}"))?;
+                notes.push(format!(
+                    "{name} failed its check ({e}); moved to {}",
+                    to.display()
+                ));
+            } else {
+                clean = false;
+                notes.push(format!("{name} fails its check ({e})"));
+            }
         }
     }
     let policy = dir.join(access::FILE_NAME);
     if policy.try_exists().unwrap_or(false)
-        && let Err(e) = protection::state_file(&policy)
+        && let Err(e) = (rules.file)(&policy)
     {
         notes.push(format!(
             "{} fails its check ({e}); the service ignores it (administrators only)",
@@ -404,7 +513,15 @@ pub fn check_state_folder(now_ms: u64) -> Result<String, String> {
         text.push_str("; ");
         text.push_str(&note);
     }
-    Ok(text)
+    Ok(StateCheck { clean, text })
+}
+
+/// The service's state folder, checked (and with `fix` repaired) with the
+/// real protection code.
+pub fn check_state_folder(now_ms: u64, fix: bool) -> Result<StateCheck, String> {
+    let index = crate::default_service_index_path().map_err(|e| e.to_string())?;
+    let dir = index.parent().ok_or("the index has no folder")?;
+    state_folder_in(dir, now_ms, fix, &PROTECTION)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -413,16 +530,37 @@ pub enum IndexCheck {
     Missing,
     /// The index loads (what it holds).
     Loads(String),
-    /// It did not load; moved here so the service rebuilds it.
+    /// It was damaged; moved here so the service rebuilds it.
     MovedAside { to: std::path::PathBuf, why: String },
 }
 
-/// Load-check the saved index with `load`; one that fails is moved aside,
-/// never deleted. When even the move fails the file stays where it is.
+/// Why a saved index did not load.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IndexProblem {
+    /// The file's content is bad (wrong magic, truncated, checksum, corrupt):
+    /// safe to move aside and rebuild.
+    Damaged(String),
+    /// Something else (a read error, a version this build does not read, a
+    /// protection failure): the file may be fine, so it is left alone.
+    Unusable(String),
+}
+
+/// Load-check the saved index with `load`. Only a damaged one is moved aside
+/// (never deleted); anything else stops the repair with the reason. When even
+/// the move fails the file stays where it is.
 pub fn check_index(
     path: &Path,
     now_ms: u64,
-    load: impl FnOnce(&Path) -> Result<String, String>,
+    load: impl FnOnce(&Path) -> Result<String, IndexProblem>,
+) -> Result<IndexCheck, String> {
+    check_index_with(path, now_ms, load, move_aside)
+}
+
+pub fn check_index_with(
+    path: &Path,
+    now_ms: u64,
+    load: impl FnOnce(&Path) -> Result<String, IndexProblem>,
+    mover: impl FnOnce(&Path, u64) -> io::Result<std::path::PathBuf>,
 ) -> Result<IndexCheck, String> {
     if !path
         .try_exists()
@@ -432,21 +570,38 @@ pub fn check_index(
     }
     match load(path) {
         Ok(what) => Ok(IndexCheck::Loads(what)),
-        Err(why) => match move_aside(path, now_ms) {
+        Err(IndexProblem::Unusable(why)) => Err(format!(
+            "the saved index cannot be checked ({why}); it was not moved. Fix the cause, or move it aside yourself, and run repair again"
+        )),
+        Err(IndexProblem::Damaged(why)) => match mover(path, now_ms) {
             Ok(to) => Ok(IndexCheck::MovedAside { to, why }),
             Err(e) => Err(format!(
-                "the saved index does not load ({why}) and could not be moved aside ({e}); it was left as it is"
+                "the saved index is damaged ({why}) and could not be moved aside ({e}); it was left as it is"
             )),
         },
     }
 }
 
-/// What the service does at start: the protection check, then the load.
-pub fn load_index(path: &Path) -> Result<String, String> {
-    protection::state_file(path).map_err(|e| format!("protection: {e}"))?;
+/// Read an index file as the service does at start.
+pub fn load_index_file(path: &Path) -> Result<String, IndexProblem> {
+    use ferrow_index::LoadError;
     ferrow_index::Index::load(path)
         .map(|index| format!("{} entries", index.len()))
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            LoadError::WrongMagic
+            | LoadError::Truncated
+            | LoadError::ChecksumMismatch
+            | LoadError::Corrupt(_) => IndexProblem::Damaged(e.to_string()),
+            LoadError::Io(_) | LoadError::UnsupportedVersion(_) => {
+                IndexProblem::Unusable(e.to_string())
+            }
+        })
+}
+
+/// What the service does at start: the protection check, then the load.
+pub fn load_index(path: &Path) -> Result<String, IndexProblem> {
+    protection::state_file(path).map_err(|e| IndexProblem::Unusable(format!("protection: {e}")))?;
+    load_index_file(path)
 }
 
 #[cfg(test)]
@@ -461,12 +616,16 @@ mod tests {
         dir
     }
 
+    fn damaged(_: &Path) -> Result<String, IndexProblem> {
+        Err(IndexProblem::Damaged("bad magic".into()))
+    }
+
     #[test]
-    fn an_index_that_does_not_load_is_moved_aside_and_never_deleted() {
+    fn a_damaged_index_is_moved_aside_and_never_deleted() {
         let dir = dir("aside");
         let index = dir.join("index.bin");
         std::fs::write(&index, b"precious but unreadable").unwrap();
-        let outcome = check_index(&index, 1_709_210_096_000, |_| Err("bad magic".into())).unwrap();
+        let outcome = check_index(&index, 1_709_210_096_000, damaged).unwrap();
         let IndexCheck::MovedAside { to, why } = outcome else {
             panic!("{outcome:?}")
         };
@@ -480,13 +639,55 @@ mod tests {
         // A second failure in the same second never overwrites the first.
         std::fs::write(&index, b"second").unwrap();
         let IndexCheck::MovedAside { to: second, .. } =
-            check_index(&index, 1_709_210_096_000, |_| Err("again".into())).unwrap()
+            check_index(&index, 1_709_210_096_000, damaged).unwrap()
         else {
             panic!()
         };
         assert_ne!(second, to);
         assert_eq!(std::fs::read(&to).unwrap(), b"precious but unreadable");
         assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_that_may_be_fine_is_reported_and_never_moved() {
+        let dir = dir("unusable");
+        let index = dir.join("index.bin");
+        std::fs::write(&index, b"maybe a newer version, maybe a busy disk").unwrap();
+        let error = check_index(&index, 0, |_| {
+            Err(IndexProblem::Unusable(
+                "reading index: access denied".into(),
+            ))
+        })
+        .unwrap_err();
+        assert!(error.contains("was not moved"), "{error}");
+        assert!(error.contains("access denied"), "{error}");
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            b"maybe a newer version, maybe a busy disk"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "nothing renamed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_move_leaves_the_file_where_it_is_and_says_so() {
+        let dir = dir("nomove");
+        let index = dir.join("index.bin");
+        std::fs::write(&index, b"damaged").unwrap();
+        let error = check_index_with(&index, 0, damaged, |_, _| {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "locked"))
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("left as it is") && error.contains("locked"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), b"damaged");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -498,25 +699,125 @@ mod tests {
             check_index(&index, 0, |_| panic!("no file to load")),
             Ok(IndexCheck::Missing)
         );
-        std::fs::write(&index, b"ok").unwrap();
-        assert_eq!(
-            check_index(&index, 0, |_| Ok("3 entries".into())),
-            Ok(IndexCheck::Loads("3 entries".into()))
+        // A real index, written and read by the real code.
+        let builder = ferrow_index::IndexBuilder::new();
+        let root = builder.add_root(b"root", ferrow_index::flags::DIR);
+        builder.add(root, b"a.txt", 0);
+        builder.freeze().save(&index).unwrap();
+        let before = std::fs::read(&index).unwrap();
+        let checked = check_index(&index, 0, load_index_file);
+        assert!(
+            matches!(&checked, Ok(IndexCheck::Loads(what)) if what.ends_with("entries")),
+            "{checked:?}"
         );
-        assert_eq!(std::fs::read(&index).unwrap(), b"ok");
+        assert_eq!(std::fs::read(&index).unwrap(), before);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_real_unreadable_index_fails_the_real_loader() {
+    fn the_real_loader_tells_damage_from_other_failures() {
         let dir = dir("real");
         let index = dir.join("index.bin");
         std::fs::write(&index, b"this is not an index").unwrap();
-        // The production check (`load_index`) must refuse it as well; here the
-        // protection step may fail first on a temp folder, which also counts.
-        assert!(load_index(&index).is_err());
+        assert!(matches!(
+            load_index_file(&index),
+            Err(IndexProblem::Damaged(_))
+        ));
+        // A real index cut short is damaged too; a missing file is an I/O error.
+        let builder = ferrow_index::IndexBuilder::new();
+        let root = builder.add_root(b"root", ferrow_index::flags::DIR);
+        builder.add(root, b"a.txt", 0);
+        builder.freeze().save(&index).unwrap();
+        let bytes = std::fs::read(&index).unwrap();
+        std::fs::write(&index, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(matches!(
+            load_index_file(&index),
+            Err(IndexProblem::Damaged(_))
+        ));
+        assert!(matches!(
+            load_index_file(&dir.join("absent.bin")),
+            Err(IndexProblem::Unusable(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn accept(_: &Path) -> io::Result<()> {
+        Ok(())
+    }
+    fn refuse(_: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unprotected",
+        ))
+    }
+    /// Refuses only files named like logs and the policy; the folder passes.
+    fn refuse_files(path: &Path) -> io::Result<()> {
+        if path.file_name().is_some_and(|n| n == "index.bin") {
+            Ok(())
+        } else {
+            refuse(path)
+        }
+    }
+
+    #[test]
+    fn a_state_folder_that_fails_its_protection_is_refused_untouched() {
+        let dir = dir("folder-bad");
+        std::fs::write(dir.join(eventlog::FILE_NAME), b"log").unwrap();
+        let rules = Rules {
+            directory: refuse,
+            file: accept,
+        };
+        let error = state_folder_in(&dir, 0, true, &rules).unwrap_err();
+        assert!(
+            error.contains("cannot be repaired automatically"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing moved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_that_fails_its_check_is_moved_aside_and_the_policy_is_only_reported() {
+        let dir = dir("folder-logs");
+        std::fs::write(dir.join(eventlog::FILE_NAME), b"log lines").unwrap();
+        std::fs::write(dir.join(access::FILE_NAME), b"{}").unwrap();
+        let rules = Rules {
+            directory: accept,
+            file: refuse_files,
+        };
+        // Checking only: reports, changes nothing.
+        let check = state_folder_in(&dir, 1_709_210_096_000, false, &rules).unwrap();
+        assert!(!check.clean, "{check:?}");
+        assert!(dir.join(eventlog::FILE_NAME).exists());
+        // Fixing: the log is kept under a new name, the policy stays.
+        let fixed = state_folder_in(&dir, 1_709_210_096_000, true, &rules).unwrap();
+        assert!(fixed.clean && fixed.text.contains("moved to"), "{fixed:?}");
+        assert!(!dir.join(eventlog::FILE_NAME).exists());
+        let moved = dir.join("service.log.bad-20240229T123456Z");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"log lines");
+        assert_eq!(std::fs::read(dir.join(access::FILE_NAME)).unwrap(), b"{}");
+        assert!(
+            fixed.text.contains("the service ignores it"),
+            "{}",
+            fixed.text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_state_folder_is_only_created_when_fixing() {
+        let base = dir("folder-missing");
+        let state = base.join("state");
+        let rules = Rules {
+            directory: |p| std::fs::create_dir_all(p),
+            file: accept,
+        };
+        let check = state_folder_in(&state, 0, false, &rules).unwrap();
+        assert!(!check.clean && !state.exists(), "{check:?}");
+        assert!(state_folder_in(&state, 0, true, &rules).unwrap().clean);
+        assert!(state.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

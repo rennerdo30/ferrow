@@ -264,3 +264,33 @@ fn service_health_and_rescan_follow_the_documented_exit_codes() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(1));
 }
+
+/// A service that answers every request with `Unauthorized` (as one does for
+/// an account its access policy refuses): the CLI must exit 4 for both
+/// `health` and `rescan`, with a message that points at the access policy.
+#[test]
+fn a_refusing_service_gives_exit_code_4() {
+    use ferrow_ipc::{ErrorCode, Listener, Response, serve_stream};
+    let fx = Fixture::new();
+    let endpoint = ferrow_ipc::Endpoint::named(&fx.endpoint_name);
+    let listener = Listener::bind(&endpoint).unwrap();
+    let server = std::thread::spawn(move || {
+        // Two connections: one for `health`, one for `rescan`.
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = serve_stream(stream, |_| {
+                vec![Response::Error {
+                    code: ErrorCode::Unauthorized,
+                    msg: "not allowed".into(),
+                }]
+            });
+        }
+    });
+    let health = fx.ferrow().args(["service", "health"]).output().unwrap();
+    assert_eq!(health.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&health.stderr).contains("does not answer this account"));
+    let rescan = fx.ferrow().args(["service", "rescan"]).output().unwrap();
+    assert_eq!(rescan.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&rescan.stderr).contains("only administrators"));
+    server.join().unwrap();
+}

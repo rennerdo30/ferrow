@@ -211,7 +211,7 @@ fn rescan() -> Result<(), Failure> {
         ),
         _ => f,
     })?;
-    println!("{msg}");
+    println!("{}", p(&msg));
     if started {
         Ok(())
     } else {
@@ -220,6 +220,12 @@ fn rescan() -> Result<(), Failure> {
 }
 
 // ---- output ------------------------------------------------------------------
+
+/// Text that came from the service, safe to print: control characters are
+/// escaped so it cannot move the cursor or recolour the terminal.
+fn p(text: &str) -> String {
+    ferrowd::access::printable(text)
+}
 
 /// The report as printed: one JSON line, or the human summary.
 pub fn render(h: &Health, json: bool) -> String {
@@ -233,14 +239,14 @@ pub fn render(h: &Health, json: bool) -> String {
         String::from("OK\n")
     } else {
         let mut text = format!("ATTENTION: {} problem(s)\n", problems.len());
-        for p in &problems {
-            text.push_str(&format!("  ! {p}\n"));
+        for problem in &problems {
+            text.push_str(&format!("  ! {}\n", p(problem)));
         }
         text
     };
     out.push_str(&format!(
         "Ferrow service {} (pid {}), up {}, started {}\n",
-        h.version,
+        p(&h.version),
         h.pid,
         format_duration(h.uptime_s * 1000),
         format_utc(h.started_ms)
@@ -248,17 +254,20 @@ pub fn render(h: &Health, json: bool) -> String {
     out.push_str(&format!(
         "index: {} entries, {}{}; access: {}\n",
         h.entries,
-        h.mode,
+        p(&h.mode),
         if h.scanning { ", scanning now" } else { "" },
-        h.access
+        p(&h.access)
     ));
     out.push_str(&format!(
         "memory: {} working set{}\n",
         mb(h.working_set),
         h.private_bytes
-            .map_or(String::new(), |p| format!(", {} private", mb(p)))
+            .map_or(String::new(), |bytes| format!(", {} private", mb(bytes)))
     ));
-    out.push_str(&format!("live changes applied: {}\n", h.live_changes));
+    out.push_str(&format!(
+        "live changes applied: {}; connection errors: {}\n",
+        h.live_changes, h.connection_errors
+    ));
     match &h.last_save {
         Some(s) if s.ok => out.push_str(&format!(
             "last save: ok, {} ({}, {})\n",
@@ -269,31 +278,34 @@ pub fn render(h: &Health, json: bool) -> String {
         Some(s) => out.push_str(&format!(
             "last save: FAILED {}: {}\n",
             ago(s.at_ms),
-            s.error
+            p(&s.error)
         )),
         None => out.push_str("last save: none yet\n"),
     }
     for v in &h.volumes {
-        out.push_str(&format!("volume {}: {}", v.root, v.mode));
+        out.push_str(&format!("volume {}: {}", p(&v.root), p(&v.mode)));
         if let Some(n) = v.entries {
             out.push_str(&format!(", {n} entries"));
         }
-        out.push_str(&format!(", journal {}\n", v.journal));
+        out.push_str(&format!(", journal {}\n", p(&v.journal)));
         if let Some(scan) = &v.last_scan {
             out.push_str(&format!(
                 "  last scan {} ({}, {})\n",
                 ago(scan.at_ms),
-                scan.reason,
+                p(&scan.reason),
                 format_duration(scan.took_ms)
             ));
         }
-        if let Some(p) = &v.rescan_pending {
+        if let Some(pending) = &v.rescan_pending {
             out.push_str(&format!(
                 "  rescan pending ({}), not before {}\n",
-                p.reason,
-                ago(p.earliest_ms)
+                p(&pending.reason),
+                ago(pending.earliest_ms)
             ));
         }
+    }
+    if h.more_volumes > 0 {
+        out.push_str(&format!("  +{} more volumes not shown\n", h.more_volumes));
     }
     let shown = h.events.len().min(10);
     out.push_str(&format!("recent events ({shown} of {}):\n", h.events.len()));
@@ -301,8 +313,8 @@ pub fn render(h: &Health, json: bool) -> String {
         out.push_str(&format!(
             "  {} {} {}\n",
             format_utc(e.at_ms),
-            e.level,
-            e.text
+            p(&e.level),
+            p(&e.text)
         ));
     }
     out
@@ -310,55 +322,129 @@ pub fn render(h: &Health, json: bool) -> String {
 
 // ---- repair --------------------------------------------------------------------
 
-fn repair() -> Result<(), Failure> {
-    let now = ferrowd::health::now_ms();
-    let stopped_hint =
-        "the service is stopped; fix the problem above, then run `ferrow service start`";
-    // One line per step; the first failure ends the repair.
-    let run = |name: &str, result: Result<String, String>| -> Result<(), Failure> {
-        match result {
-            Ok(detail) => {
-                println!("[ok] {name}: {detail}");
-                Ok(())
+/// The steps of `repair`, so their order and failure handling can be tested
+/// without a real service.
+pub trait RepairSteps {
+    /// Read-only checks: `Some(summary)` when there is nothing to repair
+    /// (registration, state folder and saved index are fine and the service
+    /// answers), `None` otherwise.
+    fn nothing_to_repair(&mut self) -> Option<String>;
+    fn registration(&mut self) -> Result<String, String>;
+    fn stop(&mut self) -> Result<String, String>;
+    fn state_folder(&mut self) -> Result<String, String>;
+    fn index(&mut self) -> Result<String, String>;
+    fn start(&mut self) -> Result<String, String>;
+    fn answers(&mut self) -> Result<String, String>;
+}
+
+const STOPPED_HINT: &str =
+    "     the service is stopped; fix the problem above, then run `ferrow service start`";
+
+/// Run the steps in order, one line each; the first failure ends the repair.
+/// A failure after the service was stopped says that it is stopped.
+pub fn run_repair(steps: &mut dyn RepairSteps, out: &mut dyn io::Write) -> Result<(), Failure> {
+    if let Some(summary) = steps.nothing_to_repair() {
+        let _ = writeln!(out, "Nothing to repair: {}", p(&summary));
+        return Ok(());
+    }
+    let mut report = |name: &str, result: Result<String, String>, stopped: bool| match result {
+        Ok(detail) => {
+            let _ = writeln!(out, "[ok] {name}: {}", p(&detail));
+            Ok(())
+        }
+        Err(detail) => {
+            let _ = writeln!(out, "[FAILED] {name}: {}", p(&detail));
+            if stopped {
+                let _ = writeln!(out, "{STOPPED_HINT}");
             }
-            Err(detail) => {
-                println!("[FAILED] {name}: {detail}");
-                Err(fail(1, format!("repair stopped at: {name}")))
-            }
+            Err(fail(1, format!("repair stopped at: {name}")))
         }
     };
-    run("binary and registration", control::repair_registration())?;
-    run("stop", control::control(Action::Stop))?;
-    let after_stop = |r: Result<String, String>| r.map_err(|e| format!("{e}\n{stopped_hint}"));
-    run("state folder", after_stop(control::check_state_folder(now)))?;
-    let index = ferrowd::default_service_index_path().map_err(|e| e.to_string())?;
-    let checked = control::check_index(&index, now, control::load_index).map(|c| match c {
-        IndexCheck::Missing => "none saved; the service builds one when it starts".into(),
-        IndexCheck::Loads(what) => format!("loads ({what})"),
-        IndexCheck::MovedAside { to, why } => format!(
-            "did not load ({why}); moved to {} (kept, never deleted); the service rebuilds it",
-            to.display()
-        ),
-    });
-    run("saved index", after_stop(checked))?;
-    run("start", control::control(Action::Start))?;
-    let endpoint = Endpoint::default_service();
-    let answering = control::wait_until(control::WAIT, Duration::from_millis(500), || {
-        control::answers(&endpoint)
-    });
-    run(
-        "service answers",
-        if answering {
-            Ok("health request answered".into())
+    report("binary and registration", steps.registration(), false)?;
+    report("stop", steps.stop(), false)?;
+    report("state folder", steps.state_folder(), true)?;
+    report("saved index", steps.index(), true)?;
+    report("start", steps.start(), true)?;
+    report("service answers", steps.answers(), false)?;
+    let _ = writeln!(out, "repair finished");
+    Ok(())
+}
+
+/// The real steps.
+struct Real {
+    now: u64,
+}
+
+impl RepairSteps for Real {
+    fn nothing_to_repair(&mut self) -> Option<String> {
+        use control::{IndexProblem, Registration};
+        if !matches!(control::check_registration(), Ok(Registration::Fine(_))) {
+            return None;
+        }
+        if !control::check_state_folder(self.now, false).is_ok_and(|c| c.clean) {
+            return None;
+        }
+        let index = ferrowd::default_service_index_path().ok()?;
+        // Read-only: whatever the problem is, nothing is moved here.
+        control::check_index(&index, self.now, |path| {
+            control::load_index(path).map_err(|e| match e {
+                IndexProblem::Damaged(why) | IndexProblem::Unusable(why) => {
+                    IndexProblem::Unusable(why)
+                }
+            })
+        })
+        .ok()?;
+        control::answers(&Endpoint::default_service()).then(|| {
+            "registration, state folder and saved index are fine and the service answers".into()
+        })
+    }
+    fn registration(&mut self) -> Result<String, String> {
+        use control::Registration::{Fine, Fixed, Needed};
+        control::repair_registration().map(|r| match r {
+            Fine(text) | Needed(text) => text,
+            Fixed(text) => format!("repaired: {text}"),
+        })
+    }
+    fn stop(&mut self) -> Result<String, String> {
+        control::control(Action::Stop)
+    }
+    fn state_folder(&mut self) -> Result<String, String> {
+        control::check_state_folder(self.now, true).map(|c| c.text)
+    }
+    fn index(&mut self) -> Result<String, String> {
+        let index = ferrowd::default_service_index_path().map_err(|e| e.to_string())?;
+        control::check_index(&index, self.now, control::load_index).map(|c| match c {
+            IndexCheck::Missing => "none saved; the service builds one when it starts".into(),
+            IndexCheck::Loads(what) => format!("loads ({what})"),
+            IndexCheck::MovedAside { to, why } => format!(
+                "damaged ({why}); moved to {} (kept, never deleted); the service rebuilds it",
+                to.display()
+            ),
+        })
+    }
+    fn start(&mut self) -> Result<String, String> {
+        control::control(Action::Start)
+    }
+    fn answers(&mut self) -> Result<String, String> {
+        let endpoint = Endpoint::default_service();
+        if control::wait_until(control::WAIT, Duration::from_millis(500), || {
+            control::answers(&endpoint)
+        }) {
+            Ok("the service answers".into())
         } else {
             Err(format!(
                 "no answer within {} s; see `ferrow service health` and the service log",
                 control::WAIT.as_secs()
             ))
-        },
-    )?;
-    println!("repair finished");
-    Ok(())
+        }
+    }
+}
+
+fn repair() -> Result<(), Failure> {
+    let mut real = Real {
+        now: ferrowd::health::now_ms(),
+    };
+    run_repair(&mut real, &mut io::stdout())
 }
 
 #[cfg(test)]
@@ -515,5 +601,148 @@ mod tests {
         let text = render(&bad, false);
         assert!(text.starts_with("ATTENTION: 2 problem(s)\n"), "{text}");
         assert!(text.contains("disk full") && text.contains("live updates stopped"));
+    }
+
+    #[test]
+    fn the_summary_shows_every_counter_and_never_prints_raw_control_characters() {
+        let mut h = sample();
+        h.connection_errors = 12;
+        h.more_volumes = 3;
+        h.events[0].text = "evil\u{1b}[2Jtext".into();
+        h.volumes[0].root = "C:\\\u{7}".into();
+        let text = render(&h, false);
+        assert!(text.contains("connection errors: 12"), "{text}");
+        assert!(text.contains("+3 more volumes"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("evil\\u{1b}[2Jtext"), "{text}");
+        // The JSON line is the data as is; the terminal form is what is escaped.
+        assert!(render(&h, true).contains("\\u001b"));
+    }
+
+    /// Records the calls and fails the named step.
+    struct Script {
+        calls: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        nothing: bool,
+    }
+    impl Script {
+        fn new(fail_at: Option<&'static str>) -> Script {
+            Script {
+                calls: Vec::new(),
+                fail_at,
+                nothing: false,
+            }
+        }
+        fn step(&mut self, name: &'static str) -> Result<String, String> {
+            self.calls.push(name);
+            if self.fail_at == Some(name) {
+                Err(format!("{name} broke"))
+            } else {
+                Ok(format!("{name} fine"))
+            }
+        }
+    }
+    impl RepairSteps for Script {
+        fn nothing_to_repair(&mut self) -> Option<String> {
+            self.calls.push("check");
+            self.nothing.then(|| "all fine".into())
+        }
+        fn registration(&mut self) -> Result<String, String> {
+            self.step("registration")
+        }
+        fn stop(&mut self) -> Result<String, String> {
+            self.step("stop")
+        }
+        fn state_folder(&mut self) -> Result<String, String> {
+            self.step("state_folder")
+        }
+        fn index(&mut self) -> Result<String, String> {
+            self.step("index")
+        }
+        fn start(&mut self) -> Result<String, String> {
+            self.step("start")
+        }
+        fn answers(&mut self) -> Result<String, String> {
+            self.step("answers")
+        }
+    }
+
+    fn repair_with(script: &mut Script) -> (Result<(), Failure>, String) {
+        let mut out = Vec::new();
+        let result = run_repair(script, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn repair_runs_its_steps_in_order() {
+        let mut script = Script::new(None);
+        let (result, out) = repair_with(&mut script);
+        assert!(result.is_ok());
+        assert_eq!(
+            script.calls,
+            [
+                "check",
+                "registration",
+                "stop",
+                "state_folder",
+                "index",
+                "start",
+                "answers"
+            ]
+        );
+        assert!(out.contains("[ok] saved index: index fine"), "{out}");
+        assert!(out.ends_with("repair finished\n"), "{out}");
+        assert!(!out.contains("stopped"), "{out}");
+    }
+
+    #[test]
+    fn a_failure_after_the_stop_says_the_service_is_stopped_and_ends_the_repair() {
+        for failing in ["state_folder", "index", "start"] {
+            let mut script = Script::new(Some(failing));
+            let (result, out) = repair_with(&mut script);
+            let failure = result.unwrap_err();
+            assert_eq!(failure.code, 1);
+            assert!(
+                failure.msg.starts_with("repair stopped at:"),
+                "{}",
+                failure.msg
+            );
+            assert_eq!(
+                script.calls.last(),
+                Some(&failing),
+                "nothing runs after the failure"
+            );
+            assert!(
+                out.contains("[FAILED]") && out.contains(&format!("{failing} broke")),
+                "{out}"
+            );
+            assert!(
+                out.contains(
+                    "the service is stopped; fix the problem above, then run `ferrow service start`"
+                ),
+                "{failing}: {out}"
+            );
+        }
+        // Before the stop nothing was stopped, so no such hint.
+        for failing in ["registration", "stop"] {
+            let mut script = Script::new(Some(failing));
+            let (result, out) = repair_with(&mut script);
+            assert!(result.is_err());
+            assert!(!out.contains("the service is stopped"), "{failing}: {out}");
+            assert!(!script.calls.contains(&"state_folder"));
+        }
+    }
+
+    #[test]
+    fn nothing_to_repair_touches_nothing() {
+        let mut script = Script::new(None);
+        script.nothing = true;
+        let (result, out) = repair_with(&mut script);
+        assert!(result.is_ok());
+        assert_eq!(script.calls, ["check"], "no stop, no restart");
+        assert_eq!(out, "Nothing to repair: all fine\n");
     }
 }
