@@ -113,6 +113,10 @@ fn file_changes_appear_in_searches_within_a_second() {
     std::fs::create_dir_all(outside.join("inner")).unwrap();
     std::fs::write(outside.join("top-yq.txt"), b"x").unwrap();
     std::fs::write(outside.join("inner").join("deep-yq.txt"), b"x").unwrap();
+    // Created a moment ago, a folder is reported as new together with its
+    // contents (no read needed); let it age past the batch window so the
+    // move is the only report for it, as for a folder that already existed.
+    std::thread::sleep(Duration::from_secs(2));
     std::fs::rename(&outside, dir.join("arrived-yq")).unwrap();
     let took = wait_until("a folder moved in with its contents", || {
         hits(&store, "yq").len() == 3
