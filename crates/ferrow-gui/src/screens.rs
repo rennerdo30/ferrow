@@ -47,6 +47,12 @@ pub(super) fn tones(dark: bool) -> Tones {
     }
 }
 
+/// Settings cards this page opens (`settings_scroll_to` names the Settings
+/// page accepts: Fast index, Own index, Windows, Appearance, Updates, About,
+/// and Service access, which scrolls to Fast index).
+const SERVICE_CARD: &str = "Service access";
+const OWN_INDEX_CARD: &str = "Own index";
+
 // -------------------------------------------------------------------
 // The state chip
 
@@ -217,7 +223,7 @@ impl FerrowApp {
             };
             resp.on_hover_text(chip.tooltip);
             if clicked {
-                self.open_settings_at("Service access");
+                self.open_settings_at(SERVICE_CARD);
             }
             x = chip_rect.right() + 10.0;
         }
@@ -548,8 +554,8 @@ impl FerrowApp {
                     self.index_home(home);
                 }
             }
-            Some(FirstStart::Choose) => self.open_settings_at("Index"),
-            Some(FirstStart::Service) => self.open_settings_at("Service access"),
+            Some(FirstStart::Choose) => self.open_settings_at(OWN_INDEX_CARD),
+            Some(FirstStart::Service) => self.open_settings_at(SERVICE_CARD),
             None => {}
         }
     }
@@ -1166,5 +1172,21 @@ mod tests {
         assert_eq!(app.chip().unwrap().text, "Indexing · 1.2 M files");
         feed(&mut app, &tx, vec![loaded(&index)]);
         assert!(app.scan_info.is_none());
+    }
+
+    #[test]
+    fn the_settings_cards_opened_from_here_are_names_the_settings_page_accepts() {
+        let accepted = [
+            "Fast index",
+            "Own index",
+            "Windows",
+            "Appearance",
+            "Updates",
+            "About",
+            "Service access",
+        ];
+        for card in [SERVICE_CARD, OWN_INDEX_CARD] {
+            assert!(accepted.contains(&card), "{card}");
+        }
     }
 }

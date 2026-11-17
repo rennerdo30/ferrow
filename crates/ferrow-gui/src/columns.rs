@@ -82,6 +82,14 @@ fn place(visible: &[(ColumnId, f32)], left: f32, right: f32) -> Vec<Placed> {
             None => break,
         }
     }
+    // In a narrow view Name stops at its useful width: what it does not need
+    // goes to Folder, whose end (the folder that tells rows apart) is what a
+    // narrow window loses first.
+    if fixed.iter().map(|c| c.2).sum::<f32>() > room {
+        for c in fixed.iter_mut().filter(|c| c.1 == ColumnId::Name) {
+            c.2 = c.2.min(useful_width(ColumnId::Name));
+        }
+    }
     // Shrink the rest, right to left, Name last.
     let mut excess = fixed.iter().map(|c| c.2).sum::<f32>() - room;
     let order: Vec<usize> = (0..fixed.len())
@@ -511,6 +519,9 @@ mod tests {
         let cols = place(&defaults(), 0.0, 520.0);
         assert!(width_of(&cols, ColumnId::Folder).unwrap() >= MIN_FOLDER);
         assert!(width_of(&cols, ColumnId::Name).unwrap() >= useful_width(ColumnId::Name));
+        // Name stops at its useful width; Folder gets what it does not need.
+        assert_eq!(width_of(&cols, ColumnId::Name), Some(220.0));
+        assert!(width_of(&cols, ColumnId::Folder).unwrap() > 200.0);
         // The rightmost column is left out first; the rest fill the width.
         assert_eq!(width_of(&cols, ColumnId::Type), None);
         assert!((cols.last().unwrap().right - 520.0).abs() < 0.01);

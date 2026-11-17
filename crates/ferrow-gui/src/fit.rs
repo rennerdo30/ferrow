@@ -52,10 +52,17 @@ fn split_path(path: &str) -> Split<'_> {
     }
 }
 
-/// `path` shortened to fit `max`: the root and first folder, `…`, then as
-/// many of the last folders as fit (`D:\Archive\…\2023\Quarterly reports`).
-/// Folders are only ever dropped whole; the last folder is kept and, if even
-/// that is too long, is returned as `…\last` for the caller to clip.
+/// `path` shortened to fit `max`, fitted from the END, because the end of a
+/// path is what tells folders apart (`…\宇多田ヒカル\Album 1` against
+/// `…\Daft Punk\Album 1`):
+///
+/// 1. As many trailing folders as fit, behind `…`, with the root (`C:\`,
+///    `\\server\share\`, `/`) in front, but only when there is room for the
+///    root, `…` and at least two trailing folders.
+/// 2. Otherwise the root goes first, never the second-to-last folder:
+///    `…\folder\last`, down to `…\last`.
+/// 3. A last folder that is too long on its own keeps its end:
+///    `…ting Documents`.
 pub fn fit_path(path: &str, max: f32, measure: Measure<'_>) -> String {
     if measure(path) <= max {
         return path.to_owned();
@@ -69,45 +76,56 @@ pub fn fit_path(path: &str, max: f32, measure: Measure<'_>) -> String {
     if n == 0 {
         return path.to_owned();
     }
-    let tail = |k: usize| segments[n - k..].join(&sep.to_string());
-    let build = |head: Option<&str>, k: usize| {
-        let mut s = String::from(root);
-        if let Some(h) = head {
-            s.push_str(h);
-            s.push(sep);
+    let sep_text = sep.to_string();
+    let build = |with_root: bool, k: usize| {
+        let mut s = String::new();
+        if with_root {
+            s.push_str(root);
         }
         s.push_str(ELLIPSIS);
         s.push(sep);
-        s.push_str(&tail(k));
+        s.push_str(&segments[n - k..].join(&sep_text));
         s
     };
-    // Keep the first folder and as many trailing ones as fit (the widest
-    // candidate that fits, found by bisection: more folders is wider).
-    if n >= 3 {
-        let (mut lo, mut hi, mut best) = (1usize, n - 2, None);
+    // The most trailing folders (`lo..=hi`) a candidate can keep and still
+    // fit: more folders is wider, so bisect.
+    let most = |with_root: bool, lo: usize, hi: usize| {
+        let (mut lo, mut hi, mut best) = (lo, hi, None);
         while lo <= hi {
             let mid = (lo + hi) / 2;
-            if measure(&build(Some(segments[0]), mid)) <= max {
+            if measure(&build(with_root, mid)) <= max {
                 best = Some(mid);
                 lo = mid + 1;
             } else {
                 hi = mid - 1;
             }
         }
-        if let Some(k) = best {
-            return build(Some(segments[0]), k);
+        best
+    };
+    if !root.is_empty()
+        && n >= 3
+        && let Some(k) = most(true, 2, n - 1)
+    {
+        return build(true, k);
+    }
+    if let Some(k) = most(false, 1, n) {
+        return build(false, k);
+    }
+    // Even `…\last` is too wide: keep the end of the last folder.
+    let last = segments[n - 1];
+    let ends: Vec<usize> = last.char_indices().map(|(i, _)| i).collect();
+    let (mut lo, mut hi, mut best) = (1usize, ends.len(), 1usize);
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let cut = format!("{ELLIPSIS}{}", &last[ends[ends.len() - mid]..]);
+        if measure(&cut) <= max {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
         }
     }
-    // Drop the first folder as well: root, `…`, last folder.
-    let without_head = build(None, 1);
-    if n >= 2 && measure(&without_head) <= max {
-        return without_head;
-    }
-    // Nothing of the root fits: `…\last`.
-    let mut s = String::from(ELLIPSIS);
-    s.push(sep);
-    s.push_str(segments[n - 1]);
-    s
+    format!("{ELLIPSIS}{}", &last[ends[ends.len() - best]..])
 }
 
 /// A name cut in the middle: `name[..head] + … + name[tail..]`.
@@ -314,23 +332,45 @@ mod tests {
     }
 
     #[test]
-    fn long_paths_keep_the_drive_the_first_folder_and_the_last_folders() {
+    fn long_paths_keep_the_root_and_as_many_last_folders_as_fit() {
         let p = r"D:\Archive\Clients\Northwind Traders\2023\Quarterly reports";
-        assert_eq!(fit(p, 40.0), r"D:\Archive\…\2023\Quarterly reports");
-        // More room: more trailing folders come back.
         assert_eq!(
-            fit(p, 54.0),
-            r"D:\Archive\…\Northwind Traders\2023\Quarterly reports"
+            fit(p, 45.0),
+            r"D:\…\Northwind Traders\2023\Quarterly reports"
         );
-        // Less room: only the last folder.
-        assert_eq!(fit(p, 30.0), r"D:\Archive\…\Quarterly reports");
+        assert_eq!(fit(p, 30.0), r"D:\…\2023\Quarterly reports");
     }
 
     #[test]
-    fn the_first_folder_is_dropped_before_the_last_one() {
+    fn the_root_goes_before_the_second_to_last_folder() {
         let p = r"D:\Archive\Clients\Northwind Traders\2023\Quarterly reports";
-        assert_eq!(fit(p, 25.0), r"D:\…\Quarterly reports");
-        assert_eq!(fit(p, 14.0), r"…\Quarterly reports");
+        // Root + … + two folders needs 27: one short of that, the root goes
+        // and the two folders stay.
+        assert_eq!(fit(p, 26.0), r"…\2023\Quarterly reports");
+        // Then the second-to-last folder goes.
+        assert_eq!(fit(p, 20.0), r"…\Quarterly reports");
+    }
+
+    #[test]
+    fn folders_that_differ_stay_visible_in_a_narrow_column() {
+        // The case behind the rule: three rows that differ only in the
+        // artist folder must not collapse to the same text.
+        let rows = [
+            r"C:\Users\Alex\Music\Daft Punk\Album 1",
+            r"C:\Users\Alex\Music\宇多田ヒカル\Album 1",
+            r"C:\Users\Alex\Music\Khruangbin\Album 1",
+        ];
+        let cut: Vec<String> = rows.iter().map(|r| fit(r, 24.0)).collect();
+        // The root stays on the rows that have room for it; every row keeps
+        // its artist folder.
+        assert_eq!(
+            cut,
+            [
+                r"C:\…\Daft Punk\Album 1",
+                r"…\宇多田ヒカル\Album 1",
+                r"C:\…\Khruangbin\Album 1"
+            ]
+        );
     }
 
     #[test]
@@ -341,35 +381,43 @@ mod tests {
     }
 
     #[test]
-    fn unc_paths_keep_server_and_share() {
+    fn unc_paths_keep_server_and_share_while_there_is_room() {
         let p = r"\\nas\media\photos\2026\Tokyo trip\day 3\raw";
-        assert_eq!(fit(p, 30.0), r"\\nas\media\photos\…\day 3\raw");
-        assert_eq!(fit(p, 20.0), r"\\nas\media\…\raw");
+        assert_eq!(fit(p, 34.0), r"\\nas\media\…\Tokyo trip\day 3\raw");
+        assert_eq!(fit(p, 25.0), r"\\nas\media\…\day 3\raw");
+        // No room for the share: the last folders win.
+        assert_eq!(fit(p, 20.0), r"…\day 3\raw");
     }
 
     #[test]
     fn unix_paths_use_their_separator() {
         let p = "/home/alex/projects/ferrow/crates/ferrow-gui/src";
-        assert_eq!(fit(p, 26.0), "/home/…/ferrow-gui/src");
+        assert_eq!(fit(p, 24.0), "/…/crates/ferrow-gui/src");
+        assert_eq!(fit(p, 16.0), "…/ferrow-gui/src");
     }
 
     #[test]
     fn japanese_folders_count_by_their_wide_width() {
         let p = r"C:\Users\Alex\Pictures\東京旅行 2026\パノラマ";
-        // 2-wide characters: `パノラマ` is 8 wide, `東京旅行 2026` is 13.
-        let cut = fit(p, 28.0);
-        assert!(width(&cut) <= 28.0, "{cut}");
-        assert!(cut.ends_with("パノラマ"), "{cut}");
-        assert!(cut.starts_with(r"C:\Users\…"), "{cut}");
+        // Wide characters count 2: `パノラマ` is 8, `東京旅行 2026` is 13.
+        assert_eq!(fit(p, 28.0), r"C:\…\東京旅行 2026\パノラマ");
+        assert_eq!(fit(p, 24.0), r"…\東京旅行 2026\パノラマ");
+        assert_eq!(fit(p, 12.0), r"…\パノラマ");
+        // Not even `…\last`: the end of the last folder, whole characters.
+        assert_eq!(fit(p, 5.0), "…ラマ");
+        for max in [5.0, 12.0, 24.0, 28.0, 40.0] {
+            assert!(width(&fit(p, max)) <= max);
+        }
     }
 
     #[test]
-    fn a_very_long_single_folder_name_is_left_for_the_caller_to_clip() {
+    fn a_very_long_last_folder_keeps_its_end() {
         let long = "x".repeat(80);
-        let p = format!(r"C:\{long}");
-        assert_eq!(fit(&p, 20.0), format!(r"…\{long}"));
-        let deep = format!(r"C:\a\b\{long}");
-        assert_eq!(fit(&deep, 20.0), format!(r"…\{long}"));
+        let expected = format!("…{}", "x".repeat(19));
+        assert_eq!(fit(&format!(r"C:\{long}"), 20.0), expected);
+        assert_eq!(fit(&format!(r"C:\a\b\{long}"), 20.0), expected);
+        let p = r"D:\Archive\Clients\Supporting Documents";
+        assert_eq!(fit(p, 15.0), "…ting Documents");
     }
 
     #[test]
