@@ -20,10 +20,12 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
 
 
-def run_config(name, base_dir, head_dir, index, rows, pairs):
+def run_config(name, base_dirs, head_dirs, index, rows, pairs):
+    # each arm = (probe dir, service-binary dir)
+    base_dir, head_dir = base_dirs[0], head_dirs[0]
     args = Namespace(
-        base_probe=Path(base_dir) / "examples/latency_probe", base_binary=Path(base_dir) / "ferrow", base_index=Path(index),
-        head_probe=Path(head_dir) / "examples/latency_probe", head_binary=Path(head_dir) / "ferrow", head_index=Path(index),
+        base_probe=Path(base_dirs[0]) / "examples/latency_probe", base_binary=Path(base_dirs[1]) / "ferrow", base_index=Path(index),
+        head_probe=Path(head_dirs[0]) / "examples/latency_probe", head_binary=Path(head_dirs[1]) / "ferrow", head_index=Path(index),
         entries=5_000_000)
     print(f"\n### {name}\n")
     print(f"base dir `{base_dir}` (len {len(str(base_dir))}), head dir `{head_dir}` (len {len(str(head_dir))})")
@@ -52,15 +54,15 @@ def main():
     index, pairs = sys.argv[1], int(sys.argv[2])
     real_base, real_head, copy_a, copy_b, copy_c = sys.argv[3:8]
     rows = [("IPC", "!tmp log", "first_page_ms"), ("IPC", "a", "first_page_ms"),
-            ("in-process", "!tmp log", "first_page_ms"), ("IPC", "!tmp log", "full_count_ms")]
+            ("in-process", "!tmp log", "first_page_ms")]
+    d = lambda x: (x, x)
     configs = {
-        "C0 real base build vs real head build (same source on this PR)": (real_base, real_head),
-        "C1 A/A: base = copy of head (temp dir), head = workspace head": (copy_a, real_head),
-        "C2 A/A reverse: base = workspace head, head = copy of head (temp dir)": (real_head, copy_a),
-        "C3 A/A two copies of equal path length": (copy_b, copy_c),
-        "C4 A/A same path for both arms (pure order/slot bias)": (real_head, real_head),
+        "C0 real base build vs real head build": (d(real_base), d(real_head)),
+        "C5 cross: base arm = base probe + HEAD service binary, head arm = head probe + head service binary":
+            ((real_base, real_head), d(real_head)),
+        "C4 A/A same path for both arms (pure order/slot bias)": (d(real_head), d(real_head)),
     }
-    wanted = os.environ.get("AA_CONFIGS", "C0,C1,C2,C3,C4").split(",")
+    wanted = os.environ.get("AA_CONFIGS", "C0,C5,C4").split(",")
     for name, (b, h) in configs.items():
         if name.split()[0] in wanted:
             run_config(name, b, h, index, rows, pairs)

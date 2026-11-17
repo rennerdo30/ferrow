@@ -177,7 +177,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
-          ref: main
+          ref: a7668b1c2f847db9e535ed6394755397be1a968c  # TEMPORARY FR-31: parent of #76 to reproduce its bench run
           path: .bench-base
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -448,7 +448,7 @@ jobs:
           done
           {
             echo "## A/A diagnostic (identical head binaries; FR-31)"
-            timeout -k 10s 1500s python3 scripts/aa_diag.py "$T/ferrow-bench.bin" 6 \
+            timeout -k 10s 1500s python3 scripts/aa_diag.py "$T/ferrow-bench.bin" 10 \
               "$T/ferrow-base-target/release" "$PWD/target/release" "$T/aa-a" "$T/aa-b" "$T/aa-c"
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Gate paired main and head medians
