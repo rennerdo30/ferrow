@@ -1254,6 +1254,75 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
     Ok(index)
 }
 
+/// What a streaming check of a saved index found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verified {
+    pub entries: u32,
+    pub bytes: u64,
+}
+
+/// The read size [`verify_file`] uses: the check holds this much memory
+/// whatever the size of the file.
+pub const VERIFY_BUFFER: usize = 1 << 20;
+
+/// Check a saved index without decoding it: the header (magic, version,
+/// counts) and the file length against it, then the whole-file CRC-32 computed
+/// over reads of at most `buffer` bytes. Memory use is the buffer, not the index;
+/// it fails the same way [`Index::load`] does for a bad magic, a short or long
+/// file and a checksum mismatch. It does not validate the offsets inside the
+/// sections (a file written by Ferrow with a matching checksum has valid ones).
+pub(crate) fn verify_reader<R: std::io::Read>(
+    reader: &mut R,
+    file_len: u64,
+    buffer: usize,
+) -> Result<Verified, LoadError> {
+    let head_len = usize::try_from(file_len.min(HEADER_LEN as u64)).unwrap_or(HEADER_LEN);
+    let mut head = vec![0u8; head_len];
+    reader.read_exact(&mut head).map_err(LoadError::Io)?;
+    let header = parse_header(&head)?;
+    let expected = expected_len(
+        header.entry_count,
+        header.arena_len,
+        header.metadata_len,
+        header.header_len,
+    );
+    if file_len < expected {
+        return Err(LoadError::Truncated);
+    }
+    if file_len > expected {
+        return Err(LoadError::Corrupt("unexpected trailing bytes"));
+    }
+    // The checksum covers everything after its own field, in both versions.
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&head[CHECKSUM_START.min(head.len())..]);
+    let mut chunk = vec![0u8; buffer.max(4096)];
+    let mut left = expected - head_len as u64;
+    while left > 0 {
+        let want = usize::try_from(left.min(chunk.len() as u64)).unwrap_or(chunk.len());
+        let got = match reader.read(&mut chunk[..want]) {
+            Ok(0) => return Err(LoadError::Truncated),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(LoadError::Io(e)),
+        };
+        crc.update(&chunk[..got]);
+        left -= got as u64;
+    }
+    if crc.finalize() != header.checksum {
+        return Err(LoadError::ChecksumMismatch);
+    }
+    Ok(Verified {
+        entries: header.entry_count,
+        bytes: expected,
+    })
+}
+
+pub(crate) fn verify_file(path: &Path) -> Result<Verified, LoadError> {
+    let mut file = std::fs::File::open(path).map_err(LoadError::Io)?;
+    let file_len = file.metadata().map_err(LoadError::Io)?.len();
+    verify_reader(&mut file, file_len, VERIFY_BUFFER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,6 +1344,97 @@ mod tests {
         let bytes = std::fs::read(&dir).unwrap();
         let _ = std::fs::remove_file(&dir);
         bytes
+    }
+
+    #[test]
+    fn verify_passes_a_good_file_and_names_every_kind_of_damage() {
+        let bytes = sample_bytes();
+        let check = |data: &[u8]| verify_reader(&mut &data[..], data.len() as u64, 4096);
+        let ok = check(&bytes).unwrap();
+        assert_eq!((ok.entries, ok.bytes), (3, bytes.len() as u64));
+        // Same verdicts as the real loader.
+        let mut flipped = bytes.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x55;
+        assert!(matches!(check(&flipped), Err(LoadError::ChecksumMismatch)));
+        assert!(matches!(
+            check(&bytes[..bytes.len() - 5]),
+            Err(LoadError::Truncated)
+        ));
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[0; 16]);
+        assert!(matches!(check(&longer), Err(LoadError::Corrupt(_))));
+        let mut magic = bytes.clone();
+        magic[0] = b'X';
+        assert!(matches!(check(&magic), Err(LoadError::WrongMagic)));
+        let mut version = bytes.clone();
+        version[8..12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(matches!(
+            check(&version),
+            Err(LoadError::UnsupportedVersion(99))
+        ));
+        assert!(matches!(check(&bytes[..4]), Err(LoadError::Truncated)));
+        for data in [&flipped[..], &bytes[..bytes.len() - 5], &magic[..]] {
+            assert!(from_bytes(data).is_err(), "the loader refuses it too");
+        }
+    }
+
+    #[test]
+    fn verify_reads_a_large_file_in_bounded_pieces_and_reports_io_errors() {
+        // A multi-megabyte index checked through a 64 KiB buffer: no single
+        // read may exceed the cap, however large the file is.
+        let b = IndexBuilder::new();
+        let root = b.add_root(b"root", flags::DIR);
+        for n in 0..40_000u32 {
+            b.add(
+                root,
+                format!("a-rather-long-file-name-{n:08}.txt").as_bytes(),
+                0,
+            );
+        }
+        let path = std::env::temp_dir().join(format!("ferrow-verify-big-{}", std::process::id()));
+        b.freeze().save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            bytes.len() > 3 << 20,
+            "the fixture is {} bytes",
+            bytes.len()
+        );
+        struct Spy<'a> {
+            data: &'a [u8],
+            biggest: usize,
+            total: usize,
+        }
+        impl std::io::Read for Spy<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.biggest = self.biggest.max(buf.len());
+                let n = self.data.read(buf)?;
+                self.total += n;
+                Ok(n)
+            }
+        }
+        let cap = 64 * 1024;
+        let mut spy = Spy {
+            data: &bytes,
+            biggest: 0,
+            total: 0,
+        };
+        let ok = verify_reader(&mut spy, bytes.len() as u64, cap).unwrap();
+        assert_eq!(ok.entries, 40_001);
+        assert_eq!(spy.total, bytes.len(), "the whole file was checked");
+        assert!(spy.biggest <= cap, "a read asked for {} bytes", spy.biggest);
+        // A read error is I/O, not damage.
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk gone"))
+            }
+        }
+        assert!(matches!(
+            verify_reader(&mut Broken, 1 << 20, cap),
+            Err(LoadError::Io(_))
+        ));
     }
 
     #[test]

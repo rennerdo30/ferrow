@@ -124,7 +124,7 @@ fn getrandom(buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_binary(path: &Path) -> io::Result<()> {
+pub fn validate_binary(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         windows::validate_path(path, windows::Role::Binary)
