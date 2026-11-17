@@ -79,9 +79,23 @@ impl Section {
     }
 }
 
-/// The last section whose top is at or above `line` (the viewport top plus a
-/// little), or the first one before any is reached. `tops` are in page order.
-fn section_in_view(tops: &[(Section, f32)], line: f32) -> Section {
+/// How far down the view the highlight line sits, as a share of its height:
+/// a section owns the view once its heading has scrolled above this line.
+const HIGHLIGHT_LINE: f32 = 0.4;
+
+/// The line a heading must be above to take the highlight in a scroll area
+/// that starts at `viewport_top` and is `viewport_h` tall.
+fn highlight_line(viewport_top: f32, viewport_h: f32) -> f32 {
+    viewport_top + viewport_h * HIGHLIGHT_LINE
+}
+
+/// The last section whose top is at or above `line`, or the first one before
+/// any is reached; the last section when the page is scrolled to its end.
+/// `tops` are in page order.
+fn section_in_view(tops: &[(Section, f32)], line: f32, at_end: bool) -> Section {
+    if at_end && let Some((last, _)) = tops.last() {
+        return *last;
+    }
     tops.iter()
         .take_while(|(_, top)| *top <= line)
         .last()
@@ -325,13 +339,17 @@ struct Anchors {
     tops: Vec<(Section, f32)>,
     /// Height of the last section.
     tail: f32,
+    /// The line a heading must be above to take the highlight.
+    line: f32,
+    /// Whether the page is scrolled to its end.
+    at_end: bool,
 }
 
 /// Screenshot tests: which section is in view (the page's own rule).
 #[cfg(all(test, feature = "screenshots"))]
-pub(crate) fn section_label_in_view(ctx: &egui::Context, content_top: f32) -> &'static str {
+pub(crate) fn section_label_in_view(ctx: &egui::Context) -> &'static str {
     let anchors: Anchors = ctx.data(|d| d.get_temp(anchors_id())).unwrap_or_default();
-    section_in_view(&anchors.tops, content_top + TITLE_HEIGHT + 56.0).label()
+    section_in_view(&anchors.tops, anchors.line, anchors.at_end).label()
 }
 
 fn anchors_id() -> egui::Id {
@@ -397,8 +415,7 @@ impl FerrowApp {
         // The list on the left highlights the section in view (from the last
         // frame) and asks to scroll to the one clicked.
         let before: Anchors = ctx.data(|d| d.get_temp(anchors_id())).unwrap_or_default();
-        let viewport_top = body_top;
-        let current = section_in_view(&before.tops, viewport_top + 56.0);
+        let current = section_in_view(&before.tops, before.line, before.at_end);
         let mut target = self
             .settings_scroll_to
             .take()
@@ -429,8 +446,9 @@ impl FerrowApp {
             scroll_to: target,
         };
         let mut tail = before.tail;
+        let line = highlight_line(body_top, viewport_h);
         let mut body = ui.new_child(egui::UiBuilder::new().max_rect(scroll));
-        egui::ScrollArea::vertical()
+        let output = egui::ScrollArea::vertical()
             .id_salt("settings-scroll")
             .auto_shrink([false, false])
             .show(&mut body, |ui| {
@@ -466,6 +484,11 @@ impl FerrowApp {
                     });
                 });
             });
+        let at_end = output.state.clamped_offset().y + output.inner_rect.height()
+            >= output.content_size.y - 1.0;
+        if output.state.clamped_offset().y > 0.5 {
+            scrolled_edge(ui, &p, scroll);
+        }
         if let Some(section) = target
             && before.tail <= 0.0
         {
@@ -478,10 +501,12 @@ impl FerrowApp {
         let now = Anchors {
             tops: marks.tops,
             tail,
+            line,
+            at_end,
         };
         // The highlight follows the scroll position; one more frame when it
         // changed, never while it holds.
-        let changed = section_in_view(&now.tops, viewport_top + 56.0) != current
+        let changed = section_in_view(&now.tops, now.line, now.at_end) != current
             || (now.tail - before.tail).abs() > 0.5;
         ctx.data_mut(|d| d.insert_temp(anchors_id(), now));
         if changed {
@@ -1293,6 +1318,32 @@ pub fn apply_theme_choice(ctx: &egui::Context, choice: ThemeChoice) {
         ThemeChoice::Light => egui::ThemePreference::Light,
         ThemeChoice::Dark => egui::ThemePreference::Dark,
     });
+}
+
+/// Height of the fade under the scroll area's top edge.
+const EDGE_FADE: f32 = 14.0;
+
+/// The clean top edge of the scrolled content: a hairline and a short fade
+/// into the page colour, so a row cut by the edge does not read as broken
+/// text. Painted only while the content is scrolled, as part of the frame
+/// that scrolled; it never asks for a repaint.
+fn scrolled_edge(ui: &egui::Ui, p: &theme::Palette, area: egui::Rect) {
+    let top = area.top();
+    let fade = egui::Rect::from_min_max(
+        egui::pos2(area.left(), top),
+        egui::pos2(area.right(), top + EDGE_FADE),
+    );
+    let mut mesh = egui::Mesh::default();
+    let clear = p.window.gamma_multiply(0.0);
+    mesh.colored_vertex(fade.left_top(), p.window);
+    mesh.colored_vertex(fade.right_top(), p.window);
+    mesh.colored_vertex(fade.right_bottom(), clear);
+    mesh.colored_vertex(fade.left_bottom(), clear);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    let painter = ui.painter_at(area.expand2(vec2(0.0, 1.0)));
+    painter.add(egui::Shape::mesh(mesh));
+    painter.hline(area.x_range(), top, egui::Stroke::new(1.0, p.divider));
 }
 
 fn back_button(ui: &mut egui::Ui, p: &theme::Palette) -> egui::Response {
@@ -2153,12 +2204,43 @@ mod tests {
             (Section::Appearance, 80.0),
             (Section::Updates, 500.0),
         ];
-        assert_eq!(section_in_view(&tops, 56.0), Section::OwnIndex);
-        assert_eq!(section_in_view(&tops, 100.0), Section::Appearance);
+        assert_eq!(section_in_view(&tops, 56.0, false), Section::OwnIndex);
+        assert_eq!(section_in_view(&tops, 100.0, false), Section::Appearance);
         // Before any section has started, the first one.
         let below = [(Section::FastIndex, 120.0), (Section::OwnIndex, 400.0)];
-        assert_eq!(section_in_view(&below, 56.0), Section::FastIndex);
-        assert_eq!(section_in_view(&[], 56.0), Section::FastIndex);
+        assert_eq!(section_in_view(&below, 56.0, false), Section::FastIndex);
+        assert_eq!(section_in_view(&[], 56.0, false), Section::FastIndex);
+    }
+
+    #[test]
+    fn a_section_takes_the_highlight_once_its_heading_is_in_the_upper_part() {
+        // The owner's picture of beta.17: a 968 point tall scroll area at
+        // y 92 with the Windows heading 370 points below its top (38 %) and
+        // the tail of the own index above it. Windows owns most of the view.
+        let tops = [
+            (Section::FastIndex, -900.0),
+            (Section::OwnIndex, -520.0),
+            (Section::Windows, 462.0),
+            (Section::Appearance, 726.0),
+            (Section::Updates, 844.0),
+        ];
+        let line = highlight_line(92.0, 968.0);
+        assert_eq!(section_in_view(&tops, line, false), Section::Windows);
+        // A heading still in the lower part of the view has not taken it.
+        let lower = [(Section::OwnIndex, -520.0), (Section::Windows, 600.0)];
+        assert_eq!(section_in_view(&lower, line, false), Section::OwnIndex);
+        // The line scales with the view, so a short window works the same.
+        assert!(highlight_line(52.0, 300.0) < 52.0 + 300.0 / 2.0);
+        assert!(highlight_line(52.0, 300.0) > 52.0 + 300.0 / 3.0 - 1.0);
+    }
+
+    #[test]
+    fn the_last_section_is_highlighted_when_scrolled_to_the_end() {
+        // About is too short to reach the line at the end of the page.
+        let tops = [(Section::Updates, -200.0), (Section::About, 500.0)];
+        let line = highlight_line(92.0, 600.0);
+        assert_eq!(section_in_view(&tops, line, false), Section::Updates);
+        assert_eq!(section_in_view(&tops, line, true), Section::About);
     }
 
     #[test]

@@ -747,6 +747,46 @@ fn render_all_screens() {
     }
 }
 
+/// Settings scrolled so a section fills most of the view, and to the start
+/// of Updates: the highlight in the section list and the top edge of the
+/// scroll area (FR-35). Also at the owner's window size. Pictures are named
+/// `4N-settings-*-<theme>-WxH.png`.
+#[test]
+#[ignore = "renders screenshots; run explicitly (see the module docs)"]
+fn render_settings_scroll_edge() {
+    const OWNER: Vec2 = vec2(1570.0, 1060.0);
+    let out = output_dir();
+    let data = out.join(".test-data");
+    std::fs::create_dir_all(&data).expect("create the scratch data folder");
+    engine::test_data_dir::set(&data);
+    let result = std::panic::catch_unwind(|| {
+        let index = fixture_index();
+        for look in Look::BOTH {
+            for size in [WIDE, OWNER] {
+                let mut s = Session::new(look, size, &out, &index, false);
+                s.settings_page();
+                // The Windows heading a third of the way down, the tail of
+                // the own index above it (the owner's picture).
+                s.goto("Windows");
+                s.scroll_by((size.y - s.content_top() - 52.0) * 0.36);
+                s.save(41, "settings-edge-windows");
+                // The start of Updates, a little of Appearance above it.
+                s.goto("Updates");
+                s.scroll_by(10.0);
+                s.save(42, "settings-edge-updates");
+                // The very end.
+                s.scroll_by(-100_000.0);
+                s.save(43, "settings-edge-end");
+            }
+        }
+    });
+    engine::test_data_dir::clear();
+    let _ = std::fs::remove_dir_all(&data);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Whether `name` is a picture this harness writes
 /// (`NN-screen-dark|light-WxH.png`). Only those are removed before a run, so
 /// pointing `FERROW_SCREENSHOT_DIR` at a folder with other pictures is safe.
@@ -1210,8 +1250,7 @@ fn a_scroll_request_on_the_first_frame_reaches_its_section() {
         s.app().focus_search = false;
         s.app().settings_scroll_to = Some(target);
         s.frames(6);
-        let top = s.content_top();
-        let seen = settings_page::section_label_in_view(&s.harness.ctx, top);
+        let seen = settings_page::section_label_in_view(&s.harness.ctx);
         assert_eq!(seen, target, "request on the first frame");
     }
 }
