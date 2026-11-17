@@ -48,10 +48,14 @@ const COMMAND_WAIT_MS: u32 = 90_000;
 pub enum ScmState {
     NotInstalled,
     Stopped,
+    /// Only the Windows service manager reports these three (`from_code`).
+    #[cfg_attr(not(windows), allow(dead_code))]
     Starting,
     Running,
+    #[cfg_attr(not(windows), allow(dead_code))]
     Stopping,
     /// Paused, or a state this app does not know.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Other,
     /// The service manager could not be asked.
     Unknown,
@@ -61,6 +65,7 @@ pub enum ScmState {
 
 impl ScmState {
     /// The service manager's `dwCurrentState`.
+    #[cfg(any(windows, test))]
     pub fn from_code(code: u32) -> ScmState {
         match code {
             1 => ScmState::Stopped,
@@ -556,7 +561,9 @@ pub fn summary(snap: Option<&Snapshot>, app_version: &str) -> Summary {
             s.hint_access = true;
             s
         }
-        (_, HealthView::Older) => caution(
+        // Silent: no answer to either question, nothing seen before: the same
+        // "older, or busy" as an older service (it may well be busy).
+        (_, HealthView::Older | HealthView::Silent) => caution(
             "Older service, or busy",
             "update with Setup if this stays".to_owned(),
         ),
@@ -736,37 +743,50 @@ fn settle_pause(n: usize) -> Duration {
 }
 
 /// Look again until the answer shows it, or `SETTLE_MAX` of pauses is used up.
-/// The asks are at 0, 1.2 and 2.4 s, then every `REFRESH`.
+/// The asks are at 0, 1.2 and 2.4 s, then every `REFRESH`. No ask is made once
+/// `allowed` says no (the window was hidden or closed meanwhile): the result is
+/// then unknown (`None`) and the next watcher finds the state out.
 fn settle(
     verb: Verb,
     before: &Snapshot,
     mut ask: impl FnMut() -> Snapshot,
+    allowed: impl Fn() -> bool,
     mut pause: impl FnMut(Duration),
-) -> (Snapshot, bool) {
+) -> (Option<Snapshot>, Option<bool>) {
+    if !allowed() {
+        return (None, None);
+    }
     let mut now = ask();
     let mut waited = Duration::ZERO;
     let mut n = 0;
     while !expected(verb, before, &now) {
         if waited >= SETTLE_MAX {
-            return (now, false);
+            return (Some(now), Some(false));
         }
         let gap = settle_pause(n);
         pause(gap);
         waited += gap;
         n += 1;
+        if !allowed() {
+            return (Some(now), None);
+        }
         now = ask();
     }
-    (now, true)
+    (Some(now), Some(true))
 }
 
 /// What to tell the user: the exit code (the contract of `ferrow service`),
-/// and whether the service's answer shows the result.
-fn outcome(verb: Verb, ran: Result<u32, RunError>, seen: bool) -> Notice {
+/// and whether the service's answer shows the result (`None`: not checked).
+fn outcome(verb: Verb, ran: Result<u32, RunError>, seen: Option<bool>) -> Notice {
     let problem = |text: &str| Notice::new(Outcome::Problem, text);
     match ran {
         Err(RunError::Declined) => Notice::new(Outcome::Declined, access::DECLINED_TEXT),
         Err(RunError::Failed(why)) => problem(&why),
-        Ok(0) if seen => Notice::new(Outcome::Done, verb.done_text()),
+        Ok(0) if seen == Some(true) => Notice::new(Outcome::Done, verb.done_text()),
+        Ok(0) if seen.is_none() => Notice::new(
+            Outcome::Unconfirmed,
+            "The command finished. Ferrow stopped checking while the window was hidden; the state shows when you look again.",
+        ),
         Ok(0) => problem(
             "The command ran, but the service isn't answering yet. Check again in a moment.",
         ),
@@ -946,7 +966,8 @@ pub fn shown(settings_open: bool, minimized: bool, hidden: bool) -> bool {
 // State of the section
 
 struct Done {
-    snap: Snapshot,
+    /// The state after the action; `None` when nothing was asked (hidden).
+    snap: Option<Snapshot>,
     notice: Notice,
 }
 
@@ -1043,7 +1064,9 @@ impl ServiceHealth {
         let Some(rx) = &self.done else { return false };
         match rx.try_recv() {
             Ok(done) => {
-                self.snap = Some(done.snap);
+                if done.snap.is_some() {
+                    self.snap = done.snap;
+                }
                 self.notice = Some(done.notice);
             }
             Err(TryRecvError::Empty) => return false,
@@ -1076,16 +1099,22 @@ impl ServiceHealth {
 
     /// Run an action off the UI thread; the result arrives through `poll`.
     pub fn run(&mut self, verb: Verb, wake: impl Fn() + Send + 'static) {
+        // The same test as the watcher's: the action stops asking when the
+        // window goes away.
+        let on_screen = self.visible.clone();
         self.run_with(
             verb,
             wake,
             ask_rescan,
             |args| access::run_elevated_code(args, COMMAND_WAIT_MS),
             query_snapshot,
+            move || on_screen.load(Ordering::Relaxed) && !crate::platform::is_hidden_in_tray(),
             std::thread::sleep,
         );
     }
 
+    // Every outside effect is a parameter, so tests run it without any.
+    #[allow(clippy::too_many_arguments)]
     fn run_with(
         &mut self,
         verb: Verb,
@@ -1093,6 +1122,7 @@ impl ServiceHealth {
         rescan: impl FnOnce() -> IpcRescan + Send + 'static,
         elevate: impl FnOnce(&str) -> Result<u32, RunError> + Send + 'static,
         mut ask: impl FnMut() -> Snapshot + Send + 'static,
+        allowed: impl Fn() -> bool + Send + 'static,
         pause: impl FnMut(Duration) + Send + 'static,
     ) {
         if self.busy.is_some() || self.done.is_some() {
@@ -1119,8 +1149,19 @@ impl ServiceHealth {
                     }
                 };
                 // No answer shown yet: look first, here, not on the UI thread.
-                let before = known.unwrap_or_else(&mut look);
-                let done = perform(verb, &before, &prompt, rescan, elevate, &mut look, pause);
+                let before = known.unwrap_or_else(|| {
+                    if allowed() {
+                        look()
+                    } else {
+                        Snapshot {
+                            scm: Scm::of(ScmState::Unknown),
+                            health: HealthView::NoAnswer,
+                        }
+                    }
+                });
+                let done = perform(
+                    verb, &before, &prompt, rescan, elevate, &mut look, &allowed, pause,
+                );
                 let _ = tx.send(done);
                 wake();
             });
@@ -1133,6 +1174,8 @@ impl ServiceHealth {
     }
 }
 
+// As `run_with`: each outside effect is a parameter.
+#[allow(clippy::too_many_arguments)]
 fn perform(
     verb: Verb,
     before: &Snapshot,
@@ -1140,6 +1183,7 @@ fn perform(
     rescan: impl FnOnce() -> IpcRescan,
     elevate: impl FnOnce(&str) -> Result<u32, RunError>,
     ask: &mut impl FnMut() -> Snapshot,
+    allowed: &impl Fn() -> bool,
     pause: impl FnMut(Duration),
 ) -> Done {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1153,7 +1197,7 @@ fn perform(
         };
         if let Some(outcome) = outcome {
             return Done {
-                snap: ask(),
+                snap: allowed().then(&mut *ask),
                 notice: Notice { outcome, text },
             };
         }
@@ -1162,9 +1206,10 @@ fn perform(
     let ran = elevate(verb.args());
     prompt.store(false, Relaxed);
     let (snap, seen) = if matches!(ran, Ok(0)) {
-        settle(verb, before, &mut *ask, pause)
+        settle(verb, before, &mut *ask, allowed, pause)
     } else {
-        (ask(), false)
+        // Nothing to wait for: one look, unless the window went away.
+        (allowed().then(&mut *ask), Some(false))
     };
     Done {
         snap,
