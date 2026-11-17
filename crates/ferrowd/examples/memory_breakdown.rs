@@ -11,8 +11,9 @@
 //! nothing to the measured peaks, and goes through the service's own path, in
 //! order:
 //!
-//! 1. `Parsed` chunks appended like the parallel MFT parse does,
-//! 2. `ntfs::Volume::from_parsed`,
+//! 1. `Parsed` chunks pushed into `ntfs::VolumeBuilder` like the parallel MFT
+//!    parse does,
+//! 2. `VolumeBuilder::finish` (the volume),
 //! 3. `ferrow_walk::emit_parsed_volume` (the scan's emission, which also fills
 //!    the `VolumeMap`), then `IndexBuilder::freeze`, each with its own peak,
 //! 4. `live::Live::new` and `drop(maps)`, as `live_windows::maintain` does,
@@ -37,7 +38,7 @@ use std::time::Instant;
 
 use ferrow_fixture::Rng;
 use ferrow_index::{ColumnSet, Index, IndexBuilder, SortKey, SortStatus, flags};
-use ferrow_walk::ntfs::{self, NameRecord, Parsed, RecordInfo, Volume};
+use ferrow_walk::ntfs::{self, NameRecord, Parsed, RecordInfo, Volume, VolumeBuilder};
 use ferrowd::live::{Change, Live, LiveView, RecordSource, RecordState, index_parts};
 use ferrowd::memory::{self, Breakdown, Kind, Part};
 
@@ -98,8 +99,13 @@ struct Synth {
 /// names and infos arrive in chunks of a 16 MiB read each. The stream is
 /// generated chunk by chunk and keeps only its table of directories (about
 /// 2 B/entry), so a phase's memory peak is the consumer's, not the source's.
+/// `start` makes the consumer once the volume's record count is known;
 /// `on_chunk` gets every chunk as the parallel parse would hand it over.
-fn synth_stream(n: usize, mut on_chunk: impl FnMut(Parsed)) -> Synth {
+fn synth_stream<T>(
+    n: usize,
+    start: impl FnOnce(u64) -> T,
+    mut on_chunk: impl FnMut(&mut T, Parsed),
+) -> (Synth, T) {
     // MFT records, used or free: the gaps come from their own stream, run once
     // for the total (the volume's slot count) and once more as the entries
     // arrive. The hard-link draws continue the first run's stream.
@@ -112,6 +118,7 @@ fn synth_stream(n: usize, mut on_chunk: impl FnMut(Parsed)) -> Synth {
         next += 1;
     }
     let records = next + next / 50;
+    let mut sink = start(records);
     let mut gap_rng = Rng::new(SEED ^ 0xF4EE);
     let mut next = 16u64;
     // Directories by id (ascending), with their record numbers.
@@ -167,16 +174,19 @@ fn synth_stream(n: usize, mut on_chunk: impl FnMut(Parsed)) -> Synth {
             links += 1;
         }
         if part.infos.len() >= CHUNK_RECORDS {
-            on_chunk(std::mem::take(&mut part));
+            on_chunk(&mut sink, std::mem::take(&mut part));
         }
         this
     });
-    on_chunk(part);
-    Synth {
-        records,
-        entries: n + links,
-        links,
-    }
+    on_chunk(&mut sink, part);
+    (
+        Synth {
+            records,
+            entries: n + links,
+            links,
+        },
+        sink,
+    )
 }
 
 /// The records a batch of changes will fetch (`None`: deleted).
@@ -429,13 +439,12 @@ fn session(
     let _ = memory::release_free_heap();
     let before = memory::process().bytes();
     memory::reset_peak();
-    let mut parsed = Parsed::default();
-    let synth = synth_stream(n, |chunk| parsed.append(chunk));
+    let (synth, parsed) = synth_stream(n, VolumeBuilder::new, |b, chunk| b.push(chunk));
     report.peak(
         &format!("{round}.parse"),
         before,
         memory::process().peak,
-        "Parsed chunks appended into one Parsed; peak since this phase began",
+        "parse chunks pushed into the volume builder; peak since this phase began",
     );
     println!(
         "FERROW-MEMORY-CONFIG round={round} entries={} index_entries={} mft_records={} hard_link_names={} change_count={changes}",
@@ -456,17 +465,17 @@ fn session(
     held_parts(&mut parts);
     report.show(&format!("{round}.parsed"), parts);
 
-    // Parsed -> Volume (both alive while it builds).
+    // Parse chunks -> Volume (both alive while the volume is joined).
     let before = memory::process().bytes();
     memory::reset_peak();
     let started = Instant::now();
     let records = synth.records;
-    let volume: Volume = Volume::from_parsed(parsed, records, 0xFE77);
+    let volume: Volume = parsed.finish(0xFE77);
     report.peak(
         &format!("{round}.from_parsed"),
         before,
         memory::process().peak,
-        "Parsed and Volume coexist while the volume is built; peak since this phase began",
+        "the parse chunks and the volume coexist while the volume is joined; peak since this phase began",
     );
     println!(
         "FERROW-MEMORY-TIMING round={round} step=from_parsed ms={:.1}",

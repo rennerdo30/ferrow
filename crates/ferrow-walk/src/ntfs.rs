@@ -481,30 +481,149 @@ pub struct Volume {
     pub record_size: usize,
 }
 
-impl Volume {
-    pub fn from_parsed(parsed: Parsed, records: u64, serial: u64) -> Volume {
-        let records = records as usize;
-        let mut infos = vec![RecordInfo::default(); records];
-        for (n, info) in parsed.infos {
-            if let Some(slot) = infos.get_mut(n as usize) {
+/// Takes the parse chunks of a volume one by one into the layout [`Volume`]
+/// needs, so the whole parse never sits beside the finished volume. The
+/// per-record table is allocated once for all `records` and filled as each
+/// chunk arrives; a chunk's names stay in their own exactly sized vectors
+/// until [`VolumeBuilder::finish`] joins them (growing one vector chunk by
+/// chunk would hold up to twice the names at every doubling).
+pub struct VolumeBuilder {
+    infos: Vec<RecordInfo>,
+    chunks: Vec<(Vec<NameRecord>, Vec<u8>)>,
+    patches: Vec<Patch>,
+}
+
+impl VolumeBuilder {
+    /// A builder for a volume of `records` MFT records (used or free).
+    pub fn new(records: u64) -> VolumeBuilder {
+        VolumeBuilder {
+            infos: vec![RecordInfo::default(); records as usize],
+            chunks: Vec::new(),
+            patches: Vec::new(),
+        }
+    }
+
+    /// Take one parsed chunk; later values for a record replace earlier ones.
+    pub fn push(&mut self, chunk: Parsed) {
+        for (n, info) in chunk.infos {
+            if let Some(slot) = self.infos.get_mut(n as usize) {
                 *slot = info;
             }
         }
-        for patch in parsed.patches {
-            match patch {
+        self.patches.extend(chunk.patches);
+        let (mut names, mut arena) = (chunk.names, chunk.arena);
+        names.shrink_to_fit();
+        arena.shrink_to_fit();
+        self.chunks.push((names, arena));
+    }
+
+    /// Forget what was parsed for the records in `changed`, so a fresh parse
+    /// of them can be pushed (the journal refresh after a long read). A
+    /// changed record's name or patch stays only where the matching `keep_*`
+    /// says so.
+    pub fn forget(
+        &mut self,
+        changed: &std::collections::BTreeSet<u64>,
+        keep_names: impl Fn(u64) -> bool,
+        keep_patches: impl Fn(u64) -> bool,
+    ) {
+        for &n in changed {
+            if let Some(slot) = self.infos.get_mut(n as usize) {
+                *slot = RecordInfo::default();
+            }
+        }
+        self.patches.retain(|p| match p {
+            Patch::Size { record, .. } | Patch::Reparse { record, .. } => keep_patches(*record),
+        });
+        for (names, _) in &mut self.chunks {
+            names.retain(|n| keep_names(n.record));
+        }
+    }
+
+    /// Heap held while the chunks are collected, by capacity (memory
+    /// accounting).
+    pub fn heap_parts(&self) -> [(&'static str, usize); 4] {
+        [
+            (
+                "parsed.infos",
+                self.infos.capacity() * size_of::<RecordInfo>(),
+            ),
+            (
+                "parsed.names",
+                self.chunks
+                    .iter()
+                    .map(|c| c.0.capacity() * size_of::<NameRecord>())
+                    .sum(),
+            ),
+            (
+                "parsed.arena",
+                self.chunks.iter().map(|c| c.1.capacity()).sum(),
+            ),
+            (
+                "parsed.patches",
+                self.patches.capacity() * size_of::<Patch>(),
+            ),
+        ]
+    }
+
+    /// Join the chunks into the volume. Names and arena are made one after the
+    /// other and every chunk's part is freed as soon as it is copied, so the
+    /// copy never holds more than one extra copy of the larger of the two.
+    pub fn finish(mut self, serial: u64) -> Volume {
+        let records = self.infos.len();
+        for patch in &self.patches {
+            match *patch {
                 Patch::Size { record, size } => {
-                    if let Some(info) = infos.get_mut(record as usize) {
+                    if let Some(info) = self.infos.get_mut(record as usize) {
                         info.size = size;
                     }
                 }
                 Patch::Reparse { record, tag } => {
-                    if let Some(info) = infos.get_mut(record as usize) {
+                    if let Some(info) = self.infos.get_mut(record as usize) {
                         info.reparse_tag = tag;
                     }
                 }
             }
         }
-        let names = parsed.names;
+        let mut bases = Vec::with_capacity(self.chunks.len());
+        let mut arena_len = 0usize;
+        for (_, arena) in &self.chunks {
+            bases.push(arena_len as u32);
+            arena_len += arena.len();
+        }
+        let mut names = Vec::with_capacity(self.chunks.iter().map(|c| c.0.len()).sum());
+        for ((chunk, _), base) in self.chunks.iter_mut().zip(&bases) {
+            names.extend(chunk.drain(..).map(|mut n| {
+                n.name_offset += base;
+                n
+            }));
+            *chunk = Vec::new();
+        }
+        let mut arena = Vec::with_capacity(arena_len);
+        for (_, part) in &mut self.chunks {
+            arena.extend_from_slice(part);
+            *part = Vec::new();
+        }
+        let infos = std::mem::take(&mut self.infos);
+        Volume::group(infos, names, arena, records, serial)
+    }
+}
+
+impl Volume {
+    pub fn from_parsed(parsed: Parsed, records: u64, serial: u64) -> Volume {
+        let mut builder = VolumeBuilder::new(records);
+        builder.push(parsed);
+        builder.finish(serial)
+    }
+
+    /// The volume from its tables: groups the names by parent record.
+    fn group(
+        infos: Vec<RecordInfo>,
+        names: Vec<NameRecord>,
+        arena: Vec<u8>,
+        records: usize,
+        serial: u64,
+    ) -> Volume {
         let mut first = vec![0u32; records + 1];
         for n in &names {
             if (n.parent_record as usize) < records {
@@ -525,8 +644,8 @@ impl Volume {
         }
         Volume {
             infos,
-            names: names.into_iter().collect(),
-            arena: parsed.arena,
+            names,
+            arena,
             order,
             first,
             serial,
@@ -594,7 +713,8 @@ pub use platform::{
 #[cfg(windows)]
 mod platform {
     use super::{
-        Parsed, Patch, UsnRecord, Volume, apply_fixup, mft_runs, parse_record, parse_usn_records,
+        Parsed, UsnRecord, Volume, VolumeBuilder, apply_fixup, mft_runs, parse_record,
+        parse_usn_records,
     };
     use rayon::prelude::*;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -800,7 +920,7 @@ mod platform {
         let serial = data.VolumeSerialNumber as u64;
 
         // Reader thread: sequential reads; this thread parses in parallel.
-        let parsed = std::thread::scope(|scope| -> Result<Parsed, String> {
+        let mut builder = std::thread::scope(|scope| -> Result<VolumeBuilder, String> {
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Aligned)>(2);
             let volume = &volume;
             let reader = scope.spawn(move || -> Result<(), String> {
@@ -837,7 +957,7 @@ mod platform {
                 }
                 Ok(())
             });
-            let mut all = Parsed::default();
+            let mut all = VolumeBuilder::new(records);
             for (first_record, mut buf) in rx {
                 let part = buf
                     .as_mut_slice()
@@ -854,22 +974,21 @@ mod platform {
                         a.append(b);
                         a
                     });
-                all.append(part);
+                all.push(part);
             }
             reader
                 .join()
                 .map_err(|_| "MFT reader panicked".to_string())??;
             Ok(all)
         })?;
-        let mut parsed = parsed;
         let journal = match journal_before {
             Some(j) => {
-                let next = refresh_recent(&volume, j, read_started, record_size, &mut parsed)?;
+                let next = refresh_recent(&volume, j, read_started, record_size, &mut builder)?;
                 Some((j.0, next))
             }
             None => None,
         };
-        let mut out = Volume::from_parsed(parsed, records, serial);
+        let mut out = builder.finish(serial);
         out.journal = journal;
         out.record_size = record_size;
         Ok((device, out))
@@ -1104,7 +1223,7 @@ mod platform {
         journal: (u64, i64, i64),
         read_started: std::time::SystemTime,
         record_size: usize,
-        parsed: &mut Parsed,
+        builder: &mut VolumeBuilder,
     ) -> Result<i64, String> {
         const WINDOW_BYTES: i64 = 64 << 20;
         let (id, first, before) = journal;
@@ -1157,19 +1276,17 @@ mod platform {
             fresh.names.iter().map(|n| n.record).collect();
         let still_used: std::collections::HashSet<u64> =
             fresh.infos.iter().map(|(n, _)| *n).collect();
-        parsed.infos.retain(|(n, _)| !changed.contains(n));
-        parsed.patches.retain(|p| match p {
-            Patch::Size { record, .. } | Patch::Reparse { record, .. } => {
-                still_used.contains(record) || !changed.contains(record)
-            }
-        });
         // Names of deleted files go; names of refreshed files are replaced
         // (names kept in extension records survive a base-only refresh).
-        parsed.names.retain(|n| {
-            !changed.contains(&n.record)
-                || (still_used.contains(&n.record) && !refreshed_names.contains(&n.record))
-        });
-        parsed.append(fresh);
+        builder.forget(
+            &changed,
+            |record| {
+                !changed.contains(&record)
+                    || (still_used.contains(&record) && !refreshed_names.contains(&record))
+            },
+            |record| still_used.contains(&record) || !changed.contains(&record),
+        );
+        builder.push(fresh);
         Ok(next)
     }
 
@@ -1514,5 +1631,151 @@ pub(crate) mod tests {
         assert_eq!(root, ["Docs", "a-link.txt"], "no '.', no metafiles");
         assert_eq!(names(20), ["a.txt"], "stale parent references are dropped");
         assert!(names(99).is_empty());
+    }
+
+    /// Records 5 (root), 20 (Docs), 21..=60 (files, every fifth also linked in
+    /// the root), as parse chunks of `per` names each, with an extension-record
+    /// size patch for 22 and a reparse patch for 23.
+    fn chunks(per: usize) -> Vec<Parsed> {
+        let info = |is_dir: bool, size: u64| RecordInfo {
+            in_use: true,
+            is_dir,
+            sequence: 1,
+            attributes: if is_dir { 0x10 } else { 0x20 },
+            size,
+            ..RecordInfo::default()
+        };
+        type Row = (u64, RecordInfo, Vec<(u64, String)>);
+        let mut rows: Vec<Row> = vec![
+            (5, info(true, 0), vec![]),
+            (20, info(true, 0), vec![(5, "Docs".into())]),
+        ];
+        for r in 21..=60u64 {
+            let mut names = vec![(20, format!("fä{r}.txt"))];
+            if r % 5 == 0 {
+                names.push((5, format!("link{r}")));
+            }
+            rows.push((r, info(false, r), names));
+        }
+        let mut out = vec![Parsed::default()];
+        for (record, info, names) in rows {
+            if out.last().unwrap().names.len() >= per {
+                out.push(Parsed::default());
+            }
+            let part = out.last_mut().unwrap();
+            part.infos.push((record, info));
+            for (parent, name) in names {
+                let name_offset = part.arena.len() as u32;
+                part.arena.extend_from_slice(name.as_bytes());
+                part.names.push(NameRecord {
+                    record,
+                    parent_record: parent,
+                    parent_sequence: 1,
+                    name_offset,
+                    name_len: name.len() as u16,
+                });
+            }
+        }
+        out[0].patches.push(Patch::Size {
+            record: 22,
+            size: 9999,
+        });
+        out.last_mut().unwrap().patches.push(Patch::Reparse {
+            record: 23,
+            tag: 0xA000_000C,
+        });
+        out
+    }
+
+    fn built(per: usize) -> Volume {
+        let mut b = VolumeBuilder::new(64);
+        for chunk in chunks(per) {
+            b.push(chunk);
+        }
+        b.finish(7)
+    }
+
+    type Kids = Vec<(u64, Vec<u8>)>;
+
+    fn listing(v: &Volume) -> Vec<(u64, Kids)> {
+        (0..64)
+            .map(|r| {
+                let mut kids: Vec<_> = v.children(r).map(|(n, b)| (n.record, b.to_vec())).collect();
+                kids.sort();
+                (r, kids)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_volume_built_from_chunks_is_the_same_whatever_the_chunking() {
+        let whole = built(usize::MAX);
+        assert!(chunks(usize::MAX).len() == 1 && chunks(3).len() > 10);
+        for per in [1, 3, 7, 50] {
+            let v = built(per);
+            assert_eq!(v.infos, whole.infos, "records, chunks of {per}");
+            assert_eq!(listing(&v), listing(&whole), "children, chunks of {per}");
+            assert_eq!(v.names.len(), whole.names.len());
+            assert_eq!(v.arena.len(), whole.arena.len());
+        }
+        // What the chunks said: sizes, a patched size and reparse tag, links.
+        assert_eq!(whole.infos[21].size, 21);
+        assert_eq!(whole.infos[22].size, 9999, "patch from an extension record");
+        assert_eq!(whole.infos[23].reparse_tag, 0xA000_000C);
+        assert_eq!(whole.children(20).count(), 40);
+        assert_eq!(whole.children(5).count(), 1 + 8, "Docs and eight links");
+        assert!(whole.children(5).any(|(_, n)| n == b"link25"));
+        assert!(whole.children(20).any(|(_, n)| n == "fä33.txt".as_bytes()));
+        assert_eq!((whole.serial, whole.record_size), (7, 1024));
+    }
+
+    #[test]
+    fn forgetting_a_record_lets_a_fresh_parse_replace_it() {
+        let mut b = VolumeBuilder::new(64);
+        for chunk in chunks(5) {
+            b.push(chunk);
+        }
+        // Record 30 is deleted, 31 renamed, 25 (two names) is rewritten with one.
+        let changed: std::collections::BTreeSet<u64> = [25, 30, 31].into();
+        let mut fresh = Parsed::default();
+        for (record, name) in [(31u64, "renamed.txt"), (25, "only.txt")] {
+            let info = RecordInfo {
+                in_use: true,
+                attributes: 0x20,
+                sequence: 1,
+                ..RecordInfo::default()
+            };
+            fresh.infos.push((record, info));
+            fresh.names.push(NameRecord {
+                record,
+                parent_record: 20,
+                parent_sequence: 1,
+                name_offset: fresh.arena.len() as u32,
+                name_len: name.len() as u16,
+            });
+            fresh.arena.extend_from_slice(name.as_bytes());
+        }
+        let used: std::collections::HashSet<u64> = [31, 25].into();
+        let renamed: std::collections::HashSet<u64> = [31, 25].into();
+        b.forget(
+            &changed,
+            |r| !changed.contains(&r) || (used.contains(&r) && !renamed.contains(&r)),
+            |r| used.contains(&r) || !changed.contains(&r),
+        );
+        b.push(fresh);
+        let v = b.finish(1);
+        let names = |dir| {
+            let mut n: Vec<String> = v
+                .children(dir)
+                .map(|(_, n)| String::from_utf8(n.to_vec()).unwrap())
+                .collect();
+            n.sort();
+            n
+        };
+        assert!(!names(20).iter().any(|n| n.contains("30")), "deleted");
+        assert!(names(20).contains(&"renamed.txt".to_string()));
+        assert!(!names(20).iter().any(|n| n.contains("31")), "old name gone");
+        assert!(!names(5).contains(&"link25".to_string()), "old link gone");
+        assert!(v.info(30).is_none() && v.info(31).is_some());
     }
 }
