@@ -105,6 +105,36 @@ fn file_changes_appear_in_searches_within_a_second() {
 
     std::fs::remove_dir_all(dir.join("moved-dir-zq")).unwrap();
     wait_until("deleted files", || hits(&store, "zq").is_empty());
+
+    // A folder moved in from outside the indexed root (git moves its
+    // temporary folders into place like this): read in the background
+    // through the volume handle, no rescan of the volumes.
+    let outside = std::env::temp_dir().join(format!("ferrow-live-out-{}", std::process::id()));
+    std::fs::create_dir_all(outside.join("inner")).unwrap();
+    std::fs::write(outside.join("top-yq.txt"), b"x").unwrap();
+    std::fs::write(outside.join("inner").join("deep-yq.txt"), b"x").unwrap();
+    std::fs::rename(&outside, dir.join("arrived-yq")).unwrap();
+    let took = wait_until("a folder moved in with its contents", || {
+        hits(&store, "yq").len() == 3
+    });
+    eprintln!("moved-in folder read after {took:?}");
+    let policy = ferrowd::access::Policy {
+        mode: ferrow_ipc::AccessMode::Everyone,
+        users: Vec::new(),
+    };
+    let stats = ferrowd::health::STATE.report(&store, &policy).live_stats;
+    eprintln!("{stats:?}");
+    assert!(stats.folder_reads >= 1, "the read did not run: {stats:?}");
+    assert_eq!(stats.folder_read_fallbacks, 0, "{stats:?}");
+    assert!(
+        !stats.scans_by_reason.contains_key("moved-in folder"),
+        "the moved-in folder rescanned: {stats:?}"
+    );
+    std::fs::rename(dir.join("arrived-yq"), &outside).unwrap();
+    wait_until("the folder moved out again", || {
+        hits(&store, "yq").is_empty()
+    });
+    let _ = std::fs::remove_dir_all(&outside);
     let status = ferrowd::handle(&store, Request::Status);
     eprintln!("{status:?}");
     let _ = std::fs::remove_dir_all(&dir);
