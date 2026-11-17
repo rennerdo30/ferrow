@@ -63,11 +63,9 @@ impl Persistence {
                 let result = save(config, snapshot);
                 let took = started.elapsed();
                 crate::health::STATE.save_done(took, result.as_ref().err().map(|e| e.to_string()));
-                match &result {
-                    Ok(()) => {
-                        crate::eventlog::info(format!("index saved in {:.1} s", took.as_secs_f64()))
-                    }
-                    Err(error) => crate::eventlog::error(format!("index save failed: {error}")),
+                // A failure is logged once, by the worker that stops on it.
+                if result.is_ok() {
+                    crate::eventlog::info(format!("index saved in {:.1} s", took.as_secs_f64()));
                 }
                 result?;
                 last = Some(index);

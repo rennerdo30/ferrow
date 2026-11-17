@@ -60,8 +60,13 @@ pub struct Health {
     pub live_changes: u64,
     /// A scan or rescan is running now.
     pub scanning: bool,
+    /// Connections that ended with an error since the service started
+    /// (counted, not logged one by one).
+    pub connection_errors: u64,
     pub last_save: Option<SaveInfo>,
     pub volumes: Vec<VolumeHealth>,
+    /// Volumes left out of `volumes` because there were more than [`MAX_VOLUMES`].
+    pub more_volumes: u32,
     /// The newest events, oldest first.
     pub events: Vec<EventInfo>,
 }
@@ -121,7 +126,10 @@ impl Health {
     /// Drop the oldest events (then trailing volumes) until the JSON fits
     /// the frame's text cap. Real reports are far smaller.
     pub fn fit(&mut self) {
-        self.volumes.truncate(MAX_VOLUMES);
+        if self.volumes.len() > MAX_VOLUMES {
+            self.more_volumes = (self.volumes.len() - MAX_VOLUMES) as u32;
+            self.volumes.truncate(MAX_VOLUMES);
+        }
         self.events
             .drain(..self.events.len().saturating_sub(MAX_EVENTS));
         while self.to_json().len() > MAX_TEXT_BYTES && !self.events.is_empty() {

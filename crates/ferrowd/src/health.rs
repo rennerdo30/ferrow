@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrow_ipc::health::{
     Health, JOURNAL_ERROR, JOURNAL_NONE, JOURNAL_RESET, MAX_EVENTS, MODE_UNAVAILABLE, MODE_WALK,
-    RescanInfo, SaveInfo, ScanInfo, VolumeHealth,
+    RescanInfo, SaveInfo, ScanInfo, VolumeHealth, format_duration,
 };
 use ferrow_ipc::{ErrorCode, Request, Response};
 
@@ -68,12 +68,19 @@ struct Inner {
     scan: Option<ScanInfo>,
     pending: Option<RescanInfo>,
     volumes: Vec<VolumeState>,
+    /// When the last scan ended (the earliest a requested rescan may follow).
+    last_finished: Option<Instant>,
 }
+
+/// Least time between the end of one scan and a requested rescan: an
+/// administrator's own repeated requests must not keep the service scanning.
+pub const MIN_FORCED_GAP: Duration = Duration::from_secs(60);
 
 pub struct State {
     inner: Mutex<Inner>,
     started: Mutex<Option<(Instant, u64)>>,
     live_changes: AtomicU64,
+    connection_errors: AtomicU64,
     scanning: AtomicBool,
     /// A requested rescan was sent and has not started yet.
     forced: AtomicBool,
@@ -87,9 +94,11 @@ impl State {
                 scan: None,
                 pending: None,
                 volumes: Vec::new(),
+                last_finished: None,
             }),
             started: Mutex::new(None),
             live_changes: AtomicU64::new(0),
+            connection_errors: AtomicU64::new(0),
             scanning: AtomicBool::new(false),
             forced: AtomicBool::new(false),
         }
@@ -131,6 +140,7 @@ impl State {
             }
         }
         inner.volumes = volumes;
+        inner.last_finished = Some(Instant::now());
         inner.scan = Some(ScanInfo {
             at_ms: now_ms(),
             reason: reason.into(),
@@ -166,6 +176,11 @@ impl State {
         });
     }
 
+    /// A connection ended with an error (counted; never logged one by one).
+    pub fn connection_error(&self) {
+        self.connection_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn add_live_changes(&self, n: usize) {
         self.live_changes.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -183,16 +198,27 @@ impl State {
         self.scanning.load(Ordering::Acquire)
     }
 
-    /// Claim the one requested rescan: false when a scan runs or one is
-    /// already on its way.
-    pub fn claim_rescan(&self) -> Result<(), &'static str> {
+    /// Claim the one requested rescan at `now`. Refused, with the reason and
+    /// when it may run, while a scan runs, one is already on its way, or the
+    /// last scan ended less than [`MIN_FORCED_GAP`] ago.
+    pub fn claim_rescan(&self, now: Instant) -> Result<(), String> {
         if self.is_scanning() {
-            return Err("a scan is already running and covers every volume");
+            return Err("a scan is already running and covers every volume".into());
+        }
+        if let Some(done) = self.lock().last_finished {
+            let wait = (done + MIN_FORCED_GAP).saturating_duration_since(now);
+            if !wait.is_zero() {
+                return Err(format!(
+                    "a scan ended {} ago; a rescan can be requested in {}",
+                    format_duration(now.duration_since(done).as_millis() as u64),
+                    format_duration(wait.as_millis() as u64)
+                ));
+            }
         }
         self.forced
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
-            .map_err(|_| "a rescan was already requested and is about to start")
+            .map_err(|_| "a rescan was already requested and is about to start".into())
     }
 
     /// Give the claim back (the request could not be delivered).
@@ -210,6 +236,8 @@ impl State {
             None => (now, 0),
         };
         let (working_set, private_bytes) = memory();
+        // The ring has a lock of its own: read it before taking this state's.
+        let events = eventlog::to_info(eventlog::global().recent(MAX_EVENTS));
         let inner = self.lock();
         let volumes = inner
             .volumes
@@ -240,7 +268,9 @@ impl State {
             scanning: self.is_scanning(),
             last_save: inner.last_save.clone(),
             volumes,
-            events: eventlog::to_info(eventlog::global().recent(MAX_EVENTS)),
+            connection_errors: self.connection_errors.load(Ordering::Relaxed),
+            events,
+            ..Health::default()
         };
         drop(inner);
         health.fit();
@@ -296,6 +326,13 @@ pub fn answer(
         }
         Request::Rescan => {
             let (started, msg) = rescan();
+            if started {
+                // Who asked: an audit line (an account id, never a file name).
+                eventlog::info(format!(
+                    "rescan requested by account {}",
+                    caller.id().unwrap_or_else(|| "unknown".into())
+                ));
+            }
             vec![Response::Rescan { started, msg }]
         }
         _ => vec![Response::Error {
@@ -395,6 +432,7 @@ mod tests {
 
     struct Fake {
         admin: bool,
+        id: &'static str,
     }
     impl Caller for Fake {
         fn admin(&self) -> bool {
@@ -407,7 +445,7 @@ mod tests {
             true
         }
         fn id(&self) -> Option<String> {
-            Some("1000".into())
+            Some(self.id.into())
         }
     }
 
@@ -466,7 +504,10 @@ mod tests {
         let report = match &ask(
             &state,
             Request::Health,
-            &Fake { admin: false },
+            &Fake {
+                admin: false,
+                id: "1000",
+            },
             true,
             || unreachable!(),
         )[..]
@@ -550,9 +591,16 @@ mod tests {
     fn a_refused_caller_gets_unauthorized_for_both_requests() {
         let state = State::new();
         for request in [Request::Health, Request::Rescan] {
-            let answer = ask(&state, request, &Fake { admin: true }, false, || {
-                panic!("a refused caller must not reach the rescan")
-            });
+            let answer = ask(
+                &state,
+                request,
+                &Fake {
+                    admin: true,
+                    id: "1000",
+                },
+                false,
+                || panic!("a refused caller must not reach the rescan"),
+            );
             assert!(
                 matches!(
                     &answer[..],
@@ -569,7 +617,10 @@ mod tests {
     #[test]
     fn an_allowed_non_admin_gets_health_but_not_a_rescan() {
         let state = State::new();
-        let user = Fake { admin: false };
+        let user = Fake {
+            admin: false,
+            id: "1000",
+        };
         let health = ask(&state, Request::Health, &user, true, || unreachable!());
         assert!(matches!(&health[..], [Response::Health(_)]));
         let rescan = ask(&state, Request::Rescan, &user, true, || {
@@ -582,9 +633,16 @@ mod tests {
                 ..
             }]
         ));
-        let admin = ask(&state, Request::Rescan, &Fake { admin: true }, true, || {
-            (true, "ok".into())
-        });
+        let admin = ask(
+            &state,
+            Request::Rescan,
+            &Fake {
+                admin: true,
+                id: "1000",
+            },
+            true,
+            || (true, "ok".into()),
+        );
         assert_eq!(
             admin,
             vec![Response::Rescan {
@@ -597,26 +655,181 @@ mod tests {
     #[test]
     fn a_second_rescan_request_is_a_no_op_with_a_clear_answer() {
         let state = State::new();
-        assert!(state.claim_rescan().is_ok());
-        let again = state.claim_rescan().unwrap_err();
+        let now = Instant::now();
+        assert!(state.claim_rescan(now).is_ok());
+        let again = state.claim_rescan(now).unwrap_err();
         assert!(again.contains("already requested"), "{again}");
         // Once the scan starts, the claim is spent and the running scan answers.
         state.scan_started();
         assert!(
             state
-                .claim_rescan()
+                .claim_rescan(now)
                 .unwrap_err()
                 .contains("already running")
         );
         state.scan_finished("rescan", Duration::ZERO, vec![]);
+        let later = Instant::now() + MIN_FORCED_GAP;
         assert!(
-            state.claim_rescan().is_ok(),
-            "a finished scan frees the next request"
+            state.claim_rescan(later).is_ok(),
+            "a finished scan frees the next request after the gap"
         );
         state.release_rescan();
         assert!(
-            state.claim_rescan().is_ok(),
+            state.claim_rescan(later).is_ok(),
             "an undelivered request is given back"
         );
+    }
+
+    #[test]
+    fn a_rescan_right_after_a_scan_is_refused_with_the_time_it_may_run() {
+        let state = State::new();
+        state.scan_started();
+        state.scan_finished("startup", Duration::from_secs(3), vec![]);
+        let soon = Instant::now() + Duration::from_secs(10);
+        let why = state.claim_rescan(soon).unwrap_err();
+        assert!(why.contains("a rescan can be requested in"), "{why}");
+        assert!(why.contains("50.0 s") || why.contains("49."), "{why}");
+        // Refusals do not take the claim: after the gap it is granted once.
+        let after = Instant::now() + MIN_FORCED_GAP + Duration::from_secs(1);
+        assert!(state.claim_rescan(after).is_ok());
+        assert!(state.claim_rescan(after).is_err(), "one request at a time");
+    }
+
+    #[test]
+    fn an_asking_account_is_named_in_the_audit_event() {
+        let state = State::new();
+        let admin = Fake {
+            admin: true,
+            id: "S-1-5-21-7777",
+        };
+        ask(&state, Request::Rescan, &admin, true, || {
+            (true, "ok".into())
+        });
+        let events = eventlog::global().recent(usize::MAX);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.text == "rescan requested by account S-1-5-21-7777"),
+            "{events:?}"
+        );
+        // A refused attempt starts nothing and is not an audit line.
+        let user = Fake {
+            admin: false,
+            id: "S-1-5-21-8888",
+        };
+        ask(&state, Request::Rescan, &user, true, || unreachable!());
+        assert!(
+            !eventlog::global()
+                .recent(usize::MAX)
+                .iter()
+                .any(|e| e.text.contains("8888"))
+        );
+    }
+
+    #[test]
+    fn the_development_endpoint_lets_its_non_admin_owner_rescan() {
+        let state = State::new();
+        let store = SnapshotStore::new(Snapshot::empty());
+        let policy = Policy::default();
+        let scope = Scope {
+            system: false,
+            allowed: true,
+            state: &state,
+            store: &store,
+            policy: &policy,
+        };
+        let owner = Fake {
+            admin: false,
+            id: "1000",
+        };
+        let answer = answer(&Request::Rescan, &owner, &scope, || (true, "ok".into()));
+        assert_eq!(
+            answer,
+            vec![Response::Rescan {
+                started: true,
+                msg: "ok".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn listed_mode_answers_a_listed_account_health_but_never_a_rescan() {
+        use ferrow_ipc::AccessUser;
+        let state = State::new();
+        let store = SnapshotStore::new(Snapshot::empty());
+        let policy = Policy {
+            mode: AccessMode::Listed,
+            users: vec![AccessUser {
+                id: "1000".into(),
+                name: "alice".into(),
+            }],
+        };
+        let ask_as = |who: &Fake, request: Request| {
+            let scope = Scope {
+                system: true,
+                allowed: policy.allows(who),
+                state: &state,
+                store: &store,
+                policy: &policy,
+            };
+            answer(&request, who, &scope, || {
+                unreachable!("not an administrator")
+            })
+        };
+        let alice = Fake {
+            admin: false,
+            id: "1000",
+        };
+        let Some(Response::Health(report)) = ask_as(&alice, Request::Health).into_iter().next()
+        else {
+            panic!("a listed account must get Health")
+        };
+        assert_eq!(report.access, "listed");
+        assert!(matches!(
+            &ask_as(&alice, Request::Rescan)[..],
+            [Response::Error {
+                code: ErrorCode::Unauthorized,
+                ..
+            }]
+        ));
+        let bob = Fake {
+            admin: false,
+            id: "1001",
+        };
+        for request in [Request::Health, Request::Rescan] {
+            assert!(matches!(
+                &ask_as(&bob, request)[..],
+                [Response::Error {
+                    code: ErrorCode::Unauthorized,
+                    ..
+                }]
+            ));
+        }
+    }
+
+    #[test]
+    fn connection_errors_are_counted_not_logged_and_reach_the_report() {
+        let state = State::new();
+        let before = eventlog::global().len();
+        for _ in 0..500 {
+            state.connection_error();
+        }
+        assert_eq!(eventlog::global().len(), before, "no event per error");
+        let store = SnapshotStore::new(Snapshot::empty());
+        let report = state.report(&store, &Policy::default());
+        assert_eq!(report.connection_errors, 500);
+    }
+
+    #[test]
+    fn many_volumes_leave_a_marker_instead_of_vanishing() {
+        let state = State::new();
+        let volumes = (0..40)
+            .map(|n| VolumeState::walked(format!("E:\r{n}"), ""))
+            .collect();
+        state.scan_finished("startup", Duration::ZERO, volumes);
+        let store = SnapshotStore::new(Snapshot::empty());
+        let report = state.report(&store, &Policy::default());
+        assert_eq!(report.volumes.len(), 32);
+        assert_eq!(report.more_volumes, 8);
     }
 }
