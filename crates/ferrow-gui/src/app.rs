@@ -138,6 +138,8 @@ pub struct FerrowApp {
     updater: crate::update::Updater,
     /// Settings → Service access.
     access: crate::access::Access,
+    /// Settings → Service health.
+    service_health: crate::service::ServiceHealth,
     /// Set while the Ferrow service answers searches: its entry count.
     pub(crate) service_entries: Option<u64>,
     /// Why the service is not used (refused account, lost); `None` when it
@@ -274,6 +276,7 @@ impl FerrowApp {
             sort_unavailable: false,
             updater: crate::update::Updater::new(),
             access: crate::access::Access::new(),
+            service_health: crate::service::ServiceHealth::new(),
             service_entries: None,
             service_problem: None,
             scan_info: None,
@@ -1372,6 +1375,21 @@ impl eframe::App for FerrowApp {
         }
 
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        // Service health: an action's result applies whether or not Settings
+        // is open; the periodic asker runs only while Settings is on screen
+        // (never minimized or hidden in the tray).
+        if self.service_health.poll() {
+            self.engine.service_changed();
+        }
+        let wake = ctx.clone();
+        self.service_health.set_visible(
+            crate::service::shown(
+                self.page == Page::Settings,
+                minimized,
+                platform::is_hidden_in_tray(),
+            ),
+            move || wake.request_repaint(),
+        );
         if self.live_change_pending && !minimized && !platform::is_hidden_in_tray() {
             self.live_change_pending = false;
             self.refreshing = true;

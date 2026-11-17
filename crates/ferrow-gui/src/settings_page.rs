@@ -17,6 +17,9 @@ use crate::settings::{SourceKind, ThemeChoice, UpdateChannel};
 use crate::theme;
 use crate::update::{self, UpdateState};
 
+#[path = "service_section.rs"]
+mod service_section;
+
 const CARD_GAP: f32 = 4.0;
 const SECTION_GAP: f32 = 20.0;
 const MAX_WIDTH: f32 = 860.0;
@@ -33,6 +36,7 @@ const MIN_TEXT_WIDTH: f32 = 140.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Section {
     FastIndex,
+    ServiceHealth,
     OwnIndex,
     Windows,
     Appearance,
@@ -41,8 +45,9 @@ pub(super) enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::FastIndex,
+        Section::ServiceHealth,
         Section::OwnIndex,
         Section::Windows,
         Section::Appearance,
@@ -53,6 +58,7 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::FastIndex => "Fast index",
+            Section::ServiceHealth => "Service health",
             Section::OwnIndex => "Own index",
             Section::Windows => "Windows",
             Section::Appearance => "Appearance",
@@ -227,7 +233,11 @@ struct FastIndexStatus {
     retry: bool,
 }
 
-fn fast_index_status(service_entries: Option<u64>, view: &access::View) -> FastIndexStatus {
+fn fast_index_status(
+    service_entries: Option<u64>,
+    view: &access::View,
+    manager: Option<crate::service::ScmState>,
+) -> FastIndexStatus {
     let off = |tone, reason: &str, retry| FastIndexStatus {
         tone,
         on: false,
@@ -258,9 +268,21 @@ fn fast_index_status(service_entries: Option<u64>, view: &access::View) -> FastI
             reason: None,
             retry: false,
         },
+        // The service manager knows which it is: say it, and point to the
+        // button that fixes it (Setup advice only when there is nothing to start).
         access::View::NoService => off(
             Tone::Caution,
-            "The Ferrow service isn't installed or isn't running. Install or start it with Setup to index every drive in seconds and keep the index current.",
+            match manager {
+                Some(crate::service::ScmState::Stopped) => {
+                    "The Ferrow service is stopped. Start it under Service health to index every drive in seconds and keep the index current."
+                }
+                Some(crate::service::ScmState::NotInstalled) => {
+                    "The Ferrow service isn't installed. Install it with Setup to index every drive in seconds and keep the index current."
+                }
+                _ => {
+                    "The Ferrow service isn't installed or isn't running. Install or start it with Setup to index every drive in seconds and keep the index current."
+                }
+            },
             true,
         ),
         access::View::TooOld => off(
@@ -490,8 +512,12 @@ impl FerrowApp {
                 egui::pos2(outer.left() + nav_left + NAV_WIDTH, outer.bottom()),
             );
             let live = self.service_entries.is_some();
+            let health = self.service_health.snap.as_ref().map(|snap| {
+                let line = crate::service::summary(Some(snap), env!("CARGO_PKG_VERSION"));
+                (line.level, line.filled)
+            });
             ui.scope_builder(egui::UiBuilder::new().max_rect(nav), |ui| {
-                if let Some(section) = nav_list(ui, &p, current, live) {
+                if let Some(section) = nav_list(ui, &p, current, live, health) {
                     target = Some(section);
                 }
             });
@@ -526,6 +552,9 @@ impl FerrowApp {
                         self.settings_error_line(ui);
                         marks.begin(ui, Section::FastIndex);
                         self.fast_index_section(ui);
+                        ui.add_space(SECTION_GAP);
+                        marks.begin(ui, Section::ServiceHealth);
+                        self.service_health_section(ui);
                         ui.add_space(SECTION_GAP);
                         marks.begin(ui, Section::OwnIndex);
                         self.own_index_section(ui);
@@ -607,7 +636,8 @@ impl FerrowApp {
             let wake = ctx.clone();
             self.access.refresh(move || wake.request_repaint());
         }
-        let status = fast_index_status(self.service_entries, &self.access.view);
+        let manager = self.service_health.snap.as_ref().map(|s| s.scm.state);
+        let status = fast_index_status(self.service_entries, &self.access.view, manager);
         let view = self.access.view.clone();
         let message = self.access.message.clone();
         let input = AccessIn {
@@ -625,6 +655,13 @@ impl FerrowApp {
             look_up: false,
         };
         let mut retry = false;
+        // The service is down or needs a look: point to Service health.
+        let attention = self
+            .service_health
+            .snap
+            .as_ref()
+            .is_some_and(|s| s.needs_attention(env!("CARGO_PKG_VERSION")));
+        let mut open_health = false;
         let color = tone_color(&p, status.tone);
         status_card(ui, &p, color, |ui| {
             ui.horizontal(|ui| {
@@ -639,9 +676,16 @@ impl FerrowApp {
                         .font(FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into())))
                         .color(if status.on { color } else { p.text }),
                 );
-                if status.retry {
+                if status.retry || attention {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        retry = ui.add(std_button(&p, "Retry", 90.0)).clicked();
+                        if status.retry {
+                            retry = ui.add(std_button(&p, "Retry", 90.0)).clicked();
+                        }
+                        if attention {
+                            open_health = ui
+                                .add(std_button(&p, "Open Service health", 170.0))
+                                .clicked();
+                        }
                     });
                 }
             });
@@ -668,6 +712,9 @@ impl FerrowApp {
         }
         if retry {
             self.access.retry();
+        }
+        if open_health {
+            self.settings_scroll_to = Some("Service health");
         }
         if let Some(action) = out.action {
             let wake = ctx.clone();
@@ -1776,15 +1823,7 @@ fn access_block(
     }
     if let Some(notice) = input.message {
         ui.add_space(10.0);
-        let (tone, filled) = match notice.outcome {
-            access::Outcome::Done => (Tone::Good, true),
-            // The command succeeded but this account cannot see the result.
-            access::Outcome::Unconfirmed => (Tone::Neutral, true),
-            // The command ran and there was nothing to do (Service health).
-            access::Outcome::NoChange => (Tone::Neutral, true),
-            access::Outcome::Declined => (Tone::Neutral, false),
-            access::Outcome::Problem => (Tone::Caution, true),
-        };
+        let (tone, filled) = notice_look(notice.outcome);
         dot_row(ui, p, tone, filled, &notice.text, "");
     }
     AccessOut {
@@ -1792,6 +1831,18 @@ fn access_block(
         confirm,
         add,
         look_up,
+    }
+}
+
+/// How an outcome is drawn: the dot's tone, filled or a ring.
+fn notice_look(outcome: access::Outcome) -> (Tone, bool) {
+    match outcome {
+        access::Outcome::Done => (Tone::Good, true),
+        // The command succeeded but this account cannot see the result, or
+        // there was nothing to do.
+        access::Outcome::Unconfirmed | access::Outcome::NoChange => (Tone::Neutral, true),
+        access::Outcome::Declined => (Tone::Neutral, false),
+        access::Outcome::Problem => (Tone::Caution, true),
     }
 }
 
@@ -2023,12 +2074,21 @@ fn status_card(
     );
 }
 
+fn tone_of(level: crate::service::Level) -> Tone {
+    match level {
+        crate::service::Level::Good => Tone::Good,
+        crate::service::Level::Caution => Tone::Caution,
+        crate::service::Level::Neutral => Tone::Neutral,
+    }
+}
+
 /// The section list: the section in view is marked; returns the one clicked.
 fn nav_list(
     ui: &mut egui::Ui,
     p: &theme::Palette,
     current: Section,
     live: bool,
+    health: Option<(crate::service::Level, bool)>,
 ) -> Option<Section> {
     let mut clicked = None;
     ui.spacing_mut().item_spacing.y = 2.0;
@@ -2064,11 +2124,24 @@ fn nav_list(
             galley,
             p.text,
         );
-        if section == Section::FastIndex {
-            // The state stays visible while the page is scrolled away.
+        // The state stays visible while the page is scrolled away: a dot when
+        // the thing runs, a ring when it does not.
+        let state = match section {
+            Section::FastIndex => Some((
+                if live {
+                    crate::service::Level::Good
+                } else {
+                    crate::service::Level::Caution
+                },
+                live,
+            )),
+            Section::ServiceHealth => health,
+            _ => None,
+        };
+        if let Some((level, filled)) = state {
             let c = egui::pos2(text_at.x + width + 12.0, rect.center().y);
-            let color = if live { p.ok() } else { p.caution() };
-            if live {
+            let color = tone_color(p, tone_of(level));
+            if filled {
                 ui.painter().circle_filled(c, 4.0, color);
             } else {
                 ui.painter().circle_stroke(c, 3.5, Stroke::new(1.5, color));
@@ -2226,13 +2299,13 @@ mod tests {
 
     #[test]
     fn the_status_says_on_with_the_file_count_or_off_with_the_reason() {
-        let live = fast_index_status(Some(18_422_907), &access::View::Checking);
+        let live = fast_index_status(Some(18_422_907), &access::View::Checking, None);
         assert!(live.on && live.tone == Tone::Good && live.word == "On");
         assert!(live.line.contains("18,422,907 files") && live.line.contains("every drive"));
         assert!(live.reason.is_none() && !live.retry);
 
         let reason = |view: &access::View| {
-            let s = fast_index_status(None, view);
+            let s = fast_index_status(None, view, None);
             assert!(!s.on, "{view:?}");
             s
         };
@@ -2258,7 +2331,7 @@ mod tests {
         assert_eq!(refused.tone, Tone::Caution);
         assert_eq!(reason(&access::View::Checking).tone, Tone::Neutral);
         // The service live wins over a stale access answer.
-        assert!(fast_index_status(Some(1), &access::View::NoService).on);
+        assert!(fast_index_status(Some(1), &access::View::NoService, None).on);
     }
 
     #[test]

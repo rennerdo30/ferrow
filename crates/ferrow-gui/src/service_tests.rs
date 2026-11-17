@@ -1188,6 +1188,30 @@ fn what_is_shown_includes_what_the_details_show() {
 }
 
 #[test]
+fn the_engine_is_told_when_the_service_starts_or_stops_answering() {
+    let mut state = ServiceHealth::new();
+    let tx = state.tx.clone();
+    // The first answer is not a change.
+    tx.send(snap(ScmState::Stopped, HealthView::NoAnswer))
+        .unwrap();
+    assert!(!state.poll());
+    // Same answer class: nothing to tell.
+    tx.send(snap(ScmState::Stopped, HealthView::NoAnswer))
+        .unwrap();
+    assert!(!state.poll());
+    // It starts answering...
+    tx.send(healthy()).unwrap();
+    assert!(state.poll());
+    // ...a new report of the same kind is not a change...
+    tx.send(with(|h| h.uptime_s += 600)).unwrap();
+    assert!(!state.poll());
+    // ...and it stops (here: the process is gone).
+    tx.send(snap(ScmState::Stopped, HealthView::NoAnswer))
+        .unwrap();
+    assert!(state.poll());
+}
+
+#[test]
 fn while_the_service_starts_or_stops_nothing_can_be_done_whatever_the_report_says() {
     for state in [ScmState::Starting, ScmState::Stopping] {
         // Also with a (soon stale) report and with none.

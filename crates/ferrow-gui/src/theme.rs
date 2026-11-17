@@ -457,4 +457,13 @@ impl Palette {
             Color32::from_rgb(0x9D, 0x5D, 0x00)
         }
     }
+
+    /// Errors (Windows 11 "critical"): readable on the card in both themes.
+    pub fn error(&self) -> Color32 {
+        if self.dark {
+            Color32::from_rgb(0xFF, 0x99, 0xA4)
+        } else {
+            Color32::from_rgb(0xC4, 0x2B, 0x1C)
+        }
+    }
 }

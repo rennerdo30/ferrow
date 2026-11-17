@@ -14,8 +14,6 @@
 //! not the exit code, decides whether they worked. An action's follow-up asks
 //! (at 0, 1.2 and 2.4 s, then every [`REFRESH`]) are the one exception to the
 //! gap, and they push the next periodic ask back.
-// The Settings section that draws this follows in the next change.
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
@@ -30,6 +28,8 @@ use crate::access::{self, Notice, Outcome, RunError};
 pub const SERVICE_NAME: &str = "ferrowd";
 const HEALTH_DEADLINE: Duration = Duration::from_millis(1000);
 const STATUS_DEADLINE: Duration = Duration::from_millis(800);
+// Test builds never connect, so the real asks below are not compiled in.
+#[cfg_attr(test, allow(dead_code))]
 const RESCAN_DEADLINE: Duration = Duration::from_secs(2);
 /// The shortest gap between two periodic asks while Settings is shown.
 pub const REFRESH: Duration = Duration::from_secs(5);
@@ -58,8 +58,10 @@ pub enum ScmState {
     #[cfg_attr(not(windows), allow(dead_code))]
     Other,
     /// The service manager could not be asked.
+    #[cfg_attr(any(test, not(windows)), allow(dead_code))]
     Unknown,
     /// This OS has no service manager the app can ask (Linux, macOS).
+    #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
 }
 
@@ -272,6 +274,7 @@ fn ask_health(endpoint: &Endpoint) -> HealthView {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 mod scm {
     use super::{SERVICE_NAME, Scm, ScmState};
     use windows_sys::Win32::Foundation::{
@@ -369,6 +372,7 @@ mod scm {
 }
 
 #[cfg(not(windows))]
+#[cfg_attr(test, allow(dead_code))]
 mod scm {
     use super::{Scm, ScmState};
     pub fn query() -> Scm {
@@ -1055,13 +1059,17 @@ impl ServiceHealth {
     }
 
     /// Take finished answers and results (every frame, also while Settings is
-    /// closed). True when an action ended: the engine should look for the
-    /// service again.
+    /// closed). True when the engine should look for the service again: an
+    /// action ended, or the service started or stopped answering.
     pub fn poll(&mut self) -> bool {
+        let before = self.snap.as_ref().map(Snapshot::answers);
         while let Ok(snap) = self.updates.try_recv() {
             self.snap = Some(snap);
         }
-        let Some(rx) = &self.done else { return false };
+        let flipped = before.is_some_and(|b| Some(b) != self.snap.as_ref().map(Snapshot::answers));
+        let Some(rx) = &self.done else {
+            return flipped;
+        };
         match rx.try_recv() {
             Ok(done) => {
                 if done.snap.is_some() {
@@ -1069,7 +1077,7 @@ impl ServiceHealth {
                 }
                 self.notice = Some(done.notice);
             }
-            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Empty) => return flipped,
             // The worker ended without a result: never leave the buttons
             // waiting for it.
             Err(TryRecvError::Disconnected) => {
