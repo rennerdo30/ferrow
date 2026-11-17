@@ -115,6 +115,22 @@ fn a_volume_shows_its_mode_its_reason_and_what_it_knows() {
         "{detail}"
     );
 
+    // Live changes folded into the index in memory: not a scan, said so.
+    let folded = VolumeHealth {
+        last_compaction: Some(ScanInfo {
+            at_ms: 6_000,
+            reason: "50001 live changes".into(),
+            took_ms: 12_400,
+        }),
+        ..live.clone()
+    };
+    let (_, _, _, detail) = volume_lines(&folded);
+    assert!(
+        detail.contains(" · live changes last merged ") && detail.contains(", took 12.4 s"),
+        "{detail}"
+    );
+    assert!(!volume_lines(&live).3.contains("last merged"));
+
     let lost = VolumeHealth {
         mode: MODE_UNAVAILABLE.into(),
         reason: "access denied".into(),

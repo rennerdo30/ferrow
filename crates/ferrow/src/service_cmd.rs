@@ -302,6 +302,14 @@ pub fn render(h: &Health, json: bool) -> String {
                 format_duration(scan.took_ms)
             ));
         }
+        if let Some(c) = &v.last_compaction {
+            out.push_str(&format!(
+                "  last compaction {} (in memory, {}, {})\n",
+                ago(c.at_ms),
+                p(&c.reason),
+                format_duration(c.took_ms)
+            ));
+        }
         if let Some(pending) = &v.rescan_pending {
             out.push_str(&format!(
                 "  rescan pending ({}), not before {}\n",
@@ -642,6 +650,21 @@ mod tests {
         let text = render(&bad, false);
         assert!(text.starts_with("ATTENTION: 2 problem(s)\n"), "{text}");
         assert!(text.contains("disk full") && text.contains("live updates stopped"));
+
+        // An in-memory compaction is shown beside the last scan.
+        let mut folded = sample();
+        folded.volumes[0].last_compaction = Some(ScanInfo {
+            at_ms: 1_709_219_000_000,
+            reason: "50001 live changes".into(),
+            took_ms: 12_400,
+        });
+        let text = render(&folded, false);
+        assert!(
+            text.contains("  last compaction ")
+                && text.contains("(in memory, 50001 live changes, "),
+            "{text}"
+        );
+        assert!(!render(&sample(), false).contains("last compaction"));
 
         // A live volume's warning is shown under it, but is not a problem.
         let mut warned = sample();

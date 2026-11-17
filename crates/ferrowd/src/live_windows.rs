@@ -17,9 +17,11 @@ use ferrow_walk::subtree::{Subtree, WalkError, walk_subtree};
 use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 
 use crate::health::{STATE, VolumeState};
+use crate::live;
 use crate::live::{
-    Applied, Change, Live, MAX_WALK_TIME, NOTABLE_WALK, PublishGate, REASON_ADMIN, RecordSource,
-    RecordState, RescanPolicy, WALK_SLACK, WalkJob, index_parts, walk_limits_text,
+    Applied, Change, Due, Live, MAX_WALK_TIME, Maintenance, NOTABLE_WALK, PublishGate,
+    REASON_ADMIN, RecordSource, RecordState, WALK_SLACK, WalkJob, compact_and_publish, index_parts,
+    walk_limits_text,
 };
 use crate::memory::Breakdown;
 use crate::{Snapshot, SnapshotStore, eventlog};
@@ -508,24 +510,57 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         ));
         log_memory("after scan", Some(&live), &base, &store);
         let mut applied_total = 0usize;
-        let mut rescan = RescanPolicy::after_scan(Instant::now(), took);
-        let hard_delta = live.limits().hard_delta;
+        let mut rescan = Maintenance::after_scan(Instant::now(), took);
+        let mut hard_delta = live.limits().hard_delta;
+        let mut base = base;
         let mut gate = PublishGate::new();
         reason = loop {
             let urgent = live.delta_len() > hard_delta;
-            if let Some(why) = rescan.due(Instant::now(), urgent) {
-                // The fullest the live layer gets: what it holds before the
-                // rescan replaces it.
-                log_memory("before rescan", Some(&live), &base, &store);
-                break why;
+            match rescan.due(Instant::now(), urgent, live.walks_outstanding()) {
+                Some(Due::Rescan(why)) => {
+                    // The fullest the live layer gets: what it holds before
+                    // the rescan replaces it.
+                    log_memory("before rescan", Some(&live), &base, &store);
+                    break why;
+                }
+                Some(Due::Compact(why)) => {
+                    log_memory("before compaction", Some(&live), &base, &store);
+                    let report = format!("{summary}; {applied_total} live changes");
+                    // Single writer: this thread, on the low-priority pool.
+                    // Journal changes queue in the channel meanwhile, and
+                    // searches read the snapshot published before.
+                    let took = compact_and_publish(&mut live, &store, report, |live| match &pool {
+                        Some(pool) => pool.install(|| live.compact()),
+                        None => live.compact(),
+                    });
+                    if let Some(took) = took {
+                        base = live.base().clone();
+                        hard_delta = live.limits().hard_delta;
+                        gate = PublishGate::new();
+                        rescan.compacted(Instant::now(), took);
+                        STATE.compaction_done(&why, took);
+                        eventlog::info(format!(
+                            "folded the live changes into the index in memory ({why}) in {:.1} s: {} entries, no disk read",
+                            took.as_secs_f64(),
+                            base.len()
+                        ));
+                        log_memory("after compaction", Some(&live), &base, &store);
+                    }
+                    continue;
+                }
+                None => {}
             }
-            // Wake for a pending rescan, for a view that is owed but held
-            // back by the duty gate, and to check on a folder read that may
-            // be stuck.
-            let wake = [rescan.wake_at(), gate.wake_at(), live.next_walk_deadline()]
-                .into_iter()
-                .flatten()
-                .min();
+            // Wake for a pending rescan or compaction, for a view that is
+            // owed but held back by the duty gate, and to check on a folder
+            // read that may be stuck.
+            let wake = [
+                rescan.wake_at(live.walks_outstanding()),
+                gate.wake_at(),
+                live.next_walk_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let Some(batch) = next_batch(&rx, &device_index, wake) else {
                 return;
             };
@@ -539,13 +574,13 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                     eventlog::warn(format!("journal of {device}: {reason}"));
                     STATE.journal_problem(&device, fatal, &reason);
                     if rescan.request(format!("{device}: {reason}")) {
-                        STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                        STATE.set_pending(rescan.rescan_pending());
                     }
                     continue;
                 }
                 Batch::RescanNow => {
                     rescan.force(Instant::now(), REASON_ADMIN.into());
-                    STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                    STATE.set_pending(rescan.rescan_pending());
                     continue;
                 }
             };
@@ -609,10 +644,14 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             if let Some(why) = outcome.rescan {
                 // The reason text changes with every batch (it carries the
                 // delta size): only the start of an episode is an event.
-                let wanted = format!("rescan wanted: {why}");
+                let wanted = if live::is_overflow(&why) {
+                    format!("compaction wanted: {why}")
+                } else {
+                    format!("rescan wanted: {why}")
+                };
                 if rescan.request(why) {
                     eventlog::info(wanted);
-                    STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                    STATE.set_pending(rescan.rescan_pending());
                 }
             }
             if outcome.changed > 0 || outcome.merged > 0 {
@@ -628,7 +667,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 continue;
             }
             let mut report = format!("{summary}; {applied_total} live changes");
-            if let Some(why) = rescan.pending() {
+            if let Some((why, _)) = rescan.rescan_pending() {
                 report.push_str(&format!("; rescan pending ({why})"));
             }
             let built = Instant::now();

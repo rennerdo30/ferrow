@@ -68,6 +68,30 @@ that peak.
 Budget: the delta costs about the base per-entry size for its entries; the
 bitsets cost 0.25 bytes per base entry when in use.
 
+**Re-freeze, as built (FR-42, 2026-11).** The first live-index release did
+not build this: it asked for a full disk rescan when the delta grew past a
+fixed 50,000 entries. The design above is now true, with these differences:
+
+- It is `Live::compact` in `ferrowd`, run by the maintainer thread on the
+  low-priority rescan pool, for the size reasons only; a journal reset, a
+  moved-in folder that could not be read, an administrator's request and the
+  start of the service still rescan, because only a scan can fix those.
+- The trigger is the scaled limit (1 % of the index, 50,000 to 250,000
+  delta entries; dead entries and hidden frozen entries have their own
+  bounds), not `max(64 K, 2 %)`, and there is no 10-minute timer: with an
+  empty delta there is nothing to fold.
+- There is no pending log and no replay. The maintainer is the only writer
+  and runs the compaction itself, so journal batches queue in its channel and
+  are applied to the new layer after the swap. It does not start while a
+  background folder read is outstanding.
+- The new base is built through `IndexBuilder` (ids are re-dealt: frozen
+  entries still shown, then the live ones), not by a merge of sorted orders;
+  that primitive is a possible later change. Peak memory is about 85 bytes
+  per entry above the old state (a rescan: about 161), not two full bases.
+- A new `Live` is built over the new index from the same volume tables,
+  roots, excluded records and hard links, and one `SnapshotStore::swap`
+  publishes it with no delta; searches use the old snapshot until then.
+
 ## File reference numbers
 
 The journal names files by FRN (NTFS: 48-bit MFT record number + 16-bit

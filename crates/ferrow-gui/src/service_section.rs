@@ -171,6 +171,14 @@ fn volume_lines(v: &VolumeHealth) -> (String, Level, String, String) {
             health::format_duration(scan.took_ms)
         ));
     }
+    if let Some(c) = &v.last_compaction {
+        // Not a scan: the live changes were folded into the index in memory.
+        parts.push(format!(
+            "live changes last merged {}, took {}",
+            when(c.at_ms),
+            health::format_duration(c.took_ms)
+        ));
+    }
     if let Some(r) = &v.rescan_pending {
         let why = if r.reason.is_empty() {
             String::new()

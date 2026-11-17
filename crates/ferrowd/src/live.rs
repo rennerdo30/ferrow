@@ -15,8 +15,10 @@
 //!   gets an entry at once and its subtree is read by a bounded background
 //!   walk ([`WalkJob`]) whose result is merged later (see [`Live::finish_walk`]).
 //!
-//! When the delta grows large, the owner rescans the volume (seconds with
-//! the MFT reader) and starts over from a fresh frozen index.
+//! When the delta grows large, the owner folds it into a new frozen index in
+//! memory ([`Live::compact`]: seconds of one background thread, no disk); a
+//! journal that cannot be trusted or a folder that could not be read still
+//! asks for a rescan of the volumes (see [`Maintenance`]).
 //!
 //! The logic here is platform-independent; the journal readers and record
 //! fetching live in `live_windows`.
@@ -31,7 +33,7 @@ use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
 use ferrow_walk::subtree::{Limits, Subtree, WalkError};
 
-/// Rescan once the overlay holds more live delta entries than
+/// Ask for a compaction once the overlay holds more live delta entries than
 /// [`DeltaLimits::max_delta`] (about 1 % of the index, never less than this)…
 pub const MIN_DELTA: usize = 50_000;
 /// …and never more than this (a view of this many entries takes about
@@ -278,6 +280,150 @@ impl PublishGate {
     }
 }
 
+/// The name health reports for compactions (in the scans-by-reason counters).
+pub const KIND_COMPACTION: &str = "compaction";
+
+/// Whether a rescan reason only says the live layer has grown too large: the
+/// service folds it in memory ([`Live::compact`]) instead of reading the
+/// disks again. Every other reason (a journal reset, a folder that could not
+/// be read, an administrator's request, startup) means the index may be
+/// wrong, which only a scan can fix.
+pub fn is_overflow(reason: &str) -> bool {
+    matches!(
+        reason_kind(reason),
+        "too many live changes" | "too many replaced entries" | "too many superseded entries"
+    )
+}
+
+/// A compaction may use this share of the time (1 in 6): the next one waits
+/// this many times the last one's duration…
+const COMPACT_DUTY: u32 = 5;
+/// …but at least this long…
+const MIN_COMPACT_GAP: Duration = Duration::from_secs(60);
+/// …and at most this long.
+const MAX_COMPACT_GAP: Duration = Duration::from_secs(10 * 60);
+
+/// What the maintainer does next about the size of the live layer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Due {
+    /// Read the disks again (the reason is the first one asked for).
+    Rescan(String),
+    /// Fold the live layer into a new frozen index in memory.
+    Compact(String),
+}
+
+/// When a requested rescan or compaction may start. A reason that only says
+/// the live layer is large asks for a compaction (seconds of one low-priority
+/// thread, no disk); any other reason asks for a rescan (see [`is_overflow`]).
+/// A pending rescan covers a pending compaction: a fresh index has no live
+/// layer.
+#[derive(Debug)]
+pub struct Maintenance {
+    rescan: RescanPolicy,
+    compact: Option<String>,
+    compact_earliest: Instant,
+}
+
+impl Maintenance {
+    /// After a scan that took `took` and finished at `now`.
+    pub fn after_scan(now: Instant, took: Duration) -> Maintenance {
+        Maintenance {
+            rescan: RescanPolicy::after_scan(now, took),
+            compact: None,
+            compact_earliest: now + MIN_COMPACT_GAP,
+        }
+    }
+
+    /// Ask for a rescan or a compaction, by the reason; the first of each is
+    /// kept. True when this started a pending episode of the kind it asks
+    /// for: only then is it news.
+    pub fn request(&mut self, reason: String) -> bool {
+        if is_overflow(&reason) {
+            let fresh = self.compact.is_none();
+            self.compact.get_or_insert(reason);
+            fresh
+        } else {
+            self.rescan.request(reason)
+        }
+    }
+
+    /// An administrator asked for a rescan now.
+    pub fn force(&mut self, now: Instant, reason: String) {
+        self.rescan.force(now, reason);
+    }
+
+    /// The rescan waiting for its time (a waiting compaction is not one).
+    pub fn rescan_pending(&self) -> Option<(&str, Instant)> {
+        self.rescan
+            .pending()
+            .map(|why| (why, self.rescan.earliest()))
+    }
+
+    /// Whether a rescan is waiting.
+    pub fn rescan_waiting(&self) -> bool {
+        self.rescan.pending().is_some()
+    }
+
+    /// What to do now, if anything. `urgent`: the delta outgrew
+    /// [`DeltaLimits::hard_delta`] (no waiting for the gap). A compaction
+    /// never starts while `walks` (folders are being read) or a rescan waits.
+    pub fn due(&mut self, now: Instant, urgent: bool, walks: bool) -> Option<Due> {
+        if let Some(why) = self.rescan.due(now, urgent) {
+            return Some(Due::Rescan(why));
+        }
+        if walks || self.rescan.pending().is_some() {
+            return None;
+        }
+        if self.compact.is_some() && (urgent || now >= self.compact_earliest) {
+            return self.compact.take().map(Due::Compact);
+        }
+        None
+    }
+
+    /// A compaction that took `took` ended at `now`: the next waits for its
+    /// share of the time.
+    pub fn compacted(&mut self, now: Instant, took: Duration) {
+        let gap = (took * COMPACT_DUTY).clamp(MIN_COMPACT_GAP, MAX_COMPACT_GAP);
+        self.compact_earliest = now + gap;
+    }
+
+    /// When the maintainer must wake to start what is pending. A compaction
+    /// held back by a folder read needs no timer: the read's answer wakes it.
+    pub fn wake_at(&self, walks: bool) -> Option<Instant> {
+        let compact = (self.compact.is_some() && !walks && !self.rescan_waiting())
+            .then_some(self.compact_earliest);
+        [self.rescan.wake_at(), compact].into_iter().flatten().min()
+    }
+}
+
+/// Compact `live` and publish the result with one snapshot swap, or do
+/// nothing (`None`) when `build` declines (folders are being read). `build`
+/// is the compaction itself: the service runs it on its low-priority pool, a
+/// test can make it slow. Searches use the snapshot published before for as
+/// long as it runs, and never wait for it; the old index is freed when the
+/// last search that holds it ends. `report` is the new snapshot's report
+/// line. Returns how long it took.
+pub fn compact_and_publish(
+    live: &mut Live,
+    store: &crate::SnapshotStore,
+    report: String,
+    build: impl FnOnce(&mut Live) -> Option<Live>,
+) -> Option<Duration> {
+    let started = Instant::now();
+    let new = build(live)?;
+    let took = started.elapsed();
+    // Everything applied so far is in the new index: no delta to show.
+    store.swap(crate::Snapshot {
+        index: new.base().clone(),
+        live: None,
+        mode: "live".into(),
+        report,
+    });
+    // The old layer's tables go now; its index goes with the old snapshot.
+    *live = new;
+    Some(took)
+}
+
 /// Where an entry lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Loc {
@@ -324,6 +470,14 @@ pub trait RecordSource {
     fn certainly_free(&self, _volume: usize, _record: u64) -> bool {
         true
     }
+}
+
+/// What a volume's tables are built from.
+struct VolumeSeed {
+    /// Table size: the highest record number plus one.
+    records: u64,
+    excluded: Arc<HashSet<u64>>,
+    roots: HashSet<u64>,
 }
 
 struct Volume {
@@ -440,7 +594,19 @@ impl Applied {
         self.abandoned += other.abandoned;
         self.walks.extend(other.walks);
         if let Some(reason) = other.rescan {
-            self.rescan.get_or_insert(reason);
+            self.ask(reason);
+        }
+    }
+
+    /// Ask for a rescan, or for a compaction when the reason only says the
+    /// live layer is large ([`is_overflow`]). The first reason is kept,
+    /// except that one which needs the disks read again replaces one which
+    /// a compaction answers: the maintainer routes by this reason.
+    fn ask(&mut self, reason: String) {
+        match &self.rescan {
+            None => self.rescan = Some(reason),
+            Some(old) if is_overflow(old) && !is_overflow(&reason) => self.rescan = Some(reason),
+            Some(_) => {}
         }
     }
 }
@@ -506,35 +672,71 @@ impl Live {
     pub fn new(base: Arc<Index>, maps: &[VolumeMap]) -> Live {
         let n = base.len();
         let mut base_record = vec![u64::MAX; n];
-        let mut volumes = Vec::with_capacity(maps.len());
         for (v, map) in maps.iter().enumerate() {
-            let records = map.entries.iter().map(|&(r, _)| r + 1).max().unwrap_or(0);
-            let mut record_base = vec![u32::MAX; records as usize];
-            let mut overlay: HashMap<u64, Vec<Loc>> = HashMap::new();
             for &(record, id) in &map.entries {
                 if (id as usize) < n {
                     base_record[id as usize] = ((v as u64) << 48) | record;
                 }
-                let slot = &mut record_base[record as usize];
-                if *slot == u32::MAX && !overlay.contains_key(&record) {
-                    *slot = id;
-                } else {
-                    // A second name: keep every location in the overlay.
-                    let list = overlay.entry(record).or_default();
-                    if *slot != u32::MAX {
-                        list.push(Loc::Base(*slot));
-                        *slot = u32::MAX;
-                    }
-                    list.push(Loc::Base(id));
-                }
             }
-            volumes.push(Volume {
-                record_base,
-                overlay,
+        }
+        let seeds = maps
+            .iter()
+            .map(|map| VolumeSeed {
+                records: map.entries.iter().map(|&(r, _)| r + 1).max().unwrap_or(0),
                 excluded: Arc::new(map.excluded.iter().copied().collect()),
                 roots: map.roots.iter().map(|&(r, _)| r).collect(),
-            });
+            })
+            .collect();
+        let entries = maps
+            .iter()
+            .enumerate()
+            .flat_map(|(v, map)| map.entries.iter().map(move |&(record, id)| (v, record, id)));
+        let volumes = Live::volumes(seeds, entries);
+        Live::assemble(base, base_record, volumes, 0)
+    }
+
+    /// The per-volume record tables from `(volume, record, frozen id)`.
+    fn volumes(
+        seeds: Vec<VolumeSeed>,
+        entries: impl Iterator<Item = (usize, u64, u32)>,
+    ) -> Vec<Volume> {
+        let mut volumes: Vec<Volume> = seeds
+            .into_iter()
+            .map(|seed| Volume {
+                record_base: vec![u32::MAX; seed.records as usize],
+                overlay: HashMap::new(),
+                excluded: seed.excluded,
+                roots: seed.roots,
+            })
+            .collect();
+        for (v, record, id) in entries {
+            let volume = &mut volumes[v];
+            let slot = &mut volume.record_base[record as usize];
+            if *slot == u32::MAX && !volume.overlay.contains_key(&record) {
+                *slot = id;
+            } else {
+                // A second name: keep every location in the overlay.
+                let list = volume.overlay.entry(record).or_default();
+                if *slot != u32::MAX {
+                    list.push(Loc::Base(*slot));
+                    *slot = u32::MAX;
+                }
+                list.push(Loc::Base(id));
+            }
         }
+        volumes
+    }
+
+    /// A live layer over `base` with nothing changed yet. `next_walk`: the id
+    /// of the next folder read (ids stay unique across a compaction, so a
+    /// late answer of an abandoned reader cannot be taken for a new read).
+    fn assemble(
+        base: Arc<Index>,
+        base_record: Vec<u64>,
+        volumes: Vec<Volume>,
+        next_walk: u64,
+    ) -> Live {
+        let n = base.len();
         Live {
             limits: DeltaLimits::for_base(n),
             columns: base.columns_present(),
@@ -548,7 +750,7 @@ impl Live {
             base_record,
             base_children: OnceLock::new(),
             walks: Vec::new(),
-            next_walk: 0,
+            next_walk,
             log: HashMap::new(),
             log_seq: 0,
             progress: Instant::now(),
@@ -874,7 +1076,7 @@ impl Live {
                 if blocked {
                     deferred.push((change, state));
                 } else if let Err(reason) = self.apply_one(change, state, &mut applied) {
-                    applied.rescan.get_or_insert(reason);
+                    applied.ask(reason);
                 }
             }
             pending = deferred;
@@ -884,7 +1086,7 @@ impl Live {
         }
         for (change, state) in pending {
             if let Err(reason) = self.apply_one(change, state, &mut applied) {
-                applied.rescan.get_or_insert(reason);
+                applied.ask(reason);
             }
         }
         self.check_limits(&mut applied);
@@ -894,22 +1096,16 @@ impl Live {
     /// Ask for a rescan when the overlay has outgrown its limits.
     fn check_limits(&self, applied: &mut Applied) {
         if self.delta_alive > self.limits.max_delta {
-            applied
-                .rescan
-                .get_or_insert_with(|| format!("{} live changes", self.delta_alive));
+            applied.ask(format!("{} live changes", self.delta_alive));
         }
         // Entries replaced or deleted again stay in the delta until the next
         // rescan: few live ones among many dead still cost memory.
         let dead = self.delta.len() - self.delta_alive;
         if dead > self.limits.max_dead {
-            applied
-                .rescan
-                .get_or_insert_with(|| format!("{dead} {REASON_SUPERSEDED_SUFFIX}"));
+            applied.ask(format!("{dead} {REASON_SUPERSEDED_SUFFIX}"));
         }
         if self.removed_count > self.base.len() / MAX_REMOVED_DIVISOR + 1000 {
-            applied
-                .rescan
-                .get_or_insert_with(|| format!("{} replaced entries", self.removed_count));
+            applied.ask(format!("{} replaced entries", self.removed_count));
         }
     }
 
@@ -1262,7 +1458,7 @@ impl Live {
                 created: true,
             };
             if let Err(reason) = self.apply_one(change, Some(state), &mut applied) {
-                applied.rescan.get_or_insert(reason);
+                applied.ask(reason);
             }
         }
         applied.merged = std::mem::take(&mut applied.changed);
@@ -1280,7 +1476,7 @@ impl Live {
         applied.changed = rest.changed;
         applied.walks.extend(rest.walks);
         if let Some(reason) = rest.rescan {
-            applied.rescan.get_or_insert(reason);
+            applied.ask(reason);
         }
         // Folders that moved in below the walked one after it listed it.
         for &(record, sequence) in &walk.covered {
@@ -1292,7 +1488,7 @@ impl Live {
                 && !listed.contains(&record)
                 && let Err(reason) = self.walk_moved_in(volume, record, sequence, &mut applied)
             {
-                applied.rescan.get_or_insert(reason);
+                applied.ask(reason);
             }
         }
         self.check_limits(&mut applied);
@@ -1412,6 +1608,164 @@ impl Live {
         }
         self.set_locations(volume, record, new_locs);
         Ok(())
+    }
+
+    /// Whether folders are being read in the background. A compaction waits
+    /// for them: their results are merged into the delta by id.
+    pub fn walks_outstanding(&self) -> bool {
+        !self.walks.is_empty()
+    }
+
+    /// Fold the live state into a new frozen index and a new live layer over
+    /// it: the frozen entries still shown (with their folder overrides) plus
+    /// the live delta entries, in that order. Everything a search returns
+    /// stays the same (paths and metadata); what changes is that the delta,
+    /// the hidden entries, the dead entries and the lookup tables built for
+    /// folder moves are gone, and a search no longer merges a delta.
+    ///
+    /// Entry ids change (a page re-runs its query, so nothing holds an id).
+    /// Hard links, record numbers, excluded records and roots carry over;
+    /// entries without a record stay in the index without a map entry. The
+    /// cached metadata sort orders start empty, as after a scan, and are
+    /// built when first sorted by.
+    ///
+    /// `None` while folders are being read: their records are not placed
+    /// yet, and a compaction must not drop the state that merges them.
+    ///
+    /// Memory: the builder (about 87 bytes per entry while it is fed and
+    /// frozen) and the new tables come on top of the old index, which stays
+    /// until the caller publishes the result and the last search drops the
+    /// old snapshot. No disk is read.
+    pub fn compact(&mut self) -> Option<Live> {
+        if self.walks_outstanding() {
+            return None;
+        }
+        // Lazily built lookup tables are only needed for the next folder
+        // move; the new layer builds them again on demand.
+        self.base_children = OnceLock::new();
+        self.log = HashMap::new();
+
+        let n = self.base.len();
+        // Frozen entries that survive: shown, and (every id is above its
+        // parent's) with a surviving parent. An entry whose parent was
+        // hidden without it cannot be placed, and a scan would not list it.
+        let mut keep: Vec<u64> = self.removed.iter().map(|w| !w).collect();
+        if !n.is_multiple_of(64)
+            && let Some(last) = keep.last_mut()
+        {
+            *last &= (1u64 << (n % 64)) - 1;
+        }
+        let bit = |keep: &[u64], id: u32| keep[id as usize / 64] >> (id % 64) & 1 != 0;
+        let (mut kept_base, mut name_bytes) = (0usize, 0usize);
+        for id in 0..n as u32 {
+            if !bit(&keep, id) {
+                continue;
+            }
+            let parent = self.base.parent(id);
+            if parent != ROOT_PARENT && !bit(&keep, parent) {
+                keep[id as usize / 64] &= !(1 << (id % 64));
+                continue;
+            }
+            kept_base += 1;
+            name_bytes += self.base.name(id).len();
+        }
+        // Surviving entries before each word: a frozen id's new id is that
+        // plus the survivors below it in its word.
+        let mut before: Vec<u32> = Vec::with_capacity(keep.len());
+        let mut running = 0u32;
+        for word in &keep {
+            before.push(running);
+            running += word.count_ones();
+        }
+        let new_id = |id: u32| -> u32 {
+            let word = id as usize / 64;
+            before[word] + (keep[word] & ((1u64 << (id % 64)) - 1)).count_ones()
+        };
+
+        let builder = IndexBuilder::with_columns(self.columns);
+        let delta_names: usize = self
+            .delta
+            .iter()
+            .filter(|e| e.alive)
+            .map(|e| e.name.len())
+            .sum();
+        builder.reserve(kept_base + self.delta_alive, name_bytes + delta_names);
+        let mut records: Vec<u64> = Vec::with_capacity(kept_base + self.delta_alive);
+        let mut next = 0u32;
+        for id in 0..n as u32 {
+            if !bit(&keep, id) {
+                continue;
+            }
+            let parent = self.base.parent(id);
+            let parent = if parent == ROOT_PARENT {
+                ROOT_PARENT
+            } else {
+                new_id(parent)
+            };
+            let metadata = if self.overrides.is_empty() {
+                self.base.metadata(id)
+            } else {
+                self.metadata_of(Loc::Base(id))
+            };
+            let added = builder.add_with_metadata(
+                parent,
+                self.base.name(id),
+                self.base.flags(id),
+                metadata,
+            );
+            debug_assert_eq!(added, next);
+            next += 1;
+            records.push(self.base_record[id as usize]);
+        }
+        // The live entries follow the frozen ones. A parent comes before its
+        // children in `delta` as well; one whose parent is gone is skipped.
+        let mut placed: Vec<u32> = vec![u32::MAX; self.delta.len()];
+        for (d, e) in self.delta.iter().enumerate() {
+            if !e.alive {
+                continue;
+            }
+            let parent = match e.parent {
+                Loc::Base(b) if bit(&keep, b) => new_id(b),
+                Loc::Base(_) => continue,
+                Loc::Delta(p) => match placed.get(p as usize) {
+                    Some(&id) if id != u32::MAX => id,
+                    _ => continue,
+                },
+            };
+            placed[d] = builder.add_with_metadata(parent, &e.name, e.flags, e.metadata);
+            records.push(if e.record == u64::MAX {
+                u64::MAX
+            } else {
+                ((e.volume as u64) << 48) | e.record
+            });
+        }
+        drop(keep);
+        drop(before);
+        drop(placed);
+        let index = Arc::new(builder.freeze());
+        debug_assert_eq!(index.len(), records.len());
+
+        // The tables of the new layer, after the builder has been freed.
+        let mut seeds: Vec<VolumeSeed> = self
+            .volumes
+            .iter()
+            .map(|v| VolumeSeed {
+                records: 0,
+                excluded: v.excluded.clone(),
+                roots: v.roots.clone(),
+            })
+            .collect();
+        for &packed in records.iter().filter(|&&p| p != u64::MAX) {
+            let seed = &mut seeds[(packed >> 48) as usize];
+            seed.records = seed.records.max((packed & RECORD_MASK) + 1);
+        }
+        let entries = records
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p != u64::MAX)
+            .map(|(id, &p)| ((p >> 48) as usize, p & RECORD_MASK, id as u32));
+        let volumes = Live::volumes(seeds, entries);
+        Some(Live::assemble(index, records, volumes, self.next_walk))
     }
 
     /// Build the searchable view of the current state.
@@ -2928,5 +3282,917 @@ mod tests {
         for pair in published_at.windows(2) {
             assert!(pair[1] - pair[0] >= build * PUBLISH_DUTY, "{pair:?}");
         }
+    }
+
+    // ---- compaction -----------------------------------------------------
+
+    /// Every entry a search can return from `base` plus `view`: its path and
+    /// metadata, sorted.
+    fn listing(base: &Index, view: &LiveView) -> Vec<(String, EntryMetadata)> {
+        let norm = |p: std::path::PathBuf| p.to_string_lossy().replace('/', "\\");
+        let mut out = Vec::new();
+        for id in 0..base.len() as u32 {
+            if view.allowed[id as usize / 64] >> (id % 64) & 1 != 0 {
+                out.push((norm(base.path(id)), view.base_metadata(base, id)));
+            }
+        }
+        for id in 0..view.delta.len() as u32 {
+            if view.delta_allowed[id as usize / 64] >> (id % 64) & 1 != 0 {
+                out.push((norm(view.delta.path(id)), view.delta.metadata(id)));
+            }
+        }
+        assert_eq!(out.len(), view.entries, "the view counts what it shows");
+        out.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1)))
+        });
+        out
+    }
+
+    /// The scan of a fake file system: the tree below its root (record 5,
+    /// named `C:`), every name of a hard-linked record, and the map of
+    /// `(record, id)` a scan returns. `unmapped` entries are added without a
+    /// map entry (a scan that has no record for them).
+    fn scan(f: &Fake, unmapped: &[&str]) -> (Arc<Index>, VolumeMap) {
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let root = b.add_with_metadata(
+            ROOT_PARENT,
+            b"C:",
+            flags::DIR,
+            f.0[&5].info.metadata(ColumnSet::DEFAULT),
+        );
+        let mut entries = vec![(5u64, root)];
+        let mut at: HashMap<u64, Vec<u32>> = HashMap::from([(5, vec![root])]);
+        let mut queue = std::collections::VecDeque::from([5u64]);
+        let mut dirs: HashMap<String, u32> = HashMap::new();
+        while let Some(dir) = queue.pop_front() {
+            let mut kids: Vec<(u64, Vec<u8>)> =
+                f.0.iter()
+                    .filter(|(r, _)| **r != dir && **r != 30)
+                    .flat_map(|(r, s)| {
+                        s.names
+                            .iter()
+                            .filter(|(p, _)| *p == dir)
+                            .map(move |(_, n)| (*r, n.clone()))
+                    })
+                    .collect();
+            kids.sort();
+            for (record, name) in kids {
+                let state = &f.0[&record];
+                for parent in at[&dir].clone() {
+                    let id = b.add_with_metadata(
+                        parent,
+                        &name,
+                        state.info.entry_flags(),
+                        state.info.metadata(ColumnSet::DEFAULT),
+                    );
+                    entries.push((record, id));
+                    if state.info.is_dir {
+                        dirs.insert(format!("{dir}/{}", String::from_utf8_lossy(&name)), id);
+                        at.entry(record).or_default().push(id);
+                    }
+                }
+                if state.info.is_dir && !queue.contains(&record) {
+                    queue.push_back(record);
+                }
+            }
+        }
+        // Unmapped files below the first folders (by `dirs` order, stable).
+        let mut dir_ids: Vec<u32> = dirs.values().copied().collect();
+        dir_ids.sort();
+        for (i, name) in unmapped.iter().enumerate() {
+            let parent = dir_ids
+                .get(i % dir_ids.len().max(1))
+                .copied()
+                .unwrap_or(root);
+            b.add_with_metadata(
+                parent,
+                name.as_bytes(),
+                0,
+                file_info(77).metadata(ColumnSet::DEFAULT),
+            );
+        }
+        let map = VolumeMap {
+            entries,
+            excluded: vec![30],
+            roots: vec![(5, root)],
+            ..VolumeMap::default()
+        };
+        (Arc::new(b.freeze()), map)
+    }
+
+    /// A fake file system that changes at random: what the journal would
+    /// report, and the state a record fetch answers from.
+    struct World {
+        fs: Fake,
+        next: u64,
+        rng: u64,
+        tick: i64,
+        /// A folder was moved or deleted in the batch being built. Two in one
+        /// batch can reverse their nesting (each is applied against the
+        /// other's old place), which the live layer answers with a rescan.
+        folder_op: bool,
+    }
+
+    impl World {
+        fn new(seed: u64) -> World {
+            let mut w = World {
+                fs: Fake::default(),
+                next: 100,
+                rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                tick: 133_000_000_000_000_000,
+                folder_op: false,
+            };
+            w.fs.set(5, DIR_INFO, &[(5, ".")]);
+            for _ in 0..40 {
+                w.create();
+            }
+            w
+        }
+
+        fn random(&mut self, n: usize) -> usize {
+            self.rng ^= self.rng << 13;
+            self.rng ^= self.rng >> 7;
+            self.rng ^= self.rng << 17;
+            (self.rng % n.max(1) as u64) as usize
+        }
+
+        fn records(&self, dirs: Option<bool>) -> Vec<u64> {
+            let mut out: Vec<u64> = self
+                .fs
+                .0
+                .iter()
+                .filter(|(r, s)| **r != 5 && **r != 30 && dirs.is_none_or(|d| s.info.is_dir == d))
+                .map(|(r, _)| *r)
+                .collect();
+            out.sort();
+            out
+        }
+
+        fn dir(&mut self) -> u64 {
+            let mut dirs = self.records(Some(true));
+            dirs.push(5);
+            dirs[self.random(dirs.len())]
+        }
+
+        /// `dir` and every folder below it.
+        fn subtree(&self, dir: u64) -> HashSet<u64> {
+            let mut out = HashSet::from([dir]);
+            loop {
+                let more: Vec<u64> = self
+                    .fs
+                    .0
+                    .iter()
+                    .filter(|(r, s)| {
+                        s.info.is_dir
+                            && !out.contains(r)
+                            && s.names.iter().any(|(p, _)| out.contains(p))
+                    })
+                    .map(|(r, _)| *r)
+                    .collect();
+                if more.is_empty() {
+                    return out;
+                }
+                out.extend(more);
+            }
+        }
+
+        fn name(&mut self) -> String {
+            // Few names: collisions in one folder and the same name in
+            // several folders both happen.
+            ["a", "B", "c.txt", "Report", "x.log", "ÄÖ"][self.random(6)].to_string()
+                + &self.random(5).to_string()
+        }
+
+        fn info(&mut self, dir: bool) -> RecordInfo {
+            self.tick += 10_000_000 * (1 + self.random(5) as i64);
+            let base = if dir {
+                DIR_INFO
+            } else {
+                file_info(self.random(1000) as u64)
+            };
+            RecordInfo {
+                modified: self.tick,
+                created: self.tick - 5 * 10_000_000,
+                ..base
+            }
+        }
+
+        fn create(&mut self) -> Change {
+            let record = self.next;
+            self.next += 1;
+            let dir = self.random(4) == 0;
+            let parent = self.dir();
+            let name = self.name();
+            let info = self.info(dir);
+            self.fs.set(record, info, &[(parent, &name)]);
+            change(record, true)
+        }
+
+        /// One random step: the records that changed.
+        fn step(&mut self) -> Vec<Change> {
+            let files = self.records(Some(false));
+            let dirs = self.records(Some(true));
+            let pick = |w: &mut World, of: &[u64]| of.get(w.random(of.len())).copied();
+            match self.random(14) {
+                0..=2 => vec![self.create()],
+                3 | 4 => match pick(self, &files) {
+                    // A file written: new size and dates, same place.
+                    Some(r) => {
+                        let names = self.fs.0[&r].names.clone();
+                        let info = self.info(false);
+                        self.fs.0.insert(r, RecordState { info, names });
+                        vec![change(r, false)]
+                    }
+                    None => vec![],
+                },
+                5 | 6 => match pick(self, &files) {
+                    // Renamed or moved: its first name changes.
+                    Some(r) => {
+                        let (parent, name) = (self.dir(), self.name());
+                        let state = self.fs.0.get_mut(&r).unwrap();
+                        state.names[0] = (parent, name.into_bytes());
+                        vec![change(r, false)]
+                    }
+                    None => vec![],
+                },
+                7 | 8 | 10 if std::mem::replace(&mut self.folder_op, true) => vec![],
+                7 | 8 => match pick(self, &dirs) {
+                    // A folder renamed or moved, not into itself.
+                    Some(r) => {
+                        let (parent, name) = (self.dir(), self.name());
+                        if self.subtree(r).contains(&parent) {
+                            return vec![];
+                        }
+                        let state = self.fs.0.get_mut(&r).unwrap();
+                        state.names = vec![(parent, name.into_bytes())];
+                        vec![change(r, false)]
+                    }
+                    None => vec![],
+                },
+                9 => match pick(self, &files) {
+                    Some(r) => {
+                        self.fs.0.remove(&r);
+                        vec![change(r, false)]
+                    }
+                    None => vec![],
+                },
+                10 => match pick(self, &dirs) {
+                    // A folder deleted with everything in it (only the
+                    // folder is reported; the rest follows from it).
+                    Some(r) => {
+                        let gone = self.subtree(r);
+                        let mut changed = vec![change(r, false)];
+                        let records: Vec<u64> = self.fs.0.keys().copied().collect();
+                        for record in records {
+                            let state = self.fs.0.get_mut(&record).unwrap();
+                            let before = state.names.len();
+                            state.names.retain(|(p, _)| !gone.contains(p));
+                            if state.names.is_empty() || gone.contains(&record) {
+                                self.fs.0.remove(&record);
+                            } else if state.names.len() != before {
+                                changed.push(change(record, false));
+                            }
+                        }
+                        changed
+                    }
+                    None => vec![],
+                },
+                11 => match pick(self, &files) {
+                    // A hard link: a second name for a file.
+                    Some(r) => {
+                        let (parent, name) = (self.dir(), self.name());
+                        let state = self.fs.0.get_mut(&r).unwrap();
+                        state.names.push((parent, name.into_bytes()));
+                        vec![change(r, false)]
+                    }
+                    None => vec![],
+                },
+                12 => match pick(self, &files) {
+                    // One name of a hard-linked file removed.
+                    Some(r) if self.fs.0[&r].names.len() > 1 => {
+                        self.fs.0.get_mut(&r).unwrap().names.pop();
+                        vec![change(r, false)]
+                    }
+                    _ => vec![],
+                },
+                _ => {
+                    // A folder's own dates change (the created file's effect
+                    // on its parent), a root's too, and an excluded record
+                    // appears.
+                    let r = if self.random(3) == 0 { 5 } else { self.dir() };
+                    let state = self.fs.0.get_mut(&r).unwrap();
+                    state.info.modified += 10_000_000 * 3;
+                    let mut out = vec![change(r, false)];
+                    if self.random(4) == 0 {
+                        let parent = self.dir();
+                        self.fs.set(30, file_info(1), &[(parent, "excluded.bin")]);
+                        out.push(change(30, true));
+                    }
+                    out
+                }
+            }
+        }
+    }
+
+    /// Random batches of steps, applied to every live layer in `lives` the
+    /// way the maintainer does: a folder the journal reports without an entry
+    /// (it moved while its parent also changed) is read by the walker, which
+    /// is mocked here, and merged. None may ask for a rescan.
+    fn drive(w: &mut World, lives: &mut [&mut Live], batches: usize) {
+        for _ in 0..batches {
+            let mut changes: Vec<Change> = Vec::new();
+            w.folder_op = false;
+            for _ in 0..1 + w.random(6) {
+                changes.extend(w.step());
+            }
+            changes.sort_by_key(|c| (c.volume, c.record));
+            changes.dedup_by_key(|c| (c.volume, c.record));
+            for live in lives.iter_mut() {
+                let mut r = live.apply(&changes, &w.fs);
+                while let Some(job) = r.walks.pop() {
+                    let listing = walk_fake(&w.fs, &job);
+                    r.absorb(live.finish_walk(job.id, Ok(listing.into()), &w.fs));
+                }
+                assert!(r.rescan.is_none(), "{r:?}");
+                assert!(!live.walks_outstanding());
+            }
+        }
+    }
+
+    #[test]
+    fn a_compacted_index_shows_exactly_what_the_live_one_showed() {
+        for seed in 1..=24u64 {
+            let mut w = World::new(seed);
+            // Even seeds: a scan that has no record for two of its entries.
+            let unmapped: &[&str] = if seed % 2 == 0 {
+                &["unmapped-1.txt", "unmapped-2.txt"]
+            } else {
+                &[]
+            };
+            let (base, map) = scan(&w.fs, unmapped);
+            let mut old = Live::new(base.clone(), &[map]);
+            drive(&mut w, &mut [&mut old], 25);
+            let shown = listing(&base, &old.view());
+            let mut new = old.compact().expect("no folder is being read");
+            let nbase = new.base().clone();
+            let nview = new.view();
+            assert_eq!(listing(&nbase, &nview), shown, "seed {seed}");
+            assert_eq!(nview.delta.len(), 0, "nothing left in a delta");
+            assert_eq!(nview.entries, nbase.len());
+            assert_eq!(new.delta_len(), 0);
+            assert_eq!(new.removed_count, 0);
+            if unmapped.is_empty() {
+                // Nothing a fresh scan would not list: it agrees too.
+                let (fresh, _) = scan(&w.fs, &[]);
+                let none = LiveView {
+                    allowed: Arc::new(vec![u64::MAX; fresh.len().div_ceil(64)]),
+                    delta: Arc::new(IndexBuilder::new().freeze()),
+                    delta_allowed: Arc::new(Vec::new()),
+                    overrides: Arc::new(HashMap::new()),
+                    entries: fresh.len(),
+                };
+                assert_eq!(listing(&fresh, &none), shown, "fresh scan, seed {seed}");
+            }
+            // The same changes now give the same result on both: the new
+            // layer tracks every record (hard links, folders moved, roots).
+            for round in 0..4 {
+                drive(&mut w, &mut [&mut old, &mut new], 8);
+                assert_eq!(
+                    listing(&nbase, &new.view()),
+                    listing(&base, &old.view()),
+                    "seed {seed}, round {round}"
+                );
+            }
+            // And a second compaction of the changed layer loses nothing.
+            let shown = listing(&nbase, &new.view());
+            let mut third = new.compact().unwrap();
+            assert_eq!(
+                listing(third.base(), &third.view()),
+                shown,
+                "seed {seed}, again"
+            );
+            drive(&mut w, &mut [&mut new, &mut third], 5);
+            assert_eq!(
+                listing(third.base(), &third.view()),
+                listing(&nbase, &new.view()),
+                "seed {seed}, after the second"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_hard_links_folder_dates_and_unmapped_entries() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        // A hard link, a folder's dates, a root's dates, a new folder.
+        f.set(21, file_info(1), &[(20, "a.txt"), (5, "a-link.txt")]);
+        f.set(
+            20,
+            RecordInfo {
+                modified: 133_100_000_000_000_000,
+                ..DIR_INFO
+            },
+            &[(5, "Docs")],
+        );
+        f.set(
+            5,
+            RecordInfo {
+                modified: 133_200_000_000_000_000,
+                ..DIR_INFO
+            },
+            &[(5, ".")],
+        );
+        f.set(50, DIR_INFO, &[(5, "NewDir")]);
+        f.set(51, file_info(4), &[(50, "inside.txt")]);
+        let r = live.apply(
+            &[
+                change(21, false),
+                change(20, false),
+                change(5, false),
+                change(51, true),
+                change(50, true),
+            ],
+            &f,
+        );
+        assert!(r.rescan.is_none() && r.walks.is_empty(), "{r:?}");
+        let shown = listing(&base, &live.view());
+        let mut new = live.compact().unwrap();
+        let nbase = new.base().clone();
+        assert_eq!(listing(&nbase, &new.view()), shown);
+        // Folder dates are folded into the new columns, not kept as overrides.
+        assert!(new.overrides.is_empty());
+        let docs = (0..nbase.len() as u32)
+            .find(|&i| nbase.name(i) == b"Docs")
+            .unwrap();
+        assert_eq!(
+            nbase.metadata(docs),
+            RecordInfo {
+                modified: 133_100_000_000_000_000,
+                ..DIR_INFO
+            }
+            .metadata(ColumnSet::DEFAULT)
+        );
+        // Both names of the hard link are entries of the one record.
+        let record_21 = new.locations(0, 21);
+        assert_eq!(record_21.len(), 2, "{record_21:?}");
+        // Removing one name leaves the other, as it would without a compaction.
+        f.set(21, file_info(1), &[(20, "a.txt")]);
+        new.apply(&[change(21, false)], &f);
+        live.apply(&[change(21, false)], &f);
+        assert_eq!(listing(&nbase, &new.view()), listing(&base, &live.view()));
+        // The root's entry still only follows its dates, and an excluded
+        // record is still never indexed.
+        assert!(new.volumes[0].roots.contains(&5));
+        assert!(new.volumes[0].excluded.contains(&30));
+        f.set(30, file_info(1), &[(5, "excluded.txt")]);
+        f.set(
+            5,
+            RecordInfo {
+                modified: 133_300_000_000_000_000,
+                ..DIR_INFO
+            },
+            &[(5, ".")],
+        );
+        let r = new.apply(&[change(30, true), change(5, false)], &f);
+        assert_eq!(r.changed, 1, "only the root's dates: {r:?}");
+        assert!(
+            !listing(&nbase, &new.view())
+                .iter()
+                .any(|(p, _)| p.contains("excluded")),
+            "excluded stays excluded"
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_each_volumes_records_apart() {
+        // Two volumes with the same record numbers.
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let c = b.add_root(b"C:", flags::DIR);
+        let d = b.add_root(b"D:", flags::DIR);
+        let md = file_info(1).metadata(ColumnSet::DEFAULT);
+        let on_c = b.add_with_metadata(c, b"same.txt", 0, md);
+        let on_d = b.add_with_metadata(d, b"same.txt", 0, md);
+        let maps = [
+            VolumeMap {
+                entries: vec![(5, c), (21, on_c)],
+                excluded: vec![30],
+                roots: vec![(5, c)],
+                ..VolumeMap::default()
+            },
+            VolumeMap {
+                entries: vec![(5, d), (21, on_d)],
+                excluded: vec![31],
+                roots: vec![(5, d)],
+                ..VolumeMap::default()
+            },
+        ];
+        struct Two(Vec<Fake>);
+        impl RecordSource for Two {
+            fn fetch(&self, volume: usize, record: u64) -> Option<RecordState> {
+                self.0[volume].0.get(&record).cloned()
+            }
+        }
+        let mut fs = Two(vec![Fake::default(), Fake::default()]);
+        for fake in &mut fs.0 {
+            fake.set(5, DIR_INFO, &[(5, ".")]);
+            fake.set(21, file_info(1), &[(5, "same.txt")]);
+        }
+        let mut live = Live::new(Arc::new(b.freeze()), &maps);
+        // A change on D: only D's file is replaced.
+        fs.0[1].set(21, file_info(900), &[(5, "same.txt")]);
+        live.apply(
+            &[Change {
+                volume: 1,
+                record: 21,
+                created: false,
+            }],
+            &fs,
+        );
+        let mut new = live.compact().unwrap();
+        let nbase = new.base().clone();
+        let shown = listing(&nbase, &new.view());
+        let sizes: Vec<(&str, Option<u64>)> =
+            shown.iter().map(|(p, m)| (p.as_str(), m.size)).collect();
+        assert_eq!(
+            sizes,
+            [
+                ("C:", None),
+                ("C:\\same.txt", Some(1)),
+                ("D:", None),
+                ("D:\\same.txt", Some(900)),
+            ]
+        );
+        assert!(new.volumes[0].excluded.contains(&30) && !new.volumes[0].excluded.contains(&31));
+        assert!(new.volumes[1].excluded.contains(&31));
+        // Record 21 of volume 0 and of volume 1 are still different entries.
+        fs.0[0].set(21, file_info(5), &[(5, "same.txt")]);
+        new.apply(
+            &[Change {
+                volume: 0,
+                record: 21,
+                created: false,
+            }],
+            &fs,
+        );
+        let sizes: Vec<Option<u64>> = listing(&nbase, &new.view())
+            .iter()
+            .map(|(_, m)| m.size)
+            .collect();
+        assert_eq!(sizes, [None, Some(5), None, Some(900)]);
+    }
+
+    #[test]
+    fn compaction_frees_what_a_folder_move_built_and_the_delta() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        let mut f = initial();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        for i in 0..200u64 {
+            f.set(500 + i, file_info(1), &[(20, &format!("n{i}.txt"))]);
+        }
+        let changes: Vec<Change> = (0..200u64)
+            .map(|i| change(500 + i, true))
+            .chain([change(20, false)])
+            .collect();
+        live.apply(&changes, &f);
+        let bytes = |live: &Live, name: &str| {
+            live.memory_parts()
+                .into_iter()
+                .find(|p| p.name == name)
+                .map_or(0, |p| p.bytes)
+        };
+        assert!(bytes(&live, "live.base_children") > 0, "built by the move");
+        assert!(bytes(&live, "live.delta") > 0);
+        let new = live.compact().unwrap();
+        assert_eq!(bytes(&live, "live.base_children"), 0, "freed first");
+        assert_eq!(bytes(&new, "live.base_children"), 0);
+        assert_eq!(bytes(&new, "live.delta"), 0, "no delta any more");
+        assert_eq!(bytes(&new, "live.delta_children"), 0);
+        assert_eq!(new.base().len(), 4 + 200);
+        assert_eq!(new.limits(), DeltaLimits::for_base(204));
+    }
+
+    #[test]
+    fn compaction_waits_for_folder_reads() {
+        let f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        assert!(live.walks_outstanding());
+        assert!(live.compact().is_none(), "a read is outstanding");
+        // Nothing is published and nothing changes.
+        let store = crate::SnapshotStore::new(crate::Snapshot {
+            index: base.clone(),
+            live: Some(Arc::new(live.view())),
+            mode: "live".into(),
+            report: String::new(),
+        });
+        let built = std::cell::Cell::new(false);
+        let took = compact_and_publish(&mut live, &store, "r".into(), |live| {
+            built.set(true);
+            live.compact()
+        });
+        assert!(took.is_none() && built.get());
+        assert!(Arc::ptr_eq(&store.get().index, &base), "no swap");
+        assert_eq!(shown(&live, &base).len(), 5);
+        // Once the read has been merged it folds, including what it read,
+        // and the next read still gets a new id.
+        let done = live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        assert_eq!(done.rescan, None);
+        assert!(!live.walks_outstanding());
+        let mut new = live.compact().expect("no read outstanding");
+        assert_eq!(
+            listing(new.base(), &new.view())
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect::<Vec<_>>(),
+            oracle(&f)
+        );
+        let mut f = f;
+        f.set(70, DIR_INFO, &[(5, "Another")]);
+        let r = new.apply(&[change(70, false)], &f);
+        assert_eq!(r.walks.len(), 1);
+        assert_eq!(r.walks[0].id, job.id + 1, "ids never repeat");
+    }
+
+    /// The text of every path a query finds, through the service's handler.
+    fn found(store: &crate::SnapshotStore, text: &str) -> Vec<String> {
+        let answers = crate::handle(
+            store,
+            ferrow_ipc::Request::Query {
+                text: text.into(),
+                limit: 100,
+                sort: ferrow_ipc::Sort::Name,
+                flags: 0,
+            },
+        );
+        let mut out = Vec::new();
+        for answer in answers {
+            match answer {
+                ferrow_ipc::Response::Results { paths, .. } => out.extend(
+                    paths
+                        .into_iter()
+                        .map(|p| String::from_utf8_lossy(&p).replace('/', "\\")),
+                ),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_search_never_waits_for_a_compaction_and_the_old_snapshot_stays_until_the_swap() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        f.set(40, file_info(9), &[(20, "fresh.txt")]);
+        f.0.remove(&22);
+        live.apply(&[change(40, true), change(22, false)], &f);
+        let store = crate::SnapshotStore::new(crate::Snapshot {
+            index: base.clone(),
+            live: Some(Arc::new(live.view())),
+            mode: "live".into(),
+            report: "before".into(),
+        });
+        let weak_old = Arc::downgrade(&base);
+        // A search that began before the compaction and is still running.
+        let in_flight = store.get();
+        let (started_tx, started_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let (answer_tx, answer_rx) = channel();
+        std::thread::scope(|scope| {
+            // The compaction, with a stage that stays slow until released.
+            let (live_ref, store_ref) = (&mut live, &store);
+            let compaction = scope.spawn(move || {
+                compact_and_publish(live_ref, store_ref, "after".into(), |live| {
+                    started_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    live.compact()
+                })
+            });
+            started_rx.recv().unwrap();
+            // Mid-compaction: searches are answered, from the old snapshot
+            // (its delta included), and are not held up.
+            let searcher = scope.spawn(|| {
+                let text = found(&store, "txt");
+                let seen = store.get();
+                answer_tx
+                    .send((text, Arc::ptr_eq(&seen.index, &base), seen.report.clone()))
+                    .ok();
+            });
+            let answered = answer_rx.recv_timeout(Duration::from_secs(20));
+            // Release the compaction whatever happened above.
+            go_tx.send(()).unwrap();
+            match answered {
+                Ok((hits, old_index, report)) => {
+                    assert_eq!(
+                        hits,
+                        ["C:\\Docs\\a.txt", "C:\\Docs\\fresh.txt"],
+                        "the live state of the old snapshot"
+                    );
+                    assert!(old_index, "the old index is still the published one");
+                    assert_eq!(report, "before");
+                }
+                Err(RecvTimeoutError::Timeout) => panic!("a search waited for the compaction"),
+                Err(e) => panic!("{e:?}"),
+            }
+            searcher.join().unwrap();
+            assert!(compaction.join().unwrap().is_some());
+        });
+        // After the swap: the new index answers the same, with no delta.
+        let now = store.get();
+        assert_eq!(now.report, "after");
+        assert!(now.live.is_none());
+        assert!(!Arc::ptr_eq(&now.index, &base));
+        assert_eq!(now.entries(), 4);
+        assert_eq!(
+            found(&store, "txt"),
+            ["C:\\Docs\\a.txt", "C:\\Docs\\fresh.txt"]
+        );
+        // The search that was running keeps the old snapshot whole.
+        assert!(Arc::ptr_eq(&in_flight.index, &base));
+        assert_eq!(in_flight.entries(), 4);
+        assert_eq!(in_flight.index.len(), 4);
+        assert!(weak_old.upgrade().is_some(), "held by the running search");
+        // The old index is freed when the last holder lets go.
+        drop(in_flight);
+        drop(now);
+        drop(base);
+        assert!(weak_old.upgrade().is_none(), "the old index is freed");
+    }
+
+    #[test]
+    fn compactions_are_rate_limited_by_their_own_short_gap() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        // After a 3-minute scan a rescan waits 27 minutes; a compaction
+        // only a minute.
+        let mut m = Maintenance::after_scan(t0, s(180));
+        assert!(m.request("50001 live changes".into()), "starts an episode");
+        assert!(!m.request("50002 live changes".into()));
+        assert_eq!(m.rescan_pending(), None, "a compaction is not a rescan");
+        assert_eq!(m.wake_at(false), Some(t0 + MIN_COMPACT_GAP));
+        assert_eq!(m.due(t0 + s(59), false, false), None);
+        assert_eq!(
+            m.due(t0 + s(60), false, false),
+            Some(Due::Compact("50001 live changes".into())),
+            "the first reason is kept"
+        );
+        assert_eq!(m.due(t0 + s(61), false, false), None, "taken");
+        // A compaction that took 30 s: the next waits 5 times that.
+        let end = t0 + s(100);
+        m.compacted(end, s(30));
+        assert!(m.request("60000 live changes".into()));
+        assert_eq!(m.wake_at(false), Some(end + s(150)));
+        assert_eq!(m.due(end + s(149), false, false), None);
+        assert!(matches!(
+            m.due(end + s(150), false, false),
+            Some(Due::Compact(_))
+        ));
+        // A quick one still waits the minimum, a very slow one at most ten minutes.
+        m.compacted(end, Duration::from_millis(300));
+        m.request("x live changes".into());
+        assert_eq!(m.wake_at(false), Some(end + MIN_COMPACT_GAP));
+        m.compacted(end, s(3600));
+        assert_eq!(m.wake_at(false), Some(end + MAX_COMPACT_GAP));
+        // A delta far past its limit does not wait for the gap.
+        assert!(matches!(
+            m.due(end + s(1), true, false),
+            Some(Due::Compact(_))
+        ));
+        // Folders being read hold it back, urgent or not, without a timer
+        // (the read's answer wakes the maintainer).
+        m.request("y live changes".into());
+        assert_eq!(m.wake_at(true), None);
+        assert_eq!(m.due(end + s(3600), true, true), None);
+        assert!(matches!(
+            m.due(end + s(3600), false, false),
+            Some(Due::Compact(_))
+        ));
+    }
+
+    #[test]
+    fn only_overflow_reasons_are_compacted_and_a_real_rescan_covers_a_compaction() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        for overflow in [
+            "50001 live changes",
+            "12345 replaced entries",
+            "99999 superseded entries",
+        ] {
+            assert!(is_overflow(overflow), "{overflow}");
+        }
+        for rescan in [
+            REASON_MOVED_IN,
+            "a folder moved into an indexed location (too many changes to read its contents live)",
+            REASON_LARGE_MOVE,
+            REASON_ADMIN,
+            "startup",
+            "\\\\?\\Volume{1}: change journal reset: overrun",
+        ] {
+            assert!(!is_overflow(rescan), "{rescan}");
+        }
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request("50001 live changes".into());
+        // A journal reset asks for a rescan: it is shown as pending, and the
+        // compaction is not run first (a fresh scan replaces everything).
+        assert!(m.request("Volume{1}: change journal reset".into()));
+        assert_eq!(
+            m.rescan_pending().map(|(why, _)| why),
+            Some("Volume{1}: change journal reset")
+        );
+        // A 10 s scan: the rescan waits 9 times that.
+        assert_eq!(m.wake_at(false), Some(t0 + s(90)));
+        assert_eq!(m.due(t0 + s(60), false, false), None);
+        assert_eq!(
+            m.due(t0 + s(90), false, false),
+            Some(Due::Rescan("Volume{1}: change journal reset".into()))
+        );
+        // An administrator's request is not held back, and replaces any wait.
+        let mut m = Maintenance::after_scan(t0, s(10));
+        m.request("50001 live changes".into());
+        m.force(t0 + s(5), REASON_ADMIN.into());
+        assert_eq!(
+            m.due(t0 + s(5), false, false),
+            Some(Due::Rescan(REASON_ADMIN.into()))
+        );
+        // Within one batch, the reason that needs the disks wins over the
+        // size of the delta, whichever came first.
+        let mut applied = Applied::default();
+        applied.ask("50001 live changes".into());
+        applied.ask(REASON_LARGE_MOVE.into());
+        applied.ask("60000 replaced entries".into());
+        assert_eq!(applied.rescan.as_deref(), Some(REASON_LARGE_MOVE));
+        let mut first = Applied::default();
+        first.ask("50001 live changes".into());
+        let mut second = Applied::default();
+        second.ask(REASON_MOVED_IN.into());
+        first.absorb(second);
+        assert_eq!(first.rescan.as_deref(), Some(REASON_MOVED_IN));
+        let mut kept = Applied::default();
+        kept.ask("1 live changes".into());
+        kept.ask("2 replaced entries".into());
+        assert_eq!(kept.rescan.as_deref(), Some("1 live changes"));
+    }
+
+    #[test]
+    fn the_new_index_sorts_by_metadata_like_a_fresh_one() {
+        use ferrow_index::{SortKey, SortStatus};
+        let mut w = World::new(7);
+        let (base, map) = scan(&w.fs, &[]);
+        let mut live = Live::new(base, &[map]);
+        drive(&mut w, &mut [&mut live], 15);
+        let new = live.compact().unwrap();
+        let index = new.base();
+        // The sort orders are lazy: empty after a compaction, built when asked.
+        assert!(
+            index_parts(index, "index")
+                .iter()
+                .filter(|p| p.name.ends_with(".order"))
+                .all(|p| p.bytes == 0)
+        );
+        assert_ne!(index.request_sort(SortKey::Size), SortStatus::Unavailable);
+        let started = Instant::now();
+        while index.request_sort(SortKey::Size) != SortStatus::Ready {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "sort never ready"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let order = index.metadata_order(SortKey::Size, false).unwrap();
+        let sizes: Vec<Option<u64>> = order
+            .range(0, order.len())
+            .map(|id| index.metadata(id).size)
+            .collect();
+        assert_eq!(sizes.len(), index.len());
+        let mut sorted = sizes.clone();
+        sorted.sort();
+        assert_eq!(sizes, sorted, "ascending by size");
+        // Name order: the sorted permutation is by folded name.
+        let names: Vec<Vec<u8>> = index
+            .sorted()
+            .iter()
+            .map(|&id| index.folded_name(id).to_vec())
+            .collect();
+        let mut by_name = names.clone();
+        by_name.sort();
+        assert_eq!(names, by_name);
+    }
+
+    #[test]
+    fn compaction_counters_and_kinds() {
+        assert_eq!(KIND_COMPACTION, "compaction");
+        // A compaction is never counted under a reason of a scan.
+        for why in [
+            "50001 live changes",
+            "1 replaced entries",
+            "9 superseded entries",
+        ] {
+            assert_ne!(reason_kind(why), KIND_COMPACTION);
+        }
+        assert_eq!(reason_kind("50001 live changes"), "too many live changes");
     }
 }

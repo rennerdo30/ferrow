@@ -3,7 +3,8 @@
 Written against `5685bef` (main after beta.18), before any change. Part 1 of the plan in
 section 4 is implemented by FR-42 part 1 (see `CHANGELOG.md`, `docs/service.md` and
 `crates/ferrowd/examples/delta_limit_bench.rs`, the measurement example behind the figures
-below); the compaction (section 3 (c), part 2) is not built yet.
+below); the compaction (section 3 (c), part 2) is built by FR-42 part 2 (builder path; see
+section 9 for what it measured).
 
 ## Short answer
 
@@ -365,3 +366,57 @@ about 0.3 ms.
   (333 B per entry), which is 5 % of a 27 M index; a rescan peaks at about 4.3 GB.
 - Not measured: real NTFS record reads, the 18 to 27 M sizes (the figures above are linear
   from 1 M), and the effect of folder-date overrides on the view.
+
+## 9. Part 2 as built (FR-42): in-memory compaction
+
+`Live::compact` (builder path, section 3 (c) stage 1) replaces the disk rescan for the three size
+reasons. `delta_limit_bench` prints a `DELTA-COMPACT` row at each checkpoint. Release build, one
+PC (32 threads, other work running), 1,000,000-entry synthetic base, three runs (the rows agreed
+within about 10 % except one outlier of 1,025 ms on the service pool while the PC was busy);
+`memory_breakdown` at 1 M entries gives the rescan figures.
+
+| Live delta entries | 50 k | 250 k |
+|---|---:|---:|
+| entries in the new index | 1,036,078 | 1,172,705 |
+| compaction, wall, service pool (8 low-priority threads), ms | 104 to 113 | 132 to 138 |
+| compaction, one thread (CPU proxy), ms | 309 to 332 | 341 to 350 |
+| compaction, wall, default pool, ms | 95 to 101 | 112 to 129 |
+| process private-byte peak above the old state, MB | 87 to 88 | 100 |
+| peak per entry of the new index, B | 84.2 to 84.7 | 85.3 to 85.6 |
+| growth once built (old and new held), MB | 77 to 78 | 86 to 87 |
+| new live layer, B per entry | 16.0 | 15.6 |
+| search "report", first 100, ms (with delta / after) | 0.72 / 0.50 | 1.48 / 0.49 |
+| search "build-obj" (delta hits), ms (with delta / after) | 2.07 / 1.42 | 2.17 / 0.48 |
+| search "zzzqq" (no match), ms (with delta / after) | 1.97 / 1.77 | 2.81 / 2.22 |
+
+- **Against a rescan of the same base** (`memory_breakdown`, 1 M entries, synthetic MFT build,
+  one scan with the old index and view held): the scan's peak is 163 B per entry above the old
+  state (163 MB), the compaction's about 85; a rescan of 27 million entries measured 74 s and
+  198 s on the author's PCs and reads the whole file table (or walks the disks), a compaction
+  reads no disk. Linear to 27 M: about 9 s of one thread's CPU (about 3 to 4 s wall on the
+  background pool) and about 2.3 GB of peak, against 74 to 198 s and about 4.4 GB.
+  Both extrapolations are linear and not measured at that size.
+- **Search is not slower, before or after:** a compacted index has no delta to merge, so the
+  searches above are as fast as the plain base (the first page in about 0.5 ms), and faster than
+  with a delta at every row.
+- **Not measured:** 18 to 27 M entries, real NTFS record reads, a compaction racing a real
+  journal storm, the memory the allocator returns to Windows after the old index is freed, the
+  first sort by size or date after a compaction (the orders start empty, as after a scan), and
+  the merge-primitive variant (section 3 (c) stage 2, still a possible later change).
+
+### Effect on the `docs/SPEC.md` section 3 numbers
+
+- **Keystroke to first results, full re-query and sort:** unchanged before a compaction (no search code
+  changed); after it, the same or faster (no delta to merge, no merge sort). The compaction itself
+  does not lock or block a search.
+- **Live change visible in results (at most 1 s):** unchanged normally. A change that arrives while a
+  compaction runs is applied right after it, so it shows about the compaction's duration later:
+  about 0.1 s at 1 M entries (measured), a few seconds at 27 M (extrapolated; that is past the
+  1 s target for those few seconds, but a rescan blocked the maintainer for 74 to 198 s).
+- **Idle daemon (0 % CPU, no timers):** unchanged. A compaction timer exists only while one is
+  waiting for its gap; nothing is armed when the delta is small.
+- **Memory (steady state):** the new live layer is 16 B per entry, as before; a compacted index has
+  no delta, so the steady memory after a compaction is lower than before it. The peak while it runs
+  is about 85 B per entry above the old state, about half of a rescan's.
+- **CPU and disk:** about 9 s of one thread (extrapolated to 27 M) instead of 74 to 198 s of all
+  cores and disk reads, on the low-priority pool.

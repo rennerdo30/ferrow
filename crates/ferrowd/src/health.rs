@@ -73,6 +73,10 @@ struct Inner {
     last_finished: Option<Instant>,
     /// Scans started, by kind of reason.
     scans_by_reason: BTreeMap<String, u64>,
+    /// The last in-memory compaction, how many there were and their total time.
+    compaction: Option<ScanInfo>,
+    compactions: u64,
+    compaction_ms: u64,
 }
 
 /// Least time between the end of one scan and a requested rescan: an
@@ -104,6 +108,9 @@ impl State {
                 volumes: Vec::new(),
                 last_finished: None,
                 scans_by_reason: BTreeMap::new(),
+                compaction: None,
+                compactions: 0,
+                compaction_ms: 0,
             }),
             started: Mutex::new(None),
             live_changes: AtomicU64::new(0),
@@ -212,6 +219,25 @@ impl State {
             .or_default() += 1;
     }
 
+    /// A compaction finished: the live layer grown past `reason`'s limit was
+    /// folded into a new index in memory in `took`. Counted as its own kind
+    /// next to the scans, but it is not a scan: no disk was read and
+    /// [`State::is_scanning`] never said so.
+    pub fn compaction_done(&self, reason: &str, took: Duration) {
+        let mut inner = self.lock();
+        *inner
+            .scans_by_reason
+            .entry(crate::live::KIND_COMPACTION.into())
+            .or_default() += 1;
+        inner.compactions += 1;
+        inner.compaction_ms += took.as_millis() as u64;
+        inner.compaction = Some(ScanInfo {
+            at_ms: now_ms(),
+            reason: reason.into(),
+            took_ms: took.as_millis() as u64,
+        });
+    }
+
     /// A background read of a moved-in folder finished with `entries`,
     /// `skipped` subfolders having vanished meanwhile.
     pub fn folder_read(&self, entries: usize, skipped: usize, took: Duration) {
@@ -295,6 +321,7 @@ impl State {
                 journal_detail: v.journal_detail.clone(),
                 last_scan: inner.scan.clone(),
                 rescan_pending: inner.pending.clone(),
+                last_compaction: inner.compaction.clone(),
             })
             .collect();
         let mut health = Health {
@@ -320,6 +347,8 @@ impl State {
                 folder_read_skipped: self.folder_read_skipped.load(Ordering::Relaxed),
                 folder_read_fallbacks: self.folder_read_fallbacks.load(Ordering::Relaxed),
                 scans_by_reason: inner.scans_by_reason.clone(),
+                compactions: inner.compactions,
+                compaction_ms: inner.compaction_ms,
             },
             events,
             ..Health::default()
@@ -572,6 +601,46 @@ mod tests {
         assert!(json.contains("\"scans_by_reason\""), "{json}");
         let old = ferrow_ipc::health::Health::from_json(r#"{"version":"1"}"#).unwrap();
         assert_eq!(old.live_stats, LiveStats::default());
+    }
+
+    #[test]
+    fn a_compaction_is_counted_as_its_own_kind_and_is_not_a_scan() {
+        let state = State::new();
+        state.scan_started();
+        state.scan_finished("startup", Duration::from_secs(70), vec![live_volume()]);
+        state.count_scan("startup");
+        state.compaction_done("50001 live changes", Duration::from_millis(12_400));
+        state.compaction_done("60000 live changes", Duration::from_millis(600));
+        assert!(!state.is_scanning(), "folding in memory reads no disk");
+        let store = SnapshotStore::new(Snapshot::empty());
+        let policy = Policy {
+            mode: AccessMode::Everyone,
+            users: vec![],
+        };
+        let report = state.report(&store, &policy);
+        let stats = &report.live_stats;
+        assert_eq!(stats.scans_by_reason["compaction"], 2);
+        assert_eq!(stats.scans_by_reason["startup"], 1);
+        assert_eq!((stats.compactions, stats.compaction_ms), (2, 13_000));
+        // The volume still reports its last real scan, and the last compaction
+        // beside it with its own time.
+        let volume = &report.volumes[0];
+        assert_eq!(volume.last_scan.as_ref().unwrap().reason, "startup");
+        let last = volume.last_compaction.as_ref().unwrap();
+        assert_eq!(
+            (last.reason.as_str(), last.took_ms),
+            ("60000 live changes", 600)
+        );
+        assert!(last.at_ms > 0);
+        // Additive on the wire: a report of an older service has none.
+        let json = report.to_json();
+        assert!(json.contains("\"last_compaction\"") && json.contains("\"compactions\":2"));
+        let old = ferrow_ipc::health::Health::from_json(
+            r#"{"live_stats":{"folder_reads":1},"volumes":[{"root":"C:\\"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.live_stats.compactions, 0);
+        assert_eq!(old.volumes[0].last_compaction, None);
     }
 
     #[test]
