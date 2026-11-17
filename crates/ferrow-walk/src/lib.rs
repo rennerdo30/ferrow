@@ -69,6 +69,9 @@ pub struct ScanReport {
     /// existing exclude could not be fully resolved. The index is
     /// empty and must not be persisted as a scan result.
     pub fatal_error: Option<String>,
+    /// Roots on an NTFS volume whose fast MFT read failed and that were
+    /// walked instead, with the error the read gave: `(root, error)`.
+    pub fast_read_errors: Vec<(PathBuf, String)>,
     pub elapsed: Duration,
 }
 
@@ -669,6 +672,10 @@ pub struct VolumeMap {
     pub serial: u64,
     /// Change journal id and the position to continue reading from.
     pub journal: Option<(u64, i64)>,
+    /// Set when the change journal could not be re-checked after the MFT
+    /// read (the volume is still live, from before the read): changes just
+    /// before the scan may show their old state until the next scan.
+    pub warning: Option<String>,
     pub record_size: usize,
     /// `(record number, entry id)` for every entry from this volume,
     /// including root entries. A record with several names (hard links)
@@ -730,6 +737,7 @@ fn scan_inner(
                 errors: errors.count.load(Ordering::Relaxed),
                 error_samples: errors.samples.into_inner().expect("error samples poisoned"),
                 fatal_error: Some(fatal),
+                fast_read_errors: Vec::new(),
                 elapsed: started.elapsed(),
             };
             return (builder.freeze(), report, Vec::new());
@@ -837,6 +845,8 @@ fn scan_inner(
     let mut modes: Vec<String> = Vec::new();
     #[allow(unused_mut, reason = "only filled on Windows")]
     let mut maps: Vec<VolumeMap> = Vec::new();
+    #[allow(unused_mut, reason = "only filled on Windows")]
+    let mut fast_read_errors: Vec<(PathBuf, String)> = Vec::new();
     #[cfg(windows)]
     let root_dirs = if options.follow_symlinks || options.ntfs == NtfsMode::Off {
         root_dirs
@@ -844,7 +854,7 @@ fn scan_inner(
         let (mft, walk): (Vec<_>, Vec<_>) = root_dirs
             .into_iter()
             .partition(|(dir, _, _)| options.ntfs == NtfsMode::AllRoots || is_volume_root(dir));
-        let mut rest = scan_from_mft(mft, &walker, &mut modes, &mut maps);
+        let mut rest = scan_from_mft(mft, &walker, &mut modes, &mut maps, &mut fast_read_errors);
         rest.extend(walk);
         rest
     };
@@ -880,6 +890,7 @@ fn scan_inner(
         errors: errors.count.load(Ordering::Relaxed),
         error_samples: errors.samples.into_inner().expect("error samples poisoned"),
         fatal_error: None,
+        fast_read_errors,
         elapsed: started.elapsed(),
     };
     (index, report, maps)
@@ -893,6 +904,7 @@ fn scan_from_mft(
     walker: &Walker<'_>,
     modes: &mut Vec<String>,
     maps: &mut Vec<VolumeMap>,
+    read_errors: &mut Vec<(PathBuf, String)>,
 ) -> Vec<(PathBuf, u32, Option<FileId>)> {
     let mut pending: Vec<(PathBuf, u32, Option<FileId>)> = root_dirs;
     let mut walk = Vec::new();
@@ -902,6 +914,7 @@ fn scan_from_mft(
             Ok(v) => v,
             Err(reason) => {
                 modes.push(format!("walk {} ({reason})", dir.display()));
+                read_errors.push((dir.clone(), reason));
                 walk.push((dir, id, identity));
                 continue;
             }
@@ -923,6 +936,7 @@ fn scan_from_mft(
             device: device.clone(),
             serial: volume.serial,
             journal: volume.journal,
+            warning: volume.warning.clone(),
             record_size: volume.record_size,
             excluded: walker
                 .excludes

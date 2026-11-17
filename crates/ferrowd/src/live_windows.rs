@@ -118,12 +118,25 @@ fn root_key(root: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Why a volume root that the fast read did not cover was walked: the error
+/// the read gave when there is one, a guess only when there is none.
+fn walked_reason(can_read_volume: bool, error: Option<&str>) -> String {
+    if !can_read_volume {
+        return "reading the MFT needs raw volume access (administrator or SYSTEM)".into();
+    }
+    match error.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(error) => format!("reading the MFT failed ({error}); walked instead"),
+        None => "the volume is not NTFS or its MFT could not be read; walked instead".into(),
+    }
+}
+
 /// How each configured root is read and, for volumes read through their MFT,
 /// what the scan found (device, entries, journal).
 fn describe_volumes(
     options: &WalkOptions,
     base: &ferrow_index::Index,
     maps: &[VolumeMap],
+    read_errors: &[(std::path::PathBuf, String)],
 ) -> Vec<VolumeState> {
     let mut buf = Vec::new();
     let found: Vec<(Vec<String>, &VolumeMap)> = maps
@@ -156,12 +169,12 @@ fn describe_volumes(
             }
             let key = root_key(&text);
             let Some((_, map)) = found.iter().find(|(roots, _)| roots.contains(&key)) else {
-                let why = if ntfs::can_read_volume(root) {
-                    "the volume is not NTFS or its MFT could not be read; walked instead"
-                } else {
-                    "reading the MFT needs raw volume access (administrator or SYSTEM)"
-                };
-                return VolumeState::walked(text, why);
+                let error = read_errors
+                    .iter()
+                    .find(|(dir, _)| root_key(&dir.display().to_string()) == key)
+                    .map(|(_, error)| error.as_str());
+                let why = walked_reason(ntfs::can_read_volume(root), error);
+                return VolumeState::walked(text, &why);
             };
             let journal = map.journal.is_some();
             VolumeState {
@@ -175,7 +188,9 @@ fn describe_volumes(
                 },
                 entries: Some(map.entries.len() as u64),
                 journal: if journal { JOURNAL_OK } else { JOURNAL_NONE },
-                journal_detail: String::new(),
+                // A journal that could not be re-checked after the MFT read:
+                // still live, with what may be stale.
+                journal_detail: map.warning.clone().unwrap_or_default(),
             }
         })
         .collect()
@@ -420,7 +435,15 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             took.as_secs_f64()
         );
         eventlog::info(&summary);
-        STATE.scan_finished(&reason, took, describe_volumes(&options, &base, &maps));
+        let volumes = describe_volumes(&options, &base, &maps, &report.fast_read_errors);
+        // A volume that is live but could not re-check its change journal
+        // after the MFT read: visible in the event log as well as in health.
+        for v in volumes.iter().filter(|v| v.journal == JOURNAL_OK) {
+            if !v.journal_detail.is_empty() {
+                eventlog::warn(format!("{}: {}", v.root, v.journal_detail));
+            }
+        }
+        STATE.scan_finished(&reason, took, volumes);
         store.swap(Snapshot {
             index: base.clone(),
             live: None,
@@ -786,6 +809,29 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_walked_volume_shows_the_error_the_fast_read_gave() {
+        let os87 = "read change journal: Falscher Parameter. (os error 87)";
+        assert_eq!(
+            walked_reason(true, Some(os87)),
+            format!("reading the MFT failed ({os87}); walked instead")
+        );
+        // The guess is only for no error text at all.
+        for none in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                walked_reason(true, none),
+                "the volume is not NTFS or its MFT could not be read; walked instead"
+            );
+        }
+        // Without raw volume access the read never ran, whatever else is known.
+        for error in [None, Some(os87)] {
+            assert_eq!(
+                walked_reason(false, error),
+                "reading the MFT needs raw volume access (administrator or SYSTEM)"
+            );
+        }
+    }
     use ferrow_index::{ColumnSet, IndexBuilder, flags};
     use ferrow_walk::ntfs::RecordInfo;
 
