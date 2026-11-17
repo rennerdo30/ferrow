@@ -362,21 +362,13 @@ fn snapshot_search(
             ..options.clone()
         },
     );
-    // The delta is small: search it in name order, then order its hits
-    // the way the frozen search ordered its own.
-    let delta = ferrow_query::search(
-        &live.delta,
-        query,
-        &SearchOptions {
-            sort: ferrow_query::SortKey::Name,
-            descending: false,
-            limit: None,
-            allowed: Some(live.delta_allowed.clone()),
-            cancel: options.cancel.clone(),
-            ..SearchOptions::default()
-        },
-    );
-    result.cancelled |= delta.cancelled;
+    // The delta is searched in name order, then its hits are ordered the way
+    // the frozen search ordered its own. When the result is in name order
+    // itself, the delta's first `limit` hits in name order are all the merge
+    // can use, so the search stops after them (a first-page query then does
+    // not scan the whole delta) and its order is already the merge order
+    // (folded name, name, id). Descending name order keeps the full search:
+    // reversing the walk would reverse the order of equal names too.
     let key = if result.sort_status == ferrow_query::SortStatus::Ready {
         options.sort
     } else {
@@ -384,6 +376,24 @@ fn snapshot_search(
     };
     let descending = options.descending
         && (key != ferrow_query::SortKey::Name || options.sort == ferrow_query::SortKey::Name);
+    let by_name_ascending = key == ferrow_query::SortKey::Name && !descending;
+    let delta = ferrow_query::search(
+        &live.delta,
+        query,
+        &SearchOptions {
+            sort: ferrow_query::SortKey::Name,
+            descending: false,
+            limit: if by_name_ascending {
+                options.limit
+            } else {
+                None
+            },
+            allowed: Some(live.delta_allowed.clone()),
+            cancel: options.cancel.clone(),
+            ..SearchOptions::default()
+        },
+    );
+    result.cancelled |= delta.cancelled;
     let compare = |a: Hit, b: Hit| -> std::cmp::Ordering {
         let (ia, ib) = (snapshot.index_of(a), snapshot.index_of(b));
         let by_name = || {
@@ -412,7 +422,9 @@ fn snapshot_search(
         .iter()
         .map(|&id| Hit { delta: true, id })
         .collect();
-    extra.sort_by(|&a, &b| compare(a, b));
+    if !by_name_ascending {
+        extra.sort_by(|&a, &b| compare(a, b));
+    }
     let base: Vec<Hit> = result
         .hits
         .iter()
@@ -1046,5 +1058,220 @@ mod shutdown_tests {
         listener.cancel().unwrap(); // bound cleanup even with the handshake broken
         thread.join().unwrap();
         assert!(stopped.unwrap());
+    }
+}
+
+/// The delta search is given the page limit when the result is in ascending
+/// name order. The merged hits must be exactly what the unlimited search of
+/// the delta plus a full re-sort gave (the reference below is that code).
+#[cfg(test)]
+mod delta_search_tests {
+    use super::*;
+    use ferrow_fixture::Rng;
+    use ferrow_index::{ColumnSet, EntryMetadata, flags};
+    use ferrow_query::SortKey;
+    use live::LiveView;
+
+    const WORDS: [&str; 7] = ["alpha", "Alpha", "ALPHA", "beta", "report", "Report", "a"];
+
+    fn random_name(rng: &mut Rng) -> String {
+        let word = WORDS[rng.below(WORDS.len())];
+        match rng.below(3) {
+            0 => word.to_string(),
+            1 => format!("{word}-{}", rng.below(4)),
+            _ => format!("{word}.txt"),
+        }
+    }
+
+    fn meta(rng: &mut Rng) -> EntryMetadata {
+        EntryMetadata {
+            size: Some(rng.below(6) as u64),
+            modified: Some(rng.below(6) as i64),
+            ..EntryMetadata::default()
+        }
+    }
+
+    /// A frozen index of `n` entries and a delta of `m` entries (below a
+    /// shadow root), many with equal or case-different names.
+    fn snapshot(rng: &mut Rng, n: usize, m: usize) -> Snapshot {
+        let base = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let root = base.add_root(b"C:", flags::DIR);
+        for _ in 0..n {
+            let name = random_name(rng);
+            base.add_with_metadata(root, name.as_bytes(), 0, meta(rng));
+        }
+        let base = base.freeze();
+        let mut allowed = vec![u64::MAX; base.len().div_ceil(64)];
+        for id in 0..base.len() {
+            if rng.chance(1, 8) {
+                allowed[id / 64] &= !(1 << (id % 64));
+            }
+        }
+        let delta = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let shadow = delta.add_root(b"C:", flags::DIR);
+        for _ in 0..m {
+            let name = random_name(rng);
+            delta.add_with_metadata(shadow, name.as_bytes(), 0, meta(rng));
+        }
+        let delta = delta.freeze();
+        let mut delta_allowed = vec![u64::MAX; delta.len().div_ceil(64)];
+        for id in 0..delta.len() as u32 {
+            if delta.parent(id) == ferrow_index::ROOT_PARENT {
+                delta_allowed[id as usize / 64] &= !(1 << (id % 64));
+            }
+        }
+        Snapshot {
+            index: Arc::new(base),
+            live: Some(Arc::new(LiveView {
+                entries: 0,
+                allowed: Arc::new(allowed),
+                delta: Arc::new(delta),
+                delta_allowed: Arc::new(delta_allowed),
+                overrides: Arc::new(Default::default()),
+            })),
+            mode: "live".into(),
+            report: String::new(),
+        }
+    }
+
+    /// The search before the limit was passed down: the whole delta in name
+    /// order, then sorted again with the merge's comparison.
+    fn reference(snapshot: &Snapshot, query: &Query, options: &SearchOptions) -> Vec<Hit> {
+        let live = snapshot.live.as_ref().unwrap();
+        let result = ferrow_query::search(
+            &snapshot.index,
+            query,
+            &SearchOptions {
+                allowed: Some(live.allowed.clone()),
+                ..options.clone()
+            },
+        );
+        let delta = ferrow_query::search(
+            &live.delta,
+            query,
+            &SearchOptions {
+                sort: SortKey::Name,
+                descending: false,
+                limit: None,
+                allowed: Some(live.delta_allowed.clone()),
+                cancel: options.cancel.clone(),
+                ..SearchOptions::default()
+            },
+        );
+        let key = if result.sort_status == ferrow_query::SortStatus::Ready {
+            options.sort
+        } else {
+            SortKey::Name
+        };
+        let descending =
+            options.descending && (key != SortKey::Name || options.sort == SortKey::Name);
+        let compare = |a: Hit, b: Hit| -> std::cmp::Ordering {
+            let (ia, ib) = (snapshot.index_of(a), snapshot.index_of(b));
+            let by_name = || {
+                ia.folded_name(a.id)
+                    .cmp(ib.folded_name(b.id))
+                    .then_with(|| ia.name(a.id).cmp(ib.name(b.id)))
+                    .then(a.delta.cmp(&b.delta))
+            };
+            if key == SortKey::Name {
+                let o = by_name();
+                return if descending { o.reverse() } else { o };
+            }
+            let value = |h: Hit, i: &Index| i.metadata_value(key, h.id);
+            match (value(a, ia), value(b, ib)) {
+                (Some(x), Some(y)) => {
+                    let o = x.cmp(&y);
+                    (if descending { o.reverse() } else { o }).then_with(by_name)
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => by_name(),
+            }
+        };
+        let mut extra: Vec<Hit> = delta
+            .hits
+            .iter()
+            .map(|&id| Hit { delta: true, id })
+            .collect();
+        extra.sort_by(|&a, &b| compare(a, b));
+        let base: Vec<Hit> = result
+            .hits
+            .iter()
+            .map(|&id| Hit { delta: false, id })
+            .collect();
+        let mut merged = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        while i < base.len() || j < extra.len() {
+            let take_base = j == extra.len()
+                || (i < base.len() && compare(base[i], extra[j]) != std::cmp::Ordering::Greater);
+            if take_base {
+                merged.push(base[i]);
+                i += 1;
+            } else {
+                merged.push(extra[j]);
+                j += 1;
+            }
+        }
+        if let Some(limit) = options.limit {
+            merged.truncate(limit);
+        }
+        merged
+    }
+
+    #[test]
+    fn the_limited_delta_search_gives_the_same_page_as_the_unlimited_one() {
+        let mut compared = 0usize;
+        let mut mixed = 0usize;
+        for seed in 0..25u64 {
+            let mut rng = Rng::new(seed + 1);
+            let (n, m) = (40 + rng.below(300), 1 + rng.below(200));
+            let snap = snapshot(&mut rng, n, m);
+            // Metadata orders are built in the background on first use; a
+            // search before they are ready falls back to name order, which
+            // would compare a different path with itself.
+            for key in [SortKey::Size, SortKey::Modified] {
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while snap.index.request_sort(key) != ferrow_index::SortStatus::Ready {
+                    assert!(std::time::Instant::now() < until, "sort order never ready");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            for text in ["", "alpha", "report", "a", "-1", ".txt", "zzz"] {
+                let query = Query::parse(text).unwrap();
+                for (sort, descending) in [
+                    (SortKey::Name, false),
+                    (SortKey::Name, true),
+                    (SortKey::Size, false),
+                    (SortKey::Size, true),
+                    (SortKey::Modified, false),
+                ] {
+                    for limit in [None, Some(0), Some(1), Some(7), Some(50), Some(1000)] {
+                        let options = SearchOptions {
+                            sort,
+                            descending,
+                            limit,
+                            ..SearchOptions::default()
+                        };
+                        let (got, _) = snapshot_search(&snap, &query, &options);
+                        let want = reference(&snap, &query, &options);
+                        assert!(
+                            got == want,
+                            "seed {seed} query {text:?} sort {sort:?} desc {descending} limit {limit:?}: {} hits against {}",
+                            got.len(),
+                            want.len()
+                        );
+                        compared += 1;
+                        if got.iter().any(|h| h.delta) && got.iter().any(|h| !h.delta) {
+                            mixed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // The comparison must have exercised pages that mix both sources.
+        assert!(
+            compared > 4000 && mixed > compared / 4,
+            "{mixed}/{compared}"
+        );
     }
 }

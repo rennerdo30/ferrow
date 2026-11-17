@@ -31,39 +31,90 @@ use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
 use ferrow_walk::subtree::{Limits, Subtree, WalkError};
 
-/// Rescan once the overlay holds this many live delta entries…
-const MAX_DELTA: usize = 50_000;
+/// Rescan once the overlay holds more live delta entries than
+/// [`DeltaLimits::max_delta`] (about 1 % of the index, never less than this)…
+pub const MIN_DELTA: usize = 50_000;
+/// …and never more than this (a view of this many entries takes about
+/// 100 ms to build and about 80 MB to hold).
+pub const MAX_DELTA_CAP: usize = 250_000;
 /// …or once this share of frozen entries is hidden (1/10)…
 const MAX_REMOVED_DIVISOR: usize = 10;
 /// …or a single folder move would copy more than this many entries.
 const MAX_MOVE: usize = 100_000;
 
+/// The size limits of the live layer. They follow the index: a fixed limit
+/// asked a PC with 27 million entries for a full rescan (over a minute of
+/// heavy CPU and disk) as often as one with 1 million, though the overlay
+/// costs the same per entry on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaLimits {
+    /// Rescan when more delta entries than this are alive; also the room a
+    /// folder read in the background can fill.
+    pub max_delta: usize,
+    /// Rescan when more delta entries than this are dead (replaced or
+    /// deleted again, kept until the next rescan). Twice `max_delta`: dead
+    /// entries cost memory only (a view skips them), and git or a build
+    /// that creates and deletes a temporary folder of tens of thousands of
+    /// files must not cost a full rescan.
+    pub max_dead: usize,
+    /// A pending rescan starts at once when the delta, dead entries
+    /// included, grows past this (bounds its memory and per-batch view cost:
+    /// at most 750,000 entries, a few hundred MB in the worst case).
+    pub hard_delta: usize,
+    /// Records remembered as changed while walks run.
+    pub max_touched: usize,
+}
+
+impl DeltaLimits {
+    /// The limits for a frozen index of `base_len` entries.
+    pub fn for_base(base_len: usize) -> DeltaLimits {
+        let max_delta = max_delta(base_len);
+        DeltaLimits {
+            max_delta,
+            max_dead: 2 * max_delta,
+            hard_delta: MIN_HARD_DELTA.max(3 * max_delta),
+            max_touched: max_delta,
+        }
+    }
+}
+
+/// Live delta entries a frozen index of `base_len` entries may carry before
+/// a rescan is asked for: 1 %, between [`MIN_DELTA`] and [`MAX_DELTA_CAP`]
+/// (1 million entries: 50,000; 18.6 million: 186,000; 27 million: 250,000).
+pub fn max_delta(base_len: usize) -> usize {
+    (base_len / 100).clamp(MIN_DELTA, MAX_DELTA_CAP)
+}
+
+/// The least [`DeltaLimits::hard_delta`] (8 times the smallest `max_delta`).
+const MIN_HARD_DELTA: usize = 8 * MIN_DELTA;
+
 /// A folder moved in from outside the index is read by a background walk of
 /// at most this many entries (and never more than the delta has room for:
-/// every walked entry becomes a delta entry, and past [`MAX_DELTA`] a
-/// rescan is asked for anyway), …
+/// every walked entry becomes a delta entry, and past
+/// [`DeltaLimits::max_delta`] a rescan is asked for anyway), …
 const MIN_WALK_BUDGET: usize = 1_000;
 /// …at most this long (a cold hard disk lists on the order of 10,000
-/// entries per second, so a full budget fits; a rescan reads 27 million
+/// entries per second, so 300,000 entries fit; a larger budget can run out
+/// of time first, which falls back to a rescan; a rescan reads 27 million
 /// entries in about 74 s on the owner's PC, which is cheaper per entry
 /// beyond that), …
 pub const MAX_WALK_TIME: Duration = Duration::from_secs(30);
 /// A finished walk at least this long is an event in the service log.
 pub const NOTABLE_WALK: Duration = Duration::from_secs(1);
 /// What the log line at the start of a live session says is on.
-pub fn walk_limits_text() -> String {
+pub fn walk_limits_text(base_len: usize) -> String {
     format!(
-        "up to {MAX_DELTA} entries and {} s each, at most {MAX_WALKS} at once",
+        "up to {} entries and {} s each, at most {MAX_WALKS} at once",
+        max_delta(base_len),
         MAX_WALK_TIME.as_secs()
     )
 }
 /// …with this many folders waiting at once (a package manager moves dozens
 /// of sibling folders in one burst; the reader takes them one by one), …
 const MAX_WALKS: usize = 64;
-/// …at most this many records remembered as changed while walks run (they
-/// are looked at again once a result is merged), …
-const MAX_TOUCHED: usize = MAX_DELTA;
-/// …and a walk the reader has not finished this long after its time budget
+/// (At most [`DeltaLimits::max_touched`] records are remembered as changed
+/// while walks run; they are looked at again once a result is merged.)
+/// A walk the reader has not finished this long after its time budget
 /// is given up (a folder on a hung network share or cloud placeholder can
 /// block the listing call itself).
 pub const WALK_SLACK: Duration = Duration::from_secs(10);
@@ -75,6 +126,8 @@ const RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 pub const REASON_MOVED_IN: &str = "a folder moved into an indexed location";
 pub const REASON_LARGE_MOVE: &str = "a large folder moved";
 pub const REASON_ADMIN: &str = "requested by an administrator";
+/// The end of the reason text for a delta full of dead entries (`"N …"`).
+const REASON_SUPERSEDED_SUFFIX: &str = "superseded entries";
 
 /// The counter a rescan reason belongs to (reasons carry numbers and
 /// device names, so they cannot be counted as written).
@@ -87,6 +140,8 @@ pub fn reason_kind(reason: &str) -> &'static str {
         "too many live changes"
     } else if reason.ends_with(" replaced entries") {
         "too many replaced entries"
+    } else if reason.ends_with(REASON_SUPERSEDED_SUFFIX) {
+        "too many superseded entries"
     } else if reason == REASON_ADMIN {
         "administrator"
     } else if reason == "startup" {
@@ -103,10 +158,6 @@ const RESCAN_DUTY: u32 = 9;
 const MIN_RESCAN_GAP: Duration = Duration::from_secs(60);
 /// …and at most this long.
 const MAX_RESCAN_GAP: Duration = Duration::from_secs(30 * 60);
-/// A pending rescan starts at once when the delta, removed entries
-/// included, grows past this (bounds its memory and per-batch view cost).
-pub const HARD_DELTA: usize = 8 * MAX_DELTA;
-
 /// When a requested rescan may start. A rescan is a full scan: on a busy
 /// disk the triggers (a folder moved in, a full delta, a journal reset)
 /// can arrive every few seconds, and rescanning on each kept the service
@@ -153,7 +204,7 @@ impl RescanPolicy {
     }
 
     /// The reason to rescan now: one is pending and its gap has passed, or
-    /// `urgent` (the delta outgrew [`HARD_DELTA`]).
+    /// `urgent` (the delta outgrew [`DeltaLimits::hard_delta`]).
     pub fn due(&mut self, now: Instant, urgent: bool) -> Option<String> {
         if self.pending.is_some() && (urgent || now >= self.earliest) {
             self.pending.take()
@@ -165,6 +216,65 @@ impl RescanPolicy {
     /// When the maintainer must wake to start a pending rescan.
     pub fn wake_at(&self) -> Option<Instant> {
         self.pending.as_ref().map(|_| self.earliest)
+    }
+}
+
+/// A view build may use this share of the time (1 in 11): the next view is
+/// published this many times the last build's duration after the last one.
+const PUBLISH_DUTY: u32 = 10;
+/// …but never wait longer than this to show a change.
+const MAX_PUBLISH_GAP: Duration = Duration::from_secs(5);
+
+/// When the maintainer may publish the next view. Building a view costs time
+/// in proportion to the delta (about 0.5 µs of CPU per entry); doing it after
+/// every 200 ms batch of a long storm (a build, an install) kept a core busy.
+/// Changes that arrive meanwhile are already merged into [`Live`], so waiting
+/// loses nothing: the next view shows all of them. The last batch is always
+/// published, at the latest when the gap has passed. A search never waits for
+/// a build: it reads the snapshot published before.
+#[derive(Debug, Default)]
+pub struct PublishGate {
+    /// When the last view was published (none yet: the first goes at once).
+    last: Option<Instant>,
+    /// How long that view took to build.
+    build: Duration,
+    /// Changes were applied since the last view.
+    dirty: bool,
+}
+
+impl PublishGate {
+    pub fn new() -> PublishGate {
+        PublishGate::default()
+    }
+
+    /// Changes were applied: a view is owed.
+    pub fn changed(&mut self) {
+        self.dirty = true;
+    }
+
+    /// The wait after a publish: [`PUBLISH_DUTY`] times the build time.
+    fn gap(&self) -> Duration {
+        (self.build * PUBLISH_DUTY).min(MAX_PUBLISH_GAP)
+    }
+
+    /// A view is owed and its time has come.
+    pub fn due(&self, now: Instant) -> bool {
+        self.dirty && self.last.is_none_or(|last| now >= last + self.gap())
+    }
+
+    /// When the maintainer must wake to publish an owed view.
+    pub fn wake_at(&self) -> Option<Instant> {
+        self.dirty
+            .then(|| self.last.map(|last| last + self.gap()))
+            .flatten()
+    }
+
+    /// A view that took `build` to make was published at `now` (the end of
+    /// the build); it showed every change so far.
+    pub fn published(&mut self, now: Instant, build: Duration) {
+        self.last = Some(now);
+        self.build = build;
+        self.dirty = false;
     }
 }
 
@@ -366,6 +476,7 @@ struct Touch {
 
 pub struct Live {
     base: Arc<Index>,
+    limits: DeltaLimits,
     columns: ColumnSet,
     removed: Vec<u64>,
     removed_count: usize,
@@ -425,6 +536,7 @@ impl Live {
             });
         }
         Live {
+            limits: DeltaLimits::for_base(n),
             columns: base.columns_present(),
             removed: vec![0; n.div_ceil(64)],
             removed_count: 0,
@@ -446,6 +558,11 @@ impl Live {
 
     pub fn base(&self) -> &Arc<Index> {
         &self.base
+    }
+
+    /// The size limits of this layer (they follow the frozen index).
+    pub fn limits(&self) -> DeltaLimits {
+        self.limits
     }
 
     fn is_alive(&self, loc: Loc) -> bool {
@@ -776,10 +893,18 @@ impl Live {
 
     /// Ask for a rescan when the overlay has outgrown its limits.
     fn check_limits(&self, applied: &mut Applied) {
-        if self.delta_alive > MAX_DELTA {
+        if self.delta_alive > self.limits.max_delta {
             applied
                 .rescan
                 .get_or_insert_with(|| format!("{} live changes", self.delta_alive));
+        }
+        // Entries replaced or deleted again stay in the delta until the next
+        // rescan: few live ones among many dead still cost memory.
+        let dead = self.delta.len() - self.delta_alive;
+        if dead > self.limits.max_dead {
+            applied
+                .rescan
+                .get_or_insert_with(|| format!("{dead} {REASON_SUPERSEDED_SUFFIX}"));
         }
         if self.removed_count > self.base.len() / MAX_REMOVED_DIVISOR + 1000 {
             applied
@@ -812,11 +937,11 @@ impl Live {
         self.trim_log();
     }
 
-    /// Keep the log within [`MAX_TOUCHED`] records: the oldest walks lose
+    /// Keep the log within [`DeltaLimits::max_touched`] records: the oldest walks lose
     /// their window first (they fall back to the rescan when they finish),
     /// younger ones keep theirs.
     fn trim_log(&mut self) {
-        while self.log.len() > MAX_TOUCHED {
+        while self.log.len() > self.limits.max_touched {
             let Some(oldest) = self
                 .walks
                 .iter()
@@ -919,7 +1044,7 @@ impl Live {
             self.walks[above].covered.push((record, sequence));
             return Ok(());
         }
-        let budget = MAX_DELTA.saturating_sub(self.delta_alive);
+        let budget = self.limits.max_delta.saturating_sub(self.delta_alive);
         if self.walks.len() >= MAX_WALKS || budget < MIN_WALK_BUDGET {
             return Err(format!(
                 "{REASON_MOVED_IN} (too many changes to read its contents live)"
@@ -1234,9 +1359,12 @@ impl Live {
             if old.iter().all(|&l| self.metadata_of(l) == new_metadata) {
                 return Ok(());
             }
-            if descended {
-                // A folder's own size or dates: keep its entry so its
-                // children stay attached.
+            // A folder's own size or dates keep its entry so its children
+            // stay attached. A file that already lives in the delta is
+            // updated in place too: replacing its entry would leave a dead
+            // one behind (and cost a view entry) on every write of a busy
+            // log or database file.
+            if descended || old.iter().all(|l| matches!(l, Loc::Delta(_))) {
                 for &loc in &old {
                     match loc {
                         Loc::Base(id) => {
@@ -1793,7 +1921,7 @@ mod tests {
         assert_eq!((job.volume, job.record), (0, 60));
         assert_eq!(
             job.limits.max_entries,
-            MAX_DELTA - 1,
+            MIN_DELTA - 1,
             "the room left after the folder itself"
         );
         assert_eq!(job.limits.max_time, MAX_WALK_TIME);
@@ -1839,13 +1967,13 @@ mod tests {
         }
         live.apply(&changes, &f);
         let r = live.apply(&[change(60, false)], &f);
-        assert_eq!(r.walks[0].limits.max_entries, MAX_DELTA - 2000 - 1);
+        assert_eq!(r.walks[0].limits.max_entries, MIN_DELTA - 2000 - 1);
         // With the delta nearly full there is no room to read a folder into:
         // ask for the rescan right away (and do not start a walk).
         let (base, map) = fixture();
         let mut live = Live::new(base, &[map]);
         let mut changes = Vec::new();
-        for i in 0..(MAX_DELTA - 500) as u64 {
+        for i in 0..(MIN_DELTA - 500) as u64 {
             f.set(5000 + i, file_info(1), &[(20, &format!("m{i}.txt"))]);
             changes.push(change(5000 + i, true));
         }
@@ -1979,7 +2107,7 @@ mod tests {
     fn too_many_changes_during_a_walk_fall_back_to_the_rescan() {
         let f = moved_in();
         let (mut live, _, job) = after_move_in(&f);
-        let flood: Vec<Change> = (0..MAX_TOUCHED as u64 + 1)
+        let flood: Vec<Change> = (0..live.limits().max_touched as u64 + 1)
             .map(|r| change(10_000 + r, false))
             .collect();
         live.apply(&flood, &f);
@@ -2213,7 +2341,7 @@ mod tests {
         f.set(101, file_info(1), &[(100, "o.txt")]);
         let (mut live, _, first) = after_move_in(&f);
         // Many changes outside the index while the first walk runs…
-        let flood: Vec<Change> = (0..MAX_TOUCHED as u64 - 10)
+        let flood: Vec<Change> = (0..live.limits().max_touched as u64 - 10)
             .map(|r| change(10_000 + r, false))
             .collect();
         live.apply(&flood, &f);
@@ -2344,7 +2472,7 @@ mod tests {
         // them all.
         let after: Vec<Change> = (0..20_000u64).map(|r| change(100_000 + r, false)).collect();
         live.apply(&after, &f);
-        assert!(live.log.len() <= MAX_TOUCHED);
+        assert!(live.log.len() <= live.limits().max_touched);
         let (a, b) = (&live.walks[0], &live.walks[1]);
         assert!(a.overflowed, "the oldest walk lost its window");
         assert!(!b.overflowed, "the younger one keeps its own");
@@ -2599,5 +2727,206 @@ mod tests {
             paths(&base, &live.view()),
             ["C:", "C:\\Docs", "C:\\Docs\\a.txt", "C:\\Docs\\b-link.txt"]
         );
+    }
+
+    #[test]
+    fn a_rewritten_file_keeps_one_delta_entry() {
+        // A log or database file written again and again: the first write
+        // moves its frozen entry into the delta, every later one updates
+        // that entry. Replacing it each time left one dead entry per write
+        // (2000 batches gave a delta of 2000 with one alive).
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        f.set(40, file_info(9), &[(20, "new.txt")]);
+        live.apply(&[change(40, true)], &f);
+        for size in 100..2100u64 {
+            f.set(21, file_info(size), &[(20, "a.txt")]);
+            f.set(40, file_info(size), &[(20, "new.txt")]);
+            let r = live.apply(&[change(21, false), change(40, false)], &f);
+            assert_eq!(r.changed, 2);
+            assert_eq!(r.rescan, None);
+        }
+        assert_eq!(live.delta_len(), 2, "one entry for each file, no dead ones");
+        assert_eq!(live.delta_alive, 2);
+        assert_eq!(live.delta_children.values().map(Vec::len).sum::<usize>(), 2);
+        let view = live.view();
+        assert_eq!(view.delta.len(), 3, "two entries and the shadow root");
+        let q = Query::parse("size:2099").unwrap();
+        let hit = ferrow_query::search(
+            &view.delta,
+            &q,
+            &SearchOptions {
+                allowed: Some(view.delta_allowed.clone()),
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(hit.hits.len(), 2, "the latest write is what is searched");
+        assert_eq!(
+            paths(&base, &view),
+            [
+                "C:",
+                "C:\\Docs",
+                "C:\\Docs\\a.txt",
+                "C:\\Docs\\new.txt",
+                "C:\\b.txt"
+            ]
+        );
+        assert_eq!(live.locations(0, 40).len(), 1);
+    }
+
+    #[test]
+    fn moving_a_file_still_replaces_its_entry() {
+        // Only a change of metadata is done in place; a new place is a new
+        // entry (and the old one is dead until the next rescan).
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        f.set(40, file_info(9), &[(20, "new.txt")]);
+        live.apply(&[change(40, true)], &f);
+        f.set(40, file_info(9), &[(5, "moved.txt")]);
+        live.apply(&[change(40, false)], &f);
+        assert_eq!(live.delta_len(), 2);
+        assert_eq!(live.delta_alive, 1);
+        assert_eq!(
+            paths(&base, &live.view()),
+            [
+                "C:",
+                "C:\\Docs",
+                "C:\\Docs\\a.txt",
+                "C:\\b.txt",
+                "C:\\moved.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_delta_limit_follows_the_index() {
+        for (base_len, max) in [
+            (0, 50_000),
+            (1_000_000, 50_000),
+            (5_000_000, 50_000),
+            (5_100_000, 51_000),
+            (18_600_000, 186_000),
+            (25_000_000, 250_000),
+            (27_000_000, 250_000),
+            (usize::MAX / 2, 250_000),
+        ] {
+            assert_eq!(max_delta(base_len), max, "base of {base_len}");
+            let l = DeltaLimits::for_base(base_len);
+            assert_eq!(l.max_delta, max);
+            assert_eq!(l.max_touched, max, "the change log follows");
+            assert_eq!(l.max_dead, 2 * max);
+            assert!(l.hard_delta >= 400_000 && l.hard_delta >= 3 * max, "{l:?}");
+            assert!(l.hard_delta <= 750_000, "bounded memory: {l:?}");
+        }
+        assert_eq!(DeltaLimits::for_base(1_000_000).hard_delta, 400_000);
+        assert_eq!(DeltaLimits::for_base(27_000_000).hard_delta, 750_000);
+        assert!(walk_limits_text(27_000_000).starts_with("up to 250000 entries"));
+        assert!(walk_limits_text(1_000_000).starts_with("up to 50000 entries"));
+        let (base, map) = fixture();
+        assert_eq!(Live::new(base, &[map]).limits(), DeltaLimits::for_base(4));
+    }
+
+    #[test]
+    fn a_delta_of_mostly_dead_entries_asks_for_a_rescan() {
+        // One file renamed back and forth: one live entry, a growing pile of
+        // dead ones. The live count never reaches the limit.
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        let max_dead = live.limits().max_dead;
+        let mut f = initial();
+        let mut asked = None;
+        for i in 0..=(max_dead + 2) {
+            let name = if i % 2 == 0 { "ping.txt" } else { "pong.txt" };
+            f.set(40, file_info(9), &[(20, name)]);
+            if let Some(why) = live.apply(&[change(40, i == 0)], &f).rescan {
+                asked = Some((i, why));
+                break;
+            }
+        }
+        let (at, why) = asked.expect("dead entries are bounded");
+        assert_eq!(live.delta_alive, 1);
+        assert_eq!(at, max_dead + 1, "the first change past the bound: {why}");
+        assert_eq!(reason_kind(&why), "too many superseded entries", "{why}");
+    }
+
+    #[test]
+    fn views_are_published_by_duty_not_per_batch() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut gate = PublishGate::new();
+        assert!(!gate.due(t0), "nothing changed");
+        assert_eq!(gate.wake_at(), None);
+        // The first change after start-up is shown at once.
+        gate.changed();
+        assert!(gate.due(t0));
+        // A view that took 70 ms: the next one no earlier than 700 ms later.
+        gate.published(t0, ms(70));
+        assert!(!gate.due(t0 + ms(5_000)), "no change owed, nothing to show");
+        assert_eq!(gate.wake_at(), None);
+        gate.changed();
+        assert!(!gate.due(t0 + ms(200)), "the next batch is coalesced");
+        assert!(!gate.due(t0 + ms(699)));
+        assert_eq!(gate.wake_at(), Some(t0 + ms(700)));
+        assert!(gate.due(t0 + ms(700)), "the last batch is published");
+        // More changes meanwhile change nothing about the time owed.
+        gate.changed();
+        gate.changed();
+        assert_eq!(gate.wake_at(), Some(t0 + ms(700)));
+        // It is published late (the maintainer was busy): the clock restarts
+        // at the end of that publish, with the new build time.
+        gate.published(t0 + ms(900), ms(40));
+        gate.changed();
+        assert!(!gate.due(t0 + ms(1_299)));
+        assert!(gate.due(t0 + ms(1_300)));
+        // A cheap build never holds a change back for longer than a batch…
+        gate.published(t0 + ms(1_300), ms(2));
+        gate.changed();
+        assert!(gate.due(t0 + ms(1_320)));
+        // …and a very costly one never for more than the cap.
+        gate.published(t0 + ms(2_000), Duration::from_secs(3));
+        gate.changed();
+        assert_eq!(gate.wake_at(), Some(t0 + ms(2_000) + MAX_PUBLISH_GAP));
+        assert!(!gate.due(t0 + ms(6_999)));
+        assert!(gate.due(t0 + ms(7_000)));
+    }
+
+    #[test]
+    fn a_storm_publishes_every_change_eventually_within_the_duty() {
+        // A fake clock: a batch every 200 ms for a minute, each view costing
+        // 70 ms. Views stay within the duty, and the last change is shown.
+        let t0 = Instant::now();
+        let mut gate = PublishGate::new();
+        let build = Duration::from_millis(70);
+        let mut now = t0;
+        let mut published_at = Vec::new();
+        for _ in 0..300 {
+            gate.changed();
+            if gate.due(now) {
+                now += build;
+                gate.published(now, build);
+                published_at.push(now);
+            }
+            now += Duration::from_millis(200);
+        }
+        // The storm stops with a change still owed: it is published at its
+        // time, within one gap, and nothing is owed afterwards.
+        let at = gate.wake_at().expect("the last batch is still owed");
+        assert!(at <= now + build * PUBLISH_DUTY, "bounded wait");
+        assert!(gate.due(at));
+        gate.published(at + build, build);
+        assert_eq!(gate.wake_at(), None);
+        assert!(!gate.due(at + Duration::from_secs(60)));
+        let busy = build * (published_at.len() as u32 + 1);
+        assert!(
+            busy.as_secs_f64() / (now - t0).as_secs_f64() <= 0.11,
+            "{} builds of {build:?} in {:?}",
+            published_at.len(),
+            now - t0
+        );
+        for pair in published_at.windows(2) {
+            assert!(pair[1] - pair[0] >= build * PUBLISH_DUTY, "{pair:?}");
+        }
     }
 }

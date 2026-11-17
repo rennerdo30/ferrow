@@ -22,13 +22,31 @@ Windows MFT/USN journal).
   0 % CPU while nothing changes). Changes are applied in 200 ms batches
   and searches see them within a second. The frozen index is never
   rebuilt for a change: replaced entries are hidden, new ones live in a
-  small second index, and a background rescan folds them in once that
-  grows large or the journal is reset.
+  small second index (the delta), and a background rescan folds them in
+  once that grows large or the journal is reset.
+  - **The limit follows the index:** a rescan is asked for when more than
+    1 % of the index's entries are live delta entries, at least 50,000 and
+    at most 250,000 (1 million entries: 50,000; 18.6 million: 186,000;
+    27 million and more: 250,000), or when dead delta entries (replaced or
+    deleted again, kept until the next rescan) outnumber twice that limit,
+    or at once when the delta with its dead entries grows past 3 times the
+    limit (at least 400,000, at most 750,000) while a rescan is waiting for
+    its rate limit. A file that is
+    written again and again keeps one delta entry, so a busy log or
+    database file is no reason to rescan.
+  - **The delta's view is built cheaply:** after a batch the delta is
+    published as a small searchable index on the low-priority background
+    pool the rescans use (never on the cores searches use), at most about
+    9 % of the time: the next one is published 10 times the last build's
+    duration after the last, at most 5 s later, and the changes in between
+    are merged into it. A search never waits for a build; it reads the view
+    published before. A first page of results in name order asks the delta
+    only for as many hits as the page holds.
 - **Folders moved into the index.** A folder that arrives from outside
   the indexed places (git and git-lfs move temporary folders into place
   all the time) gets its entry at once, and one low-priority thread lists
-  its contents by file reference (up to the delta's room, 50,000 entries,
-  and 30 s). Changes the journal reports while it is listed are read
+  its contents by file reference (up to the delta's room, 1 % of the index,
+  50,000 to 250,000 entries, and 30 s). Changes the journal reports while it is listed are read
   again after the result is merged, so none is lost or doubled. Only a
   folder too large or too slow to list, or a failed read, asks for the
   full rescan. The health report counts scans by reason and the

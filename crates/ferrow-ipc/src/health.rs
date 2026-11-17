@@ -113,7 +113,7 @@ pub struct LiveStats {
     pub folder_read_fallbacks: u64,
     /// Scans started, by why: `startup`, `moved-in folder`, `large folder
     /// move`, `too many live changes`, `too many replaced entries`,
-    /// `journal`, `administrator`.
+    /// `too many superseded entries`, `journal`, `administrator`.
     pub scans_by_reason: BTreeMap<String, u64>,
 }
 
