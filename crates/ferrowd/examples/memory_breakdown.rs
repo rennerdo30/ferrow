@@ -449,33 +449,25 @@ fn session(
     held_parts(&mut parts);
     report.show(&format!("{round}.volume"), parts);
 
-    // Emission and freeze (the builder's per-entry records live meanwhile).
+    // Emission and freeze. As in the scan, the parsed volume is dropped once it
+    // is emitted and before the freeze: the builder's per-entry records live
+    // beside the volume during emission, then beside the frozen columns.
     let before = memory::process().bytes();
     memory::reset_peak();
     let started = Instant::now();
-    let (index, map) = ferrow_walk::index_from_parsed_volume(
-        &volume,
-        ntfs::ROOT_RECORD,
-        b"C:",
-        ColumnSet::DEFAULT,
-    );
-    report.peak(&format!("{round}.emit_freeze"), before, memory::process().peak, "IndexBuilder raw entries and the frozen columns coexist at freeze; peak since this phase began",
+    let (index, map) =
+        ferrow_walk::index_from_parsed_volume(volume, ntfs::ROOT_RECORD, b"C:", ColumnSet::DEFAULT);
+    report.peak(
+        &format!("{round}.emit_freeze"),
+        before,
+        memory::process().peak,
+        "volume plus builder records during emission, then builder records plus frozen columns; peak since this phase began",
     );
     println!(
         "FERROW-MEMORY-TIMING round={round} step=emit_freeze ms={:.1}",
         started.elapsed().as_secs_f64() * 1000.0
     );
     assert_eq!(index.len(), synth.entries, "every name became an entry");
-    let mut parts = transient(&volume.heap_parts());
-    parts.extend(index_parts(&index, "index"));
-    parts.push(Part::new(
-        "scan.volume_map",
-        map.heap_bytes(),
-        Kind::Transient,
-    ));
-    held_parts(&mut parts);
-    report.show(&format!("{round}.scanned"), parts);
-    drop(volume);
     let mut parts = index_parts(&index, "index");
     parts.push(Part::new(
         "scan.volume_map",
@@ -483,7 +475,7 @@ fn session(
         Kind::Transient,
     ));
     held_parts(&mut parts);
-    report.show(&format!("{round}.volume_dropped"), parts);
+    report.show(&format!("{round}.scanned"), parts);
 
     // The service plans its changes from nothing; the benchmark needs the
     // pairs, which `Live::new` consumes, so plan first from a borrow.

@@ -1160,10 +1160,11 @@ fn emit_mft_subtree(
 /// `root_record`, then the subtree through the same emission, then freeze),
 /// without reading a disk. For memory benchmarks and tests that need the
 /// service's structures from a synthetic record stream; the scan itself does
-/// not call it.
+/// not call it. Like the scan, it drops the parsed volume once it is emitted
+/// and before the freeze, so the freeze does not hold it.
 #[doc(hidden)]
 pub fn index_from_parsed_volume(
-    volume: &ntfs::Volume,
+    volume: ntfs::Volume,
     root_record: u64,
     root_name: &[u8],
     columns: ColumnSet,
@@ -1190,13 +1191,14 @@ pub fn index_from_parsed_volume(
     map.roots.push((root_record, root_id));
     map.entries.push((root_record, root_id));
     emit_mft_subtree(
-        volume,
+        &volume,
         root_record,
         root_id,
         Path::new(""),
         &walker,
         &mut map.entries,
     );
+    drop(volume);
     (builder.freeze(), map)
 }
 
@@ -1238,7 +1240,8 @@ mod tests {
             });
         }
         let volume = Volume::from_parsed(parsed, 32, 0xABCD);
-        let (index, map) = index_from_parsed_volume(&volume, 5, b"C:", ColumnSet::DEFAULT);
+        let volume_heap: usize = volume.heap_parts().iter().map(|(_, b)| b).sum();
+        let (index, map) = index_from_parsed_volume(volume, 5, b"C:", ColumnSet::DEFAULT);
         let mut paths: Vec<String> = (0..index.len() as u32)
             .map(|id| index.path(id).to_string_lossy().replace('\\', "/"))
             .collect();
@@ -1263,8 +1266,7 @@ mod tests {
             "sizes come from the record"
         );
         // The parts of the volume's heap add up to its tables.
-        let parts: usize = volume.heap_parts().iter().map(|(_, b)| b).sum();
-        assert!(parts >= 32 * size_of::<ntfs::RecordInfo>());
+        assert!(volume_heap >= 32 * size_of::<ntfs::RecordInfo>());
         assert!(map.heap_bytes() >= 5 * size_of::<(u64, u32)>());
     }
 
