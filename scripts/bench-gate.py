@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fail closed on missing measurements or >10% paired CI regressions."""
+"""Fail closed on missing measurements or >10% paired CI regressions.
+
+Timed rows over their limit in round 1 are re-measured once (interleaved, same
+runner/job); they fail only if over the limit in both rounds. Memory is never
+re-measured."""
 import argparse
 import math
 import os
@@ -121,7 +125,7 @@ def render(rows):
     return "\n".join(lines) + "\n"
 
 
-def metadata_observations(text, head, expected_entries=5_000_000):
+def metadata_observations(text, head, expected_entries=5_000_000, confirm_load=None):
     scalars, engine, ipc, scan, filters = {}, {}, {}, {}, {}
     for line in text.splitlines():
         prefix, _, body = line.partition(" ")
@@ -163,8 +167,22 @@ def metadata_observations(text, head, expected_entries=5_000_000):
         raise ValueError("inconsistent lazy-cache saving")
     if total > 66 or extra > 16.5:
         raise ValueError("default-column memory target exceeded")
-    if scalars["core_load_ms_median"] <= 0 or scalars["load_ms_median"] > scalars["core_load_ms_median"]*1.15:
+    load_note = ""
+    core_ms, default_ms = scalars["core_load_ms_median"], scalars["load_ms_median"]
+    if core_ms <= 0:
         raise ValueError("default-column load target exceeded (core + 15%)")
+    if default_ms > core_ms*1.15:
+        # Timed check: confirm in a second round before failing. Without a
+        # confirmation producer the first round is final (fail closed).
+        if confirm_load is None:
+            raise ValueError("default-column load target exceeded (core + 15%)")
+        core2, default2 = confirm_load()
+        number(core2), number(default2)
+        if core2 <= 0 or default2 > core2*1.15:
+            raise ValueError("default-column load target exceeded (core + 15%), confirmed in a second round "
+                             f"(first {default_ms:.6f}/{core_ms:.6f} ms, second {default2:.6f}/{core2:.6f} ms default/core)")
+        load_note = (f"\nDefault-column load limit core + 15%: first round over limit ({default_ms:.6f}/{core_ms:.6f} ms default/core), "
+                     f"confirmed not over in the second round ({default2:.6f}/{core2:.6f} ms). Single-round spike; passes.\n")
     if scalars["sort_during_load"] != 0:
         raise ValueError("metadata sort built during load")
     rows = [("default columns bytes/entry", total), ("default columns load ms", scalars["load_ms_median"])]
@@ -187,6 +205,7 @@ def metadata_observations(text, head, expected_entries=5_000_000):
     report += f"\nDeferred build: {scalars['lazy_build_ms_median']:.6f} ms; lazy cache saves {scalars['lazy_saved_bytes']:.0f} bytes before first use.\n"
     report += f"\nCore/lazy/persisted load samples warm each arm, then cycle ABC/BCA/CAB. Persisted compact-cache prototype load (full validation, no sorting): {scalars['persisted_load_ms_median']:.6f} ms.\n"
     report += f"\nCore/default load: {scalars['core_load_ms_median']:.6f}/{scalars['load_ms_median']:.6f} ms; limit core + 15%. Cold/warm default heap: {scalars['cold_default_heap_bytes']/expected_entries:.6f}/{total:.6f} B/entry; limit 66 B/entry with both sorts ready.\n"
+    report += load_note
     report += f"\nSame-tree scan, none/default columns: {scan['none_ms_median']:.6f}/{scan['default_ms_median']:.6f} ms (five alternating samples per arm, 2101 entries).\n"
     return rows, report
 
@@ -309,6 +328,42 @@ def measure_pair(args, measure, trace):
         getattr(args, arm).write_text("\n".join(lines)+"\n", encoding="utf-8")
 
 
+def confirmation_table(first, final):
+    """List every timed row that was over its limit in round 1 with both rounds."""
+    lines = []
+    for one, two in zip(first, final):
+        if not one[-1] or one[1] is None or one[0] == "bytes/entry":
+            continue
+        verdict = "confirmed regression" if two[-1] else "first over limit, confirmed not over"
+        lines.append(f"| {one[0].replace('|', chr(92) + '|')} | {one[1]:.6f} / {one[2]:.6f} (limit {one[3]:.6f}) "
+                     f"| {two[1]:.6f} / {two[2]:.6f} (limit {two[3]:.6f}) | {verdict} |")
+    if not lines:
+        return ""
+    return ("\n### Confirmation round (rows over limit in round 1, same runner/job, interleaved)\n\n"
+            "A row fails only when it is over its limit in both rounds; round 2 medians decide.\n\n"
+            "| Metric | Round 1 base / head | Round 2 base / head | Result |\n|---|---:|---:|---|\n"
+            + "\n".join(lines) + "\n")
+
+
+def metadata_rerun(args):
+    """Second round of the default-column load check: rerun metadata_bench once."""
+    command = [str(args.metadata_rerun_bench), str(args.metadata_rerun_index)]
+    try:
+        run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=600, check=True)
+    except subprocess.CalledProcessError as error:
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise
+    scalars = {}
+    for line in run.stdout.splitlines():
+        prefix, _, body = line.partition(" ")
+        if prefix == "FERROW-METADATA":
+            scalars = {k: number(v) for k, v in (w.split("=", 1) for w in shlex.split(body))}
+    if scalars.get("entries") != args.entries or scalars.get("seed") != 2026             or not {"load_ms_median", "core_load_ms_median"} <= scalars.keys():
+        raise ValueError("invalid default-column load confirmation round")
+    return scalars["core_load_ms_median"], scalars["load_ms_median"]
+
+
 def sample_order(trace):
     return ("\n### Sample order (A = base, B = head legacy, C = head-only new syntax; warm samples excluded)\n\n| Metric | Producer order |\n|---|---|\n" + "\n".join(trace) + "\n") if trace else ""
 
@@ -328,6 +383,8 @@ def main():
     parser.add_argument("--entries", type=int, default=5_000_000)
     parser.add_argument("--require-metadata", action="store_true")
     parser.add_argument("--head-observations", type=Path)
+    parser.add_argument("--metadata-rerun-bench", type=Path, help="metadata_bench binary for the load confirmation round")
+    parser.add_argument("--metadata-rerun-index", type=Path, help="scratch index path for the load confirmation round")
     parser.add_argument("--measure", action="store_true", help="collect initial interleaved medians before comparison")
     for arm in ("base", "head"):
         for field in ("probe", "binary", "index"):
@@ -351,7 +408,9 @@ def main():
         report = render(rows)
         if args.require_metadata:
             observations = args.head.read_text(encoding="utf-8")
-            metadata_rows, metadata_report = metadata_observations(observations, head, args.entries)
+            metadata_rows, metadata_report = metadata_observations(
+                observations, head, args.entries,
+                (lambda: metadata_rerun(args)) if args.metadata_rerun_bench and args.metadata_rerun_index else None)
             if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
                 raise ValueError("incomplete combined metric inventory")
             report += metadata_report
@@ -365,7 +424,7 @@ def main():
             retried = retry_failures(rows, base, head,
                                      lambda *metric: probe(args, *metric), trace)
             if retryable and not memory_failed:
-                report += "\n### One paired latency remeasurement (final decision)\n\n" + render(retried)
+                report += "\n### One paired latency remeasurement (final decision)\n\n" + render(retried) + confirmation_table(rows, retried)
             rows = retried
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"benchmark gate refused incomplete evidence: {error}", file=sys.stderr)

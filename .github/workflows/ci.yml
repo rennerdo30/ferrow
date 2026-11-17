@@ -446,4 +446,6 @@ jobs:
             --head-probe "$PWD/target/release/examples/latency_probe" \
             --base-binary "$RUNNER_TEMP/ferrow-base-target/release/ferrow" \
             --head-binary "$PWD/target/release/ferrow" \
-            --base-index "$RUNNER_TEMP/ferrow-bench.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin"
+            --base-index "$RUNNER_TEMP/ferrow-bench.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin" \
+            --metadata-rerun-bench "$PWD/target/release/examples/metadata_bench" \
+            --metadata-rerun-index "$RUNNER_TEMP/ferrow-metadata-confirm.bin"
