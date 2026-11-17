@@ -175,6 +175,66 @@ Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
   `index.bin`), so a reinstall picks the choice up again. Delete the folder to
   reset it, or run `ferrow service access admins`.
 
+## Health, event log and repair
+
+- **`Health` request** (`ferrow service health [--json]`): what the service
+  knows about itself, built only when asked from state it already keeps:
+  version, pid, start time and uptime, memory (Windows: working set and
+  private bytes; Unix: resident set), index entries and mode, the access mode,
+  live changes applied, connection errors, the last save (time, result,
+  duration) and per volume its root, mode (`mft+usn live`, `walk` or
+  `live unavailable` with the reason), entries, journal state (`ok`, `reset`,
+  `reader error` with the text), last scan (time, why, duration) and a pending
+  rescan (why, earliest time), then the last 50 events. It is answered to the
+  same callers as searches; a refused caller gets `Unauthorized`. The human
+  output starts with `OK` or `ATTENTION` and the list of problems. `--json` is
+  the report on one line (`ferrow_ipc::health::Health`; readers ignore unknown
+  fields). Like `AccessInfo` it is a new message kind at protocol version 4: an
+  older service never answers, so the CLI and the app ask on a connection of
+  their own with a two-second deadline and say "older, or busy".
+- **Nothing is polled.** Every figure is written when its event happens (a scan
+  ended, a save ended, a batch was applied, a journal reset); the idle service
+  still has no timer, and a search does no health work.
+- **`Rescan` request** (`ferrow service rescan`): administrators, SYSTEM and
+  root only, even when the access policy lets others search. It asks the live
+  maintainer for a full rescan of every drive now, once past the usual rate
+  limit, but not within a minute of the last scan's end and not while one runs
+  or is already requested; the answer says why and when. Where no live
+  maintainer runs (Linux and macOS scan at start; Windows without raw volume
+  access) it says so; restart the service to rescan.
+- **Event log**: the last 200 events are kept in memory (they feed `Health`),
+  and appended to `service.log` in the protected state folder
+  (`%ProgramData%\Ferrow\`, `/var/lib/ferrow/`, `/private/var/lib/ferrow/`
+  on macOS); at 1 MiB it moves to `service.1.log` (the previous one is
+  replaced, so at most about 2 MiB). The file is created like the index
+  (protected folder, no links followed, re-validated), so only administrators
+  read it. Events are state changes, never per request: a repeat only raises a
+  count, the file takes at most 30 lines a minute (one line then says how many
+  were not written), connection errors are counted in `Health` instead of
+  logged, and a failure to write the log never affects the service. Event
+  texts carry no file names beyond volume roots and the service's own paths.
+- **Control** (`ferrow service start | stop | restart`, elevated / sudo): the
+  Windows Service Control Manager, `systemctl`, or `launchctl`. Waits are
+  bounded (30 s; a service that does not stop in time is reported, never
+  killed), and every manager command runs with a timeout and its PID is printed.
+- **`ferrow service repair`** (elevated / sudo) runs, in order, and prints one
+  line per step: (1) the installed binary exists at its fixed path and passes
+  the binary protection check (it never copies a binary, and never takes a path
+  from the user), and the registration (Windows service entry, systemd unit or
+  launchd plist) runs exactly that binary, otherwise it is re-registered from
+  that path (a Windows registration keeps its `--root` list); (2) stop the
+  service; (3) the state folder passes its protection check (a missing one is
+  created; one that fails cannot be repaired automatically and the repair stops
+  with the reason) and a log file that fails its check is moved aside; (4) the
+  saved index passes the protection check and loads: if not, it is renamed to
+  `index.bin.bad-<UTC time>` (never deleted or overwritten) and the service
+  rebuilds it at start; (5) start the service; (6) wait up to 30 s until it
+  answers. The first failing step ends the repair and says what is left.
+- **Exit codes** of the `service` verbs (the app relies on them): `0` done,
+  `1` failed, `2` needs administrator/root (nothing changed), `3` no service
+  reachable or no answer within 2 s, `4` the service refused this account,
+  `5` `rescan` did not start (reason on stdout).
+
 ## Install (needs admin/root once)
 
 Installation copies `ferrowd` into its own administrator-only folder `%ProgramFiles%\Ferrow\service\` on Windows

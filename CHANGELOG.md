@@ -2,6 +2,13 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **You can check the service's health and repair it.** `ferrow service health` shows at a glance whether the service is fine (or what needs attention), how long it has been running, its memory, the index size, the last save, what each drive is doing (live updates, journal state, last scan, a rescan that is waiting) and its recent events; `--json` gives the same for other tools. The service also keeps an event log, `service.log` next to its index (administrators only, at most 2 MiB), which until now only existed on a console it never has.
+  - `ferrow service rescan` scans all drives again now (administrators only; it waits a minute after a scan has just ended and says when it can run).
+  - `ferrow service start | stop | restart` (elevated terminal / sudo) control the Windows service, systemd or launchd.
+  - `ferrow service repair` (elevated) checks the installed program and its registration (re-registering it from the installed folder if it is missing or points elsewhere), the protection of the service's data folder and the saved index (an index that does not load is renamed to `index.bin.bad-<time>`, never deleted, so the service rebuilds it), restarts the service and waits until it answers.
+
 ## 0.1.0-beta.17
 
 - **Standard accounts can use the Ferrow service.** Until now only administrator accounts could use the service's fast, live index; a standard account fell back to its own slower one. An administrator now chooses who may use it, under Settings → **Fast index → Who can use the service**:

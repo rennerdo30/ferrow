@@ -550,7 +550,7 @@ mod tests {
             &line.replace(r"C:\Program Files\Ferrow\service", r"C:\Users\x\Downloads"),
         );
         assert!(!registration_matches(&other, exe, index));
-        assert!(!registration_matches(&words[..2].to_vec(), exe, index));
+        assert!(!registration_matches(&words[..2], exe, index));
         let elsewhere = split_command_line(&line.replace(r"C:\ProgramData", r"C:\Temp"));
         assert!(!registration_matches(&elsewhere, exe, index));
         assert!(!registration_matches(&[], exe, index));

@@ -189,3 +189,78 @@ fn stalled_hello_falls_back_within_discovery_budget() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("deadline"));
 }
+
+/// The CLI contract the app relies on: `service health --json` is the report,
+/// `rescan` without a live maintainer exits 5 with its reason on stdout, and no
+/// service at all exits 3.
+#[test]
+fn service_health_and_rescan_follow_the_documented_exit_codes() {
+    let fx = Fixture::new();
+    let nothing = fx.ferrow().args(["service", "health"]).output().unwrap();
+    assert_eq!(nothing.status.code(), Some(3), "no service: exit 3");
+    assert!(String::from_utf8_lossy(&nothing.stderr).contains("no Ferrow service is reachable"));
+
+    let _daemon = KillOnDrop(
+        fx.ferrow()
+            .args(["service", "run", fx.tree.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ferrow service run"),
+    );
+    let endpoint = ferrow_ipc::Endpoint::named(&fx.endpoint_name);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Ok(mut client) = ferrow_ipc::Client::connect(&endpoint)
+            && client.status().is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "service never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let out = fx
+        .ferrow()
+        .args(["service", "health", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(text.matches('\n').count(), 1, "one line: {text}");
+    let report = ferrow_ipc::health::Health::from_json(&text).unwrap();
+    assert!(report.pid != 0 && !report.version.is_empty(), "{text}");
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| e.text.contains("listening on")),
+        "{text}"
+    );
+
+    let human = fx.ferrow().args(["service", "health"]).output().unwrap();
+    assert_eq!(human.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&human.stdout).contains("Ferrow service"));
+
+    let rescan = fx.ferrow().args(["service", "rescan"]).output().unwrap();
+    assert_eq!(rescan.status.code(), Some(5), "not started: exit 5");
+    assert!(
+        !String::from_utf8_lossy(&rescan.stdout).trim().is_empty(),
+        "the reason is on stdout"
+    );
+
+    let bad = fx
+        .ferrow()
+        .args(["service", "health", "--yaml"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1));
+}
