@@ -281,6 +281,15 @@ impl Access {
         }
     }
 
+    /// Screenshot and unit tests: show a given answer without asking.
+    #[cfg(all(test, feature = "screenshots"))]
+    pub fn show_for_test(&mut self, view: View, busy: bool, message: Option<&str>) {
+        self.view = view;
+        self.busy = busy;
+        self.message = message.map(str::to_owned);
+        self.asked = true;
+    }
+
     /// Take a finished result (called every frame, next to the updater's).
     /// True when a change was attempted: the engine should look for the
     /// service again.
@@ -300,6 +309,10 @@ impl Access {
 
     /// Whether the actions can run from this app (installed Windows copy).
     pub fn can_elevate() -> bool {
+        #[cfg(all(test, feature = "screenshots"))]
+        if FORCE_ELEVATE.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         static CAN: OnceLock<bool> = OnceLock::new();
         *CAN.get_or_init(|| {
             cfg!(windows) && crate::update::installed_sibling("ferrow.exe").is_some()
@@ -314,6 +327,53 @@ impl Access {
         *SANDBOXED.get_or_init(|| {
             ferrow_ipc::CallerIdentity::current().is_ok_and(|me| !me.is_unsandboxed())
         })
+    }
+}
+
+/// Screenshot tests show the buttons of an installed copy.
+#[cfg(all(test, feature = "screenshots"))]
+static FORCE_ELEVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, feature = "screenshots"))]
+pub fn test_can_elevate(on: bool) {
+    FORCE_ELEVATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which accounts the service serves, as one sentence.
+pub fn rule(info: &AccessInfo) -> String {
+    match (info.mode, info.users.as_ref()) {
+        (AccessMode::Admins, _) => "Only administrators can use it.".to_owned(),
+        (AccessMode::Everyone, _) => {
+            "Every person who signs in to this PC can use it and sees every file name on it."
+                .to_owned()
+        }
+        (AccessMode::Listed, Some(users)) => {
+            format!(
+                "Administrators and {} listed account(s) can use it.",
+                users.len()
+            )
+        }
+        (AccessMode::Listed, None) => {
+            "Administrators and the listed accounts can use it.".to_owned()
+        }
+    }
+}
+
+/// How the last change ended, from its message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    Declined,
+    Problem,
+}
+
+pub fn outcome_of(message: &str) -> Outcome {
+    if message.starts_with("Done") {
+        Outcome::Done
+    } else if message.contains("declined") {
+        Outcome::Declined
+    } else {
+        Outcome::Problem
     }
 }
 
@@ -332,22 +392,7 @@ pub fn summary(view: &View) -> (String, String) {
             "It is older than this app, or busy. Retry, or update Ferrow with Setup.",
         ),
         View::Info(info) => {
-            let rule = match (info.mode, info.users.as_ref()) {
-                (AccessMode::Admins, _) => "Only administrators can use it.".to_owned(),
-                (AccessMode::Everyone, _) => {
-                    "Every person who signs in to this PC can use it and sees every file name on it."
-                        .to_owned()
-                }
-                (AccessMode::Listed, Some(users)) => {
-                    format!(
-                        "Administrators and {} listed account(s) can use it.",
-                        users.len()
-                    )
-                }
-                (AccessMode::Listed, None) => {
-                    "Administrators and the listed accounts can use it.".to_owned()
-                }
-            };
+            let rule = rule(info);
             if info.you_allowed {
                 ("This account uses the Ferrow service".to_owned(), rule)
             } else {
@@ -541,6 +586,29 @@ mod tests {
                 .1
                 .contains("2 listed")
         );
+    }
+
+    #[test]
+    fn the_last_change_ends_done_declined_or_with_a_problem() {
+        assert_eq!(
+            outcome_of("Done. The service applies it within a second."),
+            Outcome::Done
+        );
+        assert_eq!(
+            outcome_of("Administrator approval was declined; nothing was changed."),
+            Outcome::Declined
+        );
+        for problem in [
+            "The change ran, but the service does not show it yet. Check again in a moment.",
+            "The change could not be started (Windows error 5).",
+            "That account id is not valid.",
+        ] {
+            assert_eq!(outcome_of(problem), Outcome::Problem, "{problem}");
+        }
+        // The card's rule line is what the summary shows.
+        let view = info(AccessMode::Everyone, true, None);
+        let View::Info(i) = &view else { unreachable!() };
+        assert_eq!(summary(&view).1, rule(i));
     }
 
     #[test]

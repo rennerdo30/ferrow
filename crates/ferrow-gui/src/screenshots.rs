@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Vec2, pos2, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
 use ferrow_index::{ColumnSet, EntryMetadata, IndexBuilder, flags};
 
 use super::*;
+use crate::access;
 use crate::engine::{self, Event};
 use crate::settings::{AutoRebuild, SortChoice, Source, SourceKind, ThemeChoice};
 use crate::update::UpdateState;
@@ -611,26 +611,18 @@ impl<'a> Session<'a> {
         self.frames(3);
     }
 
-    /// Scroll the Settings page so that the element labelled `label` is
-    /// near the top. Scrolling uses wheel events over the page.
-    fn scroll_to(&mut self, label: &str) {
-        let page_center = pos2(self.size.x / 2.0, self.size.y / 2.0);
-        let target = self.content_top() + 12.0;
-        self.hover(page_center);
-        // Back to the top first.
-        self.wheel(page_center, 100_000.0);
-        for _ in 0..60 {
-            let y = self
-                .harness
-                .query_all_by_label(label)
-                .map(|n| n.rect().min.y)
-                .fold(None::<f32>, |best, y| Some(best.map_or(y, |b| b.min(y))));
-            match y {
-                Some(y) if (y - target).abs() < 1.0 => return,
-                Some(y) => self.wheel(page_center, target - y),
-                None => self.wheel(page_center, -300.0),
-            }
-        }
+    /// Scroll Settings to a section the way a request from another page
+    /// (or a click in the section list) does.
+    fn goto(&mut self, target: &'static str) {
+        self.app().settings_scroll_to = Some(target);
+        self.frames(4);
+    }
+
+    /// Wheel scroll by `dy` points (negative: towards the bottom).
+    fn scroll_by(&mut self, dy: f32) {
+        let at = pos2(self.size.x / 2.0, self.size.y / 2.0);
+        self.hover(at);
+        self.wheel(at, dy);
     }
 
     /// Positive `dy` moves the content down (scrolls towards the top).
@@ -831,6 +823,13 @@ fn capture_all(out: &Path) {
         }
     }
 
+    // Settings, at both sizes (the section list only stands at the wide one).
+    for look in Look::BOTH {
+        for size in [WIDE, NARROW] {
+            settings_scenes(look, size, out, &index);
+        }
+    }
+
     // States that only make sense at the default size.
     for look in Look::BOTH {
         let new = |with_index| Session::new(look, WIDE, out, &index, with_index);
@@ -864,50 +863,126 @@ fn capture_all(out: &Path) {
         s.loaded();
         s.open_syntax_help();
         s.save(15, "syntax-help");
-
-        // 16..21 Settings, one picture per section.
-        let mut s = new(true);
-        s.loaded();
-        s.settings_page();
-        s.scroll_to("Settings");
-        s.save(16, "settings-index");
-        s.scroll_to("Follow symbolic links");
-        s.save(17, "settings-index-more");
-        s.scroll_to("Windows");
-        s.save(18, "settings-windows");
-        s.scroll_to("Appearance");
-        s.save(19, "settings-appearance");
-        s.scroll_to("Updates");
-        s.save(20, "settings-updates");
-        s.scroll_to("About");
-        s.save(21, "settings-about");
-
-        // 22 Update available (the installed copy offers "Install update").
-        s.app().updater.state = UpdateState::Available(ferrow_update::Release {
-            version: ferrow_update::Version {
-                major: 0,
-                minor: 1,
-                patch: 0,
-                pre: vec!["beta".into(), "17".into()],
-            },
-            has_setup: true,
-        });
-        crate::update::test_can_install(true);
-        s.scroll_to("Updates");
-        s.save(22, "settings-update-available");
-        crate::update::test_can_install(false);
-
-        // 23 Settings with the service answering.
-        let mut s = new(false);
-        s.send(Event::Remote {
-            entries: 18_422_907,
-            report: "NTFS journal, 3 volumes".into(),
-        });
-        s.frames(3);
-        s.settings_page();
-        s.scroll_to("Follow symbolic links");
-        s.save(23, "settings-service-index");
     }
+}
+
+/// Settings (16..35): the fast-index status in every state, who can use the
+/// service, the own-index group closed and open, and each section.
+fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::Index>) {
+    use ferrow_ipc::{AccessInfo, AccessMode, AccessUser};
+    let user = |id: &str, name: &str| AccessUser {
+        id: id.into(),
+        name: name.into(),
+    };
+    let info = |mode, allowed, users: Option<Vec<AccessUser>>| {
+        access::View::Info(AccessInfo {
+            mode,
+            you_allowed: allowed,
+            you: user("S-1-5-21-1-2-3-1001", r"ALEX-PC\Alex"),
+            users,
+        })
+    };
+    access::test_can_elevate(true);
+    settings_page::test_set_now(NOW as u64);
+
+    // The service is not available: the app's own index, one reason each.
+    let mut s = Session::new(look, size, out, index, true);
+    s.loaded();
+    s.settings_page();
+    s.save(16, "settings-off-no-service");
+    s.goto("Own index");
+    s.save(17, "settings-own-index-open");
+    s.app()
+        .access
+        .show_for_test(access::View::TooOld, false, None);
+    s.goto("Fast index");
+    s.save(18, "settings-off-old-service");
+    let refused = info(AccessMode::Admins, false, None);
+    s.app().access.show_for_test(refused.clone(), false, None);
+    s.frames(2);
+    s.save(19, "settings-off-refused");
+    access::test_can_elevate(false);
+    s.frames(2);
+    s.save(20, "settings-off-refused-terminal");
+    access::test_can_elevate(true);
+    let declined = "Administrator approval was declined; nothing was changed.";
+    s.app().access.show_for_test(refused, false, Some(declined));
+    s.frames(2);
+    s.save(21, "settings-access-declined");
+
+    // The service answers: on, and who can use it.
+    let mut s = Session::new(look, size, out, index, false);
+    s.send(Event::Remote {
+        entries: 18_422_907,
+        report: "NTFS journal, 3 volumes".into(),
+    });
+    s.frames(3);
+    s.settings_page();
+    let admins = info(AccessMode::Admins, true, Some(Vec::new()));
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.frames(2);
+    s.save(22, "settings-live-admins");
+    let listed = info(
+        AccessMode::Listed,
+        true,
+        Some(vec![
+            user("S-1-5-21-1-2-3-1002", r"ALEX-PC\Sam"),
+            user("S-1-5-21-1-2-3-1003", r"ALEX-PC\Kim"),
+        ]),
+    );
+    s.app().access.show_for_test(listed, false, None);
+    s.frames(2);
+    s.save(23, "settings-live-listed");
+    let everyone = info(AccessMode::Everyone, true, Some(Vec::new()));
+    s.app().access.show_for_test(everyone.clone(), false, None);
+    s.frames(2);
+    s.save(24, "settings-live-everyone");
+    s.app().access.show_for_test(admins.clone(), true, None);
+    s.frames(2);
+    s.save(25, "settings-access-busy");
+    s.app().access.show_for_test(admins.clone(), false, None);
+    s.app().access.confirm_everyone = true;
+    s.frames(2);
+    s.save(26, "settings-access-confirm");
+    s.app().access.confirm_everyone = false;
+    let done = "Done. The service applies it within a second.";
+    s.app().access.show_for_test(everyone, false, Some(done));
+    s.frames(2);
+    s.save(27, "settings-access-done");
+    s.app().access.show_for_test(admins, false, None);
+    s.frames(2);
+
+    // The own-index group: closed while the service is live, then opened.
+    s.goto("Fast index");
+    s.scroll_by(-240.0);
+    s.save(28, "settings-live-own-index-closed");
+    s.goto("Own index");
+    s.save(29, "settings-live-own-index-open");
+
+    // The other sections.
+    s.goto("Windows");
+    s.save(30, "settings-windows");
+    s.goto("Appearance");
+    s.save(31, "settings-appearance");
+    s.app().settings.last_update_check = Some(NOW as u64 - 3 * 3600);
+    s.app().updater.state = UpdateState::UpToDate;
+    s.goto("Updates");
+    s.save(32, "settings-updates");
+    s.app().updater.state = UpdateState::Available(ferrow_update::Release {
+        version: ferrow_update::Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+            pre: vec!["beta".into(), "17".into()],
+        },
+        has_setup: true,
+    });
+    crate::update::test_can_install(true);
+    s.goto("Updates");
+    s.save(33, "settings-update-available");
+    crate::update::test_can_install(false);
+    s.goto("About");
+    s.save(34, "settings-about");
 }
 
 #[cfg(test)]

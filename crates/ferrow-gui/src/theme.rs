@@ -351,3 +351,23 @@ pub fn apply_style(ctx: &egui::Context, palette: &Palette) {
         style.scroll_animation = egui::style::ScrollAnimation::none();
     });
 }
+
+/// Status colours for dots and short state words (Windows 11 "success" and
+/// "caution" tones, one per theme so each keeps its contrast).
+impl Palette {
+    pub fn ok(&self) -> Color32 {
+        if self.dark {
+            Color32::from_rgb(0x6C, 0xCB, 0x5F)
+        } else {
+            Color32::from_rgb(0x0F, 0x7B, 0x0F)
+        }
+    }
+
+    pub fn caution(&self) -> Color32 {
+        if self.dark {
+            Color32::from_rgb(0xFC, 0xB9, 0x2A)
+        } else {
+            Color32::from_rgb(0x9D, 0x5D, 0x00)
+        }
+    }
+}

@@ -114,6 +114,9 @@ pub struct FerrowApp {
     access: crate::access::Access,
     /// Set while the Ferrow service answers searches: its entry count.
     pub(crate) service_entries: Option<u64>,
+    /// A page asks Settings to scroll to a section (for example "Service
+    /// access"); Settings takes it when it is drawn.
+    pub(crate) settings_scroll_to: Option<&'static str>,
     /// Re-run the query for a live change without jumping to the top.
     refreshing: bool,
     /// The service changed while the window was hidden or minimized: search
@@ -227,6 +230,7 @@ impl FerrowApp {
             updater: crate::update::Updater::new(),
             access: crate::access::Access::new(),
             service_entries: None,
+            settings_scroll_to: None,
             refreshing: false,
             live_change_pending: false,
         }
