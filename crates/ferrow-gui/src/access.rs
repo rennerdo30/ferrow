@@ -116,6 +116,12 @@ pub struct Access {
 
 /// Ask the service on a connection of its own.
 fn query() -> View {
+    // Test builds never talk to the machine's real service: unit tests use
+    // `query_at` with their own endpoint, and the screenshot harness must
+    // not depend on (or touch) whatever service this PC runs.
+    #[cfg(test)]
+    return View::NoService;
+    #[cfg(not(test))]
     query_at(&Endpoint::default_service())
 }
 
@@ -440,6 +446,13 @@ fn run_elevated(_args: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_builds_never_ask_the_real_service() {
+        // The real service on a developer PC would answer (or time out);
+        // a test build must report no service without connecting.
+        assert_eq!(super::query(), super::View::NoService);
+    }
+
     use super::*;
     use ferrow_ipc::AccessUser;
     use std::sync::atomic::{AtomicUsize, Ordering};

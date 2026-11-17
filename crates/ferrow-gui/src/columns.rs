@@ -299,7 +299,13 @@ pub(super) fn format_size(bytes: u64) -> String {
 
 /// Unix 100-ns ticks to a local "YYYY-MM-DD HH:MM".
 pub(super) fn format_time(ticks: i64) -> String {
-    use chrono::{Local, TimeZone};
+    // Tests (screenshots) show UTC so the output does not depend on the
+    // time zone of the machine that runs them.
+    #[cfg(not(test))]
+    use chrono::Local;
+    use chrono::TimeZone;
+    #[cfg(test)]
+    use chrono::Utc as Local;
     let secs = ticks.div_euclid(10_000_000);
     let nanos = (ticks.rem_euclid(10_000_000) * 100) as u32;
     match Local.timestamp_opt(secs, nanos) {
