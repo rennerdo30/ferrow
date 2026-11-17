@@ -28,9 +28,10 @@ Windows MFT/USN journal).
     1 % of the index's entries are live delta entries, at least 50,000 and
     at most 250,000 (1 million entries: 50,000; 18.6 million: 186,000;
     27 million and more: 250,000), or when dead delta entries (replaced or
-    deleted again, kept until the next rescan) outnumber that limit, or when
-    the delta with its dead entries grows past 4 times the limit (at least
-    400,000) while a rescan is waiting for its rate limit. A file that is
+    deleted again, kept until the next rescan) outnumber twice that limit,
+    or at once when the delta with its dead entries grows past 3 times the
+    limit (at least 400,000, at most 750,000) while a rescan is waiting for
+    its rate limit. A file that is
     written again and again keeps one delta entry, so a busy log or
     database file is no reason to rescan.
   - **The delta's view is built cheaply:** after a batch the delta is

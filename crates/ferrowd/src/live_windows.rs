@@ -612,6 +612,9 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             // On the low-priority pool the rescans use, so the build never
             // takes the cores a search needs.
             let view = match &pool {
+                // Low-priority threads: on a saturated PC the build (and so
+                // this thread) can wait; journal batches queue meanwhile and
+                // the gate's gap grows with the measured build time.
                 Some(pool) => pool.install(|| live.view()),
                 None => live.view(),
             };

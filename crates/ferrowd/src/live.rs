@@ -52,10 +52,14 @@ pub struct DeltaLimits {
     /// folder read in the background can fill.
     pub max_delta: usize,
     /// Rescan when more delta entries than this are dead (replaced or
-    /// deleted again, kept until the next rescan).
+    /// deleted again, kept until the next rescan). Twice `max_delta`: dead
+    /// entries cost memory only (a view skips them), and git or a build
+    /// that creates and deletes a temporary folder of tens of thousands of
+    /// files must not cost a full rescan.
     pub max_dead: usize,
     /// A pending rescan starts at once when the delta, dead entries
-    /// included, grows past this (bounds its memory and per-batch view cost).
+    /// included, grows past this (bounds its memory and per-batch view cost:
+    /// at most 750,000 entries, a few hundred MB in the worst case).
     pub hard_delta: usize,
     /// Records remembered as changed while walks run.
     pub max_touched: usize,
@@ -67,8 +71,8 @@ impl DeltaLimits {
         let max_delta = max_delta(base_len);
         DeltaLimits {
             max_delta,
-            max_dead: max_delta,
-            hard_delta: MIN_HARD_DELTA.max(4 * max_delta),
+            max_dead: 2 * max_delta,
+            hard_delta: MIN_HARD_DELTA.max(3 * max_delta),
             max_touched: max_delta,
         }
     }
@@ -90,7 +94,8 @@ const MIN_HARD_DELTA: usize = 8 * MIN_DELTA;
 /// [`DeltaLimits::max_delta`] a rescan is asked for anyway), …
 const MIN_WALK_BUDGET: usize = 1_000;
 /// …at most this long (a cold hard disk lists on the order of 10,000
-/// entries per second, so a full budget fits; a rescan reads 27 million
+/// entries per second, so 300,000 entries fit; a larger budget can run out
+/// of time first, which falls back to a rescan; a rescan reads 27 million
 /// entries in about 74 s on the owner's PC, which is cheaper per entry
 /// beyond that), …
 pub const MAX_WALK_TIME: Duration = Duration::from_secs(30);
@@ -107,9 +112,9 @@ pub fn walk_limits_text(base_len: usize) -> String {
 /// …with this many folders waiting at once (a package manager moves dozens
 /// of sibling folders in one burst; the reader takes them one by one), …
 const MAX_WALKS: usize = 64;
-/// …at most [`DeltaLimits::max_touched`] records remembered as changed
-/// while walks run (they are looked at again once a result is merged), …
-/// …and a walk the reader has not finished this long after its time budget
+/// (At most [`DeltaLimits::max_touched`] records are remembered as changed
+/// while walks run; they are looked at again once a result is merged.)
+/// A walk the reader has not finished this long after its time budget
 /// is given up (a folder on a hung network share or cloud placeholder can
 /// block the listing call itself).
 pub const WALK_SLACK: Duration = Duration::from_secs(10);
@@ -2811,11 +2816,12 @@ mod tests {
             let l = DeltaLimits::for_base(base_len);
             assert_eq!(l.max_delta, max);
             assert_eq!(l.max_touched, max, "the change log follows");
-            assert_eq!(l.max_dead, max);
-            assert!(l.hard_delta >= 400_000 && l.hard_delta >= 4 * max, "{l:?}");
+            assert_eq!(l.max_dead, 2 * max);
+            assert!(l.hard_delta >= 400_000 && l.hard_delta >= 3 * max, "{l:?}");
+            assert!(l.hard_delta <= 750_000, "bounded memory: {l:?}");
         }
         assert_eq!(DeltaLimits::for_base(1_000_000).hard_delta, 400_000);
-        assert_eq!(DeltaLimits::for_base(27_000_000).hard_delta, 1_000_000);
+        assert_eq!(DeltaLimits::for_base(27_000_000).hard_delta, 750_000);
         assert!(walk_limits_text(27_000_000).starts_with("up to 250000 entries"));
         assert!(walk_limits_text(1_000_000).starts_with("up to 50000 entries"));
         let (base, map) = fixture();
