@@ -66,7 +66,7 @@ About sections. Test builds inject the service's answer with
 `Access::show_for_test` and scroll with the `settings_scroll_to` request the
 other pages use. The "now" shown in the update line is fixed.
 
-## Service health pictures (50..73)
+## Service health pictures (50..76)
 
 Rendered at both sizes and both themes (the narrow size adds the pictures
 below the first screen: details, volumes, events): the service healthy with

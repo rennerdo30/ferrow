@@ -11,11 +11,7 @@ use crate::service::{self, Can, Level, Snapshot, Verb};
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn tone(level: Level) -> Tone {
-    match level {
-        Level::Good => Tone::Good,
-        Level::Caution => Tone::Caution,
-        Level::Neutral => Tone::Neutral,
-    }
+    tone_of(level)
 }
 
 /// `today 09:12` for a time from the service's clock (Unix milliseconds).
@@ -57,7 +53,7 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
         None => format!("{} in use", service::memory_text(h.working_set)),
     };
     rows.push(("Memory", memory, None));
-    rows.push(("Items", super::super::group(h.entries as usize), None));
+    rows.push(("Items", service::items_text(h.entries), None));
     if h.connection_errors > 0 {
         rows.push((
             "Connection errors",
@@ -97,6 +93,16 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
         ));
     }
     rows
+}
+
+/// An event's text, with its level as a word (colour alone is not enough).
+fn event_line(e: &health::EventInfo) -> String {
+    let word = match e.level.as_str() {
+        health::LEVEL_ERROR => "Error: ",
+        health::LEVEL_WARN => "Warning: ",
+        _ => "",
+    };
+    format!("{word}{}", e.text)
 }
 
 /// A volume's name, its state and what the service knows about it.
@@ -143,7 +149,12 @@ fn volume_lines(v: &VolumeHealth) -> (String, Level, String, String) {
         } else {
             format!(" ({})", r.reason)
         };
-        parts.push(format!("rescan pending{why}"));
+        let from = if r.earliest_ms > 0 {
+            format!(", not before {}", when(r.earliest_ms))
+        } else {
+            String::new()
+        };
+        parts.push(format!("rescan pending{why}{from}"));
     }
     (v.root.clone(), level, mode, parts.join(" · "))
 }
@@ -164,6 +175,8 @@ struct HealthOut {
     confirm_repair: bool,
     events_open: bool,
     copy: bool,
+    /// The hint "allow this account" was clicked: show Fast index.
+    go_access: bool,
 }
 
 impl FerrowApp {
@@ -190,6 +203,9 @@ impl FerrowApp {
             section_title(ui, &p, "Service health");
             health_ui(ui, &p, &input)
         };
+        if out.go_access {
+            self.settings_scroll_to = Some("Fast index");
+        }
         self.service_health.confirm_repair = out.confirm_repair;
         self.service_health.events_open = out.events_open;
         if out.copy
@@ -211,7 +227,13 @@ impl FerrowApp {
     }
 }
 
-fn headline(ui: &mut egui::Ui, p: &theme::Palette, s: &service::Summary, color: Color32) {
+fn headline(
+    ui: &mut egui::Ui,
+    p: &theme::Palette,
+    s: &service::Summary,
+    color: Color32,
+    out: &mut HealthOut,
+) {
     ui.horizontal_top(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(14.0, 24.0), Sense::hover());
         let c = rect.center_top() + vec2(0.0, 12.0);
@@ -238,7 +260,15 @@ fn headline(ui: &mut egui::Ui, p: &theme::Palette, s: &service::Summary, color: 
                 );
             }
             ui.label(job);
-            if !s.hint.is_empty() {
+            if s.hint_access {
+                let link = RichText::new(&s.hint).size(12.0).color(p.accent_text);
+                if ui
+                    .add(egui::Label::new(link).sense(Sense::click()))
+                    .clicked()
+                {
+                    out.go_access = true;
+                }
+            } else if !s.hint.is_empty() {
                 ui.label(RichText::new(&s.hint).size(12.0).color(p.text_secondary));
             }
         });
@@ -254,7 +284,7 @@ fn health_ui(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn) -> HealthOut {
     let s = service::summary(i.snap, APP_VERSION);
     let color = tone_color(p, tone(s.level));
     status_card(ui, p, color, |ui| {
-        headline(ui, p, &s, color);
+        headline(ui, p, &s, color, &mut out);
         ui.add_space(12.0);
         let line = ui.cursor().top();
         ui.painter()
@@ -263,7 +293,10 @@ fn health_ui(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn) -> HealthOut {
         action_block(ui, p, i, &mut out);
     });
     let Some(snap) = i.snap else { return out };
-    let Some(h) = snap.report() else { return out };
+    // A busy service shows the last report it gave (the line above says so).
+    let Some(h) = snap.last_report() else {
+        return out;
+    };
     ui.add_space(CARD_GAP);
     card(ui, p, |ui| {
         for (label, value, level) in details(h, &snap.scm) {
@@ -273,6 +306,7 @@ fn health_ui(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn) -> HealthOut {
                     vec2(130.0, 18.0),
                     Layout::left_to_right(Align::Min),
                     |ui| {
+                        ui.set_min_width(130.0);
                         ui.label(RichText::new(label).size(13.0).color(p.text_secondary));
                     },
                 );
@@ -377,11 +411,13 @@ fn events_card(ui: &mut egui::Ui, p: &theme::Palette, h: &Health, out: &mut Heal
                     vec2(128.0, 18.0),
                     Layout::left_to_right(Align::Min),
                     |ui| {
+                        ui.set_min_width(128.0);
                         let time = RichText::new(when(e.at_ms)).size(12.0);
                         ui.label(time.color(p.text_tertiary));
                     },
                 );
-                ui.add(egui::Label::new(RichText::new(&e.text).size(13.0).color(color)).wrap());
+                let text = RichText::new(event_line(e)).size(13.0).color(color);
+                ui.add(egui::Label::new(text).wrap());
             });
         }
     });
@@ -461,11 +497,18 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
     }
     // Why a button is off, visible without hovering (remote desktops).
     if i.snap.is_some() && i.busy.is_none() {
+        let missing = i
+            .snap
+            .is_some_and(|s| s.scm.state == service::ScmState::NotInstalled);
         for (label, can) in [
             ("Restart", acts.restart),
             ("Rescan now", acts.rescan),
             ("Repair", acts.repair),
         ] {
+            // "Not installed" already says it; once is enough.
+            if missing && label == "Rescan now" {
+                continue;
+            }
             if let Can::No(reason) = can
                 && reason != service::NEEDS_INSTALLED
             {
@@ -483,7 +526,7 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
             ui,
             p,
             "Repair the service?",
-            "It re-registers the service, checks its folder, moves a damaged index aside (nothing is deleted) and restarts it. Ferrow asks for administrator approval.",
+            "It checks the registration, the folder and the saved index. If something is wrong it fixes it (a damaged index is moved aside, nothing is deleted) and restarts the service. If all is fine it changes nothing. Ferrow asks for administrator approval.",
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -501,9 +544,10 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
         for (can, verb) in [
             (acts.start, Verb::Start),
             (acts.restart, Verb::Restart),
+            (acts.rescan, Verb::Rescan),
             (acts.repair, Verb::Repair),
         ] {
-            if can != Can::Hidden {
+            if matches!(can, Can::Yes | Can::No(service::NEEDS_INSTALLED)) {
                 command_row(ui, p, &verb.terminal_command());
             }
         }
@@ -516,7 +560,10 @@ fn action_block(ui: &mut egui::Ui, p: &theme::Palette, i: &HealthIn, out: &mut H
                 "Approve it to continue. Over remote desktop it can be on the secure desktop or behind this window.",
             )
         } else {
-            ("Waiting for the service…", "It can take up to 30 seconds.")
+            (
+                "Waiting for the service…",
+                "A restart can take up to about two minutes.",
+            )
         };
         dot_row(ui, p, Tone::Caution, false, title, detail);
     }

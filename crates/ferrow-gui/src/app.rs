@@ -1383,7 +1383,11 @@ impl eframe::App for FerrowApp {
         }
         let wake = ctx.clone();
         self.service_health.set_visible(
-            self.page == Page::Settings && !minimized && !platform::is_hidden_in_tray(),
+            crate::service::shown(
+                self.page == Page::Settings,
+                minimized,
+                platform::is_hidden_in_tray(),
+            ),
             move || wake.request_repaint(),
         );
         if self.live_change_pending && !minimized && !platform::is_hidden_in_tray() {

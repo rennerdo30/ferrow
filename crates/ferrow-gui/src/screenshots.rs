@@ -1241,7 +1241,7 @@ fn settings_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index:
     s.save(34, "settings-about");
 }
 
-/// Service health (50..71): the service in every state, the details, an
+/// Service health (50..76): the service in every state, the details, an
 /// action waiting for the administrator prompt, the repair question, the
 /// events expanded, and the Fast index card pointing here.
 fn health_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::Index>) {
@@ -1485,7 +1485,7 @@ fn health_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::I
         None,
         notice(
             access::Outcome::NoChange,
-            "Nothing was started: a scan is running already, or one started in the last minute.",
+            "Nothing was started. A scan is running, already requested, or ended less than a minute ago.",
         ),
         68,
         "health-nothing-started",
@@ -1517,6 +1517,24 @@ fn health_scenes(look: Look, size: Vec2, out: &Path, index: &Arc<ferrow_index::I
     );
     s.goto("Fast index");
     s.save(73, "health-fast-index-link");
+    // The same card for a service that is not installed.
+    s.app().service_health.show_for_test(
+        Some(down(ScmState::NotInstalled, HealthView::NoAnswer)),
+        None,
+        None,
+    );
+    s.goto("Fast index");
+    s.save(74, "health-fast-index-not-installed");
+    // A busy service keeps the last report it gave, and says so.
+    let busy = down(
+        ScmState::Running,
+        HealthView::Stale(Box::new(healthy_report())),
+    );
+    shot(&mut s, busy, 75, "health-busy-last-report");
+    // A service that is stopping is not "healthy" any more.
+    let mut stopping = up(healthy_report());
+    stopping.scm.state = ScmState::Stopping;
+    shot(&mut s, stopping, 76, "health-stopping");
 }
 
 /// A scroll request made on the very first frame of a freshly opened

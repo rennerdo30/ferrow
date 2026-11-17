@@ -41,7 +41,8 @@ fn the_details_say_what_is_wrong_in_the_row_that_is_wrong() {
     let ok = details(&report(), &scm(Some(2)));
     assert_eq!(row(&ok, "Service version").unwrap().1, APP_VERSION);
     assert!(ok.iter().all(|r| r.2.is_none()), "nothing to warn about");
-    assert_eq!(row(&ok, "Items").unwrap().1, "1,234,567");
+    // The headline's precision: a few more items must not change the text.
+    assert_eq!(row(&ok, "Items").unwrap().1, "1.2 M");
     assert_eq!(
         row(&ok, "Memory").unwrap().1,
         "300 MB in use, 200 MB private"
@@ -126,7 +127,7 @@ fn a_volume_shows_its_mode_its_reason_and_what_it_knows() {
     assert_eq!(level, Level::Caution);
     assert_eq!(mode, "live updates unavailable: access denied");
     assert!(detail.contains("journal reader error: reader stopped"));
-    assert!(detail.ends_with("rescan pending (journal reset)"));
+    assert!(detail.contains("rescan pending (journal reset), not before "));
 
     let walked = VolumeHealth {
         root: "E:\\Archive".into(),
@@ -177,4 +178,58 @@ fn service_health_follows_fast_index_and_is_a_scroll_target() {
         Section::from_target("service health"),
         Some(Section::ServiceHealth)
     );
+}
+
+#[test]
+fn an_event_says_its_level_in_words() {
+    let at = |level: &str| health::EventInfo {
+        at_ms: 1,
+        level: level.into(),
+        text: "journal reset".into(),
+    };
+    assert_eq!(event_line(&at(health::LEVEL_ERROR)), "Error: journal reset");
+    assert_eq!(
+        event_line(&at(health::LEVEL_WARN)),
+        "Warning: journal reset"
+    );
+    assert_eq!(event_line(&at(health::LEVEL_INFO)), "journal reset");
+}
+
+#[test]
+fn the_fast_index_card_names_the_button_that_fixes_a_stopped_service() {
+    use crate::service::ScmState;
+    let off = |manager| {
+        fast_index_status(None, &access::View::NoService, manager)
+            .reason
+            .unwrap()
+    };
+    let stopped = off(Some(ScmState::Stopped));
+    assert!(stopped.contains("Start it under Service health"));
+    assert!(
+        !stopped.contains("Setup"),
+        "no Setup advice when Start exists"
+    );
+    let missing = off(Some(ScmState::NotInstalled));
+    assert!(missing.contains("isn't installed") && missing.contains("Setup"));
+    assert!(!missing.contains("Start it"));
+    // Nothing known yet: the general text.
+    assert!(off(None).contains("isn't installed or isn't running"));
+    assert!(off(Some(ScmState::Running)).contains("isn't installed or isn't running"));
+}
+
+#[test]
+fn the_nav_dot_and_the_headline_agree() {
+    use crate::service::{HealthView, Scm, ScmState};
+    let stopped = Snapshot {
+        scm: Scm {
+            state: ScmState::Stopped,
+            pid: None,
+            start_type: None,
+        },
+        health: HealthView::NoAnswer,
+    };
+    let line = service::summary(Some(&stopped), APP_VERSION);
+    // A ring in the caution colour; the same pair the nav row is given.
+    assert_eq!((line.level, line.filled), (Level::Caution, false));
+    assert_eq!(tone_of(line.level), Tone::Caution);
 }

@@ -4,7 +4,7 @@ use ferrow_ipc::health::{
     MODE_UNAVAILABLE, MODE_WALK, RescanInfo, SaveInfo, ScanInfo, VolumeHealth,
 };
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const APP: &str = "0.1.0-beta.17";
 
@@ -111,9 +111,15 @@ fn health_is_classified_by_what_each_question_got() {
     assert_eq!(health_view(Err(denied()), never), HealthView::Refused);
     // Silent on Health but answering Status: an older service.
     assert_eq!(health_view(Err(timeout()), || Ok(())), HealthView::Older);
-    // Silent on both: nothing is there.
+    // A deadline on both: something is there and does not answer (busy).
     assert_eq!(
         health_view(Err(timeout()), || Err(timeout())),
+        HealthView::Silent
+    );
+    // Nothing listens: gone, not busy.
+    let gone = || std::io::Error::from(std::io::ErrorKind::NotFound);
+    assert_eq!(
+        health_view(Err(gone()), || Err(gone())),
         HealthView::NoAnswer
     );
     // Refused on the second question: still a refusal, not "older".
@@ -210,11 +216,43 @@ fn the_top_line_says_the_state_in_every_case() {
     );
     assert_eq!(
         down(ScmState::Running, HealthView::Older),
-        (caution, false, "Older service · update with Setup".into())
+        (
+            caution,
+            true,
+            "Older service, or busy · update with Setup if this stays".into()
+        )
     );
     assert_eq!(
-        down(ScmState::Running, HealthView::NoAnswer).2,
-        "Not answering · "
+        down(ScmState::Running, HealthView::NoAnswer),
+        (caution, true, "Not answering · ".into())
+    );
+    // A running process with a problem is a dot, never a ring.
+    for health in [HealthView::Refused, HealthView::Older, HealthView::Silent] {
+        assert!(down(ScmState::Running, health).1);
+    }
+    // The manager's word wins over a report that is about to be out of date.
+    let stopping = Snapshot {
+        scm: Scm::of(ScmState::Stopping),
+        ..healthy()
+    };
+    assert_eq!(line(&stopping), (neutral, false, "Stopping… · ".into()));
+    let starting = Snapshot {
+        scm: Scm::of(ScmState::Starting),
+        ..healthy()
+    };
+    assert_eq!(line(&starting).2, "Starting… · ");
+    // A busy service shows as not answering, with what it said last.
+    let stale = snap(
+        ScmState::Running,
+        HealthView::Stale(Box::new(report(vec![live("C:\\")]))),
+    );
+    assert_eq!(
+        line(&stale),
+        (
+            caution,
+            true,
+            "Not answering right now · it may be busy; showing its last report".into()
+        )
     );
     assert_eq!(summary(None, APP).head, "Checking the service…");
     // A running answer wins over a stale "stopped" from the manager.
@@ -331,10 +369,16 @@ fn every_way_an_action_can_end_has_its_own_outcome() {
         assert_eq!(n.outcome, Outcome::Problem, "{code}");
         assert!(n.text.contains(word), "{code}: {}", n.text);
     }
-    assert_eq!(
-        outcome(Verb::Rescan, Ok(5), false).outcome,
-        Outcome::NoChange
-    );
+    let nothing = outcome(Verb::Rescan, Ok(5), false);
+    assert_eq!(nothing.outcome, Outcome::NoChange);
+    assert!(nothing.text.contains("ended less than a minute ago"));
+    // The repair text claims only what the answer shows: it may have found
+    // nothing to repair.
+    let repaired = outcome(Verb::Repair, Ok(0), true).text;
+    assert_eq!(repaired, "Repair finished. The service is running.");
+    for claim in ["registered", "re-registered", "restarted", "moved"] {
+        assert!(!repaired.to_lowercase().contains(claim), "{claim}");
+    }
     let failed = o(Ok(1), false);
     assert_eq!(failed.outcome, Outcome::Problem);
     // It names the command for this OS (systemctl on Linux).
@@ -364,16 +408,28 @@ fn after_an_action_it_looks_again_until_the_answer_shows_it_and_gives_up_in_time
     );
     assert!(seen && shown == healthy());
     assert_eq!(*calls.borrow(), 4);
-    // It never waits longer than the bound, and then reports "not seen".
-    let paused = RefCell::new(Duration::ZERO);
+    // Looks come at 0, 1.2 and 2.4 s, then at the normal cadence, and it
+    // never waits longer than the bound; then it reports "not seen".
+    let pauses = RefCell::new(Vec::new());
     let (_, seen) = settle(
         Verb::Start,
         &stopped,
         || stopped.clone(),
-        |d| *paused.borrow_mut() += d,
+        |d| pauses.borrow_mut().push(d),
     );
     assert!(!seen);
-    assert_eq!(*paused.borrow(), SETTLE_MAX);
+    let pauses = pauses.into_inner();
+    assert_eq!(
+        pauses[..3],
+        [SETTLE_FIRST, SETTLE_FIRST, REFRESH],
+        "{pauses:?}"
+    );
+    assert!(pauses[2..].iter().all(|p| *p == REFRESH));
+    let total: Duration = pauses.iter().sum();
+    assert!(
+        total >= SETTLE_MAX && total < SETTLE_MAX + REFRESH,
+        "{total:?}"
+    );
     // A restart is done only when another process answers.
     let before = healthy();
     let mut same = healthy();
@@ -561,6 +617,7 @@ fn open(
             w.fetch_add(1, Ordering::SeqCst);
         },
         move || answer(a.fetch_add(1, Ordering::SeqCst)),
+        || false,
     );
 }
 
@@ -575,7 +632,7 @@ fn it_asks_at_most_once_per_interval_and_only_while_shown() {
     // Asks at 0, 200 and 400 ms at the most; never a burst.
     assert!((1..=3).contains(&while_open), "{while_open}");
     // Closed (or minimized, or in the tray): the thread is gone and asks stop.
-    state.set_visible_with(false, || {}, healthy);
+    state.set_visible_with(false, || {}, healthy, || false);
     assert!(!state.watching());
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(asks.load(Ordering::SeqCst), while_open);
@@ -591,7 +648,7 @@ fn closing_and_reopening_quickly_does_not_ask_twice_inside_the_interval() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
     }
-    state.set_visible_with(false, || {}, healthy);
+    state.set_visible_with(false, || {}, healthy, || false);
     open(&mut state, &asks, &wakes, |_| healthy());
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(
@@ -725,10 +782,10 @@ fn diagnostics_name_no_file_beyond_the_volume_roots() {
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked:\n{text}");
     }
-    assert!(text.contains("<path>"));
+    assert!(text.contains("<path omitted>"));
     // Newest event first.
     let list = text.split("Recent events").nth(1).expect("an events list");
-    assert!(list.find("moved <path>").unwrap() < list.find("scanning D:").unwrap());
+    assert!(list.find("moved <path omitted>").unwrap() < list.find("scanning D:").unwrap());
     // Without a report there is still a useful block.
     let none = diagnostics(
         &snap(ScmState::Stopped, HealthView::NoAnswer),
@@ -740,21 +797,409 @@ fn diagnostics_name_no_file_beyond_the_volume_roots() {
 }
 
 #[test]
-fn scrub_keeps_roots_and_plain_words() {
-    let roots = ["C:\\", "D:\\Projects", "/home"];
+fn scrub_keeps_roots_and_plain_words_and_cuts_at_the_first_other_path() {
+    let roots = ["C:\\", "D:\\Projects", "/home", "E:\\My Archive"];
+    for same in [
+        "rescan of C:\\ and /home done",
+        "(\"D:\\Projects\"), live/usn",
+        "Scan of E:\\My Archive finished in 4 s",
+        "journal reset on D:\\Projects: rescan queued",
+        "nothing to report",
+        "",
+    ] {
+        assert_eq!(scrub(same, &roots), same);
+    }
+    let cut = |text: &str| scrub(text, &roots);
+    assert_eq!(cut("D:\\Projects\\a.txt"), "<path omitted>");
+    assert_eq!(cut("see \\\\nas\\share\\x now"), "see <path omitted>");
+    assert_eq!(cut("open C:/Users/a/b failed"), "open <path omitted>");
+    assert_eq!(cut("/home/alex/file"), "<path omitted>");
+    // A path with a space in it must not leak its second half.
     assert_eq!(
-        scrub("rescan of C:\\ and /home done", &roots),
-        "rescan of C:\\ and /home done"
+        cut("could not read C:\\Users\\Jane Doe\\Documents: denied"),
+        "could not read <path omitted>"
     );
     assert_eq!(
-        scrub("(\"D:\\Projects\"), live/usn", &roots),
-        "(\"D:\\Projects\"), live/usn"
+        cut("could not read /home/jane doe/notes failed"),
+        "could not read <path omitted>"
     );
-    assert_eq!(scrub("D:\\Projects\\a.txt", &roots), "<path>");
-    assert_eq!(scrub("see \\\\nas\\share\\x now", &roots), "see <path> now");
+    assert_eq!(cut("opened name=/home/x now"), "opened <path omitted>");
+    assert_eq!(cut("opened path:C:\\Temp\\a b"), "opened <path omitted>");
+    // The cut also drops what a root-looking prefix would hide.
     assert_eq!(
-        scrub("open C:/Users/a/b failed", &roots),
-        "open <path> failed"
+        cut("scan of C:\\Users\\Jane Doe done"),
+        "scan of <path omitted>"
     );
-    assert_eq!(scrub("/home/alex/file", &roots), "<path>");
+    // A root first, a path later: the root stays.
+    assert_eq!(
+        cut("D:\\Projects: could not read D:\\Projects\\x y z"),
+        "D:\\Projects: could not read <path omitted>"
+    );
+}
+
+#[test]
+fn diagnostics_never_leak_the_half_of_a_path_after_a_space() {
+    let mut h = report(vec![live("C:\\")]);
+    h.events = vec![EventInfo {
+        at_ms: 1_000,
+        level: LEVEL_ERROR.into(),
+        text: "could not save to C:\\Users\\Jane Doe\\AppData\\Ferrow\\index.bin".into(),
+    }];
+    h.volumes[0].reason = "no access to /home/jane doe/x".into();
+    let text = diagnostics(
+        &snap(ScmState::Running, HealthView::Report(Box::new(h))),
+        APP,
+        "windows x86_64",
+    );
+    for leaked in ["Jane", "Doe", "AppData", "index.bin", "jane doe"] {
+        assert!(!text.contains(leaked), "{leaked} leaked:\n{text}");
+    }
+}
+
+/// Every state the service can be in that the UI can show.
+fn every_state() -> Vec<Snapshot> {
+    let states = [
+        ScmState::NotInstalled,
+        ScmState::Stopped,
+        ScmState::Starting,
+        ScmState::Running,
+        ScmState::Stopping,
+        ScmState::Other,
+        ScmState::Unknown,
+        ScmState::Unsupported,
+    ];
+    let busy = Box::new(report(vec![live("C:\\")]));
+    let healths = [
+        HealthView::NoAnswer,
+        HealthView::Silent,
+        HealthView::Refused,
+        HealthView::Older,
+        HealthView::Stale(busy.clone()),
+        HealthView::Report(busy),
+    ];
+    states
+        .into_iter()
+        .flat_map(|s| healths.iter().cloned().map(move |h| snap(s, h)))
+        .collect()
+}
+
+#[test]
+fn a_hint_never_points_at_a_button_that_is_off() {
+    for s in every_state() {
+        let m = summary(Some(&s), APP);
+        if let Some(verb) = m.hint_verb {
+            let acts = actions(Some(&s), true, false);
+            let can = match verb {
+                Verb::Start => acts.start,
+                Verb::Restart => acts.restart,
+                Verb::Rescan => acts.rescan,
+                Verb::Repair => acts.repair,
+            };
+            assert_eq!(
+                can,
+                Can::Yes,
+                "{:?} / {:?}: {}",
+                s.scm.state,
+                s.health,
+                m.hint
+            );
+            let word = if verb == Verb::Start {
+                "Start"
+            } else {
+                "Restart"
+            };
+            assert!(m.hint.starts_with(word), "{}", m.hint);
+        } else if m.hint_access {
+            assert_eq!(s.health, HealthView::Refused);
+        }
+    }
+    // The cases the review named: no service manager to ask, and a busy one.
+    let linux = summary(
+        Some(&snap(ScmState::Unsupported, HealthView::NoAnswer)),
+        APP,
+    );
+    assert_eq!(linux.hint_verb, Some(Verb::Start));
+    let busy = summary(
+        Some(&snap(
+            ScmState::Running,
+            HealthView::Stale(Box::new(report(vec![]))),
+        )),
+        APP,
+    );
+    assert_eq!(busy.hint_verb, Some(Verb::Restart));
+    // Something is wrong in every state that has a hint, and a healthy one has none.
+    assert!(summary(Some(&healthy()), APP).hint.is_empty());
+}
+
+#[test]
+fn a_queued_rescan_and_a_busy_service_turn_rescan_off_with_a_reason() {
+    let pending = with(|h| {
+        h.volumes[0].rescan_pending = Some(RescanInfo {
+            reason: "journal reset".into(),
+            earliest_ms: 9,
+        });
+    });
+    assert!(matches!(
+        actions(Some(&pending), true, false).rescan,
+        Can::No(why) if why.contains("queued")
+    ));
+    let stale = snap(
+        ScmState::Running,
+        HealthView::Stale(Box::new(report(vec![]))),
+    );
+    assert!(matches!(
+        actions(Some(&stale), true, false).rescan,
+        Can::No(why) if why.contains("right now")
+    ));
+    assert_eq!(actions(Some(&stale), true, false).restart, Can::Yes);
+    let silent = snap(ScmState::Running, HealthView::Silent);
+    assert!(matches!(
+        actions(Some(&silent), true, false).rescan,
+        Can::No(_)
+    ));
+}
+
+#[test]
+fn a_silent_service_is_busy_only_after_it_answered_in_this_session() {
+    let (tx, rx) = channel();
+    let feed = Feed::new(tx, || {});
+    let running = |health| snap(ScmState::Running, health);
+    // Never seen: stays "older, or busy".
+    let (older, _) = feed.adopt(running(HealthView::Older));
+    assert_eq!(older.health, HealthView::Older);
+    // A report is seen...
+    let (seen, changed) = feed.adopt(healthy());
+    assert!(changed && matches!(seen.health, HealthView::Report(_)));
+    // ...then it goes silent while the process runs: busy, with that report.
+    for silent in [HealthView::Silent, HealthView::Older] {
+        let (stale, changed) = feed.adopt(running(silent));
+        let HealthView::Stale(last) = &stale.health else {
+            panic!("expected Stale, got {:?}", stale.health)
+        };
+        assert_eq!(**last, report(vec![live("C:\\"), live("D:\\")]));
+        assert!(changed || stale.display_key() == feed.adopt(stale.clone()).0.display_key());
+    }
+    // Stopped or gone is not busy.
+    let (stopped, _) = feed.adopt(snap(ScmState::Stopped, HealthView::NoAnswer));
+    assert_eq!(stopped.health, HealthView::NoAnswer);
+    let (gone, _) = feed.adopt(running(HealthView::NoAnswer));
+    assert_eq!(
+        gone.health,
+        HealthView::NoAnswer,
+        "nothing listens: gone, not busy"
+    );
+    drop(rx);
+}
+
+#[test]
+fn whether_the_section_is_on_screen_depends_on_all_three() {
+    for settings in [false, true] {
+        for minimized in [false, true] {
+            for hidden in [false, true] {
+                assert_eq!(
+                    shown(settings, minimized, hidden),
+                    settings && !minimized && !hidden,
+                    "{settings} {minimized} {hidden}"
+                );
+            }
+        }
+    }
+    assert!(shown(true, false, false));
+    assert!(!shown(true, false, true), "hidden in the tray");
+}
+
+#[test]
+fn hiding_the_window_stops_the_asks_without_any_frame() {
+    // The window is hidden to the tray: no frame follows, so `set_visible`
+    // is never called again. The watcher must notice by itself.
+    let (mut state, asks, wakes) = counted(Duration::from_millis(40));
+    let hidden = Arc::new(AtomicBool::new(false));
+    let h = hidden.clone();
+    let (a, w) = (asks.clone(), wakes.clone());
+    state.set_visible_with(
+        true,
+        move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        },
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            healthy()
+        },
+        move || h.load(Ordering::SeqCst),
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while asks.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < deadline, "it never asked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    hidden.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(120)); // an ask in flight may finish
+    let at_hide = asks.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(asks.load(Ordering::SeqCst), at_hide, "asked while hidden");
+    assert!(!state.watching(), "the thread ends when hidden");
+    // Shown again: the next frame starts it again.
+    hidden.store(false, Ordering::SeqCst);
+    let (a, w) = (asks.clone(), wakes.clone());
+    let h = hidden.clone();
+    state.set_visible_with(
+        true,
+        move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        },
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            healthy()
+        },
+        move || h.load(Ordering::SeqCst),
+    );
+    assert!(state.watching());
+}
+
+#[test]
+fn nothing_asks_after_set_visible_false_even_when_no_frame_follows() {
+    let (mut state, asks, wakes) = counted(Duration::from_millis(40));
+    open(&mut state, &asks, &wakes, |_| healthy());
+    std::thread::sleep(Duration::from_millis(150));
+    state.set_visible_with(false, || {}, healthy, || false);
+    std::thread::sleep(Duration::from_millis(100)); // an ask in flight may finish
+    let at_close = asks.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(asks.load(Ordering::SeqCst), at_close);
+    assert!(!state.watching());
+}
+
+#[test]
+fn an_actions_follow_up_asks_push_the_periodic_ask_back() {
+    let interval = Duration::from_millis(300);
+    let (tx, _rx) = channel();
+    let feed = Arc::new(Feed::new(tx, || {}));
+    let asks = Arc::new(AtomicUsize::new(0));
+    let a = asks.clone();
+    let _watcher = spawn_watcher(
+        feed.clone(),
+        interval,
+        move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            healthy()
+        },
+        || true,
+    );
+    // The first ask is at once.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while asks.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // An action keeps asking (its asks mark the throttle): the periodic one
+    // does not fire while they come.
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(100));
+        feed.mark();
+    }
+    assert_eq!(
+        asks.load(Ordering::SeqCst),
+        1,
+        "asked inside the gap of an action ask"
+    );
+    // When they stop, it resumes within one interval.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(asks.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn every_look_of_an_action_goes_through_the_throttle() {
+    let mut state = ServiceHealth::new();
+    let (tx, _rx) = channel();
+    let feed = Arc::new(Feed::new(tx, || {}));
+    state.feed = Some(feed.clone());
+    let started = feed.wait(REFRESH);
+    assert_eq!(started, Duration::ZERO, "nothing asked yet");
+    state.snap = Some(snap(ScmState::Stopped, HealthView::NoAnswer));
+    state.run_with(
+        Verb::Start,
+        || {},
+        || IpcRescan::NotAllowed,
+        |_| Ok(0),
+        healthy,
+        |_| {},
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !state.poll() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The action's look marked the throttle: the periodic asker now waits.
+    assert!(feed.wait(REFRESH) > Duration::from_secs(4));
+}
+
+#[test]
+fn a_worker_that_vanishes_does_not_leave_the_buttons_waiting() {
+    let mut state = ServiceHealth::new();
+    let (tx, rx) = channel::<Done>();
+    drop(tx);
+    state.done = Some(rx);
+    state.busy = Some((Verb::Restart, Arc::new(AtomicBool::new(false))));
+    assert!(state.poll());
+    assert!(state.busy.is_none() && state.done.is_none());
+    let notice = state.notice.clone().expect("an outcome");
+    assert_eq!(notice.outcome, Outcome::Problem);
+    // And it can act again.
+    state.run_with(
+        Verb::Start,
+        || {},
+        || IpcRescan::NotAllowed,
+        |_| Ok(0),
+        healthy,
+        |_| {},
+    );
+    assert!(state.busy.is_some());
+}
+
+#[test]
+fn what_is_shown_includes_what_the_details_show() {
+    let base = healthy();
+    for changed in [
+        with(|h| h.connection_errors += 1),
+        with(|h| h.more_volumes = 3),
+    ] {
+        assert_ne!(base.display_key(), changed.display_key());
+    }
+    // Shown with the precision it has: one more item changes nothing,
+    // another hundred thousand does.
+    assert_eq!(base.display_key(), with(|h| h.entries += 3).display_key());
+    assert_ne!(
+        base.display_key(),
+        with(|h| h.entries += 600_000).display_key()
+    );
+    // A stale report does not look like a current one.
+    let stale = snap(
+        ScmState::Running,
+        HealthView::Stale(Box::new(report(vec![live("C:\\"), live("D:\\")]))),
+    );
+    assert_ne!(base.display_key(), stale.display_key());
+}
+
+#[test]
+fn the_engine_is_told_when_the_service_starts_or_stops_answering() {
+    let mut state = ServiceHealth::new();
+    let tx = state.tx.clone();
+    // The first answer is not a change.
+    tx.send(snap(ScmState::Stopped, HealthView::NoAnswer))
+        .unwrap();
+    assert!(!state.poll());
+    // Same answer class: nothing to tell.
+    tx.send(snap(ScmState::Stopped, HealthView::NoAnswer))
+        .unwrap();
+    assert!(!state.poll());
+    // It starts answering...
+    tx.send(healthy()).unwrap();
+    assert!(state.poll());
+    // ...a new report of the same kind is not a change...
+    tx.send(with(|h| h.uptime_s += 600)).unwrap();
+    assert!(!state.poll());
+    // ...and it stops (here: the process is gone).
+    tx.send(snap(ScmState::Stopped, HealthView::NoAnswer))
+        .unwrap();
+    assert!(state.poll());
 }
