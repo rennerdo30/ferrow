@@ -47,9 +47,10 @@ pub enum ScmState {
     /// Paused, or a state this app does not know.
     Other,
     /// The service manager could not be asked.
-    #[cfg_attr(test, allow(dead_code))]
+    #[cfg_attr(any(test, not(windows)), allow(dead_code))]
     Unknown,
     /// This OS has no service manager the app can ask (Linux, macOS).
+    #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
 }
 
