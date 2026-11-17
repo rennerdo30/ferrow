@@ -29,8 +29,9 @@ Windows MFT/USN journal).
 
 ## Modes
 
-- **The app.** When the system service answers (an administrator
-  account; see the access rule below), the Ferrow app searches through
+- **The app.** When the system service answers this account (an
+  administrator, or an account the access policy allows; see the access rule
+  below), the Ferrow app searches through
   it, loads further rows while scrolling and refreshes its results on
   live changes. Otherwise it keeps its own index.
 - **Service mode (default when reachable).** `ferrow search`
@@ -60,8 +61,100 @@ receives `Error{Unauthorized}` without paths, counts or status data; the
 CLI and the app explain the refusal and fall back to the per-user saved
 index. An admin account could elevate and read every file name anyway,
 so this exposes nothing new to it. Development mode serves only the OS
-user who started it. Per-user result filtering for standard accounts is
-M2c (ADR 0002).
+user who started it. This is the default (mode `admins`); an administrator
+can widen it with the access policy below. Per-user result filtering for
+standard accounts is M2c (ADR 0002).
+
+### Access policy: who the system service answers
+
+An administrator can widen the rule above without waiting for M2c, at the
+cost of showing file names unfiltered to the chosen accounts. The policy is
+the file `access.json` next to the service index (`%ProgramData%\Ferrow\` on
+Windows, `/var/lib/ferrow/` on Linux, `/private/var/lib/ferrow/` on macOS):
+
+```json
+{"version":1,"mode":"listed","users":[{"id":"S-1-5-21-…-1001","name":"PC\\alice"}]}
+```
+
+- `mode` is `admins` (the default: SYSTEM, root and administrators, exactly
+  the rule above), `everyone`, or `listed` (administrators plus the accounts
+  in `users`). `id` is the Windows SID or Unix uid and is what authorizes;
+  `name` is display only. SYSTEM and root are always answered.
+  - **`everyone` means every person who signs in to this PC**, not every
+    account that exists. Windows: the caller's token holds the INTERACTIVE
+    group (S-1-5-4: console and remote-desktop sign-ins) as an enabled group
+    and is not a Guest (not in Guests S-1-5-32-546, not relative id 501), and
+    it is not sandboxed (restricted token, AppContainer, below medium
+    integrity). Service, virtual and network-logon tokens have no INTERACTIVE
+    group and are refused. Unix: a regular uid, at or above the platform's
+    first one (Linux `UID_MIN` from `/etc/login.defs`, read once when the
+    service starts, default 1000; macOS 501), and not `nobody` (65534, or -2
+    on macOS).
+  - **`listed` admits exactly the listed ids** (an administrator chose them,
+    so a listed service account works) but still refuses sandboxed callers.
+- A missing file means `admins`. The file is validated like `index.bin`
+  (protected folder and file, administrator-only grants); an unprotected,
+  unreadable, malformed (unknown version, mode or field, a non-canonical id,
+  more than 256 users) or larger than 64 KiB file is ignored, logged once,
+  and means `admins`. A bad file never widens access. One leading UTF-8 byte
+  order mark is accepted. An id is a canonical SID (`S-1-` and plain decimal
+  parts, at least two) or a canonical decimal uid.
+- The service checks the file at most once a second. Whichever request
+  thread wins a `try_lock` does it; every other request uses the current
+  policy at once, so a slow disk or a stalled validation delays one request
+  at most and never the rest (no extra thread, no per-request file read).
+  Each check re-validates the file's protection (an ACL or owner change
+  applies even when the content did not change), compares its size, time and
+  identity, and reloads on change. A failed check is retried on the next
+  tick and remembers nothing (a transient error does not stick), and the
+  policy swaps in atomically. A change applies within about a second and a
+  removed account is refused on its next request. The development endpoint
+  (`ferrow service run`) ignores the policy and serves only its owner.
+- **`AccessInfo` request** (every authenticated caller of the system endpoint,
+  refused ones too): the mode, whether the caller is answered, and the
+  caller's own id (the display name only when the policy lists it; the service
+  never looks up accounts on a request thread, because a domain lookup can
+  wait). The user list goes only to an allowed administrator. It is a new
+  message kind and the protocol version stays 4: an older service does not
+  know it and never answers it (it only drops the connection later), so
+  clients ask on a connection of their own with a short deadline and treat
+  silence as "the service is older, or busy".
+- **Command line:** `ferrow service access show` (any account, asks the
+  service), and `admins`, `everyone`, `add <account-or-SID>`,
+  `remove <account-or-SID>`, which need an elevated terminal / sudo and say so
+  otherwise. The file is replaced atomically: the new policy must parse under
+  the same limits the service applies (so a file the service would refuse is
+  never written), goes into a temporary file in the same protected folder (so
+  it inherits only the protected grants; on Windows its owner is set to
+  Administrators), is validated like the service validates it, and is renamed
+  and made durable (folder sync on Unix, buffer flush on Windows). The command
+  reads the file's stamp first and refuses with "the access list changed
+  meanwhile, try again" if the file changed before the rename, so two
+  administrators cannot silently overwrite each other (the window between that
+  check and the rename is a few microseconds). `add` lists the user (and switches `admins` to `listed`),
+  `everyone` and `admins` clear the list, and removing the last listed user
+  returns to `admins`. Names resolve with `LookupAccountNameW` /
+  `getpwnam_r` in the short-lived administrator process; groups are refused,
+  and control characters in names are escaped when printed.
+- **The app** (Settings → Service access) shows in one line whether this
+  account uses the service, and runs the same commands through the installed
+  `ferrow.exe` with a UAC prompt (Windows; elsewhere it shows the `sudo`
+  commands to copy). When a standard user approves it with an
+  administrator's password the command runs as that administrator, so
+  **Allow me** passes the standard user's SID explicitly (taken from
+  `AccessInfo`), never "the current user". The status query uses a connection
+  of its own with an 800 ms deadline, so a service that predates the request
+  (or is busy) shows "did not answer: older, or busy" with a Retry button
+  without delaying the window. After the elevated command exits, the app asks
+  the service again (at 0, 1.2 and 2.4 seconds, off the UI thread) until the
+  answer shows the change; that answer, not the exit code, decides whether it
+  worked, and it applies even when Settings is not open. Elevated launches
+  only start `ferrow.exe` from the Setup-installed Program Files folder (found
+  with the shell's known-folder API, with that folder as the working
+  directory), never from a portable or development copy.
+- Uninstall keeps `access.json` with the rest of the state (as it keeps
+  `index.bin`), so a reinstall picks the choice up again. Delete the folder to
+  reset it, or run `ferrow service access admins`.
 
 ## Install (needs admin/root once)
 

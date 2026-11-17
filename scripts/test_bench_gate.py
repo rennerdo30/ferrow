@@ -433,5 +433,134 @@ class GateTests(unittest.TestCase):
             self.assertIn("| Metric | Base | Head |", (Path(folder) / "summary.md").read_text(encoding="utf-8"))
 
 
+class ConfirmationRoundTests(unittest.TestCase):
+    """Timed rows over their limit in round 1 fail only when round 2 agrees."""
+
+    def run_main(self, head_text, producer, extra=()):
+        with tempfile.TemporaryDirectory() as folder:
+            base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
+            base.write_text(fixture(language=False), encoding="utf-8")
+            head.write_text(head_text, encoding="utf-8")
+            argv = ["bench-gate.py", str(base), str(head), "--entries", "16", *extra]
+            for arm in ("base", "head"):
+                for field in ("probe", "binary", "index"):
+                    argv += [f"--{arm}-{field}", "dummy"]
+            with patch.object(sys, "argv", argv), patch.object(gate, "publish") as publish, \
+                    patch.object(gate, "probe", side_effect=producer) as probe, \
+                    patch("sys.stderr"):
+                code = gate.main()
+            return code, probe, publish.call_args.args[0]
+
+    def spike(self):
+        return fixture().replace('FERROW-SERVICE query="a" first_page_ms=0.2', 'FERROW-SERVICE query="a" first_page_ms=4', 1)
+
+    @staticmethod
+    def steady(_args, arm, kind, query, operation):
+        return (0.2 if operation == "first_page_ms" else 10), 2, 0, 800, 16
+
+    def test_single_round_spike_passes_and_is_reported(self):
+        code, probe, report = self.run_main(self.spike(), self.steady)
+        self.assertEqual(code, 0)
+        self.assertEqual(probe.call_count, 12)  # only that row again: 6 samples per arm
+        self.assertIn("first over limit, confirmed not over", report)
+        self.assertNotIn("confirmed regression", report)
+        self.assertIn("Round 1 base / head", report)
+
+    def test_persistent_regression_fails_in_both_rounds(self):
+        code, probe, report = self.run_main(
+            self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
+        self.assertEqual(code, 1)
+        self.assertIn("confirmed regression", report)
+
+    def test_nothing_over_runs_no_second_round(self):
+        code, probe, report = self.run_main(fixture(), self.steady)
+        self.assertEqual(code, 0)
+        self.assertEqual(probe.call_count, 0)
+        self.assertNotIn("Confirmation round", report)
+
+    def test_missing_confirmation_data_fails_closed(self):
+        for error in (ValueError("retry producer must emit exactly one receipt"),
+                      subprocess.TimeoutExpired("probe", 120)):
+            with self.subTest(error=error):
+                code, probe, report = self.run_main(self.spike(), error)
+                self.assertEqual(code, 2)
+                self.assertIn("refused", report)
+        code, _, _ = self.run_main("", self.steady)
+        self.assertEqual(code, 2)
+
+    def test_memory_rows_are_never_remeasured(self):
+        code, probe, report = self.run_main(
+            fixture().replace("heap_bytes=800", "heap_bytes=1000"), self.steady)
+        self.assertEqual(code, 1)
+        self.assertEqual(probe.call_count, 0)
+        # Latency spikes beside a memory regression are not re-measured either.
+        code, probe, _ = self.run_main(self.spike().replace("heap_bytes=800", "heap_bytes=1000"), self.steady)
+        self.assertEqual(code, 1)
+        self.assertEqual(probe.call_count, 0)
+
+    def test_core_plus_15_percent_follows_the_same_rule(self):
+        slow = metadata_fixture().replace("load_ms_median=200 core", "load_ms_median=260 core")
+        head = gate.parse(fixture())
+        rerun = []
+        def second(values):
+            def run():
+                rerun.append(values)
+                return values
+            return run
+        # Spike: round 2 is within core + 15%. Passes and is reported.
+        rows, report = gate.metadata_observations(slow, head, 16, second((200, 210)))
+        self.assertEqual(len(rows), gate.EXPECTED_METADATA_METRICS)
+        self.assertIn("first round over limit", report)
+        self.assertIn("confirmed not over", report)
+        # Persistent: over in both rounds fails.
+        with self.assertRaisesRegex(ValueError, r"core \+ 15%\), confirmed in a second round"):
+            gate.metadata_observations(slow, head, 16, second((200, 260)))
+        # Within limit in round 1: no second round.
+        rerun.clear()
+        gate.metadata_observations(metadata_fixture(), head, 16, second((1, 1000)))
+        self.assertEqual(rerun, [])
+        # Missing or invalid round-2 data fails closed.
+        def broken():
+            raise ValueError("invalid default-column load confirmation round")
+        with self.assertRaises(ValueError):
+            gate.metadata_observations(slow, head, 16, broken)
+        with self.assertRaises(ValueError):
+            gate.metadata_observations(slow, head, 16, second((float("nan"), 1)))
+        # Without a confirmation producer the first round stays final.
+        with self.assertRaisesRegex(ValueError, "core \\+ 15%"):
+            gate.metadata_observations(slow, head, 16)
+
+    def test_main_wires_the_metadata_rerun_flags(self):
+        slow = metadata_fixture().replace("load_ms_median=200 core_load_ms_median=200",
+                                          "load_ms_median=240 core_load_ms_median=200")
+        rerun_ok = metadata_fixture().replace("load_ms_median=200 core_load_ms_median=200",
+                                              "load_ms_median=210 core_load_ms_median=200")
+        rerun_over = slow
+        with tempfile.TemporaryDirectory() as folder:
+            base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
+            base.write_text(fixture(language=False), encoding="utf-8")
+            flags = ["--metadata-rerun-bench", "bench", "--metadata-rerun-index", "idx"]
+            for extra, rerun, expected, runs in ((flags, rerun_ok, 0, 1), (flags, rerun_over, 2, 1), ([], rerun_ok, 2, 0)):
+                with self.subTest(flags=bool(extra), rerun=rerun is rerun_ok):
+                    head.write_text(fixture() + "\n" + slow, encoding="utf-8")
+                    argv = ["bench-gate.py", str(base), str(head), "--entries", "16", "--require-metadata", *extra]
+                    with patch.object(sys, "argv", argv), patch.object(gate, "publish"), patch("sys.stderr"), \
+                            patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=rerun)) as run:
+                        self.assertEqual(gate.main(), expected)
+                        self.assertEqual(run.call_count, runs)
+
+    def test_metadata_rerun_parses_and_validates_the_second_round(self):
+        args = SimpleNamespace(metadata_rerun_bench=Path("bench"), metadata_rerun_index=Path("idx"), entries=16)
+        good = SimpleNamespace(stdout=metadata_fixture().replace("load_ms_median=200 core_load_ms_median=200",
+                                                               "load_ms_median=210 core_load_ms_median=200"))
+        with patch.object(gate.subprocess, "run", return_value=good) as run:
+            self.assertEqual(gate.metadata_rerun(args), (200, 210))
+            self.assertEqual(run.call_args.kwargs["timeout"], 600)
+        for bad in ("", metadata_fixture().replace("entries=16", "entries=17")):
+            with self.subTest(bad=bad), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=bad)):
+                with self.assertRaises(ValueError):
+                    gate.metadata_rerun(args)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,15 @@ the fast index (`docs/service.md`). Standard accounts stay refused. This
 ADR then filters standard accounts; whether admin accounts stay unfiltered
 is decided with it.
 
+**Interim access policy (owner request 2026-11-17, FR-27):** an administrator
+can allow every account or a list of accounts (`access.json`, `ferrow
+service access`, Settings → Service access; `docs/service.md`). Those
+accounts then see every name unfiltered, exactly as an administrator does:
+this is an explicit grant of the visibility the threat model below forbids to
+ordinary callers, so the default stays administrators only, the file is read
+only from the protected state folder and fails closed, and the whole policy is
+removed (or reduced to the "filtered" meaning) when this ADR is implemented.
+
 ## Goal and threat model
 
 The system service runs as SYSTEM and indexes every name on fixed local
@@ -416,7 +425,9 @@ review of its own once rules 1–5 work and are measured.
 ## Unix
 
 Unchanged: non-root callers stay `Unauthorized` until a revision covers
-effective groups, ACLs and MAC (review 1 items 5 and 6).
+effective groups, ACLs and MAC (review 1 items 5 and 6), except the accounts
+an administrator allowed with the interim access policy (`access.json`: every
+regular, non-`nobody` uid or a list of uids; `docs/service.md`).
 
 ## Tests (merge gates; disposable Windows CI only)
 

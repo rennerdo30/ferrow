@@ -165,7 +165,10 @@ pub fn state_file(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         let meta = unix::metadata(path, false)?;
         if meta.mode() & 0o7777 != 0o600 {
-            return Err(refused("service index must be root-owned 0600"));
+            return Err(refused(&format!(
+                "{}: state file must be root-owned 0600",
+                path.display()
+            )));
         }
         Ok(())
     }
@@ -492,6 +495,35 @@ pub(crate) mod windows {
         // SAFETY: path and initialized attributes live through creation; descriptor copied.
         if unsafe { CreateDirectoryW(name.as_ptr(), &attrs) } == 0 {
             return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    /// Make Administrators the owner of `path` (the token must be allowed to
+    /// assign it, as an elevated administrator's is).
+    pub fn own_by_administrators(path: &Path) -> io::Result<()> {
+        let sid_text: Vec<u16> = "S-1-5-32-544".encode_utf16().chain(Some(0)).collect();
+        let mut sid = std::ptr::null_mut();
+        // SAFETY: terminated input; the returned SID is freed below.
+        if unsafe { ConvertStringSidToSidW(sid_text.as_ptr(), &raw mut sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let name = wide(path);
+        // SAFETY: terminated path and a valid SID that outlive the call.
+        let code = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                sid,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        // SAFETY: frees the SID allocated by the conversion above.
+        unsafe { LocalFree(sid.cast()) };
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(code as i32));
         }
         Ok(())
     }
