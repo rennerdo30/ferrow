@@ -604,10 +604,10 @@ class GateTests(unittest.TestCase):
 class ConfirmationRoundTests(unittest.TestCase):
     """Timed rows over their limit in round 1 fail only when round 2 agrees."""
 
-    def run_main(self, head_text, producer, extra=()):
+    def run_main(self, head_text, producer, extra=(), base_text=None):
         with tempfile.TemporaryDirectory() as folder:
             base, head = [Path(folder) / name for name in ("base.txt", "head.txt")]
-            base.write_text(fixture(language=False), encoding="utf-8")
+            base.write_text(fixture(language=False) if base_text is None else base_text, encoding="utf-8")
             head.write_text(head_text, encoding="utf-8")
             argv = ["bench-gate.py", str(base), str(head), "--entries", "16", *extra]
             for arm in ("base", "head"):
@@ -806,6 +806,88 @@ class ConfirmationRoundTests(unittest.TestCase):
         with patch.object(gate, "control_rows", side_effect=wrapped):
             code, _, report = self.run_main(self.spike(), lambda _a, arm, *_: (0.2 if arm == "base" or phase["control"] else 4, 2, 0, 800, 16, 1))
         self.assertEqual(code, 1)
+
+    # --- cold-path check (owner, 2026-11-17): head cold <= 1.5 x base cold + 1.2 ms -------------
+
+    @staticmethod
+    def cold_producer(head_first_cold, base_first_cold=0.2):
+        def produce(_args, arm, kind, query, operation):
+            cold = (base_first_cold if arm == "base" else head_first_cold) if operation == "first_page_ms" else 10
+            return (0.2 if operation == "first_page_ms" else 10), 2, 0, 800, 16, cold
+        return produce
+
+    def cold_regression_files(self):
+        """Repeated medians unchanged; IPC 'a' first page cold 3x + 5 ms slower on head."""
+        base = with_cold(fixture(language=False))
+        head = with_cold(fixture(), {'FERROW-SERVICE query="a"': (0.2 * 3 + 5, 10)})
+        return base, head
+
+    def test_cold_rows_fail_only_over_one_and_a_half_times_plus_1_2_ms(self):
+        base = gate.parse(with_cold(fixture(language=False)), require_new=False)
+        same = gate.cold_rows(base, gate.parse(with_cold(fixture())))
+        self.assertEqual(len(same), 24)  # 2 kinds x 6 queries x first page and full count
+        self.assertTrue(all(row[0].startswith("cold ") and not row[-1] for row in same))
+        limit = gate.cold_limit(0.2)
+        self.assertAlmostEqual(limit, 0.2 * 1.5 + 1.2)
+        edge = {'FERROW-SERVICE query="a"': (limit, 10)}
+        self.assertFalse(any(r[-1] for r in gate.cold_rows(base, gate.parse(with_cold(fixture(), edge)))))
+        edge = {'FERROW-SERVICE query="a"': (limit + 0.001, 10)}
+        bad = [r for r in gate.cold_rows(base, gate.parse(with_cold(fixture(), edge))) if r[-1]]
+        self.assertEqual([r[0] for r in bad], ["cold IPC 'a' first_page_ms"])
+        # Legacy files without cold samples have no cold rows (and are refused when producers ran).
+        self.assertEqual(gate.cold_rows(gate.parse(fixture(language=False), require_new=False), gate.parse(fixture())), [])
+
+    def test_a_cold_regression_with_unchanged_repeated_medians_fails_the_gate(self):
+        base_text, head_text = self.cold_regression_files()
+        base = gate.parse(base_text, require_new=False)
+        head = gate.parse(head_text)
+        # The paired rows on the repeated medians do not see it ...
+        self.assertFalse(any(row[-1] for row in gate.compare(base, head, 16)))
+        # ... the cold rows do, in both rounds, through the same retry path.
+        code, probe, report = self.run_main(head_text, self.cold_producer(0.2 * 3 + 5), base_text=base_text)
+        self.assertEqual(code, 1)
+        self.assertIn("| cold IPC 'a' first_page_ms |", report)
+        self.assertIn("confirmed regression", report)
+        self.assertEqual(probe.call_count, 22 + 22)  # one remeasurement of that row, then its A/A control
+        self.assertIn("1.5 x base + 1.2 ms", report)
+
+    def test_a_cold_spike_in_one_round_only_passes_and_is_reported(self):
+        base_text, head_text = self.cold_regression_files()
+        code, probe, report = self.run_main(head_text, self.cold_producer(0.2), base_text=base_text)
+        self.assertEqual(code, 0)
+        self.assertIn("first over limit, confirmed not over", report)
+        self.assertIn("cold IPC 'a' first_page_ms", report)
+
+    def test_cold_rows_go_through_the_a_a_control_on_the_cold_median(self):
+        base = gate.parse(with_cold(fixture(language=False)), require_new=False)
+        calls = []
+        def measure(arm, *_):
+            calls.append(arm)  # identical medians, but a cold sample 3x + 5 ms slower on one arm
+            return 0.2, 2, 0, 800, 16, (0.2 if arm == "base" else 5.6)
+        result = gate.control_rows(["cold IPC 'a' first_page_ms", "IPC 'a' first_page_ms"], base, measure)
+        self.assertEqual([(name, bad) for name, _, _, bad in result],
+                         [("cold IPC 'a' first_page_ms", True), ("IPC 'a' first_page_ms", False)])
+        self.assertEqual(len(calls), 22)  # both names share one A/A measurement
+        # End to end: a cold regression whose A/A control also differs is unresolved, exit 3.
+        base_text, head_text = self.cold_regression_files()
+        with patch.object(gate, "control_rows", side_effect=lambda names, b, m, trace=None: [(n, 0.2, 5.6, True) for n in names]):
+            code, _, report = self.run_main(head_text, self.cold_producer(0.2 * 3 + 5), base_text=base_text)
+        self.assertEqual(code, 3)
+        self.assertIn("Harness unresolved: identical binaries also differ. Rerun; do not merge on this result.", report)
+
+    def test_a_row_and_its_cold_row_share_one_remeasurement(self):
+        base = gate.parse(with_cold(fixture(language=False)), require_new=False)
+        head = gate.parse(with_cold(fixture(), {'FERROW-SERVICE query="a"': (5.6, 10)}).replace(
+            'FERROW-SERVICE query="a" first_page_ms=0.2', 'FERROW-SERVICE query="a" first_page_ms=4', 1))
+        rows = gate.compare(base, head, 16) + gate.cold_rows(base, head)
+        self.assertEqual({r[0] for r in rows if r[-1]}, {"IPC 'a' first_page_ms", "cold IPC 'a' first_page_ms"})
+        calls = []
+        def measure(arm, *_):
+            calls.append(arm)
+            return (0.2 if arm == "base" else 4), 2, 0, 800, 16, (0.2 if arm == "base" else 5.6)
+        result = gate.retry_failures(rows, base, head, measure)
+        self.assertEqual(len(calls), 12)  # 1 warm-up + 5 samples per arm, once for both rows
+        self.assertTrue(all(r[-1] for r in result if r[0] in ("IPC 'a' first_page_ms", "cold IPC 'a' first_page_ms")))
 
     def test_nothing_over_runs_no_second_round(self):
         code, probe, report = self.run_main(fixture(), self.steady)

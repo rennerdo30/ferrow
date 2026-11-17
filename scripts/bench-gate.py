@@ -40,6 +40,11 @@ MIN_PROBE_REPEATS = 3
 # where the 0.1 ms absolute tolerance dominates, collect 10 balanced samples.
 SUBMS_LIMIT_MS = 2.0
 SUBMS_SAMPLES = 10
+# Cold-path check (owner, 2026-11-17): the cold first sample per row is compared
+# as well, next to the 10% rule on the repeated medians. The cold sample is far
+# noisier, hence a ratio plus a fixed allowance. Fails when head > base * 1.5 + 1.2 ms.
+COLD_RATIO = 1.5
+COLD_ALLOWANCE_MS = 1.2
 # The A/A control is for isolated rows: a broad failure is not plausibly harness bias.
 MAX_CONTROL_ROWS = 8
 
@@ -151,6 +156,7 @@ def render(rows):
              "Limit: base + max(10%, 0.1 ms); memory: base + 10%. "
              "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms, "
              "judged on the cold first sample of each process (not the repeated median). "
+             "Rows named cold compare the cold first sample per row: head <= 1.5 x base + 1.2 ms. "
              "Section 3 absolute targets remain reported goals.", "",
              "| Metric | Base | Head | Limit | Result |", "|---|---:|---:|---:|---|"]
     def cell(value):
@@ -346,18 +352,47 @@ def exceeds(low, high):
     return high > low + max(low * 0.10, 0.1)
 
 
+def cold_limit(base_cold):
+    return base_cold * COLD_RATIO + COLD_ALLOWANCE_MS
+
+
+def cold_exceeds(low, high):
+    """True when a cold median is over base * 1.5 + 1.2 ms."""
+    return high > cold_limit(low)
+
+
+def cold_rows(base, head):
+    """Paired rows on the cold first sample per process (median over processes).
+
+    Row names start with "cold ". Empty for legacy files without cold samples."""
+    rows = []
+    for label, b, h in (("in-process", base[1], head[1]), ("IPC", base[2], head[2])):
+        for query in sorted(QUERIES):
+            for key, cold_key in (("first_page_ms", "first_page_cold_ms"), ("full_count_ms", "full_count_cold_ms")):
+                if cold_key not in b[query] or cold_key not in h[query]:
+                    return []
+                before, after = b[query][cold_key], h[query][cold_key]
+                rows.append((f"cold {label} {query!r} {key}", before, after, cold_limit(before), cold_exceeds(before, after)))
+    return rows
+
+
 def control_rows(names, base, measure, trace=None):
     """A/A control: measure each named row with identical binaries in both arms.
 
     `measure` must run the head binaries for either arm. The arm labels are
     arbitrary here, so a bias in either direction counts."""
     descriptors = metric_descriptors(base)
-    result = []
+    result, measured = [], {}
     for name in names:
-        kind, query, operation, expected = descriptors[name]
-        samples = interleaved(measure, kind, query, operation, expected, trace, tag="A/A control: ")
-        a, b = samples["base"][0], samples["head"][0]
-        result.append((name, a, b, exceeds(a, b) or exceeds(b, a)))
+        cold = name.startswith("cold ")
+        kind, query, operation, expected = descriptors[name[5:] if cold else name]
+        if (kind, query, operation) not in measured:
+            measured[kind, query, operation] = interleaved(measure, kind, query, operation, expected, trace, tag="A/A control: ")
+        samples = measured[kind, query, operation]
+        index = 5 if cold else 0
+        a, b = samples["base"][index], samples["head"][index]
+        biased = cold_exceeds(a, b) or cold_exceeds(b, a) if cold else exceeds(a, b) or exceeds(b, a)
+        result.append((name, a, b, biased))
     return result
 
 
@@ -380,16 +415,20 @@ def retry_failures(rows, base, head, measure, trace=None):
     if any(bad and name == "bytes/entry" for name, _, _, _, bad in rows):
         return rows
     descriptors = metric_descriptors(base)
-    result = []
+    result, measured = [], {}
     for row in rows:
         name, _, _, _, bad = row
         if not bad or row[1] is None:
             result.append(row)
             continue
-        kind, query, operation, expected = descriptors[name]
-        samples = interleaved(measure, kind, query, operation, expected, trace)
-        b, h = (samples[arm][0] for arm in ("base", "head"))
-        limit = b + max(b * 0.10, 0.1)
+        cold = name.startswith("cold ")
+        kind, query, operation, expected = descriptors[name[5:] if cold else name]
+        if (kind, query, operation) not in measured:  # a row and its cold row share one measurement
+            measured[kind, query, operation] = interleaved(measure, kind, query, operation, expected, trace)
+        samples = measured[kind, query, operation]
+        index = 5 if cold else 0
+        b, h = (samples[arm][index] for arm in ("base", "head"))
+        limit = cold_limit(b) if cold else b + max(b * 0.10, 0.1)
         result.append((name, b, h, limit, h > limit))
     return result
 
@@ -536,7 +575,8 @@ def main():
         base = parse(args.base.read_text(encoding="utf-8"), require_new=False, require_cold=args.measure)
         head = parse(args.head.read_text(encoding="utf-8"), require_cold=args.measure)
         rows = compare(base, head, args.entries)
-        report = render(rows) + cold_table(base, head)
+        cold = cold_rows(base, head)
+        report = render(rows + cold) + cold_table(base, head)
         # A refused head-only metadata observation must not hide the paired
         # result: finish the paired phase (retry, A/A control), then refuse.
         metadata_error = None
@@ -552,6 +592,7 @@ def main():
                 if len(rows) + len(metadata_rows) != EXPECTED_TOTAL_METRICS:
                     raise ValueError("incomplete combined metric inventory")
                 report += metadata_report
+        rows = rows + cold  # after the inventory check: cold rows are not part of the fixed inventory
         if any(retry_paths):
             if not all(retry_paths):
                 raise ValueError("all paired retry paths are required")
