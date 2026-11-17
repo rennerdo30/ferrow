@@ -232,6 +232,12 @@ impl Engine {
     pub fn poll(&self) -> Option<Event> {
         self.events.try_recv().ok()
     }
+
+    /// Who may use the service just changed (Settings → Service access):
+    /// look for it now instead of at the next probe.
+    pub fn service_changed(&self) {
+        let _ = self.commands.send(Command::ServiceUp);
+    }
 }
 
 struct Worker<W: Fn()> {
@@ -242,6 +248,8 @@ struct Worker<W: Fn()> {
     remote: Option<Remote>,
     /// Lets scan threads hand their result back to this worker.
     commands: Option<Sender<Command>>,
+    /// A service probe thread is running (one at a time).
+    probing: Arc<AtomicBool>,
 }
 
 impl<W: Fn()> Worker<W> {
@@ -252,6 +260,7 @@ impl<W: Fn()> Worker<W> {
             index: None,
             remote: None,
             commands: None,
+            probing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -331,7 +340,11 @@ impl<W: Fn()> Worker<W> {
         let Some(commands) = self.commands.clone() else {
             return;
         };
-        let _ = std::thread::Builder::new()
+        if self.probing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let probing = self.probing.clone();
+        let started = std::thread::Builder::new()
             .name("ferrow-service-probe".into())
             .spawn(move || {
                 let endpoint = ferrow_ipc::Endpoint::default_service();
@@ -342,11 +355,15 @@ impl<W: Fn()> Worker<W> {
                         .and_then(|mut client| client.status())
                         .is_ok();
                     if answers {
+                        probing.store(false, Ordering::Release);
                         let _ = commands.send(Command::ServiceUp);
                         return;
                     }
                 }
             });
+        if started.is_err() {
+            self.probing.store(false, Ordering::Release);
+        }
     }
 
     fn load_default(&mut self) {

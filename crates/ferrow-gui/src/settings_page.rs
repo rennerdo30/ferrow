@@ -9,6 +9,7 @@ use eframe::egui::{
 };
 
 use super::{FerrowApp, Page, PickTarget};
+use crate::access;
 use crate::platform;
 use crate::settings::{SourceKind, ThemeChoice, UpdateChannel};
 use crate::theme;
@@ -52,6 +53,8 @@ impl FerrowApp {
                         ui.add_space(SECTION_GAP);
                         self.index_section(ui);
                         ui.add_space(SECTION_GAP);
+                        self.access_section(ui);
+                        ui.add_space(SECTION_GAP);
                         self.appearance_section(ui);
                         ui.add_space(SECTION_GAP);
                         self.updates_section(ui);
@@ -61,6 +64,137 @@ impl FerrowApp {
                     });
                 });
             });
+    }
+
+    /// Who may use the Ferrow service: the status first, then the actions.
+    fn access_section(&mut self, ui: &mut egui::Ui) {
+        let p = self.palette;
+        let ctx = ui.ctx().clone();
+        if self.access.poll() {
+            self.engine.service_changed();
+        }
+        if self.access.needs_refresh() {
+            let wake = ctx.clone();
+            self.access.refresh(move || wake.request_repaint());
+        }
+        section_title(ui, &p, "Service access");
+        let (title, detail) = access::summary(&self.access.view);
+        let view = self.access.view.clone();
+        let (busy, message) = (self.access.busy, self.access.message.clone());
+        let mut confirm = self.access.confirm_everyone;
+        let elevate = access::Access::can_elevate();
+        let mut action = None;
+        card(ui, &p, |ui| {
+            row_text(ui, &p, &title, &detail);
+            let access::View::Info(info) = &view else {
+                return;
+            };
+            let me = info.you.id.clone();
+            let name = |u: &ferrow_ipc::AccessUser| {
+                if u.name.is_empty() {
+                    u.id.clone()
+                } else {
+                    u.name.clone()
+                }
+            };
+            if let Some(users) = &info.users {
+                for user in users {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name(user)).size(13.0).color(p.text));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let remove =
+                                ui.add_enabled(!busy && elevate, std_button(&p, "Remove", 90.0));
+                            if remove.clicked() {
+                                action = Some(access::Action::Remove(user.id.clone()));
+                            }
+                        });
+                    });
+                }
+            }
+            ui.add_space(10.0);
+            let allow_me = !info.you_allowed
+                && info.mode != ferrow_ipc::AccessMode::Everyone
+                && !me.is_empty();
+            let everyone = info.mode != ferrow_ipc::AccessMode::Everyone;
+            let admins = info.mode != ferrow_ipc::AccessMode::Admins;
+            if busy {
+                row_header(
+                    ui,
+                    &p,
+                    "Waiting for administrator approval…",
+                    "Approve the prompt to continue.",
+                );
+            } else if confirm {
+                row_header(
+                    ui,
+                    &p,
+                    "Allow every account on this PC?",
+                    "Every account will see every file name on this PC, including other people's folders.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(accent_button(&p, "Allow every user", 140.0, true))
+                        .clicked()
+                    {
+                        action = Some(access::Action::Everyone);
+                    }
+                    if ui.add(std_button(&p, "Cancel", 90.0)).clicked() {
+                        confirm = false;
+                    }
+                });
+            } else if elevate {
+                ui.horizontal_wrapped(|ui| {
+                    if allow_me && ui.add(accent_button(&p, "Allow me", 110.0, true)).clicked() {
+                        action = Some(access::Action::AllowMe(me.clone()));
+                    }
+                    if everyone && ui.add(std_button(&p, "Allow every user", 140.0)).clicked() {
+                        confirm = true;
+                    }
+                    if admins
+                        && ui
+                            .add(std_button(&p, "Administrators only", 160.0))
+                            .clicked()
+                    {
+                        action = Some(access::Action::Admins);
+                    }
+                });
+            } else {
+                let rows = [
+                    allow_me.then(|| access::Action::AllowMe(me.clone())),
+                    everyone.then_some(access::Action::Everyone),
+                    admins.then_some(access::Action::Admins),
+                ];
+                row_header(
+                    ui,
+                    &p,
+                    "To change this, run in an administrator terminal:",
+                    "",
+                );
+                for command in rows
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.terminal_command())
+                {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&command).monospace().size(12.0).color(p.text));
+                        if ui.add(std_button(&p, "Copy", 70.0)).clicked() {
+                            platform::copy_text(&command);
+                        }
+                    });
+                }
+            }
+            if let Some(text) = &message {
+                ui.add_space(6.0);
+                ui.label(RichText::new(text).size(12.0).color(p.text_secondary));
+            }
+        });
+        self.access.confirm_everyone = confirm;
+        if let Some(action) = action {
+            let wake = ctx.clone();
+            self.access.run(action, move || wake.request_repaint());
+        }
     }
 
     fn index_section(&mut self, ui: &mut egui::Ui) {

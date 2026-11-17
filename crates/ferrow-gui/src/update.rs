@@ -46,30 +46,32 @@ pub fn current_version() -> Version {
     })
 }
 
-/// True for a copy installed by setup, which can update itself. Other
-/// builds (development, portable) only link to the release page.
-pub fn can_install() -> bool {
+/// A file next to this app, when this is the copy Setup installed in
+/// `%ProgramFiles%\Ferrow` (Windows); `None` for development and portable
+/// copies. Elevated launches only ever start files from that protected folder.
+pub fn installed_sibling(name: &str) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        let Some(dir) = exe.parent() else {
-            return false;
-        };
-        let Some(program_files) = std::env::var_os("ProgramW6432")
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        let program_files = std::env::var_os("ProgramW6432")
             .or_else(|| std::env::var_os("ProgramFiles"))
-            .map(std::path::PathBuf::from)
-        else {
-            return false;
-        };
-        dir.eq_ignore_ascii_case_path(&program_files.join("Ferrow"))
-            && dir.join("ferrow-update.exe").is_file()
+            .map(std::path::PathBuf::from)?;
+        let file = dir.join(name);
+        (dir.eq_ignore_ascii_case_path(&program_files.join("Ferrow")) && file.is_file())
+            .then_some(file)
     }
     #[cfg(not(windows))]
     {
-        false
+        let _ = name;
+        None
     }
+}
+
+/// True for a copy installed by setup, which can update itself. Other
+/// builds (development, portable) only link to the release page.
+pub fn can_install() -> bool {
+    installed_sibling("ferrow-update.exe").is_some()
 }
 
 #[cfg(windows)]
