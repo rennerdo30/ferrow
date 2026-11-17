@@ -158,7 +158,7 @@ jobs:
   bench:
     name: bench (5M fixture)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     # Explicit bash runs with -eo pipefail, so a failing or timed-out
     # measurement is not hidden behind `| tee`.
     defaults:
@@ -452,7 +452,8 @@ jobs:
             --head-binary "$PWD/target/release/ferrow" \
             --base-index "$RUNNER_TEMP/ferrow-small-shared.bin" --head-index "$RUNNER_TEMP/ferrow-small-shared.bin" || result=$?
           # Smoke validates producers/content/completeness, not tiny-fixture latency.
-          test "$result" -le 1
+          # 0 pass, 1 regression, 3 biased harness: all three prove the producers ran.
+          test "$result" -le 1 -o "$result" -eq 3
       - name: Prepare one shared main-format fixture (profiling only)
         if: github.event_name == 'pull_request'
         working-directory: .bench-base
@@ -480,15 +481,6 @@ jobs:
       - name: Write fixture profiling summary (separate from paired samples)
         if: always()
         run: ./scripts/bench-summary.sh fixture-output.txt
-      - name: TEMPORARY A/A diagnostic (FR-31, removed before merge)
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        run: |
-          T="$RUNNER_TEMP"
-          {
-            echo "## Repeat-in-process diagnostic (FR-31)"
-            timeout -k 10s 1500s python3 scripts/aa_diag.py "$T/ferrow-bench.bin" 8 31 "$T/ferrow-base-target/release" "$PWD/target/release"
-          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
         run: |
@@ -502,3 +494,23 @@ jobs:
             --base-index "$RUNNER_TEMP/ferrow-bench.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin" \
             --metadata-rerun-bench "$PWD/target/release/examples/metadata_bench" \
             --metadata-rerun-index "$RUNNER_TEMP/ferrow-metadata-confirm.bin"
+      - name: TEMPORARY A/A gate runs on identical head binaries (FR-31, removed before merge)
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          T="$RUNNER_TEMP"
+          mkdir -p "$T/aa-a/examples"
+          cp target/release/ferrow "$T/aa-a/ferrow"
+          cp target/release/examples/latency_probe "$T/aa-a/examples/latency_probe"
+          sha256sum target/release/ferrow "$T/aa-a/ferrow" target/release/examples/latency_probe "$T/aa-a/examples/latency_probe"
+          # Run 1: base arm = copy in a temp directory, head arm = workspace. Run 2: reversed.
+          for run in copy-as-base copy-as-head; do
+            if [ "$run" = copy-as-base ]; then B="$T/aa-a"; H="$PWD/target/release"; else B="$PWD/target/release"; H="$T/aa-a"; fi
+            echo "## A/A gate run ($run): identical head binaries in both arms" >> "$GITHUB_STEP_SUMMARY"
+            result=0
+            timeout -k 10s 1200s python3 scripts/bench-gate.py "$T/aa-base-$run.txt" "$T/aa-head-$run.txt" --measure \
+              --base-probe "$B/examples/latency_probe" --head-probe "$H/examples/latency_probe" \
+              --base-binary "$B/ferrow" --head-binary "$H/ferrow" \
+              --base-index "$T/ferrow-bench.bin" --head-index "$T/ferrow-bench.bin" || result=$?
+            echo "A/A $run exit code $result" | tee -a "$GITHUB_STEP_SUMMARY"
+          done

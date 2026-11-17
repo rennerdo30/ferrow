@@ -3,11 +3,17 @@
 
 Timed rows over their limit in round 1 are re-measured once (interleaved, same
 runner/job); they fail only if over the limit in both rounds. Memory is never
-re-measured."""
+re-measured. Each probe process repeats its timed operation and reports the
+median (FR-31: one cold sample per process is dominated by scheduling jitter).
+A row that fails both rounds is then re-measured against itself (the head
+binaries in both arms, an A/A control); if the control also exceeds the limit
+the harness cannot resolve the tolerance and the gate reports a biased
+harness (exit 3), not a regression."""
 import argparse
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import sys
 import subprocess
@@ -24,6 +30,10 @@ PAIRED_METRICS = 2 + 2 * 2 * len(QUERIES)
 EXPECTED_METRICS = PAIRED_METRICS + 2 * 2 * len(NEW_QUERIES)
 EXPECTED_METADATA_METRICS = 2 + 2 * 2 * len(QUERIES) + 2 * len(FILTER_QUERIES)
 EXPECTED_TOTAL_METRICS = EXPECTED_METRICS + EXPECTED_METADATA_METRICS
+# In-process repeats per probe process (at most; the probe stops after about
+# 100 ms of repeats, never below MIN_PROBE_REPEATS). The probe proves it ran.
+PROBE_REPEATS = 31
+MIN_PROBE_REPEATS = 3
 
 
 def number(value):
@@ -113,7 +123,7 @@ def compare(base, head, expected_entries=5_000_000):
 
 def render(rows):
     lines = ["## Paired benchmark regression gate", "",
-             "Same runner/job; median of 3 loads and 5 queries per arm. "
+             "Same runner/job; median of 3 loads and 5 queries per arm, each query sample the median of in-process repeats. "
              "Limit: base + max(10%, 0.1 ms); memory: base + 10%. "
              "All 24 new-syntax head-only observations are required; common wildcard pages must be <= 16 ms. "
              "Section 3 absolute targets remain reported goals.", "",
@@ -252,6 +262,45 @@ def interleaved(measure, kind, query, operation, expected=None, trace=None, obse
     return {arm: (statistics.median(s[0] for s in values), *values[0][1:]) for arm, values in samples.items()}
 
 
+def metric_descriptors(base):
+    descriptors = {"load total (ms)": ("load", "", "load", base[0]["entries"])}
+    for label, queries in (("in-process", base[1]), ("IPC", base[2])):
+        for query, values in queries.items():
+            for operation, hits in (("first_page_ms", "page_hits"), ("full_count_ms", "total_hits")):
+                descriptors[f"{label} {query!r} {operation}"] = (label, query, operation, values[hits])
+    return descriptors
+
+
+def exceeds(low, high):
+    """True when high is over low + max(10%, 0.1 ms): the gate's own limit."""
+    return high > low + max(low * 0.10, 0.1)
+
+
+def control_rows(names, base, measure):
+    """A/A control: measure each named row with identical binaries in both arms.
+
+    `measure` must run the head binaries for either arm. The arm labels are
+    arbitrary here, so a bias in either direction counts."""
+    descriptors = metric_descriptors(base)
+    result = []
+    for name in names:
+        kind, query, operation, expected = descriptors[name]
+        samples = interleaved(measure, kind, query, operation, expected)
+        a, b = samples["base"][0], samples["head"][0]
+        result.append((name, a, b, exceeds(a, b) or exceeds(b, a)))
+    return result
+
+
+def control_table(control):
+    lines = [f"| {name.replace('|', chr(92) + '|')} | {a:.6f} | {b:.6f} | "
+             f"{'biased harness' if biased else 'identical binaries within the limit'} |"
+             for name, a, b, biased in control]
+    return ("\n### A/A control (identical head binaries in both arms, same runner/job)\n\n"
+            "Run only for rows that failed both rounds. A row whose control is also over the limit "
+            "is a biased harness, not a regression.\n\n"
+            "| Metric | Arm A | Arm B | Result |\n|---|---:|---:|---|\n" + "\n".join(lines) + "\n")
+
+
 def retry_failures(rows, base, head, measure, trace=None):
     """Validate first, then retry each failing latency exactly once per arm.
 
@@ -260,11 +309,7 @@ def retry_failures(rows, base, head, measure, trace=None):
     """
     if any(bad and name == "bytes/entry" for name, _, _, _, bad in rows):
         return rows
-    descriptors = {"load total (ms)": ("load", "", "load", base[0]["entries"])}
-    for label, queries in (("in-process", base[1]), ("IPC", base[2])):
-        for query, values in queries.items():
-            for operation, hits in (("first_page_ms", "page_hits"), ("full_count_ms", "total_hits")):
-                descriptors[f"{label} {query!r} {operation}"] = (label, query, operation, values[hits])
+    descriptors = metric_descriptors(base)
     result = []
     for row in rows:
         name, _, _, _, bad = row
@@ -286,14 +331,22 @@ def probe(args, arm, kind, query, operation):
                str(getattr(args, arm + "_index")), kind, query, operation]
     if arm == "base":
         command.append("--legacy-queries")
+    env = {**os.environ, "FERROW_PROBE_REPEATS": str(PROBE_REPEATS)}
     try:
-        run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True)
+        run = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=120, check=True, env=env)
     except subprocess.CalledProcessError as error:
         if error.stderr:
             print(error.stderr, file=sys.stderr, end="")
         raise
-    if getattr(run, "stderr", ""):
-        print(run.stderr, file=sys.stderr, end="")
+    stderr = getattr(run, "stderr", "") or ""
+    if stderr:
+        print(stderr, file=sys.stderr, end="")
+    if kind != "load":
+        # Every switch proves it ran: a probe that ignored the request would
+        # silently go back to one noisy sample per process.
+        repeats = re.findall(r"^FERROW-PROBE-REPEATS n=(\d+) ", stderr, re.MULTILINE)
+        if len(repeats) != 1 or int(repeats[0]) < MIN_PROBE_REPEATS:
+            raise ValueError("probe did not run its in-process repeats")
     records = [line for line in run.stdout.splitlines() if line.startswith("FERROW-RETRY ")]
     if len(records) != 1:
         raise ValueError("retry producer must emit exactly one receipt")
@@ -428,6 +481,17 @@ def main():
             if retryable and not memory_failed:
                 report += "\n### One paired latency remeasurement (final decision)\n\n" + render(retried) + confirmation_table(rows, retried)
             rows = retried
+            timed_failures = [row[0] for row in rows if row[-1] and row[1] is not None and row[0] != "bytes/entry"]
+            if timed_failures and retryable and not memory_failed:
+                control = control_rows(timed_failures, base, lambda arm, *metric: probe(args, "head", *metric))
+                report += control_table(control)
+                biased = {name for name, _, _, bad in control if bad}
+                if all(row[0] in biased for row in rows if row[-1]):
+                    note = ("Benchmark harness biased: identical head binaries in both arms differ beyond the limit on "
+                            + ", ".join(sorted(biased)) + "; the paired result for these rows is not evidence of a regression.")
+                    print(note, file=sys.stderr)
+                    publish(report + f"\n{note}\n" + sample_order(trace))
+                    return 3
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"benchmark gate refused incomplete evidence: {error}", file=sys.stderr)
         publish(report + f"\nBenchmark evidence refused: {error}\n" + sample_order(trace))

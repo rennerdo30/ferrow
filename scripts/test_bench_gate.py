@@ -14,6 +14,9 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 
+REPEATS = "FERROW-PROBE-REPEATS n=31 min=0.100000000 median=0.200000000 max=0.300000000\n"
+
+
 def fixture(language=True):
     lines = ["FERROW-MEASURE entries=16 seed=2026 heap_bytes=800 bytes_per_entry=50",
              "FERROW-MEASURE load_ms_median=100"]
@@ -354,7 +357,7 @@ class GateTests(unittest.TestCase):
     def test_probe_enforces_legacy_only_base(self):
         args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
         receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
-        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt)) as run:
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt, stderr=REPEATS)) as run:
             gate.probe(args, "base", "IPC", "a", "first_page_ms")
             self.assertEqual(run.call_args.args[0][-1], "--legacy-queries")
             for kind in ("IPC", "in-process"):
@@ -379,6 +382,22 @@ class GateTests(unittest.TestCase):
                 self.assertIn("One paired latency remeasurement", publish.call_args.args[0])
                 self.assertIn("new-language", publish.call_args.args[0])
 
+    def test_probe_requests_in_process_repeats_and_proves_they_ran(self):
+        args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
+        receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
+        with patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt, stderr=REPEATS)) as run:
+            gate.probe(args, "base", "IPC", "a", "first_page_ms")
+            self.assertEqual(run.call_args.kwargs["env"]["FERROW_PROBE_REPEATS"], str(gate.PROBE_REPEATS))
+            # Loads time one process start-up and have no repeats to prove.
+            gate.probe(args, "base", "load", "", "load")
+        # A probe that ignored the request (old driver) or repeated too little is refused.
+        for stderr in ("", "FERROW-PROBE-ACTIVE pid=1 timeout_s=120\n", REPEATS * 2,
+                       "FERROW-PROBE-REPEATS n=2 min=1 median=1 max=1\n"):
+            with self.subTest(stderr=stderr), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=receipt, stderr=stderr)):
+                for kind in ("IPC", "in-process"):
+                    with self.assertRaisesRegex(ValueError, "in-process repeats"):
+                        gate.probe(args, "base", kind, "a", "first_page_ms")
+
     def test_retry_producer_failure_and_timeout_are_not_retry_passes(self):
         args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
         for error in (subprocess.CalledProcessError(42, "probe"), subprocess.TimeoutExpired("probe", 120)):
@@ -393,7 +412,7 @@ class GateTests(unittest.TestCase):
         args = SimpleNamespace(base_probe=Path("probe"), base_binary=Path("ferrow"), base_index=Path("fixture"), entries=16)
         receipt = "FERROW-RETRY value_ms=1 hits=2 digest=42 heap_bytes=800 entries=16\n"
         for stdout in ("", receipt*2, receipt.replace("value_ms=1", "value_ms=NaN"), "FERROW-RETRY value_ms=1\n"):
-            with self.subTest(stdout=stdout), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+            with self.subTest(stdout=stdout), patch.object(gate.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, stderr=REPEATS)):
                 with self.assertRaises((ValueError, KeyError)):
                     gate.probe(args, "base", "IPC", "a", "first_page_ms")
 
@@ -471,6 +490,55 @@ class ConfirmationRoundTests(unittest.TestCase):
             self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
         self.assertEqual(code, 1)
         self.assertIn("confirmed regression", report)
+
+    def test_a_a_control_flags_bias_in_either_direction(self):
+        base = gate.parse(fixture(language=False), require_new=False)
+        name = "IPC 'a' first_page_ms"
+        for slow_arm in ("base", "head"):
+            def biased(arm, *_):
+                return (4 if arm == slow_arm else 0.2), 2, 0, 800, 16
+            with self.subTest(slow_arm=slow_arm):
+                self.assertTrue(gate.control_rows([name], base, biased)[0][-1])
+        control = gate.control_rows([name], base, lambda arm, *_: (0.2, 2, 0, 800, 16))
+        self.assertFalse(control[0][-1])
+        self.assertIn("identical binaries within the limit", gate.control_table(control))
+
+    def test_confirmed_regression_with_clean_control_is_still_a_regression(self):
+        code, probe, report = self.run_main(
+            self.spike(), lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
+        self.assertEqual(code, 1)
+        self.assertIn("A/A control", report)
+        self.assertIn("identical binaries within the limit", report)
+        self.assertNotIn("Benchmark harness biased", report)
+        # The control always runs the head binaries, in both arms.
+        self.assertTrue(all(call.args[1] == "head" for call in probe.call_args_list[-12:]))
+
+    def test_biased_harness_is_reported_not_called_a_regression(self):
+        producer = lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16)
+        def control(names, base, measure):
+            return [(name, 0.2, 4, True) for name in names]
+        with patch.object(gate, "control_rows", side_effect=control):
+            code, _, report = self.run_main(self.spike(), producer)
+        self.assertEqual(code, 3)
+        self.assertIn("Benchmark harness biased", report)
+        self.assertIn("not evidence of a regression", report)
+
+    def test_one_clean_control_keeps_the_regression_verdict(self):
+        two = self.spike().replace('FERROW-SERVICE query="re" first_page_ms=0.2', 'FERROW-SERVICE query="re" first_page_ms=4', 1)
+        def control(names, base, measure):
+            self.assertEqual(len(names), 2)
+            return [(name, 0.2, 4, index == 0) for index, name in enumerate(names)]
+        with patch.object(gate, "control_rows", side_effect=control):
+            code, _, report = self.run_main(two, lambda _args, arm, *_: (0.2 if arm == "base" else 4, 2, 0, 800, 16))
+        self.assertEqual(code, 1)
+        self.assertNotIn("Benchmark harness biased", report)
+
+    def test_control_never_runs_for_a_passing_gate_or_a_memory_failure(self):
+        with patch.object(gate, "control_rows") as control:
+            self.run_main(fixture(), self.steady)
+            self.run_main(self.spike(), self.steady)
+            self.run_main(self.spike().replace("heap_bytes=800", "heap_bytes=1000"), self.steady)
+        control.assert_not_called()
 
     def test_nothing_over_runs_no_second_round(self):
         code, probe, report = self.run_main(fixture(), self.steady)
