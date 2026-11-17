@@ -41,9 +41,11 @@ pub const MIN_DELTA: usize = 50_000;
 pub const MAX_DELTA_CAP: usize = 250_000;
 /// …or once this share of frozen entries is hidden (1/10)…
 const MAX_REMOVED_DIVISOR: usize = 10;
-/// A folder move copies at most this many entries into the delta; a larger
-/// frozen subtree stays in place, hidden, and a compaction re-attaches it
-/// (see [`Live::move_children`]).
+/// A folder move copies frozen entries into the delta while its frozen
+/// subtree has at most this many entries (folders and dead entries count);
+/// a larger frozen subtree stays in place, hidden, and a compaction
+/// re-attaches it. Delta entries below the folder are always copied (the
+/// delta limits bound them). See [`Live::move_children`].
 const MAX_MOVE: usize = 100_000;
 
 /// The size limits of the live layer. They follow the index: a fixed limit
@@ -130,6 +132,7 @@ const RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 pub const REASON_MOVED_IN: &str = "a folder moved into an indexed location";
 pub const REASON_LARGE_MOVE: &str = "a large folder moved";
 pub const REASON_ADMIN: &str = "requested by an administrator";
+pub const REASON_NESTING: &str = "a folder moved below a folder that was inside it";
 /// The end of the reason text for a delta full of dead entries (`"N …"`).
 const REASON_SUPERSEDED_SUFFIX: &str = "superseded entries";
 
@@ -140,6 +143,8 @@ pub fn reason_kind(reason: &str) -> &'static str {
         "moved-in folder"
     } else if reason.starts_with(REASON_LARGE_MOVE) {
         "large folder move"
+    } else if reason.starts_with(REASON_NESTING) {
+        "folders swapped nesting"
     } else if reason.ends_with(" live changes") {
         "too many live changes"
     } else if reason.ends_with(" replaced entries") {
@@ -396,8 +401,9 @@ impl Load {
 /// When a requested rescan or compaction may start. A reason that only says
 /// the live layer is large asks for a compaction (seconds of one low-priority
 /// thread, no disk); any other reason asks for a rescan (see [`ReasonKind`]).
-/// A pending rescan covers a pending compaction: a fresh index has no live
-/// layer.
+/// A pending rescan covers a pending compaction (a fresh index has no live
+/// layer), except one that shows entries hidden by a large folder move
+/// ([`Load::prompt`]): that one runs first and the rescan still follows.
 #[derive(Debug)]
 pub struct Maintenance {
     rescan: RescanPolicy,
@@ -408,6 +414,9 @@ pub struct Maintenance {
     duty_earliest: Instant,
     /// Since when the delta has been past its hard limit (without a break).
     urgent_since: Option<Instant>,
+    /// Since when entries have been hidden by a large folder move: they
+    /// wait for folder reads and saves no longer than an overgrown delta.
+    prompt_since: Option<Instant>,
 }
 
 impl Maintenance {
@@ -419,6 +428,7 @@ impl Maintenance {
             compact_earliest: now + MIN_COMPACT_GAP,
             duty_earliest: now,
             urgent_since: None,
+            prompt_since: None,
         }
     }
 
@@ -453,12 +463,19 @@ impl Maintenance {
         self.rescan.pending().is_some()
     }
 
-    /// Whether an overgrown delta has waited as long as it may.
+    /// Whether an overgrown delta, or entries hidden by a large folder
+    /// move, have waited as long as they may.
     fn overdue(&self, now: Instant, load: Load) -> bool {
-        load.severe
-            || self
-                .urgent_since
-                .is_some_and(|since| now >= since + URGENT_PATIENCE)
+        load.severe || self.patience().is_some_and(|end| now >= end)
+    }
+
+    /// When the patience of an overgrown delta or of hidden entries ends.
+    fn patience(&self) -> Option<Instant> {
+        [self.urgent_since, self.prompt_since]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|since| since + URGENT_PATIENCE)
     }
 
     /// What to do now, if anything. A compaction waits for folder reads (their
@@ -467,10 +484,16 @@ impl Maintenance {
     /// for its gap. The hard limit stays a cap: an urgent delta that has
     /// waited [`URGENT_PATIENCE`], or a [`Load::severe`] one, is not held
     /// back by a save, and when folders keep being read the volumes are
-    /// rescanned, as before compactions existed.
+    /// rescanned, as before compactions existed. Entries hidden by a large
+    /// folder move ([`Load::prompt`]) have the same patience.
     pub fn due(&mut self, now: Instant, load: Load) -> Option<Due> {
         self.urgent_since = if load.urgent {
             self.urgent_since.or(Some(now))
+        } else {
+            None
+        };
+        self.prompt_since = if load.prompt {
+            self.prompt_since.or(Some(now))
         } else {
             None
         };
@@ -506,6 +529,7 @@ impl Maintenance {
         self.compact_earliest = now + gap;
         self.duty_earliest = now + (took * COMPACT_DUTY).min(MAX_COMPACT_GAP);
         self.urgent_since = None;
+        self.prompt_since = None;
     }
 
     /// When the maintainer must wake to start what is pending. A compaction
@@ -515,7 +539,7 @@ impl Maintenance {
     pub fn wake_at(&self, now: Instant, load: Load) -> Option<Instant> {
         let compact = (self.compact.is_some() && (load.prompt || !self.rescan_waiting()))
             .then(|| {
-                let patience = self.urgent_since.map(|since| since + URGENT_PATIENCE);
+                let patience = self.patience();
                 let earliest = if load.prompt {
                     self.compact_earliest.min(self.duty_earliest)
                 } else {
@@ -1366,7 +1390,9 @@ impl Live {
             .map(|c| (*c, source.fetch(c.volume, c.record)))
             .collect();
         // Parents first: a record whose parent is also new in this batch
-        // waits until the parent has an entry.
+        // waits until the parent has an entry, and a folder whose new parent
+        // also moves in this batch and is still below it here waits until
+        // that parent has moved out (see `apply_one`).
         loop {
             let waiting: HashSet<(usize, u64)> =
                 pending.iter().map(|(c, _)| (c.volume, c.record)).collect();
@@ -1375,9 +1401,16 @@ impl Live {
             for (change, state) in std::mem::take(&mut pending) {
                 let blocked = state.as_ref().is_some_and(|s| {
                     s.names.iter().any(|(parent, _)| {
-                        *parent != change.record
-                            && waiting.contains(&(change.volume, *parent))
-                            && self.locations(change.volume, *parent).is_empty()
+                        if *parent == change.record || !waiting.contains(&(change.volume, *parent))
+                        {
+                            return false;
+                        }
+                        let at = self.locations(change.volume, *parent);
+                        if at.is_empty() {
+                            return true;
+                        }
+                        let own = self.locations(change.volume, change.record);
+                        !own.is_empty() && at.iter().any(|&p| self.at_or_below(p, &own))
                     })
                 });
                 if blocked {
@@ -1516,6 +1549,20 @@ impl Live {
     /// The walk of a folder that `record`'s parent chain runs through: it
     /// lists the record, or (if it listed the parent already) the record is
     /// looked at again and found missing when the walk is merged.
+    /// Whether `loc` is one of `dirs` or (still, in this index) below one
+    /// of them. A chain longer than any real path counts as below.
+    fn at_or_below(&self, loc: Loc, dirs: &[Loc]) -> bool {
+        let mut at = Some(loc);
+        for _ in 0..4096 {
+            match at {
+                None => return false,
+                Some(l) if dirs.contains(&l) => return true,
+                Some(l) => at = self.parent_of(l),
+            }
+        }
+        true
+    }
+
     fn walk_above(&self, volume: usize, record: u64) -> Option<usize> {
         self.locations(volume, record).into_iter().find_map(|loc| {
             let mut at = self.parent_of(loc);
@@ -1888,6 +1935,16 @@ impl Live {
                 return Ok(());
             }
         }
+        // A folder whose new parent this index still has below it: a folder
+        // inside it moved out and it moved below that one, and the batch
+        // reached it first (or the other move is not reported yet). Placing
+        // it there would hang it below itself (lost on the next compaction,
+        // or a loop in its path); only a scan sees the real nesting.
+        if old.iter().any(|&l| self.flags_of(l) & flags::DIR != 0)
+            && desired.iter().any(|(p, _)| self.at_or_below(*p, &old))
+        {
+            return Err(REASON_NESTING.into());
+        }
         applied.changed += 1;
         for &loc in &old {
             self.remove(loc);
@@ -1982,7 +2039,11 @@ impl Live {
         // frozen ones; which delta entries are placed depends on the frozen
         // ones in turn, so with adoptions the passes repeat until nothing
         // more is dropped.
-        let mut placed_delta = self.placeable_delta(&keep);
+        let mut placed_delta = if self.adopted.is_empty() {
+            Vec::new()
+        } else {
+            self.placeable_delta(&keep)
+        };
         loop {
             let (mut dropped, mut parent_after_child) = (false, false);
             for id in 0..n as u32 {
@@ -2005,7 +2066,9 @@ impl Live {
             if !dropped || (!parent_after_child && self.adopted.is_empty()) {
                 break;
             }
-            placed_delta = self.placeable_delta(&keep);
+            if !self.adopted.is_empty() {
+                placed_delta = self.placeable_delta(&keep);
+            }
         }
         let placed_delta = if self.adopted.is_empty() {
             self.placeable_delta(&keep)
@@ -4967,5 +5030,127 @@ mod tests {
             ..prompt
         };
         assert_eq!(m.due(t1 + s(21), reading), None);
+    }
+
+    #[test]
+    fn a_folder_moved_below_its_own_subfolder_in_one_batch_waits_for_it() {
+        // `mv Docs\Sub Sub; mv Docs Sub\Docs`: Docs has the lower record
+        // number, so the batch reaches it while Sub is still inside it.
+        let (mut live, _, mut f) = large_move_fixture();
+        f.set(23, DIR_INFO, &[(5, "Sub")]);
+        f.set(20, DIR_INFO, &[(23, "Docs")]);
+        let r = live.apply(&[change(20, false), change(23, false)], &f);
+        assert_ne!(
+            r.rescan.as_ref().map(|r| r.kind()),
+            Some(ReasonKind::Disk),
+            "{r:?}"
+        );
+        assert_eq!(shown_compacted(&mut live), oracle(&f));
+    }
+
+    #[test]
+    fn a_folder_moved_below_its_own_subfolder_before_that_one_is_reported_rescans() {
+        let (mut live, base, mut f) = large_move_fixture();
+        f.set(23, DIR_INFO, &[(5, "Sub")]);
+        f.set(20, DIR_INFO, &[(23, "Docs")]);
+        let before = shown(&live, &base);
+        let r = live.apply(&[change(20, false)], &f);
+        let why = r.rescan.expect("only a scan sees the nesting");
+        assert_eq!((why.kind(), &*why), (ReasonKind::Disk, REASON_NESTING));
+        assert!(!live.adoptions_pending());
+        assert_eq!(shown(&live, &base), before, "nothing was hung below itself");
+    }
+
+    /// [`drive`] for a live layer that adopts: compactions may be asked
+    /// for, never a disk read.
+    fn drive_adopting(w: &mut World, live: &mut Live, batches: usize, seed: u64) {
+        for _ in 0..batches {
+            let mut changes: Vec<Change> = Vec::new();
+            w.folder_op = false;
+            for _ in 0..1 + w.random(6) {
+                changes.extend(w.step());
+            }
+            changes.sort_by_key(|c| (c.volume, c.record));
+            changes.dedup_by_key(|c| (c.volume, c.record));
+            let mut r = live.apply(&changes, &w.fs);
+            while let Some(job) = r.walks.pop() {
+                let listing = walk_fake(&w.fs, &job);
+                r.absorb(live.finish_walk(job.id, Ok(listing.into()), &w.fs));
+            }
+            if let Some(why) = &r.rescan {
+                assert_eq!(why.kind(), ReasonKind::Compact, "seed {seed}: {why}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_compaction_after_large_moves_shows_what_a_scan_shows() {
+        let mut adoptions = 0;
+        for seed in 1..=32u64 {
+            let mut w = World::new(seed);
+            let (base, map) = scan(&w.fs, &[]);
+            let mut live = Live::new(base, &[map]);
+            // Every folder with more than two entries below it is "large".
+            live.move_budget = 2;
+            for round in 0..3 {
+                drive_adopting(&mut w, &mut live, 10, seed);
+                adoptions += usize::from(live.adoptions_pending());
+                let mut new = live.compact().expect("no folder is being read");
+                new.move_budget = 2;
+                let (fresh, _) = scan(&w.fs, &[]);
+                let none = LiveView {
+                    allowed: Arc::new(vec![u64::MAX; fresh.len().div_ceil(64)]),
+                    delta: Arc::new(IndexBuilder::new().freeze()),
+                    delta_allowed: Arc::new(Vec::new()),
+                    overrides: Arc::new(HashMap::new()),
+                    entries: fresh.len(),
+                };
+                assert_eq!(
+                    listing(&new.base().clone(), &new.view()),
+                    listing(&fresh, &none),
+                    "seed {seed}, round {round}"
+                );
+                live = new;
+            }
+        }
+        assert!(adoptions > 0, "the worlds moved large folders");
+    }
+
+    #[test]
+    fn hidden_entries_wait_for_folder_reads_and_saves_only_so_long() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut m = Maintenance::after_scan(t0, s(60));
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        let saving = Load {
+            prompt: true,
+            saving: true,
+            ..Load::default()
+        };
+        assert_eq!(m.due(t0 + s(1), saving), None, "a save holds it back");
+        assert_eq!(
+            m.wake_at(t0 + s(1), saving),
+            Some(t0 + s(1) + SAVE_POLL),
+            "looked at again"
+        );
+        assert!(matches!(
+            m.due(t0 + s(1) + URGENT_PATIENCE, saving),
+            Some(Due::Compact(_))
+        ));
+        m.compacted(t0 + s(42), s(1));
+        // Folder reads that keep coming: a rescan once patience ends.
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        let reading = Load {
+            prompt: true,
+            walks: true,
+            ..Load::default()
+        };
+        let t1 = t0 + s(100);
+        assert_eq!(m.due(t1, reading), None);
+        assert_eq!(m.wake_at(t1, reading), Some(t1 + URGENT_PATIENCE));
+        assert!(matches!(
+            m.due(t1 + URGENT_PATIENCE, reading),
+            Some(Due::Rescan(_))
+        ));
     }
 }

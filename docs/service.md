@@ -60,18 +60,32 @@ Windows MFT/USN journal).
     folder reads still keep arriving the volumes are rescanned instead, as
     before compactions existed. What answers a reason is carried with the
     reason (not read from its text). A pending real rescan covers a pending
-    compaction. A large folder move (a renamed or moved folder with more
-    than 100,000 frozen entries below it) is answered by a compaction too:
-    the folder's new entry adopts its frozen children instead of copying
-    them (one bit per entry and a pass over the subtree), the moved
-    contents are hidden from searches until the compaction gives them their
-    new path (never shown under the old one), and that compaction waits
-    only for its duty share (5 times the last one's duration), not for the
-    60 s gap or a waiting rescan. These still read the drives again: a
-    journal reset or overrun, a moved-in folder that could not be read, a
-    request by an administrator, and the start of the service. Memory: the builder and the new tables add about 85 bytes
-    per entry on top of the old index while it runs (a rescan adds about
-    161). The new index starts without its cached metadata sort orders (size,
+    compaction, with one exception below.
+
+    A large folder move (a renamed or moved folder with more than 100,000
+    frozen entries below it, folders and dead entries included) is answered
+    by a compaction too. The folder's new entry adopts its frozen children
+    instead of copying them (one bit per entry and a pass over the subtree;
+    the first move after a scan or compaction also builds the children
+    table, 8 bytes per entry). The moved contents are hidden from searches
+    until the compaction gives them their new path; they are never shown
+    under the old one. That compaction waits only for its duty share (5
+    times the last one's duration), not for the 60 s gap, and runs even
+    while a rescan is waiting (the rescan still follows). It waits for
+    folder reads and an index save at most 40 s, like an overgrown delta;
+    if folder reads still keep arriving, the volumes are rescanned. A folder
+    moved below a folder that was inside it waits in its batch until that
+    one has moved out; if that move is not reported yet, the volumes are
+    rescanned (`folders swapped nesting`), because placing it would hang it
+    below itself.
+
+    These still read the drives again: a journal reset or overrun, a
+    moved-in folder that could not be read, a request by an administrator,
+    and the start of the service.
+
+    A compaction's memory: the builder and the new tables add about 85
+    bytes per entry on top of the old index while it runs (a rescan adds
+    about 161). The new index starts without its cached metadata sort orders (size,
     dates); right after the swap the ones that were ready on the old index
     are prepared again in the background, one thread each at the lowest
     priority (about 0.13 s at 1 million entries), and a sorted search
