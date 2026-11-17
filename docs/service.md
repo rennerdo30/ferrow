@@ -24,6 +24,16 @@ Windows MFT/USN journal).
   rebuilt for a change: replaced entries are hidden, new ones live in a
   small second index, and a background rescan folds them in once that
   grows large or the journal is reset.
+- **Folders moved into the index.** A folder that arrives from outside
+  the indexed places (git and git-lfs move temporary folders into place
+  all the time) gets its entry at once, and one low-priority thread lists
+  its contents by file reference (up to the delta's room, 50,000 entries,
+  and 30 s). Changes the journal reports while it is listed are read
+  again after the result is merged, so none is lost or doubled. Only a
+  folder too large or too slow to list, or a failed read, asks for the
+  full rescan. The health report counts scans by reason and the
+  folder reads (`live_stats`); each fallback and each read of a second or
+  more is an event in the service log.
 - **Start.** The service answers from its saved index at once (or an
   empty one on first start) while the first scan runs.
 

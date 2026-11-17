@@ -10,7 +10,10 @@
 //!   the full path of their frozen parent folder;
 //! - a folder whose only change is its own size or dates keeps its entry
 //!   and gets a metadata override (its children stay in place);
-//! - a renamed or moved folder moves its whole subtree into the delta.
+//! - a renamed or moved folder moves its whole subtree into the delta;
+//! - a folder moved in from outside the index (or from an excluded place)
+//!   gets an entry at once and its subtree is read by a bounded background
+//!   walk ([`WalkJob`]) whose result is merged later (see [`Live::finish_walk`]).
 //!
 //! When the delta grows large, the owner rescans the volume (seconds with
 //! the MFT reader) and starts over from a fresh frozen index.
@@ -26,6 +29,7 @@ use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, flags};
 use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
+use ferrow_walk::subtree::{Limits, Subtree, WalkError};
 
 /// Rescan once the overlay holds this many live delta entries…
 const MAX_DELTA: usize = 50_000;
@@ -33,6 +37,64 @@ const MAX_DELTA: usize = 50_000;
 const MAX_REMOVED_DIVISOR: usize = 10;
 /// …or a single folder move would copy more than this many entries.
 const MAX_MOVE: usize = 100_000;
+
+/// A folder moved in from outside the index is read by a background walk of
+/// at most this many entries (and never more than the delta has room for:
+/// every walked entry becomes a delta entry, and past [`MAX_DELTA`] a
+/// rescan is asked for anyway), …
+const MIN_WALK_BUDGET: usize = 1_000;
+/// …at most this long (a cold hard disk lists on the order of 10,000
+/// entries per second, so a full budget fits; a rescan reads 27 million
+/// entries in about 74 s on the owner's PC, which is cheaper per entry
+/// beyond that), …
+pub const MAX_WALK_TIME: Duration = Duration::from_secs(30);
+/// A finished walk at least this long is an event in the service log.
+pub const NOTABLE_WALK: Duration = Duration::from_secs(1);
+/// What the log line at the start of a live session says is on.
+pub fn walk_limits_text() -> String {
+    format!(
+        "up to {MAX_DELTA} entries and {} s each, at most {MAX_WALKS} at once",
+        MAX_WALK_TIME.as_secs()
+    )
+}
+/// …with this many folders waiting at once (a package manager moves dozens
+/// of sibling folders in one burst; the reader takes them one by one), …
+const MAX_WALKS: usize = 64;
+/// …at most this many records remembered as changed while walks run (they
+/// are looked at again once a result is merged), …
+const MAX_TOUCHED: usize = MAX_DELTA;
+/// …and a walk the reader has not finished this long after its time budget
+/// is given up (a folder on a hung network share or cloud placeholder can
+/// block the listing call itself).
+pub const WALK_SLACK: Duration = Duration::from_secs(10);
+/// A record number is the low 48 bits of a file reference.
+const RECORD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// Why a rescan was asked for: the stable start of the reason text, which
+/// [`reason_kind`] maps to a counter name.
+pub const REASON_MOVED_IN: &str = "a folder moved into an indexed location";
+pub const REASON_LARGE_MOVE: &str = "a large folder moved";
+pub const REASON_ADMIN: &str = "requested by an administrator";
+
+/// The counter a rescan reason belongs to (reasons carry numbers and
+/// device names, so they cannot be counted as written).
+pub fn reason_kind(reason: &str) -> &'static str {
+    if reason.starts_with(REASON_MOVED_IN) {
+        "moved-in folder"
+    } else if reason.starts_with(REASON_LARGE_MOVE) {
+        "large folder move"
+    } else if reason.ends_with(" live changes") {
+        "too many live changes"
+    } else if reason.ends_with(" replaced entries") {
+        "too many replaced entries"
+    } else if reason == REASON_ADMIN {
+        "administrator"
+    } else if reason == "startup" {
+        "startup"
+    } else {
+        "journal"
+    }
+}
 
 /// A pending rescan waits until a full scan's worth of time has passed
 /// this many times over (rescans take at most 1/10 of the time)…
@@ -144,6 +206,14 @@ pub struct Change {
 /// Reads records' current state (`None`: deleted or unreadable).
 pub trait RecordSource {
     fn fetch(&self, volume: usize, record: u64) -> Option<RecordState>;
+
+    /// Whether the file system answered that `record` is not in use, as
+    /// opposed to the read failing: asked after `fetch` gave `None`, when a
+    /// failed read must not be taken for a deletion. A source that cannot
+    /// tell reads `None` as deleted.
+    fn certainly_free(&self, _volume: usize, _record: u64) -> bool {
+        true
+    }
 }
 
 struct Volume {
@@ -151,7 +221,7 @@ struct Volume {
     /// moved records live in `overlay` instead.
     record_base: Vec<u32>,
     overlay: HashMap<u64, Vec<Loc>>,
-    excluded: HashSet<u64>,
+    excluded: Arc<HashSet<u64>>,
     /// Configured roots: their entries never move (their own parent may be
     /// outside the index), only their size and dates follow.
     roots: HashSet<u64>,
@@ -217,15 +287,81 @@ impl LiveView {
     }
 }
 
+/// One folder to read in the background: it moved into an indexed place
+/// from somewhere the index has no entries for (outside the roots, an
+/// excluded place, another volume). Hand it to a walker thread, then give
+/// the result to [`Live::finish_walk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalkJob {
+    pub id: u64,
+    pub volume: usize,
+    /// The folder's record number and sequence, which name it whatever
+    /// happens to its path meanwhile.
+    pub record: u64,
+    pub sequence: u16,
+    pub limits: Limits,
+    /// Records of this volume the walk must leave out (the scan's excludes).
+    pub excluded: Arc<HashSet<u64>>,
+}
+
 /// Result of applying one batch.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Applied {
     /// Records whose entries changed.
     pub changed: usize,
+    /// Entries a finished walk added.
+    pub merged: usize,
     /// The overlay is too large or a change cannot be applied
-    /// incrementally (for example a folder moved in from outside the
-    /// indexed roots): rescan the volumes.
+    /// incrementally (a folder too large to read in the background, a
+    /// failed walk): rescan the volumes.
     pub rescan: Option<String>,
+    /// Folders to read in the background.
+    pub walks: Vec<WalkJob>,
+    /// Folder reads given up because the reader never answered: the reader
+    /// is stuck and must be replaced.
+    pub abandoned: usize,
+}
+
+impl Applied {
+    /// Fold the result of another step into this one.
+    pub fn absorb(&mut self, other: Applied) {
+        self.changed += other.changed;
+        self.merged += other.merged;
+        self.abandoned += other.abandoned;
+        self.walks.extend(other.walks);
+        if let Some(reason) = other.rescan {
+            self.rescan.get_or_insert(reason);
+        }
+    }
+}
+
+/// A folder being read.
+struct Walk {
+    id: u64,
+    volume: usize,
+    record: u64,
+    sequence: u16,
+    /// Position in the shared change log when it was queued: the records
+    /// reported after it are the ones to look at again once it is merged.
+    since: u64,
+    /// When it was queued, and when the reader began it (for the watchdog;
+    /// none while it waits).
+    queued: Instant,
+    started: Option<Instant>,
+    /// The log could not keep every record since `since`.
+    overflowed: bool,
+    /// Folders that moved in below this one while it was read: they have
+    /// an entry already, so their contents are only read if the walk did
+    /// not list them (checked when its result is merged).
+    covered: Vec<(u64, u16)>,
+}
+
+/// When a record was last reported while folders were being read, and when
+/// it was last reported as created (positions in the log; 0: never).
+#[derive(Clone, Copy)]
+struct Touch {
+    last: u64,
+    created: u64,
 }
 
 pub struct Live {
@@ -244,6 +380,15 @@ pub struct Live {
     base_record: Vec<u64>,
     /// Frozen children by parent, built on the first folder move.
     base_children: OnceLock<(Vec<u32>, Vec<u32>)>,
+    /// Folders waiting for their background walk.
+    walks: Vec<Walk>,
+    next_walk: u64,
+    /// One log of the records reported while any walk is outstanding.
+    log: HashMap<(usize, u64), Touch>,
+    log_seq: u64,
+    /// When the reader last showed it is alive (ready, began or finished a
+    /// folder): a queued folder only waits for it from then on.
+    progress: Instant,
 }
 
 impl Live {
@@ -275,7 +420,7 @@ impl Live {
             volumes.push(Volume {
                 record_base,
                 overlay,
-                excluded: map.excluded.iter().copied().collect(),
+                excluded: Arc::new(map.excluded.iter().copied().collect()),
                 roots: map.roots.iter().map(|&(r, _)| r).collect(),
             });
         }
@@ -290,6 +435,11 @@ impl Live {
             volumes,
             base_record,
             base_children: OnceLock::new(),
+            walks: Vec::new(),
+            next_walk: 0,
+            log: HashMap::new(),
+            log_seq: 0,
+            progress: Instant::now(),
             base,
         }
     }
@@ -429,6 +579,15 @@ impl Live {
             .base_children
             .get()
             .map_or(0, |(first, ids)| vec_bytes(first) + vec_bytes(ids));
+        // Folders waiting for or being read, and the records reported
+        // meanwhile (empty, and freed, while no walk is outstanding).
+        let walks = vec_bytes(&self.walks)
+            + self
+                .walks
+                .iter()
+                .map(|w| vec_bytes(&w.covered))
+                .sum::<usize>();
+        let change_log = table_bytes(self.log.capacity(), size_of::<((usize, u64), Touch)>());
         vec![
             Part::new(
                 "live.base_record",
@@ -452,6 +611,8 @@ impl Live {
             ),
             // Built by the first folder rename or delete, then kept.
             Part::new("live.base_children", base_children, Kind::Lazy),
+            Part::new("live.walks", walks, Kind::Steady),
+            Part::new("live.change_log", change_log, Kind::Steady),
         ]
     }
 
@@ -568,6 +729,11 @@ impl Live {
 
     /// Apply one batch of changed records.
     pub fn apply(&mut self, changes: &[Change], source: &impl RecordSource) -> Applied {
+        self.remember_for_walks(changes);
+        self.apply_changes(changes, source)
+    }
+
+    fn apply_changes(&mut self, changes: &[Change], source: &impl RecordSource) -> Applied {
         let mut applied = Applied::default();
         let mut pending: Vec<(Change, Option<RecordState>)> = changes
             .iter()
@@ -604,6 +770,12 @@ impl Live {
                 applied.rescan.get_or_insert(reason);
             }
         }
+        self.check_limits(&mut applied);
+        applied
+    }
+
+    /// Ask for a rescan when the overlay has outgrown its limits.
+    fn check_limits(&self, applied: &mut Applied) {
         if self.delta_alive > MAX_DELTA {
             applied
                 .rescan
@@ -614,6 +786,391 @@ impl Live {
                 .rescan
                 .get_or_insert_with(|| format!("{} replaced entries", self.removed_count));
         }
+    }
+
+    /// While folders are being read, remember which records change: a walk
+    /// may have listed each of them before or after the change, so
+    /// [`Live::finish_walk`] looks at them again, and a re-read of a record
+    /// always shows its current state. One log serves every outstanding
+    /// walk; each takes the part reported after it was queued.
+    fn remember_for_walks(&mut self, changes: &[Change]) {
+        if self.walks.is_empty() {
+            return;
+        }
+        self.log_seq += 1;
+        let at = self.log_seq;
+        for c in changes {
+            let touch = self.log.entry((c.volume, c.record)).or_insert(Touch {
+                last: at,
+                created: 0,
+            });
+            touch.last = at;
+            if c.created {
+                touch.created = at;
+            }
+        }
+        self.trim_log();
+    }
+
+    /// Keep the log within [`MAX_TOUCHED`] records: the oldest walks lose
+    /// their window first (they fall back to the rescan when they finish),
+    /// younger ones keep theirs.
+    fn trim_log(&mut self) {
+        while self.log.len() > MAX_TOUCHED {
+            let Some(oldest) = self
+                .walks
+                .iter()
+                .filter(|w| !w.overflowed)
+                .map(|w| w.since)
+                .min()
+            else {
+                self.log.clear();
+                return;
+            };
+            for w in self.walks.iter_mut().filter(|w| w.since == oldest) {
+                w.overflowed = true;
+            }
+            match self
+                .walks
+                .iter()
+                .filter(|w| !w.overflowed)
+                .map(|w| w.since)
+                .min()
+            {
+                Some(next) => self.log.retain(|_, t| t.last > next),
+                None => self.log.clear(),
+            }
+        }
+    }
+
+    /// Forget what no outstanding walk needs any more.
+    fn prune_log(&mut self) {
+        // A walk that lost its window needs nothing from the log.
+        match self
+            .walks
+            .iter()
+            .filter(|w| !w.overflowed)
+            .map(|w| w.since)
+            .min()
+        {
+            // Nothing needs the log: free its table (a flood of changes
+            // would otherwise keep megabytes for the rest of the session).
+            None => self.log = HashMap::new(),
+            Some(oldest) => self.log.retain(|_, t| t.last > oldest),
+        }
+    }
+
+    /// The records reported after position `since`, with whether they were
+    /// reported as created after it.
+    fn changes_since(&self, since: u64) -> Vec<Change> {
+        let mut out: Vec<Change> = self
+            .log
+            .iter()
+            .filter(|(_, t)| t.last > since)
+            .map(|(&(volume, record), t)| Change {
+                volume,
+                record,
+                created: t.created > since,
+            })
+            .collect();
+        out.sort_by_key(|c| (c.volume, c.record));
+        out
+    }
+
+    /// The walk of a folder that `record`'s parent chain runs through: it
+    /// lists the record, or (if it listed the parent already) the record is
+    /// looked at again and found missing when the walk is merged.
+    fn walk_above(&self, volume: usize, record: u64) -> Option<usize> {
+        self.locations(volume, record).into_iter().find_map(|loc| {
+            let mut at = self.parent_of(loc);
+            for _ in 0..4096 {
+                let up = at?;
+                if let Some((v, r)) = self.record_of(up)
+                    && let Some(i) = self
+                        .walks
+                        .iter()
+                        .position(|w| w.volume == v && w.record == r)
+                {
+                    return Some(i);
+                }
+                at = self.parent_of(up);
+            }
+            None
+        })
+    }
+
+    /// A folder with no entries below it has moved into the index: read it
+    /// in the background unless a walk already covers it.
+    fn walk_moved_in(
+        &mut self,
+        volume: usize,
+        record: u64,
+        sequence: u16,
+        applied: &mut Applied,
+    ) -> Result<(), String> {
+        if self
+            .walks
+            .iter()
+            .any(|w| w.volume == volume && w.record == record)
+        {
+            return Ok(());
+        }
+        if let Some(above) = self.walk_above(volume, record) {
+            self.walks[above].covered.push((record, sequence));
+            return Ok(());
+        }
+        let budget = MAX_DELTA.saturating_sub(self.delta_alive);
+        if self.walks.len() >= MAX_WALKS || budget < MIN_WALK_BUDGET {
+            return Err(format!(
+                "{REASON_MOVED_IN} (too many changes to read its contents live)"
+            ));
+        }
+        let id = self.next_walk;
+        self.next_walk += 1;
+        self.walks.push(Walk {
+            id,
+            volume,
+            record,
+            sequence,
+            since: self.log_seq,
+            queued: Instant::now(),
+            started: None,
+            overflowed: false,
+            covered: Vec::new(),
+        });
+        applied.walks.push(WalkJob {
+            id,
+            volume,
+            record,
+            sequence,
+            limits: Limits {
+                max_entries: budget,
+                max_time: MAX_WALK_TIME,
+            },
+            excluded: self.volumes[volume].excluded.clone(),
+        });
+        Ok(())
+    }
+
+    /// The reader is up and has its volumes open.
+    pub fn reader_ready(&mut self, now: Instant) {
+        self.progress = now;
+    }
+
+    /// The reader began walk `id` at `now`.
+    pub fn walk_started(&mut self, id: u64, now: Instant) {
+        self.progress = now;
+        if let Some(walk) = self.walks.iter_mut().find(|w| w.id == id) {
+            walk.started = Some(now);
+        }
+    }
+
+    /// When the maintainer must wake to check on the reader. A walk the
+    /// reader began is due its time budget plus slack after it began. While
+    /// none has begun, the queue is not being served: a folder is due that
+    /// long after it was queued or the reader last showed life, whichever is
+    /// later (the reader can hang opening its volumes before it takes a job).
+    pub fn next_walk_deadline(&self) -> Option<Instant> {
+        let patience = MAX_WALK_TIME + WALK_SLACK;
+        let running = self
+            .walks
+            .iter()
+            .filter_map(|w| w.started)
+            .map(|started| started + patience)
+            .min();
+        running.or_else(|| {
+            self.walks
+                .iter()
+                .map(|w| w.queued.max(self.progress) + patience)
+                .min()
+        })
+    }
+
+    /// Give up on walks that outlived their budget by more than the slack:
+    /// the reader is stuck inside a file-system call. Every outstanding
+    /// walk is dropped (the reader's queue goes with it), a rescan is asked
+    /// for, and `abandoned` tells the caller to start a new reader.
+    pub fn expire_walks(&mut self, now: Instant) -> Applied {
+        let mut applied = Applied::default();
+        if !self.next_walk_deadline().is_some_and(|at| at <= now) {
+            return applied;
+        }
+        applied.abandoned = self.walks.len();
+        applied.rescan = Some(format!(
+            "{REASON_MOVED_IN} (reading its contents did not finish in time)"
+        ));
+        self.walks = Vec::new();
+        self.log = HashMap::new();
+        self.progress = now;
+        applied
+    }
+
+    /// Merge the result of a [`WalkJob`].
+    ///
+    /// The walk read the folder at some time between its start and now, and
+    /// the journal kept reporting changes meanwhile. Nothing is lost or
+    /// doubled because:
+    ///
+    /// - walked entries are applied like journal records (an entry whose
+    ///   record already sits at the same place and name changes nothing),
+    ///   parents first, so a record the journal already placed is not added
+    ///   twice. A record that has entries already (a hard link also named
+    ///   outside the walked folder, or one the journal placed) is applied
+    ///   with its complete, current set of names, not just the walked ones;
+    ///   a folder listed twice (it moved between two listings) keeps its
+    ///   latest name;
+    /// - every record the journal reported while the walk ran, and that the
+    ///   walk listed or that has no entry, is read again afterwards and
+    ///   brought to its current state. A change the walk missed (made after
+    ///   it listed the folder, and dropped meanwhile because its parent had
+    ///   no entry yet) is applied then; a change the walk saw only in part
+    ///   is overwritten by the record's current state;
+    /// - a folder moved in again inside the walked one starts a walk of its
+    ///   own if the first walk did not list it.
+    ///
+    /// A failed walk (too large, too slow, an error, a folder that exists
+    /// but could not be opened) asks for a rescan; a folder that really is
+    /// gone or a result of an older index is not an error.
+    pub fn finish_walk(
+        &mut self,
+        id: u64,
+        result: Result<Subtree, WalkError>,
+        source: &impl RecordSource,
+    ) -> Applied {
+        let Some(at) = self.walks.iter().position(|w| w.id == id) else {
+            return Applied::default();
+        };
+        let walk = self.walks.remove(at);
+        self.progress = Instant::now();
+        let applied = self.merge_walk(&walk, result, source);
+        self.prune_log();
+        applied
+    }
+
+    fn merge_walk(
+        &mut self,
+        walk: &Walk,
+        result: Result<Subtree, WalkError>,
+        source: &impl RecordSource,
+    ) -> Applied {
+        let mut applied = Applied::default();
+        let volume = walk.volume;
+        // Whether the record may still be that folder: it is, unless the
+        // file system said it is free or now something else. A read that
+        // failed proves nothing.
+        let exists = |record: u64, sequence: u16| match source.fetch(volume, record) {
+            Some(s) => s.info.is_dir && (sequence == 0 || s.info.sequence == sequence),
+            None => !source.certainly_free(volume, record),
+        };
+        let listing = match result {
+            Ok(listing) => listing,
+            Err(WalkError::Cancelled) => return applied,
+            // Deleted meanwhile: the journal says so, and the records
+            // reported since are re-read below. Believed only if the record
+            // really is not a folder any more.
+            Err(WalkError::Gone) if !exists(walk.record, walk.sequence) => Subtree::default(),
+            Err(WalkError::Gone) => {
+                applied.rescan = Some(format!(
+                    "{REASON_MOVED_IN} (the folder exists but could not be opened)"
+                ));
+                return applied;
+            }
+            Err(error) => {
+                applied.rescan = Some(format!("{REASON_MOVED_IN} ({error})"));
+                return applied;
+            }
+        };
+        if walk.overflowed {
+            applied.rescan = Some(format!(
+                "{REASON_MOVED_IN} (too many changes while its contents were read)"
+            ));
+            return applied;
+        }
+        // A subfolder that could not be opened is deleted or moved away (the
+        // journal says so); one that still exists means an incomplete walk.
+        if listing
+            .skipped
+            .iter()
+            .any(|&r| exists(r & RECORD_MASK, (r >> 48) as u16))
+        {
+            applied.rescan = Some(format!(
+                "{REASON_MOVED_IN} (a subfolder exists but could not be opened)"
+            ));
+            return applied;
+        }
+        // One state per record, applied once every folder it lists is
+        // placed: at the position of its last name.
+        /// Position of its last name, its info and every `(parent, name)`.
+        type Listed = (usize, RecordInfo, Vec<(u64, Vec<u8>)>);
+        let mut states: HashMap<u64, Listed> = HashMap::new();
+        for (i, e) in listing.entries.into_iter().enumerate() {
+            let state = states.entry(e.record).or_insert((i, e.info, Vec::new()));
+            state.0 = i;
+            state.1 = e.info;
+            let name = (e.parent, e.name);
+            if e.info.is_dir {
+                // A folder has one name: the later listing is the newer.
+                state.2.clear();
+                state.2.push(name);
+            } else if !state.2.contains(&name) {
+                state.2.push(name);
+            }
+        }
+        let mut order: Vec<(usize, u64)> = states.iter().map(|(r, s)| (s.0, *r)).collect();
+        order.sort_unstable();
+        let listed: HashSet<u64> = order.iter().map(|&(_, r)| r).collect();
+        for (_, record) in order {
+            let Some((_, info, names)) = states.remove(&record) else {
+                continue;
+            };
+            let state = if self.locations(volume, record).is_empty() {
+                RecordState { info, names }
+            } else {
+                match source.fetch(volume, record) {
+                    Some(current) => current,
+                    None => continue, // deleted since: the journal removes it
+                }
+            };
+            let change = Change {
+                volume,
+                record,
+                created: true,
+            };
+            if let Err(reason) = self.apply_one(change, Some(state), &mut applied) {
+                applied.rescan.get_or_insert(reason);
+            }
+        }
+        applied.merged = std::mem::take(&mut applied.changed);
+        let again: Vec<Change> = self
+            .changes_since(walk.since)
+            .into_iter()
+            .filter(|c| {
+                (c.volume == volume && (c.record == walk.record || listed.contains(&c.record)))
+                    || self.locations(c.volume, c.record).is_empty()
+            })
+            .collect();
+        // Not `apply`: these records were logged when they changed, and
+        // logging them again would only fill other walks' windows.
+        let rest = self.apply_changes(&again, source);
+        applied.changed = rest.changed;
+        applied.walks.extend(rest.walks);
+        if let Some(reason) = rest.rescan {
+            applied.rescan.get_or_insert(reason);
+        }
+        // Folders that moved in below the walked one after it listed it.
+        for &(record, sequence) in &walk.covered {
+            let is_folder = self
+                .locations(volume, record)
+                .iter()
+                .any(|&l| self.flags_of(l) & flags::DIR != 0);
+            if is_folder
+                && !listed.contains(&record)
+                && let Err(reason) = self.walk_moved_in(volume, record, sequence, &mut applied)
+            {
+                applied.rescan.get_or_insert(reason);
+            }
+        }
+        self.check_limits(&mut applied);
         applied
     }
 
@@ -714,13 +1271,14 @@ impl Live {
                 let mut budget = MAX_MOVE;
                 if self.move_children(old[0], to, &mut budget).is_none() {
                     self.set_locations(volume, record, new_locs);
-                    return Err("a large folder moved".into());
+                    return Err(REASON_LARGE_MOVE.into());
                 }
             }
             (true, _) => self.remove_subtree(old[0]),
             (false, Some(_)) if descended && !created => {
                 self.set_locations(volume, record, new_locs);
-                return Err("a folder moved into an indexed location".into());
+                let sequence = state.as_ref().map_or(0, |s| s.info.sequence);
+                return self.walk_moved_in(volume, record, sequence, applied);
             }
             _ => {}
         }
@@ -788,6 +1346,7 @@ impl Live {
 mod tests {
     use super::*;
     use ferrow_query::{CancelToken, Query, SearchOptions};
+    use ferrow_walk::subtree::SubtreeEntry;
 
     const DIR_INFO: RecordInfo = RecordInfo {
         in_use: true,
@@ -851,12 +1410,6 @@ mod tests {
         fn fetch(&self, _volume: usize, record: u64) -> Option<RecordState> {
             self.0.get(&record).cloned()
         }
-    }
-
-    fn current(base: &Fake) -> Fake {
-        let mut f = Fake(base.0.clone());
-        f.set(5, DIR_INFO, &[(5, ".")]);
-        f
     }
 
     fn initial() -> Fake {
@@ -1150,14 +1703,786 @@ mod tests {
         assert_eq!(paths(&base, &live.view()).len(), 4);
     }
 
+    /// Every path the file system holds below the root (record 5), listed
+    /// the way a fresh scan would: what a correct live index must show.
+    fn oracle(f: &Fake) -> Vec<String> {
+        let mut out = vec!["C:".to_string()];
+        let mut stack = vec![(5u64, "C:".to_string())];
+        while let Some((dir, path)) = stack.pop() {
+            for (record, state) in &f.0 {
+                if *record == dir || *record == 30 {
+                    continue; // the directory itself; the excluded record
+                }
+                for (parent, name) in &state.names {
+                    if *parent == dir {
+                        let child = format!("{path}\\{}", String::from_utf8_lossy(name));
+                        out.push(child.clone());
+                        if state.info.is_dir {
+                            stack.push((*record, child));
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The background walker, mocked: lists the subtree as the file system
+    /// is right now (breadth first, so parents come first).
+    fn walk_fake(f: &Fake, job: &WalkJob) -> Vec<SubtreeEntry> {
+        let mut out = Vec::new();
+        let mut queue = std::collections::VecDeque::from([job.record]);
+        while let Some(dir) = queue.pop_front() {
+            let mut children: Vec<_> =
+                f.0.iter()
+                    .filter(|(r, _)| **r != dir && !job.excluded.contains(r))
+                    .flat_map(|(r, s)| {
+                        s.names
+                            .iter()
+                            .filter(|(p, _)| *p == dir)
+                            .map(move |(_, n)| (*r, s.info, n.clone()))
+                    })
+                    .collect();
+            children.sort_by_key(|(r, _, _)| *r);
+            for (record, info, name) in children {
+                if info.is_descended_dir() {
+                    queue.push_back(record);
+                }
+                out.push(SubtreeEntry {
+                    record,
+                    parent: dir,
+                    name,
+                    info,
+                });
+            }
+        }
+        out
+    }
+
+    /// root/Moved(60){one.txt(61), sub(62){two.txt(63)}} arrived from outside.
+    fn moved_in() -> Fake {
+        let mut f = initial();
+        f.set(60, DIR_INFO, &[(5, "Moved")]);
+        f.set(61, file_info(1), &[(60, "one.txt")]);
+        f.set(62, DIR_INFO, &[(60, "sub")]);
+        f.set(63, file_info(2), &[(62, "two.txt")]);
+        f
+    }
+
+    /// A live index in which folder 60 has just moved in: the live index,
+    /// the base and the walk it asked for.
+    fn after_move_in(f: &Fake) -> (Live, Arc<Index>, WalkJob) {
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let r = live.apply(&[change(60, false)], f);
+        assert_eq!(r.rescan, None);
+        assert_eq!(r.walks.len(), 1, "{r:?}");
+        let job = r.walks[0].clone();
+        (live, base, job)
+    }
+
+    fn shown(live: &Live, base: &Index) -> Vec<String> {
+        paths(base, &live.view())
+    }
+
     #[test]
-    fn folder_moved_in_from_outside_asks_for_a_rescan() {
+    fn a_folder_moved_in_is_read_in_the_background_instead_of_rescanning() {
+        let f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        assert_eq!((job.volume, job.record), (0, 60));
+        assert_eq!(
+            job.limits.max_entries,
+            MAX_DELTA - 1,
+            "the room left after the folder itself"
+        );
+        assert_eq!(job.limits.max_time, MAX_WALK_TIME);
+        assert!(job.excluded.contains(&30), "the walk knows the excludes");
+        // The folder shows up at once; its contents follow the walk.
+        assert_eq!(
+            shown(&live, &base),
+            [
+                "C:",
+                "C:\\Docs",
+                "C:\\Docs\\a.txt",
+                "C:\\Moved",
+                "C:\\b.txt"
+            ]
+        );
+        let done = live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        assert_eq!(done.rescan, None);
+        assert!(done.walks.is_empty());
+        assert_eq!(done.merged, 3);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        assert!(
+            shown(&live, &base).contains(&"C:\\Moved\\sub\\two.txt".to_string()),
+            "searchable through the delta"
+        );
+        // The walked records are tracked like any other: later changes follow.
+        let mut f = f;
+        f.set(63, file_info(9), &[(62, "two-b.txt")]);
+        live.apply(&[change(63, false)], &f);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        // Nothing is waiting for a walk any more.
+        assert!(live.walks.is_empty());
+    }
+
+    #[test]
+    fn the_walk_budget_is_the_room_left_in_the_delta() {
         let (base, map) = fixture();
         let mut live = Live::new(base, &[map]);
-        let mut f = current(&initial());
-        f.set(60, DIR_INFO, &[(5, "FromElsewhere")]);
+        let mut f = moved_in();
+        let mut changes = Vec::new();
+        for i in 0..2000u64 {
+            f.set(1000 + i, file_info(1), &[(20, &format!("n{i}.txt"))]);
+            changes.push(change(1000 + i, true));
+        }
+        live.apply(&changes, &f);
         let r = live.apply(&[change(60, false)], &f);
-        assert!(r.rescan.is_some());
+        assert_eq!(r.walks[0].limits.max_entries, MAX_DELTA - 2000 - 1);
+        // With the delta nearly full there is no room to read a folder into:
+        // ask for the rescan right away (and do not start a walk).
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        let mut changes = Vec::new();
+        for i in 0..(MAX_DELTA - 500) as u64 {
+            f.set(5000 + i, file_info(1), &[(20, &format!("m{i}.txt"))]);
+            changes.push(change(5000 + i, true));
+        }
+        let r = live.apply(&changes, &f);
+        assert_eq!(r.rescan, None, "still within the limit");
+        let r = live.apply(&[change(60, false)], &f);
+        assert!(r.walks.is_empty());
+        let why = r.rescan.expect("no room to walk a folder");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+    }
+
+    #[test]
+    fn changes_during_the_walk_are_neither_lost_nor_doubled() {
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        // The walker lists the folder now…
+        let listed = walk_fake(&f, &job);
+        // …and the file system changes before its result arrives:
+        // a file created directly in the folder (the folder has an entry,
+        // so it is applied at once), …
+        f.set(64, file_info(1), &[(60, "created-direct.txt")]);
+        // …a rename of a listed file, …
+        f.set(61, file_info(1), &[(60, "renamed.txt")]);
+        let r = live.apply(&[change(64, true), change(61, false)], &f);
+        assert_eq!(r.rescan, None);
+        // …a file created and one deleted below a folder not read yet (its
+        // parent has no entry, so these are dropped for now), …
+        f.set(65, file_info(1), &[(62, "created-deep.txt")]);
+        f.0.remove(&63);
+        live.apply(&[change(65, true), change(63, false)], &f);
+        // …a new folder with a file below the unread folder, …
+        f.set(66, DIR_INFO, &[(62, "newdir")]);
+        f.set(67, file_info(1), &[(66, "in-newdir.txt")]);
+        live.apply(&[change(66, true), change(67, true)], &f);
+        // …and the unread folder itself renamed.
+        f.set(62, DIR_INFO, &[(60, "sub2")]);
+        let r = live.apply(&[change(62, false)], &f);
+        assert!(r.walks.is_empty(), "inside the folder being read: {r:?}");
+        let done = live.finish_walk(job.id, Ok(listed.into()), &f);
+        assert_eq!(done.rescan, None);
+        assert!(done.walks.is_empty(), "{done:?}");
+        assert_eq!(shown(&live, &base), oracle(&f));
+        // Exactly one entry per name: the delta holds Moved, one.txt→renamed,
+        // created-direct, sub2 and what is below it, no stale copies alive.
+        assert_eq!(
+            live.delta_alive, 7,
+            "Moved, renamed, created-direct, sub2, created-deep, newdir, in-newdir"
+        );
+    }
+
+    #[test]
+    fn a_change_the_journal_placed_before_the_listing_is_not_added_twice() {
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        f.set(64, file_info(1), &[(60, "early.txt")]);
+        live.apply(&[change(64, true)], &f);
+        let listed = walk_fake(&f, &job); // lists the file the journal placed
+        assert!(listed.iter().any(|e| e.record == 64));
+        live.finish_walk(job.id, Ok(listed.into()), &f);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        assert_eq!(
+            live.delta_alive, 5,
+            "Moved, one.txt, early.txt, sub, two.txt"
+        );
+    }
+
+    #[test]
+    fn the_folder_deleted_or_renamed_during_its_walk() {
+        // Deleted: nothing of it shows, no rescan.
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        let listed = walk_fake(&f, &job);
+        for r in [60, 61, 62, 63] {
+            f.0.remove(&r);
+        }
+        live.apply(&[change(60, false)], &f);
+        let done = live.finish_walk(job.id, Ok(listed.into()), &f);
+        assert_eq!(done.rescan, None);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        assert_eq!(live.delta_alive, 0);
+        // The walker found it gone (deleted before it could open it).
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        for r in [60, 61, 62, 63] {
+            f.0.remove(&r);
+        }
+        live.apply(&[change(60, false)], &f);
+        let done = live.finish_walk(job.id, Err(WalkError::Gone), &f);
+        assert_eq!(done.rescan, None);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        // Renamed: the contents arrive under the new name.
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        let listed = walk_fake(&f, &job);
+        f.set(60, DIR_INFO, &[(5, "Renamed")]);
+        live.apply(&[change(60, false)], &f);
+        let done = live.finish_walk(job.id, Ok(listed.into()), &f);
+        assert_eq!(done.rescan, None);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        assert!(shown(&live, &base).contains(&"C:\\Renamed\\sub\\two.txt".to_string()));
+    }
+
+    #[test]
+    fn a_walk_over_budget_or_failed_asks_for_the_rescan() {
+        for error in [
+            WalkError::OverBudget,
+            WalkError::TimedOut,
+            WalkError::Io("access denied".into()),
+        ] {
+            let f = moved_in();
+            let (mut live, base, job) = after_move_in(&f);
+            let done = live.finish_walk(job.id, Err(error.clone()), &f);
+            let why = done.rescan.expect("falls back to the rescan");
+            assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+            assert!(why.contains(&error.to_string()), "{why}");
+            // The folder keeps its entry; the rescan fills it in.
+            assert!(shown(&live, &base).contains(&"C:\\Moved".to_string()));
+            assert!(live.walks.is_empty());
+        }
+        // A cancelled walk (a rescan started) is not a failure.
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let done = live.finish_walk(job.id, Err(WalkError::Cancelled), &f);
+        assert_eq!(done, Applied::default());
+        // A result nobody waits for (an older index) is ignored.
+        let done = live.finish_walk(job.id, Ok(Subtree::default()), &f);
+        assert_eq!(done, Applied::default());
+    }
+
+    #[test]
+    fn too_many_changes_during_a_walk_fall_back_to_the_rescan() {
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let flood: Vec<Change> = (0..MAX_TOUCHED as u64 + 1)
+            .map(|r| change(10_000 + r, false))
+            .collect();
+        live.apply(&flood, &f);
+        let done = live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        let why = done.rescan.expect("too many changes to look at again");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+    }
+
+    #[test]
+    fn nested_moved_in_folders_are_covered_by_one_walk() {
+        // Both arrive in one batch: the inner one is inside the folder
+        // already being read.
+        let mut f = moved_in();
+        f.set(70, DIR_INFO, &[(60, "inner")]);
+        f.set(71, file_info(1), &[(70, "deep.txt")]);
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let r = live.apply(&[change(60, false), change(70, false)], &f);
+        assert_eq!(r.rescan, None);
+        assert_eq!(r.walks.len(), 1, "one walk covers both: {r:?}");
+        let job = r.walks[0].clone();
+        let done = live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        assert!(done.walks.is_empty());
+        assert_eq!(shown(&live, &base), oracle(&f));
+
+        // The inner folder moves in after the walker listed the outer one:
+        // no second walk while the first runs, but the re-read after its
+        // merge starts the inner folder's own walk.
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        let listed = walk_fake(&f, &job);
+        f.set(70, DIR_INFO, &[(60, "inner")]);
+        f.set(71, file_info(1), &[(70, "deep.txt")]);
+        let r = live.apply(&[change(70, false)], &f);
+        assert!(r.walks.is_empty(), "covered while the outer walk runs");
+        let done = live.finish_walk(job.id, Ok(listed.into()), &f);
+        assert_eq!(done.rescan, None);
+        assert_eq!(done.walks.len(), 1, "the outer walk did not list it");
+        assert_eq!(done.walks[0].record, 70);
+        let job = done.walks[0].clone();
+        let done = live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        assert!(done.walks.is_empty());
+        assert_eq!(shown(&live, &base), oracle(&f));
+
+        // The walker listed it (it moved in before the listing): no second walk.
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        f.set(70, DIR_INFO, &[(60, "inner")]);
+        f.set(71, file_info(1), &[(70, "deep.txt")]);
+        live.apply(&[change(70, false)], &f);
+        let done = live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        assert!(done.walks.is_empty(), "{done:?}");
+        assert_eq!(shown(&live, &base), oracle(&f));
+        // The same folder asked for twice is one walk.
+        let mut f = moved_in();
+        let (mut live, _, _) = after_move_in(&f);
+        f.set(60, DIR_INFO, &[(5, "Moved2")]);
+        let r = live.apply(&[change(60, false)], &f);
+        assert!(r.walks.is_empty());
+    }
+
+    fn entry(record: u64, parent: u64, name: &str, info: RecordInfo) -> SubtreeEntry {
+        SubtreeEntry {
+            record,
+            parent,
+            name: name.as_bytes().to_vec(),
+            info,
+        }
+    }
+
+    /// A source that counts how often each record is read.
+    struct Counting<'a>(&'a Fake, std::cell::RefCell<HashMap<u64, usize>>);
+    impl RecordSource for Counting<'_> {
+        fn fetch(&self, volume: usize, record: u64) -> Option<RecordState> {
+            *self.1.borrow_mut().entry(record).or_default() += 1;
+            self.0.fetch(volume, record)
+        }
+    }
+
+    #[test]
+    fn a_hard_link_named_outside_the_walked_folder_keeps_its_other_name() {
+        // b.txt (record 22, in the base at C:\b.txt) also got a name in the
+        // moved-in folder; the walk lists only that name.
+        let mut f = moved_in();
+        f.set(22, file_info(2), &[(5, "b.txt"), (60, "b-link.txt")]);
+        let (mut live, base, job) = after_move_in(&f);
+        let listed = walk_fake(&f, &job);
+        assert!(listed.iter().any(|e| e.record == 22));
+        live.finish_walk(job.id, Ok(listed.into()), &f);
+        let shown = shown(&live, &base);
+        assert!(shown.contains(&"C:\\b.txt".to_string()), "{shown:?}");
+        assert_eq!(shown, oracle(&f));
+    }
+
+    #[test]
+    fn a_folder_listed_twice_keeps_its_latest_name_and_its_children_once() {
+        // Moved{A, B}: A moved into B after Moved was listed, so the walk
+        // saw A under both parents (its children only once).
+        let mut f = initial();
+        f.set(60, DIR_INFO, &[(5, "Moved")]);
+        f.set(72, DIR_INFO, &[(60, "B")]);
+        f.set(70, DIR_INFO, &[(72, "A-moved")]);
+        f.set(71, file_info(1), &[(70, "x.txt")]);
+        let (mut live, base, job) = after_move_in(&f);
+        let listed = vec![
+            entry(70, 60, "A", DIR_INFO),
+            entry(72, 60, "B", DIR_INFO),
+            entry(70, 72, "A-moved", DIR_INFO),
+            entry(71, 70, "x.txt", file_info(1)),
+            entry(71, 70, "x.txt", file_info(1)), // the same name twice
+        ];
+        live.finish_walk(job.id, Ok(listed.into()), &f);
+        assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    #[test]
+    fn a_walk_the_reader_never_finishes_is_given_up() {
+        let f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        let mut f2 = f;
+        f2.set(100, DIR_INFO, &[(5, "Other")]);
+        let waiting = live.apply(&[change(100, false)], &f2).walks[0].clone();
+        let t0 = Instant::now();
+        assert!(
+            live.next_walk_deadline().is_some(),
+            "a queued folder has one too"
+        );
+        live.walk_started(job.id, t0);
+        assert_eq!(
+            live.next_walk_deadline(),
+            Some(t0 + MAX_WALK_TIME + WALK_SLACK)
+        );
+        assert_eq!(live.expire_walks(t0 + MAX_WALK_TIME), Applied::default());
+        let r = live.expire_walks(t0 + MAX_WALK_TIME + WALK_SLACK);
+        let why = r.rescan.expect("falls back to the rescan");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        // The stuck reader's queue goes with it: both folders are given up.
+        assert_eq!(r.abandoned, 2);
+        assert!(live.walks.is_empty());
+        assert_eq!(live.next_walk_deadline(), None);
+        // A late answer of the stuck read is ignored.
+        let late = live.finish_walk(job.id, Ok(walk_fake(&f2, &job).into()), &f2);
+        assert_eq!(late, Applied::default());
+        let late = live.finish_walk(waiting.id, Ok(Subtree::default()), &f2);
+        assert_eq!(late, Applied::default());
+        // Nothing waits on the given-up folder any more: it can be read again.
+        assert!(shown(&live, &base).contains(&"C:\\Moved".to_string()));
+        f2.set(60, DIR_INFO, &[(5, "Moved")]);
+        let r = live.apply(&[change(61, false)], &f2);
+        assert!(r.rescan.is_none() && r.walks.is_empty());
+    }
+
+    #[test]
+    fn a_folder_that_could_not_be_opened_is_gone_only_if_it_is_gone() {
+        // It still exists: the walk is incomplete, so rescan.
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let done = live.finish_walk(job.id, Err(WalkError::Gone), &f);
+        let why = done.rescan.expect("it exists");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        assert!(why.contains("exists"), "{why}");
+        // Deleted, or its record reused by another folder (new sequence).
+        for reused in [false, true] {
+            let mut f = moved_in();
+            let (mut live, base, job) = after_move_in(&f);
+            for r in [60, 61, 62, 63] {
+                f.0.remove(&r);
+            }
+            if reused {
+                let info = RecordInfo {
+                    sequence: 2,
+                    ..DIR_INFO
+                };
+                f.set(60, info, &[(777, "elsewhere")]);
+            }
+            live.apply(&[change(60, false)], &f);
+            let done = live.finish_walk(job.id, Err(WalkError::Gone), &f);
+            assert_eq!(done.rescan, None, "reused: {reused}");
+            assert_eq!(shown(&live, &base), oracle(&f));
+        }
+        // A subfolder the walk could not open: gone is fine, existing is not.
+        let skipped = vec![(1u64 << 48) | 62];
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let listing = Subtree {
+            entries: walk_fake(&f, &job),
+            skipped: skipped.clone(),
+        };
+        let done = live.finish_walk(job.id, Ok(listing), &f);
+        let why = done.rescan.expect("the subfolder exists");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        f.0.remove(&62);
+        f.0.remove(&63);
+        let listing = Subtree {
+            entries: walk_fake(&f, &job),
+            skipped,
+        };
+        let done = live.finish_walk(job.id, Ok(listing), &f);
+        assert_eq!(done.rescan, None);
+        assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    #[test]
+    fn only_records_the_walk_listed_or_without_an_entry_are_read_again() {
+        let mut f = moved_in();
+        let (mut live, base, job) = after_move_in(&f);
+        let listed = walk_fake(&f, &job);
+        // a.txt (in the base, not in the walked folder) changes and is
+        // applied at once; a record outside the index changes too.
+        f.set(21, file_info(9), &[(20, "a.txt")]);
+        f.set(99, file_info(1), &[(777, "outside.txt")]);
+        let source = Counting(&f, Default::default());
+        live.apply(&[change(21, false), change(99, false)], &source);
+        live.finish_walk(job.id, Ok(listed.into()), &source);
+        let reads = source.1.borrow();
+        assert_eq!(reads[&21], 1, "read when it changed, not again");
+        assert_eq!(
+            reads[&99], 2,
+            "no entry: read again in case it belongs inside"
+        );
+        drop(reads);
+        assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    #[test]
+    fn merging_one_walk_does_not_fill_another_walks_window() {
+        let mut f = moved_in();
+        f.set(100, DIR_INFO, &[(5, "Other")]);
+        f.set(101, file_info(1), &[(100, "o.txt")]);
+        let (mut live, _, first) = after_move_in(&f);
+        // Many changes outside the index while the first walk runs…
+        let flood: Vec<Change> = (0..MAX_TOUCHED as u64 - 10)
+            .map(|r| change(10_000 + r, false))
+            .collect();
+        live.apply(&flood, &f);
+        let second = live.apply(&[change(100, false)], &f).walks[0].clone();
+        // …are read again when it is merged, which must not count against
+        // the second walk, which was queued after them.
+        live.finish_walk(first.id, Ok(walk_fake(&f, &first).into()), &f);
+        assert!(!live.walks[0].overflowed);
+        assert!(live.changes_since(live.walks[0].since).is_empty());
+        live.apply(&[change(20_000, false)], &f);
+        let done = live.finish_walk(second.id, Ok(walk_fake(&f, &second).into()), &f);
+        assert_eq!(done.rescan, None);
+    }
+
+    #[test]
+    fn overlapping_walks_each_read_again_what_changed_after_they_were_queued() {
+        let mut f = moved_in();
+        f.set(100, DIR_INFO, &[(5, "Other")]);
+        f.set(101, file_info(1), &[(100, "o.txt")]);
+        let (mut live, base, first) = after_move_in(&f);
+        let listed_first = walk_fake(&f, &first);
+        f.0.remove(&61); // listed by the first walk
+        live.apply(&[change(61, false)], &f);
+        let second = live.apply(&[change(100, false)], &f).walks[0].clone();
+        let listed_second = walk_fake(&f, &second);
+        f.set(102, file_info(1), &[(100, "p.txt")]);
+        f.0.remove(&63);
+        live.apply(&[change(102, true), change(63, false)], &f);
+        // The results arrive in the other order.
+        live.finish_walk(second.id, Ok(listed_second.into()), &f);
+        live.finish_walk(first.id, Ok(listed_first.into()), &f);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        assert!(
+            live.walks.is_empty() && live.log.is_empty(),
+            "nothing is kept"
+        );
+    }
+
+    /// A source whose reads of a missing record fail instead of saying "free".
+    struct Unsure<'a>(&'a Fake);
+    impl RecordSource for Unsure<'_> {
+        fn fetch(&self, volume: usize, record: u64) -> Option<RecordState> {
+            self.0.fetch(volume, record)
+        }
+        fn certainly_free(&self, _volume: usize, _record: u64) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_reader_that_never_takes_a_job_is_given_up() {
+        // The reader hangs before it takes its first job (opening a volume):
+        // no walk ever starts, yet the queued folder must not wait forever.
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let patience = MAX_WALK_TIME + WALK_SLACK;
+        let queued = live.walks[0].queued;
+        let due = live
+            .next_walk_deadline()
+            .expect("a queued folder has a deadline");
+        assert_eq!(due, queued.max(live.progress) + patience);
+        assert_eq!(live.expire_walks(queued), Applied::default());
+        // A reader that shows life (ready) gets its patience from then on.
+        let later = queued + Duration::from_secs(20);
+        live.reader_ready(later);
+        assert_eq!(live.next_walk_deadline(), Some(later + patience));
+        assert_eq!(
+            live.expire_walks(later + patience - Duration::from_secs(1)),
+            Applied::default()
+        );
+        let r = live.expire_walks(later + patience);
+        let why = r.rescan.expect("falls back to the rescan");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        assert_eq!(r.abandoned, 1);
+        assert!(live.walks.is_empty());
+        assert_eq!(
+            live.finish_walk(job.id, Ok(Subtree::default()), &f),
+            Applied::default()
+        );
+        // A folder behind a running one waits for it: only the running
+        // walk's own deadline counts.
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        let mut f2 = f;
+        f2.set(100, DIR_INFO, &[(5, "Other")]);
+        live.apply(&[change(100, false)], &f2);
+        let t0 = Instant::now() + Duration::from_secs(5);
+        live.walk_started(job.id, t0);
+        assert_eq!(live.next_walk_deadline(), Some(t0 + patience));
+    }
+
+    #[test]
+    fn a_failed_read_is_not_a_deletion() {
+        // The folder's record cannot be read (not "free"): not confirmed
+        // gone, so the walk that could not open it falls back to the rescan.
+        let mut f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        for r in [60, 61, 62, 63] {
+            f.0.remove(&r);
+        }
+        let done = live.finish_walk(job.id, Err(WalkError::Gone), &Unsure(&f));
+        let why = done.rescan.expect("not confirmed gone");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+        // The same for a subfolder that could not be opened.
+        let mut f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        f.0.remove(&62);
+        f.0.remove(&63);
+        let listing = Subtree {
+            entries: walk_fake(&f, &job),
+            skipped: vec![(1u64 << 48) | 62],
+        };
+        let done = live.finish_walk(job.id, Ok(listing), &Unsure(&f));
+        assert!(done.rescan.is_some());
+    }
+
+    #[test]
+    fn a_full_log_drops_the_oldest_window_first() {
+        let f = moved_in();
+        let (mut live, _, first) = after_move_in(&f);
+        let mut f = f;
+        // 40,000 changes during the first walk…
+        let before: Vec<Change> = (0..40_000u64).map(|r| change(10_000 + r, false)).collect();
+        live.apply(&before, &f);
+        f.set(100, DIR_INFO, &[(5, "Other")]);
+        let second = live.apply(&[change(100, false)], &f).walks[0].clone();
+        // …and 20,000 more during both: the log (50,000 at most) cannot hold
+        // them all.
+        let after: Vec<Change> = (0..20_000u64).map(|r| change(100_000 + r, false)).collect();
+        live.apply(&after, &f);
+        assert!(live.log.len() <= MAX_TOUCHED);
+        let (a, b) = (&live.walks[0], &live.walks[1]);
+        assert!(a.overflowed, "the oldest walk lost its window");
+        assert!(!b.overflowed, "the younger one keeps its own");
+        assert_eq!(live.changes_since(b.since).len(), 20_000);
+        // The younger walk merges first: the older, which lost its window,
+        // needs nothing from the log, so nothing is kept for it.
+        let done = live.finish_walk(second.id, Ok(walk_fake(&f, &second).into()), &f);
+        assert_eq!(done.rescan, None);
+        assert!(live.log.is_empty(), "{} records kept", live.log.len());
+        // The older one falls back to the rescan when it finishes.
+        let done = live.finish_walk(first.id, Ok(walk_fake(&f, &first).into()), &f);
+        let why = done.rescan.expect("its window is gone");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+    }
+
+    #[test]
+    fn a_burst_of_folders_is_queued_up_to_a_cap() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        let mut f = initial();
+        let mut changes = Vec::new();
+        for i in 0..(MAX_WALKS as u64 + 1) {
+            f.set(100 + i, DIR_INFO, &[(5, &format!("m{i}"))]);
+            changes.push(change(100 + i, false));
+        }
+        let r = live.apply(&changes, &f);
+        assert_eq!(r.walks.len(), MAX_WALKS);
+        let why = r.rescan.expect("one folder too many");
+        assert_eq!(reason_kind(&why), "moved-in folder", "{why}");
+    }
+
+    #[test]
+    fn walked_hard_links_and_excluded_records() {
+        let mut f = moved_in();
+        // One file with a name in two walked folders, and an excluded record.
+        f.set(80, file_info(3), &[(60, "link-a.txt"), (62, "link-b.txt")]);
+        f.set(30, file_info(1), &[(60, "excluded.txt")]);
+        let (mut live, base, job) = after_move_in(&f);
+        assert!(!walk_fake(&f, &job).iter().any(|e| e.record == 30));
+        // Even if a walker returned the excluded record, it is not shown.
+        let mut listed = walk_fake(&f, &job);
+        listed.push(SubtreeEntry {
+            record: 30,
+            parent: 60,
+            name: b"excluded.txt".to_vec(),
+            info: file_info(1),
+        });
+        live.finish_walk(job.id, Ok(listed.into()), &f);
+        let shown = shown(&live, &base);
+        assert!(
+            shown.contains(&"C:\\Moved\\link-a.txt".to_string()),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&"C:\\Moved\\sub\\link-b.txt".to_string()),
+            "{shown:?}"
+        );
+        assert!(!shown.iter().any(|p| p.contains("excluded")), "{shown:?}");
+    }
+
+    #[test]
+    fn rescan_reasons_are_counted_by_kind() {
+        assert_eq!(reason_kind(REASON_MOVED_IN), "moved-in folder");
+        assert_eq!(
+            reason_kind("a folder moved into an indexed location (the walk took longer)"),
+            "moved-in folder"
+        );
+        assert_eq!(reason_kind(REASON_LARGE_MOVE), "large folder move");
+        assert_eq!(reason_kind("50001 live changes"), "too many live changes");
+        assert_eq!(
+            reason_kind("12345 replaced entries"),
+            "too many replaced entries"
+        );
+        assert_eq!(reason_kind(REASON_ADMIN), "administrator");
+        assert_eq!(reason_kind("startup"), "startup");
+        assert_eq!(
+            reason_kind("\\\\?\\Volume{1}: change journal reset: x"),
+            "journal"
+        );
+    }
+
+    #[test]
+    fn a_folder_moved_within_the_index_is_still_moved_without_a_walk() {
+        // Not a moved-in folder: its old place is indexed, so it moves its
+        // entries (the earlier behaviour) and reads nothing.
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        let r = live.apply(&[change(20, false)], &f);
+        assert!(r.walks.is_empty() && r.rescan.is_none());
+        assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    /// Prices `Live::view` (run by hand: `cargo test --release -p ferrowd
+    /// --lib price_view -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement, run by hand"]
+    fn price_view() {
+        use std::time::Instant;
+        // The allowed bit set of 27 M base entries: what every view copies.
+        let words = 27_000_000usize.div_ceil(64);
+        let removed = vec![0u64; words];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for i in 0..200 {
+            let mut copy: Vec<u64> = std::hint::black_box(&removed).iter().map(|w| !w).collect();
+            copy[i] = 1;
+            sink ^= std::hint::black_box(&copy)[words / 2] ^ copy[i];
+        }
+        eprintln!(
+            "allowed bit set, 27 M entries ({} KB): {:.3} ms per view (sink {sink})",
+            words * 8 / 1024,
+            t.elapsed().as_secs_f64() * 1000.0 / 200.0
+        );
+        // The delta index rebuilt per view, for growing deltas.
+        for n in [1_000u64, 5_000, 19_000, 50_000] {
+            let (base, map) = fixture();
+            let mut live = Live::new(base, &[map]);
+            let mut f = initial();
+            let mut changes = Vec::new();
+            for i in 0..n {
+                f.set(1000 + i, file_info(i), &[(20, &format!("file-{i:06}.txt"))]);
+                changes.push(change(1000 + i, true));
+            }
+            live.apply(&changes, &f);
+            let t = Instant::now();
+            let views = 10;
+            for _ in 0..views {
+                let v = live.view();
+                sink ^= v.entries as u64;
+            }
+            eprintln!(
+                "delta of {n} entries: {:.2} ms per view",
+                t.elapsed().as_secs_f64() * 1000.0 / views as f64
+            );
+        }
+        assert_ne!(sink, 1);
     }
 
     #[test]
@@ -1209,6 +2534,46 @@ mod tests {
         assert_eq!(all.accounted() as usize, expected);
         assert_eq!(all.entries, 4);
         assert!(part(&all.parts, "view.allowed") >= 8);
+    }
+
+    #[test]
+    fn memory_accounting_covers_the_walks_and_their_change_log() {
+        let part = |parts: &[Part], name: &str| {
+            parts
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .bytes
+        };
+        let f = moved_in();
+        let (mut live, _, job) = after_move_in(&f);
+        // A folder waits, and changes are logged meanwhile.
+        let flood: Vec<Change> = (0..5_000u64).map(|r| change(10_000 + r, false)).collect();
+        live.apply(&flood, &f);
+        let parts = live.memory_parts();
+        assert!(part(&parts, "live.walks") >= size_of::<Walk>() as u64);
+        assert_eq!(
+            part(&parts, "live.change_log"),
+            table_bytes(live.log.capacity(), size_of::<((usize, u64), Touch)>()) as u64
+        );
+        assert!(part(&parts, "live.change_log") >= 5_000 * size_of::<Touch>() as u64);
+        // Covered folders are counted by capacity too.
+        live.walks[0].covered.push((70, 1));
+        let more = live.memory_parts();
+        assert!(part(&more, "live.walks") > part(&parts, "live.walks"));
+        // They are in the breakdown's total (nothing is counted outside the
+        // named parts).
+        let all = live.breakdown(None, 0);
+        assert_eq!(
+            part(&all.parts, "live.change_log"),
+            part(&more, "live.change_log")
+        );
+        // Once the walk is merged nothing is kept: the table is freed, not
+        // just emptied.
+        live.finish_walk(job.id, Ok(walk_fake(&f, &job).into()), &f);
+        let after = live.memory_parts();
+        assert_eq!(part(&after, "live.change_log"), 0);
+        assert!(live.walks.is_empty());
     }
 
     #[test]

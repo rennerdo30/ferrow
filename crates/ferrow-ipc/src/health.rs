@@ -9,6 +9,8 @@
 //! clock when the report was made, so a client shows ages without depending
 //! on its own clock.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::MAX_TEXT_BYTES;
@@ -63,6 +65,8 @@ pub struct Health {
     /// Connections that ended with an error since the service started
     /// (counted, not logged one by one).
     pub connection_errors: u64,
+    /// What the live updater did since the service started.
+    pub live_stats: LiveStats,
     pub last_save: Option<SaveInfo>,
     pub volumes: Vec<VolumeHealth>,
     /// Volumes left out of `volumes` because there were more than [`MAX_VOLUMES`].
@@ -88,6 +92,29 @@ pub struct ScanInfo {
     /// Why it ran: `startup`, `requested by an administrator`, a journal reset…
     pub reason: String,
     pub took_ms: u64,
+}
+
+/// Counters of the live updater, so a rescan storm or a failing optimisation
+/// shows up without reading logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LiveStats {
+    /// Folders moved into the index whose contents were read in the
+    /// background instead of rescanning every volume: finished reads…
+    pub folder_reads: u64,
+    /// …the entries they found, the milliseconds they took…
+    pub folder_read_entries: u64,
+    pub folder_read_ms: u64,
+    /// Subfolders that vanished while a folder was read (deleted or moved
+    /// away; each is checked, and one that still exists is a fallback).
+    pub folder_read_skipped: u64,
+    /// …and reads that failed or were too large, each of which asked for a
+    /// rescan instead.
+    pub folder_read_fallbacks: u64,
+    /// Scans started, by why: `startup`, `moved-in folder`, `large folder
+    /// move`, `too many live changes`, `too many replaced entries`,
+    /// `journal`, `administrator`.
+    pub scans_by_reason: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
