@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Choose who can use the Ferrow service (command line).** Until now only administrator accounts could use the service's fast index; a standard account fell back to its own slower one. An administrator can now allow every account or a list of accounts: `ferrow service access show | admins | everyone | add <account-or-SID> | remove <account-or-SID>` (elevated terminal / sudo to change; `show` works for any account). Allowing every user means every account on the PC sees every file name on it. Changes apply within a second, without restarting the service. Nothing changes unless you change it: without a policy file only administrators are served, as before. Needs the new service: run Setup to update it.
+
 ## 0.1.0-beta.16
 
 - **Fixed: the service kept rescanning and used gigabytes of memory.** On a busy disk, almost any folder moved into an indexed place, or a burst of changes, started a full rescan of every drive. While a rescan ran, two indexes were in memory and the search threads were busy with the scan, and afterwards the whole index file was written again. Now:
