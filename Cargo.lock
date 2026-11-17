@@ -1224,6 +1224,7 @@ name = "ferrowd"
 version = "0.1.0-beta.17"
 dependencies = [
  "arc-swap",
+ "ferrow-fixture",
  "ferrow-index",
  "ferrow-ipc",
  "ferrow-query",

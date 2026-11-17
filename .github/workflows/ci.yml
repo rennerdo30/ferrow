@@ -421,6 +421,7 @@ jobs:
           cargo build --release --locked -p ferrow-walk --example scan_cost
           cargo build --release --locked -p ferrow-query --example service_bench
           cargo build --release --locked -p ferrow-query --example latency_probe
+          cargo build --release --locked -p ferrowd --example memory_breakdown
           cargo bench --no-run -p ferrow-query --bench m1_bench --locked
       - name: Build main in a separate target directory
         if: github.event_name == 'pull_request'
@@ -500,3 +501,22 @@ jobs:
             --base-index "$RUNNER_TEMP/ferrow-bench.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin" \
             --metadata-rerun-bench "$PWD/target/release/examples/metadata_bench" \
             --metadata-rerun-index "$RUNNER_TEMP/ferrow-metadata-confirm.bin"
+      # Where the service's memory goes (FR-37): the structures the service
+      # holds for a 5 M entry NTFS volume, built from a synthetic MFT-style record
+      # stream, by capacity, with the process counters and the unattributed
+      # remainder. Runs after the gate so its allocations and the saved file
+      # cannot disturb the paired timings; `always()` keeps it when the gate fails.
+      - name: Memory breakdown of the service's structures (5M synthetic MFT build)
+        if: always()
+        run: |
+          git rev-parse HEAD
+          FERROW_BENCH_ENTRIES=20000 FERROW_MEMORY_CHANGES=500 timeout -k 5s 120s target/release/examples/memory_breakdown > /dev/null
+          FERROW_MEMORY_CHANGES=20000 FERROW_MEMORY_SUMMARY="$GITHUB_STEP_SUMMARY" timeout -k 10s 900s target/release/examples/memory_breakdown 2>&1 | tee memory-breakdown-output.txt
+      - name: Keep the memory breakdown output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ferrow-memory-breakdown-${{ github.sha }}
+          path: memory-breakdown-output.txt
+          if-no-files-found: warn
+          retention-days: 14

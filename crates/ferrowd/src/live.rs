@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, flags};
 use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
@@ -170,7 +171,43 @@ pub struct LiveView {
     pub entries: usize,
 }
 
+/// A frozen index's heap by part, named `<prefix>.<part>`; a cached sort
+/// order is lazy (built when first sorted by), everything else steady.
+pub fn index_parts(index: &Index, prefix: &str) -> Vec<Part> {
+    index
+        .heap_parts()
+        .into_iter()
+        .map(|(name, bytes)| {
+            let kind = if name.ends_with(".order") {
+                Kind::Lazy
+            } else {
+                Kind::Steady
+            };
+            Part::new(format!("{prefix}.{name}"), bytes, kind)
+        })
+        .collect()
+}
+
 impl LiveView {
+    /// What the published view holds, by capacity (memory accounting).
+    pub fn memory_parts(&self) -> Vec<Part> {
+        let mut parts = vec![
+            Part::new("view.allowed", vec_bytes(&self.allowed), Kind::Steady),
+            Part::new(
+                "view.delta_allowed",
+                vec_bytes(&self.delta_allowed),
+                Kind::Steady,
+            ),
+            Part::new(
+                "view.overrides",
+                table_bytes(self.overrides.capacity(), size_of::<(u32, EntryMetadata)>()),
+                Kind::Steady,
+            ),
+        ];
+        parts.extend(index_parts(&self.delta, "view.delta_index"));
+        parts
+    }
+
     /// Metadata of a frozen entry, with any live override applied.
     pub fn base_metadata(&self, base: &Index, id: u32) -> EntryMetadata {
         self.overrides
@@ -369,6 +406,66 @@ impl Live {
     /// the next rescan): what the delta costs in memory and per view.
     pub fn delta_len(&self) -> usize {
         self.delta.len()
+    }
+
+    /// What the live layer holds beyond the frozen index, by capacity
+    /// (memory accounting; allocator overhead per allocation is not here).
+    pub fn memory_parts(&self) -> Vec<Part> {
+        let mut record_base = 0;
+        let mut overlay = 0;
+        let mut sets = 0;
+        for v in &self.volumes {
+            record_base += vec_bytes(&v.record_base);
+            overlay += table_bytes(v.overlay.capacity(), size_of::<(u64, Vec<Loc>)>())
+                + v.overlay.values().map(vec_bytes).sum::<usize>();
+            sets += table_bytes(v.excluded.capacity(), size_of::<u64>())
+                + table_bytes(v.roots.capacity(), size_of::<u64>());
+        }
+        let delta_names: usize = self.delta.iter().map(|e| e.name.capacity()).sum();
+        let delta_children =
+            table_bytes(self.delta_children.capacity(), size_of::<(Loc, Vec<u32>)>())
+                + self.delta_children.values().map(vec_bytes).sum::<usize>();
+        let base_children = self
+            .base_children
+            .get()
+            .map_or(0, |(first, ids)| vec_bytes(first) + vec_bytes(ids));
+        vec![
+            Part::new(
+                "live.base_record",
+                vec_bytes(&self.base_record),
+                Kind::Steady,
+            ),
+            Part::new("live.record_base", record_base, Kind::Steady),
+            Part::new("live.overlay", overlay, Kind::Steady),
+            Part::new("live.excluded_roots", sets, Kind::Steady),
+            Part::new("live.removed", vec_bytes(&self.removed), Kind::Steady),
+            Part::new(
+                "live.delta",
+                vec_bytes(&self.delta) + delta_names,
+                Kind::Steady,
+            ),
+            Part::new("live.delta_children", delta_children, Kind::Steady),
+            Part::new(
+                "live.overrides",
+                table_bytes(self.overrides.capacity(), size_of::<(u32, EntryMetadata)>()),
+                Kind::Steady,
+            ),
+            // Built by the first folder rename or delete, then kept.
+            Part::new("live.base_children", base_children, Kind::Lazy),
+        ]
+    }
+
+    /// The whole retained picture of a live session: the frozen index's parts
+    /// (a metadata sort order is lazy: built on first use), this layer's, and
+    /// the published view's. `baseline` is the process's private bytes before
+    /// any index existed (see [`Breakdown::baseline`]).
+    pub fn breakdown(&self, view: Option<&LiveView>, baseline: u64) -> Breakdown {
+        let mut parts: Vec<Part> = index_parts(&self.base, "index");
+        parts.extend(self.memory_parts());
+        if let Some(view) = view {
+            parts.extend(view.memory_parts());
+        }
+        Breakdown::new(self.base.len(), parts, baseline)
     }
 
     fn children(&self, loc: Loc) -> Vec<Loc> {
@@ -1061,6 +1158,57 @@ mod tests {
         f.set(60, DIR_INFO, &[(5, "FromElsewhere")]);
         let r = live.apply(&[change(60, false)], &f);
         assert!(r.rescan.is_some());
+    }
+
+    #[test]
+    fn memory_accounting_counts_each_structure_by_capacity_and_adds_up_with_the_index() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let part = |parts: &[Part], name: &str| {
+            parts
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .bytes
+        };
+        let parts = live.memory_parts();
+        assert_eq!(part(&parts, "live.base_record"), 4 * 8, "8 bytes per entry");
+        assert_eq!(part(&parts, "live.removed"), 8, "one bitset word");
+        assert_eq!(part(&parts, "live.base_children"), 0, "lazy: not built yet");
+        assert!(
+            part(&parts, "live.record_base") >= 21 * 4,
+            "4 bytes per MFT record"
+        );
+
+        // Deleting a folder is the first thing that needs the frozen children
+        // index: (entries + 1) offsets and one id per non-root entry.
+        let mut f = initial();
+        f.0.remove(&20);
+        f.set(70, file_info(1), &[(5, "a-new-name.txt")]);
+        live.apply(&[change(20, false), change(70, true)], &f);
+        let parts = live.memory_parts();
+        assert_eq!(part(&parts, "live.base_children"), (5 + 3) * 4);
+        assert!(part(&parts, "live.delta") > size_of::<DeltaEntry>() as u64);
+        assert!(part(&parts, "live.delta_children") > 0);
+
+        // Every part is counted once: the breakdown is the frozen index's
+        // heap, the live layer's parts and the view's parts, nothing else.
+        let view = live.view();
+        let all = live.breakdown(Some(&view), 0);
+        let expected = base.heap_bytes()
+            + live
+                .memory_parts()
+                .iter()
+                .map(|p| p.bytes as usize)
+                .sum::<usize>()
+            + view
+                .memory_parts()
+                .iter()
+                .map(|p| p.bytes as usize)
+                .sum::<usize>();
+        assert_eq!(all.accounted() as usize, expected);
+        assert_eq!(all.entries, 4);
+        assert!(part(&all.parts, "view.allowed") >= 8);
     }
 
     #[test]

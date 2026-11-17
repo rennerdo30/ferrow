@@ -679,6 +679,16 @@ pub struct VolumeMap {
     pub roots: Vec<(u64, u32)>,
 }
 
+impl VolumeMap {
+    /// Heap held by the map, by capacity (memory accounting).
+    pub fn heap_bytes(&self) -> usize {
+        self.device.capacity()
+            + self.entries.capacity() * size_of::<(u64, u32)>()
+            + self.excluded.capacity() * size_of::<u64>()
+            + self.roots.capacity() * size_of::<(u64, u32)>()
+    }
+}
+
 /// Scan all roots and freeze the index.
 pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
     let (index, report, _) = scan_with_maps(options);
@@ -1058,7 +1068,6 @@ fn ntfs_device_of(path: &Path) -> Option<String> {
 /// Add everything below directory `record` (already added as `root_id`)
 /// to the builder, applying excludes like the walk does. Returns the
 /// number of entries added.
-#[cfg(windows)]
 fn emit_mft_subtree(
     volume: &ntfs::Volume,
     record: u64,
@@ -1146,10 +1155,118 @@ fn emit_mft_subtree(
     added
 }
 
+/// Fill an index and its record map from an already parsed volume exactly as
+/// the MFT scan fills a volume root (one root entry named `root_name` for
+/// `root_record`, then the subtree through the same emission, then freeze),
+/// without reading a disk. For memory benchmarks and tests that need the
+/// service's structures from a synthetic record stream; the scan itself does
+/// not call it.
+#[doc(hidden)]
+pub fn index_from_parsed_volume(
+    volume: &ntfs::Volume,
+    root_record: u64,
+    root_name: &[u8],
+    columns: ColumnSet,
+) -> (Index, VolumeMap) {
+    let builder = IndexBuilder::with_columns(columns);
+    let errors = Errors::new();
+    let excludes = ExcludeSet::default();
+    let walker = Walker {
+        columns,
+        builder: &builder,
+        excludes: &excludes,
+        follow_symlinks: false,
+        errors: &errors,
+        progress: None,
+    };
+    let root_id = builder.add_root(root_name, flags::DIR);
+    let mut map = VolumeMap {
+        device: "synthetic".to_string(),
+        serial: volume.serial,
+        journal: volume.journal,
+        record_size: volume.record_size,
+        ..VolumeMap::default()
+    };
+    map.roots.push((root_record, root_id));
+    map.entries.push((root_record, root_id));
+    emit_mft_subtree(
+        volume,
+        root_record,
+        root_id,
+        Path::new(""),
+        &walker,
+        &mut map.entries,
+    );
+    (builder.freeze(), map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ferrow_index::ROOT_PARENT;
+
+    #[test]
+    fn a_parsed_volume_becomes_an_index_and_a_record_map_like_the_scan_makes_them() {
+        use ntfs::{NameRecord, Parsed, RecordInfo, Volume};
+        let info = |is_dir: bool| RecordInfo {
+            in_use: true,
+            is_dir,
+            sequence: 1,
+            attributes: if is_dir { 0x10 } else { 0x20 },
+            size: if is_dir { 0 } else { 7 },
+            ..RecordInfo::default()
+        };
+        let mut parsed = Parsed::default();
+        for (record, dir) in [(5, true), (20, true), (21, false), (22, false)] {
+            parsed.infos.push((record, info(dir)));
+        }
+        // Docs/a.txt is also linked as a-link.txt in the root.
+        for (record, parent, name) in [
+            (20u64, 5u64, "Docs"),
+            (21, 20, "a.txt"),
+            (21, 5, "a-link.txt"),
+            (22, 5, "b.txt"),
+        ] {
+            let name_offset = parsed.arena.len() as u32;
+            parsed.arena.extend_from_slice(name.as_bytes());
+            parsed.names.push(NameRecord {
+                record,
+                parent_record: parent,
+                parent_sequence: 1,
+                name_offset,
+                name_len: name.len() as u16,
+            });
+        }
+        let volume = Volume::from_parsed(parsed, 32, 0xABCD);
+        let (index, map) = index_from_parsed_volume(&volume, 5, b"C:", ColumnSet::DEFAULT);
+        let mut paths: Vec<String> = (0..index.len() as u32)
+            .map(|id| index.path(id).to_string_lossy().replace('\\', "/"))
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "C:",
+                "C:/Docs",
+                "C:/Docs/a.txt",
+                "C:/a-link.txt",
+                "C:/b.txt"
+            ]
+        );
+        assert_eq!(map.roots, [(5, 0)]);
+        assert_eq!(map.entries.len(), 5, "one pair per name, hard links twice");
+        assert_eq!(map.entries.iter().filter(|(r, _)| *r == 21).count(), 2);
+        let a_txt = map.entries.iter().find(|(r, _)| *r == 21).unwrap().1;
+        assert_eq!(
+            index.metadata(a_txt).size,
+            Some(7),
+            "sizes come from the record"
+        );
+        // The parts of the volume's heap add up to its tables.
+        let parts: usize = volume.heap_parts().iter().map(|(_, b)| b).sum();
+        assert!(parts >= 32 * size_of::<ntfs::RecordInfo>());
+        assert!(map.heap_bytes() >= 5 * size_of::<(u64, u32)>());
+    }
 
     #[cfg(windows)]
     #[test]

@@ -31,6 +31,7 @@ pub mod install;
 pub mod live;
 #[cfg(windows)]
 mod live_windows;
+pub mod memory;
 pub mod persistence;
 pub mod protection;
 
