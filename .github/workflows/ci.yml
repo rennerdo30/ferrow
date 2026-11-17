@@ -158,7 +158,7 @@ jobs:
   bench:
     name: bench (5M fixture)
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 30
     # Explicit bash runs with -eo pipefail, so a failing or timed-out
     # measurement is not hidden behind `| tee`.
     defaults:
@@ -177,7 +177,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
-          ref: a7668b1c2f847db9e535ed6394755397be1a968c  # TEMPORARY FR-31: parent of #76 to reproduce its bench run
+          ref: main
           path: .bench-base
       - run: rustup show active-toolchain
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
@@ -494,23 +494,3 @@ jobs:
             --base-index "$RUNNER_TEMP/ferrow-bench.bin" --head-index "$RUNNER_TEMP/ferrow-bench.bin" \
             --metadata-rerun-bench "$PWD/target/release/examples/metadata_bench" \
             --metadata-rerun-index "$RUNNER_TEMP/ferrow-metadata-confirm.bin"
-      - name: TEMPORARY A/A gate runs on identical head binaries (FR-31, removed before merge)
-        if: always() && github.event_name == 'pull_request'
-        continue-on-error: true
-        run: |
-          T="$RUNNER_TEMP"
-          mkdir -p "$T/aa-a/examples"
-          cp target/release/ferrow "$T/aa-a/ferrow"
-          cp target/release/examples/latency_probe "$T/aa-a/examples/latency_probe"
-          sha256sum target/release/ferrow "$T/aa-a/ferrow" target/release/examples/latency_probe "$T/aa-a/examples/latency_probe"
-          # Run 1: base arm = copy in a temp directory, head arm = workspace. Run 2: reversed.
-          for run in copy-as-base copy-as-head; do
-            if [ "$run" = copy-as-base ]; then B="$T/aa-a"; H="$PWD/target/release"; else B="$PWD/target/release"; H="$T/aa-a"; fi
-            echo "## A/A gate run ($run): identical head binaries in both arms" >> "$GITHUB_STEP_SUMMARY"
-            result=0
-            timeout -k 10s 1200s python3 scripts/bench-gate.py "$T/aa-base-$run.txt" "$T/aa-head-$run.txt" --measure \
-              --base-probe "$B/examples/latency_probe" --head-probe "$H/examples/latency_probe" \
-              --base-binary "$B/ferrow" --head-binary "$H/ferrow" \
-              --base-index "$T/ferrow-bench.bin" --head-index "$T/ferrow-bench.bin" || result=$?
-            echo "A/A $run exit code $result" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
