@@ -21,7 +21,7 @@ pub use metadata::{
     timestamp_ticks,
 };
 
-pub use persist::{LoadError, LoadTimings, SaveError};
+pub use persist::{LoadError, LoadTimings, MetadataLoad, SaveError};
 
 /// Entry flag bits stored in the `flags` column.
 pub mod flags {
