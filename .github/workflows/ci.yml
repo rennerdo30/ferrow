@@ -213,6 +213,41 @@ jobs:
               digest
           }
 
+          type Sample = (Duration, usize, u64);
+          type Failure = Box<dyn std::error::Error>;
+
+          /// FERROW_PROBE_REPEATS=N (default 1) repeats the timed operation inside this
+          /// process, about 100 ms worth (at least 3, at most N), validates every repeat and
+          /// reports the median. One cold sample per process is dominated by scheduling jitter.
+          fn sampled(mut once: impl FnMut() -> Result<Sample, Failure>) -> Result<Sample, Failure> {
+              let max: usize = std::env::var("FERROW_PROBE_REPEATS")
+                  .ok()
+                  .and_then(|value| value.parse().ok())
+                  .unwrap_or(1);
+              let first = once()?;
+              if max <= 1 {
+                  return Ok(first);
+              }
+              let wanted = (0.1 / first.0.as_secs_f64().max(1e-6)).ceil() as usize;
+              let mut times = vec![first.0];
+              for _ in 1..wanted.clamp(3, max) {
+                  let next = once()?;
+                  if next.1 != first.1 || next.2 != first.2 {
+                      return Err("repeat content mismatch".into());
+                  }
+                  times.push(next.0);
+              }
+              times.sort();
+              eprintln!(
+                  "FERROW-PROBE-REPEATS n={} min={:.9} median={:.9} max={:.9}",
+                  times.len(),
+                  times[0].as_secs_f64() * 1000.0,
+                  times[times.len() / 2].as_secs_f64() * 1000.0,
+                  times[times.len() - 1].as_secs_f64() * 1000.0
+              );
+              Ok((times[times.len() / 2], first.1, first.2))
+          }
+
           fn main() -> Result<(), Box<dyn std::error::Error>> {
               let mut args: Vec<_> = std::env::args().skip(1).collect();
               let legacy = args.last().is_some_and(|arg| arg == "--legacy-queries");
@@ -278,21 +313,26 @@ jobs:
                   }
                   let (elapsed, hits, fingerprint) = match args[2].as_str() {
                       "in-process" => {
-                          let started = Instant::now();
                           if page {
-                              let result = search(&index, &query, &options);
-                              let elapsed = started.elapsed();
-                              if result.cancelled || result.hits != expected.hits {
-                                  return Err("page content mismatch".into());
-                              }
-                              (elapsed, result.hits.len(), digest(&expected_paths))
+                              sampled(|| {
+                                  let started = Instant::now();
+                                  let result = search(&index, &query, &options);
+                                  let elapsed = started.elapsed();
+                                  if result.cancelled || result.hits != expected.hits {
+                                      return Err("page content mismatch".into());
+                                  }
+                                  Ok((elapsed, result.hits.len(), digest(&expected_paths)))
+                              })?
                           } else {
-                              let (n, cancelled) = count(&index, &query, &CancelToken::new());
-                              let elapsed = started.elapsed();
-                              if cancelled || n != total {
-                                  return Err("count mismatch".into());
-                              }
-                              (elapsed, n, n as u64)
+                              sampled(|| {
+                                  let started = Instant::now();
+                                  let (n, cancelled) = count(&index, &query, &CancelToken::new());
+                                  let elapsed = started.elapsed();
+                                  if cancelled || n != total {
+                                      return Err("count mismatch".into());
+                                  }
+                                  Ok((elapsed, n, n as u64))
+                              })?
                           }
                       }
                       "IPC" => {
@@ -332,24 +372,28 @@ jobs:
                               if client.query(&args[3], 100)? != expected_paths {
                                   return Err("IPC warm-up content mismatch".into());
                               }
-                              let started = Instant::now();
-                              let paths = client.query(&args[3], 100)?;
-                              let elapsed = started.elapsed();
-                              if paths != expected_paths {
-                                  return Err("IPC content mismatch".into());
-                              }
-                              (elapsed, paths.len(), digest(&paths))
+                              sampled(|| {
+                                  let started = Instant::now();
+                                  let paths = client.query(&args[3], 100)?;
+                                  let elapsed = started.elapsed();
+                                  if paths != expected_paths {
+                                      return Err("IPC content mismatch".into());
+                                  }
+                                  Ok((elapsed, paths.len(), digest(&paths)))
+                              })?
                           } else {
                               if client.count(&args[3])? != total as u64 {
                                   return Err("IPC warm-up count mismatch".into());
                               }
-                              let started = Instant::now();
-                              let n = client.count(&args[3])?;
-                              let elapsed = started.elapsed();
-                              if n != total as u64 {
-                                  return Err("IPC count mismatch".into());
-                              }
-                              (elapsed, n as usize, n)
+                              sampled(|| {
+                                  let started = Instant::now();
+                                  let n = client.count(&args[3])?;
+                                  let elapsed = started.elapsed();
+                                  if n != total as u64 {
+                                      return Err("IPC count mismatch".into());
+                                  }
+                                  Ok((elapsed, n as usize, n))
+                              })?
                           }
                       }
                       _ => return Err("unknown probe kind".into()),
@@ -441,15 +485,9 @@ jobs:
         continue-on-error: true
         run: |
           T="$RUNNER_TEMP"
-          mkdir -p "$T/aa-a/examples" "$T/aa-b/examples" "$T/aa-c/examples"
-          for d in aa-a aa-b aa-c; do
-            cp target/release/ferrow "$T/$d/ferrow"
-            cp target/release/examples/latency_probe "$T/$d/examples/latency_probe"
-          done
           {
-            echo "## A/A diagnostic (identical head binaries; FR-31)"
-            timeout -k 10s 1500s python3 scripts/aa_diag.py "$T/ferrow-bench.bin" 10 \
-              "$T/ferrow-base-target/release" "$PWD/target/release" "$T/aa-a" "$T/aa-b" "$T/aa-c"
+            echo "## Repeat-in-process diagnostic (FR-31)"
+            timeout -k 10s 1500s python3 scripts/aa_diag.py "$T/ferrow-bench.bin" 8 31 "$T/ferrow-base-target/release" "$PWD/target/release"
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Gate paired main and head medians
         if: github.event_name == 'pull_request'
