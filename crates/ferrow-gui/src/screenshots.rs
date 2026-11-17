@@ -48,6 +48,8 @@ use crate::update::UpdateState;
 const NOW: i64 = 1_794_916_800;
 const WIDE: Vec2 = vec2(1040.0, 680.0);
 const NARROW: Vec2 = vec2(560.0, 360.0);
+/// The owner's window (logical points).
+const OWNER: Vec2 = vec2(1570.0, 1060.0);
 
 // -------------------------------------------------------------------
 // Fixture
@@ -754,7 +756,6 @@ fn render_all_screens() {
 #[test]
 #[ignore = "renders screenshots; run explicitly (see the module docs)"]
 fn render_settings_scroll_edge() {
-    const OWNER: Vec2 = vec2(1570.0, 1060.0);
     let out = output_dir();
     let data = out.join(".test-data");
     std::fs::create_dir_all(&data).expect("create the scratch data folder");
@@ -777,6 +778,12 @@ fn render_settings_scroll_edge() {
                 // The very end.
                 s.scroll_by(-100_000.0);
                 s.save(43, "settings-edge-end");
+                // A click in the section list on a short section: it lands
+                // at the top and is the one highlighted.
+                s.goto("Appearance");
+                s.save(44, "settings-click-appearance");
+                s.goto("Updates");
+                s.save(45, "settings-click-updates");
             }
         }
     });
@@ -1244,14 +1251,17 @@ fn a_scroll_request_on_the_first_frame_reaches_its_section() {
     if cfg!(windows) {
         sections.push("Windows");
     }
-    for target in sections {
-        let mut s = Session::new(Look::Dark, WIDE, &out, &index, false);
-        s.app().page = Page::Settings;
-        s.app().focus_search = false;
-        s.app().settings_scroll_to = Some(target);
-        s.frames(6);
-        let seen = settings_page::section_label_in_view(&s.harness.ctx);
-        assert_eq!(seen, target, "request on the first frame");
+    sections.push("Fast index");
+    for size in [WIDE, OWNER] {
+        for target in &sections {
+            let mut s = Session::new(Look::Dark, size, &out, &index, false);
+            s.app().page = Page::Settings;
+            s.app().focus_search = false;
+            s.app().settings_scroll_to = Some(target);
+            s.frames(6);
+            let seen = settings_page::section_label_in_view(&s.harness.ctx);
+            assert_eq!(seen, *target, "request on the first frame at {size:?}");
+        }
     }
 }
 

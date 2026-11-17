@@ -103,6 +103,50 @@ fn section_in_view(tops: &[(Section, f32)], line: f32, at_end: bool) -> Section 
         .map_or(Section::FastIndex, |(s, _)| *s)
 }
 
+/// A heading this close to the top of the scroll area (either side) owns the
+/// view, whatever follows it: a short section scrolled to the top.
+const TOP_HEADING: f32 = 16.0;
+
+/// The section that owns the view of a scroll area that starts at
+/// `top` and is `height` tall: the one whose heading sits at its top edge,
+/// otherwise the one found by [`section_in_view`].
+fn owning_section(tops: &[(Section, f32)], top: f32, height: f32, at_end: bool) -> Section {
+    if !at_end
+        && let Some((s, _)) = tops
+            .iter()
+            .rev()
+            .find(|(_, t)| (*t - top).abs() <= TOP_HEADING)
+    {
+        return *s;
+    }
+    section_in_view(tops, highlight_line(top, height), at_end)
+}
+
+/// A section the user asked for (list click or request): it stays
+/// highlighted until the page is scrolled away from where it landed.
+#[derive(Clone, Copy)]
+struct Pin {
+    section: Section,
+    /// Scroll offset the request lands at.
+    offset: f32,
+    arrived: bool,
+}
+
+/// The pin after a frame at scroll `offset`, or `None` once released.
+fn settle_pin(pin: Pin, offset: f32, at_end: bool) -> Option<Pin> {
+    let near = (offset - pin.offset).abs() <= 2.0 || (at_end && offset < pin.offset);
+    if near {
+        Some(Pin {
+            arrived: true,
+            ..pin
+        })
+    } else if pin.arrived {
+        None
+    } else {
+        Some(pin)
+    }
+}
+
 /// Where the parts of the page go for a window `width` wide.
 #[derive(Debug, PartialEq)]
 struct PageLayout {
@@ -339,17 +383,31 @@ struct Anchors {
     tops: Vec<(Section, f32)>,
     /// Height of the last section.
     tail: f32,
-    /// The line a heading must be above to take the highlight.
-    line: f32,
+    /// Top and height of the scroll area.
+    top: f32,
+    height: f32,
+    /// Scroll offset.
+    offset: f32,
     /// Whether the page is scrolled to its end.
     at_end: bool,
+    pin: Option<Pin>,
+}
+
+impl Anchors {
+    /// The section the list highlights.
+    fn shown(&self) -> Section {
+        self.pin.map_or_else(
+            || owning_section(&self.tops, self.top, self.height, self.at_end),
+            |p| p.section,
+        )
+    }
 }
 
 /// Screenshot tests: which section is in view (the page's own rule).
 #[cfg(all(test, feature = "screenshots"))]
 pub(crate) fn section_label_in_view(ctx: &egui::Context) -> &'static str {
     let anchors: Anchors = ctx.data(|d| d.get_temp(anchors_id())).unwrap_or_default();
-    section_in_view(&anchors.tops, anchors.line, anchors.at_end).label()
+    anchors.shown().label()
 }
 
 fn anchors_id() -> egui::Id {
@@ -364,6 +422,11 @@ fn own_open_id() -> egui::Id {
 struct Marks {
     tops: Vec<(Section, f32)>,
     scroll_to: Option<Section>,
+    /// Scroll offset the request made this frame lands at.
+    landed: Option<f32>,
+    /// Offset the page had when the frame began, and the area's top.
+    offset: f32,
+    top: f32,
 }
 
 impl Marks {
@@ -377,6 +440,7 @@ impl Marks {
                 vec2(1.0, 1.0),
             );
             ui.scroll_to_rect(at, Some(Align::TOP));
+            self.landed = Some((self.offset + top - 8.0 - self.top).max(0.0));
         }
     }
 }
@@ -415,7 +479,7 @@ impl FerrowApp {
         // The list on the left highlights the section in view (from the last
         // frame) and asks to scroll to the one clicked.
         let before: Anchors = ctx.data(|d| d.get_temp(anchors_id())).unwrap_or_default();
-        let current = section_in_view(&before.tops, before.line, before.at_end);
+        let current = before.shown();
         let mut target = self
             .settings_scroll_to
             .take()
@@ -444,9 +508,11 @@ impl FerrowApp {
         let mut marks = Marks {
             tops: Vec::new(),
             scroll_to: target,
+            landed: None,
+            offset: before.offset,
+            top: body_top,
         };
         let mut tail = before.tail;
-        let line = highlight_line(body_top, viewport_h);
         let mut body = ui.new_child(egui::UiBuilder::new().max_rect(scroll));
         let output = egui::ScrollArea::vertical()
             .id_salt("settings-scroll")
@@ -484,11 +550,20 @@ impl FerrowApp {
                     });
                 });
             });
-        let at_end = output.state.clamped_offset().y + output.inner_rect.height()
-            >= output.content_size.y - 1.0;
-        if output.state.clamped_offset().y > 0.5 {
-            scrolled_edge(ui, &p, scroll);
+        let offset = output.state.clamped_offset().y;
+        let at_end =
+            offset > 0.5 && offset + output.inner_rect.height() >= output.content_size.y - 1.0;
+        if offset > 0.5 {
+            scrolled_edge(ui, &p, output.inner_rect);
         }
+        let pin = match (target, marks.landed) {
+            (Some(section), Some(landed)) => Some(Pin {
+                section,
+                offset: landed,
+                arrived: false,
+            }),
+            _ => before.pin.and_then(|pin| settle_pin(pin, offset, at_end)),
+        };
         if let Some(section) = target
             && before.tail <= 0.0
         {
@@ -501,13 +576,15 @@ impl FerrowApp {
         let now = Anchors {
             tops: marks.tops,
             tail,
-            line,
+            top: body_top,
+            height: viewport_h,
+            offset,
             at_end,
+            pin,
         };
         // The highlight follows the scroll position; one more frame when it
         // changed, never while it holds.
-        let changed = section_in_view(&now.tops, now.line, now.at_end) != current
-            || (now.tail - before.tail).abs() > 0.5;
+        let changed = now.shown() != current || (now.tail - before.tail).abs() > 0.5;
         ctx.data_mut(|d| d.insert_temp(anchors_id(), now));
         if changed {
             ctx.request_repaint();
@@ -2232,6 +2309,61 @@ mod tests {
         // The line scales with the view, so a short window works the same.
         assert!(highlight_line(52.0, 300.0) < 52.0 + 300.0 / 2.0);
         assert!(highlight_line(52.0, 300.0) > 52.0 + 300.0 / 3.0 - 1.0);
+    }
+
+    #[test]
+    fn a_short_section_at_the_top_owns_the_view_even_if_the_next_heading_is_above_the_line() {
+        // Scroll area at y 92, 968 tall (line at 479). Appearance was clicked
+        // and sits 8 points below the top; Updates starts 118 points later,
+        // well above the 40 % line.
+        let tops = [
+            (Section::Windows, -300.0),
+            (Section::Appearance, 100.0),
+            (Section::Updates, 218.0),
+            (Section::About, 600.0),
+        ];
+        assert_eq!(
+            owning_section(&tops, 92.0, 968.0, false),
+            Section::Appearance
+        );
+        // Still the one just scrolled 12 points past the top.
+        let past = [(Section::Appearance, 80.0), (Section::Updates, 198.0)];
+        assert_eq!(
+            owning_section(&past, 92.0, 968.0, false),
+            Section::Appearance
+        );
+        // A heading 40 points down does not own the top: the line rule runs.
+        let low = [(Section::Windows, -300.0), (Section::Appearance, 132.0)];
+        assert_eq!(
+            owning_section(&low, 92.0, 968.0, false),
+            Section::Appearance
+        );
+        let apart = [(Section::Windows, -300.0), (Section::Appearance, 700.0)];
+        assert_eq!(owning_section(&apart, 92.0, 968.0, false), Section::Windows);
+        // At the end the last section wins.
+        assert_eq!(owning_section(&tops, 92.0, 968.0, true), Section::About);
+    }
+
+    #[test]
+    fn a_clicked_section_stays_until_the_page_is_scrolled_away() {
+        let pin = Pin {
+            section: Section::Updates,
+            offset: 800.0,
+            arrived: false,
+        };
+        // On the way (an animated scroll): held, not yet arrived.
+        let moving = settle_pin(pin, 500.0, false).expect("held on the way");
+        assert!(!moving.arrived);
+        let landed = settle_pin(moving, 800.0, false).expect("held on arrival");
+        assert!(landed.arrived);
+        // A wheel step away releases it.
+        assert!(settle_pin(landed, 860.0, false).is_none());
+        // A page that cannot scroll that far counts as arrived at its end.
+        let far = Pin {
+            offset: 2000.0,
+            ..pin
+        };
+        assert!(settle_pin(far, 1500.0, true).is_some_and(|p| p.arrived));
     }
 
     #[test]
