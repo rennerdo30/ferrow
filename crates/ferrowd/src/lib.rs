@@ -23,6 +23,7 @@ use ferrow_walk::{ScanReport, WalkOptions};
 pub mod access;
 pub mod accounts;
 mod admission;
+pub mod control;
 #[cfg(any(unix, test))]
 mod definition;
 pub mod eventlog;

@@ -66,6 +66,19 @@ About sections. Test builds inject the service's answer with
 `Access::show_for_test` and scroll with the `settings_scroll_to` request the
 other pages use. The "now" shown in the update line is fixed.
 
+## Service health pictures (50..76)
+
+Rendered at both sizes and both themes (the narrow size adds the pictures
+below the first screen: details, volumes, events): the service healthy with
+three volumes, a rescan pending, live updates unavailable on one volume with
+an error event, stopped, not installed, running but refusing this account, an
+older service, a version that differs from the app, an action waiting for the
+administrator prompt and for the service, declined, done, nothing started, the
+repair question, a copy that cannot elevate (terminal commands), all events,
+and the Fast index card pointing to this section. Test builds inject the state
+with `ServiceHealth::show_for_test`; they never query the service manager or
+the real service, and the watcher thread is never started.
+
 ## Adding a screen
 
 Add it to `capture_all` in `crates/ferrow-gui/src/screenshots.rs`: build a

@@ -90,6 +90,8 @@ pub enum Outcome {
     Unconfirmed,
     /// The administrator prompt was declined.
     Declined,
+    /// The command ran and there was nothing to do (Service health).
+    NoChange,
     Problem,
 }
 
@@ -119,7 +121,7 @@ pub enum RunError {
     Failed(String),
 }
 
-const DECLINED_TEXT: &str = "Administrator approval was declined; nothing was changed.";
+pub const DECLINED_TEXT: &str = "Administrator approval was declined; nothing was changed.";
 
 impl Action {
     /// The `ferrow` arguments, or `None` when an id may not go on a command
@@ -820,6 +822,17 @@ fn os_resolve(text: &str) -> Result<Resolved, String> {
 
 #[cfg(windows)]
 fn run_elevated(args: &str) -> Result<(), RunError> {
+    match run_elevated_code(args, 30_000)? {
+        0 => Ok(()),
+        _ => Err(RunError::Failed("The change was not applied. Run `ferrow service access show` in a terminal for details.".to_owned())),
+    }
+}
+
+/// Run the installed `ferrow.exe` elevated with `args` and wait at most
+/// `wait_ms` for it; the exit code is the command's (the `ferrow service`
+/// contract gives the codes their meaning).
+#[cfg(windows)]
+pub fn run_elevated_code(args: &str, wait_ms: u32) -> Result<u32, RunError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_CANCELLED, GetLastError, WAIT_TIMEOUT,
@@ -881,7 +894,7 @@ fn run_elevated(args: &str) -> Result<(), RunError> {
         // SAFETY: the process handle is ours (NOCLOSEPROCESS) and closed once.
         // The command is short; a bounded wait keeps this thread from hanging on it.
         let timed_out = unsafe {
-            let waited = WaitForSingleObject(info.hProcess, 30_000);
+            let waited = WaitForSingleObject(info.hProcess, wait_ms);
             GetExitCodeProcess(info.hProcess, &raw mut exit);
             CloseHandle(info.hProcess);
             waited == WAIT_TIMEOUT
@@ -890,10 +903,8 @@ fn run_elevated(args: &str) -> Result<(), RunError> {
             Err(RunError::Failed(
                 "The change is taking longer than expected. Check again in a moment.".to_owned(),
             ))
-        } else if exit == 0 {
-            Ok(())
         } else {
-            Err(RunError::Failed("The change was not applied. Run `ferrow service access show` in a terminal for details.".to_owned()))
+            Ok(exit)
         }
     };
     if com {
@@ -904,7 +915,12 @@ fn run_elevated(args: &str) -> Result<(), RunError> {
 }
 
 #[cfg(not(windows))]
-fn run_elevated(_args: &str) -> Result<(), RunError> {
+fn run_elevated(args: &str) -> Result<(), RunError> {
+    run_elevated_code(args, 0).map(drop)
+}
+
+#[cfg(not(windows))]
+pub fn run_elevated_code(_args: &str, _wait_ms: u32) -> Result<u32, RunError> {
     Err(RunError::Failed(
         "Run the command in a terminal with sudo.".into(),
     ))
