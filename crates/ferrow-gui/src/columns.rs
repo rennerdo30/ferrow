@@ -15,6 +15,9 @@ const MIN_WIDTH: f32 = 60.0;
 /// The flexible Folder column never shrinks below this: a folder you cannot
 /// read is no use. Other columns give way first.
 const MIN_FOLDER: f32 = 160.0;
+/// In a narrow window Folder is given this much when Name can spare it: room
+/// for the last two folders of a path, which is what tells rows apart.
+const COMFORT_FOLDER: f32 = 200.0;
 /// Smallest the flexible column gets when it is not Folder.
 const MIN_FLEX: f32 = 120.0;
 
@@ -85,9 +88,18 @@ fn place(visible: &[(ColumnId, f32)], left: f32, right: f32) -> Vec<Placed> {
     // In a narrow view Name stops at its useful width: what it does not need
     // goes to Folder, whose end (the folder that tells rows apart) is what a
     // narrow window loses first.
+    // It only happens when Folder would otherwise fall below its minimum,
+    // and Name keeps everything above what Folder is given (up to
+    // COMFORT_FOLDER), never less than its useful width.
     if fixed.iter().map(|c| c.2).sum::<f32>() > room {
+        let others: f32 = fixed
+            .iter()
+            .filter(|c| c.1 != ColumnId::Name)
+            .map(|c| c.2)
+            .sum();
+        let cap = (right - left - others - COMFORT_FOLDER).max(useful_width(ColumnId::Name));
         for c in fixed.iter_mut().filter(|c| c.1 == ColumnId::Name) {
-            c.2 = c.2.min(useful_width(ColumnId::Name));
+            c.2 = c.2.min(cap);
         }
     }
     // Shrink the rest, right to left, Name last.
@@ -519,9 +531,9 @@ mod tests {
         let cols = place(&defaults(), 0.0, 520.0);
         assert!(width_of(&cols, ColumnId::Folder).unwrap() >= MIN_FOLDER);
         assert!(width_of(&cols, ColumnId::Name).unwrap() >= useful_width(ColumnId::Name));
-        // Name stops at its useful width; Folder gets what it does not need.
-        assert_eq!(width_of(&cols, ColumnId::Name), Some(220.0));
-        assert!(width_of(&cols, ColumnId::Folder).unwrap() > 200.0);
+        // Name gives up what Folder needs (not below its useful width).
+        assert_eq!(width_of(&cols, ColumnId::Name), Some(230.0));
+        assert!(width_of(&cols, ColumnId::Folder).unwrap() >= COMFORT_FOLDER);
         // The rightmost column is left out first; the rest fill the width.
         assert_eq!(width_of(&cols, ColumnId::Type), None);
         assert!((cols.last().unwrap().right - 520.0).abs() < 0.01);

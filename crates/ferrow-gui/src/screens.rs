@@ -108,7 +108,7 @@ impl FerrowApp {
             let text = if info.entries == 0 {
                 "Indexing…".to_owned()
             } else {
-                format!("Indexing · {} files", fit::compact_count(info.entries))
+                format!("Indexing · {} items", fit::compact_count(info.entries))
             };
             let mut tooltip = self.scan_status.clone().unwrap_or_default();
             if !info.location.is_empty() {
@@ -134,7 +134,7 @@ impl FerrowApp {
                 dot: Dot::Live,
                 color: t.ok,
                 text: format!(
-                    "Live · Ferrow service · {} files",
+                    "Live · Ferrow service · {} items",
                     fit::compact_count(entries)
                 ),
                 tooltip: format!(
@@ -154,6 +154,12 @@ impl FerrowApp {
                 "Own index · account not allowed",
                 "The Ferrow service doesn't allow this account — an administrator can allow it in Settings. Click for Settings → Service access."
                     .to_owned(),
+            ),
+            Some(ServiceProblem::Lost(error)) if self.no_own_index => (
+                "Own index · none yet",
+                format!(
+                    "The Ferrow service stopped answering ({error}) and this app has no index of its own yet. It reconnects by itself; or build an index in Settings."
+                ),
             ),
             Some(ServiceProblem::Lost(error)) => (
                 "Own index · service stopped",
@@ -285,11 +291,13 @@ impl FerrowApp {
 
     fn result_count(&self, index: &Index) -> (String, String) {
         if self.query.trim().is_empty() {
-            // A live service says its size in the chip.
+            // A live service says its size in the chip; an own index that is
+            // not loaded yet (or none at all) has nothing to count.
             return match self.service_entries {
                 Some(_) => Default::default(),
+                None if self.object_count(index) == 0 => Default::default(),
                 None => (
-                    format!("{} files", group(self.object_count(index))),
+                    format!("{} items", group(self.object_count(index))),
                     "Entries in this app's own index".to_owned(),
                 ),
             };
@@ -338,8 +346,12 @@ impl FerrowApp {
         if let Some(ServiceProblem::Lost(error)) = &self.service_problem {
             out.push(Notice {
                 color: t.warn,
-                text: "The Ferrow service stopped answering. Using this app's own index until it's back."
-                    .to_owned(),
+                text: if self.no_own_index {
+                    "Showing the last results. This app has no index of its own yet; it reconnects when the service is back."
+                } else {
+                    "Results may be out of date until the service is back. Searching this app's own index meanwhile."
+                }
+                .to_owned(),
                 tooltip: error.clone(),
             });
         }
@@ -408,7 +420,7 @@ impl FerrowApp {
             ));
         } else {
             lines.push(Line::new(
-                format!("{} entries found", group(info.entries as usize)),
+                format!("{} items found", group(info.entries as usize)),
                 semibold(28.0),
                 p.accent_text,
                 10.0,
@@ -428,7 +440,7 @@ impl FerrowApp {
                 14.0,
             ));
         }
-        lines.push(Line::path(
+        lines.push(Line::list(
             &format!(
                 "Locations: {}",
                 sources
@@ -482,23 +494,20 @@ impl FerrowApp {
         let cx = rect.center().x;
         let wide = 312.0_f32.min(rect.width() - 32.0);
         let mut action = None;
-        let primary = if windows {
-            "All drives (recommended)"
-        } else {
-            "Your home folder (recommended)"
-        };
+        // The home folder is the default: quick everywhere. All drives walks
+        // every file on the PC, which is slow without the Ferrow service.
         if self.big_button(
             ui,
             Rect::from_center_size(pos2(cx, y + 18.0), vec2(wide, 36.0)),
-            primary,
+            "Your home folder (recommended)",
             true,
         ) {
-            action = Some(FirstStart::Primary);
+            action = Some(FirstStart::Home);
         }
         y += 44.0;
         let secondary: Vec<(&str, FirstStart)> = if windows {
             vec![
-                ("Only my home folder", FirstStart::Home),
+                ("All drives", FirstStart::AllDrives),
                 ("Choose folders…", FirstStart::Choose),
             ]
         } else {
@@ -544,12 +553,12 @@ impl FerrowApp {
             p.text_tertiary,
         );
         match action {
-            Some(FirstStart::Primary) if windows => {
+            Some(FirstStart::AllDrives) => {
                 self.settings.windows.all_fixed_drives = true;
                 self.save_settings();
                 self.rebuild_index();
             }
-            Some(FirstStart::Primary | FirstStart::Home) => {
+            Some(FirstStart::Home) => {
                 if let Some(home) = crate::engine::home_dir() {
                     self.index_home(home);
                 }
@@ -618,7 +627,7 @@ impl FerrowApp {
                 + usize::from(cfg!(windows) && self.settings.windows.all_fixed_drives);
             let places = places.max(1);
             format!(
-                "Searched {} files in {places} {}",
+                "Searched {} items in {places} {}",
                 group(index.len()),
                 if places == 1 { "location" } else { "locations" }
             )
@@ -653,9 +662,9 @@ impl FerrowApp {
 
 #[derive(Clone, Copy)]
 enum FirstStart {
-    /// All drives (Windows) or the home folder.
-    Primary,
     Home,
+    /// Every internal drive (Windows).
+    AllDrives,
     Choose,
     Service,
 }
@@ -667,6 +676,17 @@ pub(super) struct Notice {
     tooltip: String,
 }
 
+/// How a line that is too long is cut.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// At the end (the egui default).
+    End,
+    /// A path: whole folders, the end kept (`fit_path`).
+    Path,
+    /// A list or sentence: both ends kept, the middle dropped.
+    Middle,
+}
+
 /// One centred line of a full-page state.
 struct Line {
     text: String,
@@ -674,8 +694,7 @@ struct Line {
     color: Color32,
     /// Space below the line.
     gap: f32,
-    /// A path: a long one is cut in the middle, not at the end.
-    path: bool,
+    cut: Cut,
 }
 
 impl Line {
@@ -685,13 +704,20 @@ impl Line {
             font,
             color,
             gap,
-            path: false,
+            cut: Cut::End,
         }
     }
 
     fn path(text: &str, font: FontId, color: Color32, gap: f32) -> Line {
         Line {
-            path: true,
+            cut: Cut::Path,
+            ..Line::new(text, font, color, gap)
+        }
+    }
+
+    fn list(text: &str, font: FontId, color: Color32, gap: f32) -> Line {
+        Line {
+            cut: Cut::Middle,
             ..Line::new(text, font, color, gap)
         }
     }
@@ -704,17 +730,18 @@ fn stack(ui: &egui::Ui, rect: Rect, lines: Vec<Line>, extra: f32) -> f32 {
     let galleys: Vec<(Arc<egui::Galley>, f32)> = lines
         .into_iter()
         .map(|l| {
-            let text = if l.path {
-                let ctx = ui.ctx().clone();
-                fit::fit_path(&l.text, width, &|s| {
-                    ctx.fonts_mut(|f| {
-                        f.layout_no_wrap(s.to_owned(), l.font.clone(), Color32::WHITE)
-                            .size()
-                            .x
-                    })
+            let ctx = ui.ctx().clone();
+            let measure = |s: &str| {
+                ctx.fonts_mut(|f| {
+                    f.layout_no_wrap(s.to_owned(), l.font.clone(), Color32::WHITE)
+                        .size()
+                        .x
                 })
-            } else {
-                l.text
+            };
+            let text = match l.cut {
+                Cut::Path => fit::fit_path(&l.text, width, &measure),
+                Cut::Middle => fit::fit_middle(&l.text, width, &measure),
+                Cut::End => l.text.clone(),
             };
             (ellipsized(ui, text, l.font, l.color, width), l.gap)
         })
@@ -833,9 +860,14 @@ impl FerrowApp {
                             .font(FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into()))),
                     );
                     ui.add_space(6.0);
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     egui::ScrollArea::vertical()
                         .max_height(max_h - 56.0)
                         .auto_shrink([false, true])
+                        // A short window cuts the list: show that it scrolls.
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
                         .show(ui, |ui| {
                             let columns: Vec<Vec<usize>> = if two {
                                 vec![vec![0, 1], vec![2]]
@@ -1047,7 +1079,7 @@ mod tests {
         // The next good search clears the message.
         feed(&mut app, &tx, vec![results(3)]);
         assert!(app.query_error.is_none());
-        assert_eq!(app.count_text().0, "4 files");
+        assert_eq!(app.count_text().0, "4 items");
     }
 
     /// A lost service keeps the rows on screen and says so in a notice bar;
@@ -1101,11 +1133,7 @@ mod tests {
         assert_eq!(app.row_count(), 2, "the rows stay");
         let notices = app.notices();
         assert_eq!(notices.len(), 1);
-        assert!(
-            notices[0]
-                .text
-                .starts_with("The Ferrow service stopped answering.")
-        );
+        assert!(notices[0].text.starts_with("Results may be out of date"));
         assert!(
             !notices[0].text.contains("os error"),
             "the raw error is only in the tooltip"
@@ -1169,7 +1197,7 @@ mod tests {
                 progress(1_204_331),
             ],
         );
-        assert_eq!(app.chip().unwrap().text, "Indexing · 1.2 M files");
+        assert_eq!(app.chip().unwrap().text, "Indexing · 1.2 M items");
         feed(&mut app, &tx, vec![loaded(&index)]);
         assert!(app.scan_info.is_none());
     }
@@ -1188,5 +1216,114 @@ mod tests {
         for card in [SERVICE_CARD, OWN_INDEX_CARD] {
             assert!(accepted.contains(&card), "{card}");
         }
+    }
+
+    fn service_rows_event() -> Event {
+        let row = |path: &str| ferrow_ipc::FileRow {
+            path: path.as_bytes().to_vec(),
+            ..Default::default()
+        };
+        Event::Results {
+            generation: 1,
+            hits: crate::engine::service_hits_for_test(
+                1,
+                2,
+                vec![row("/a/x.txt"), row("/a/y.txt")],
+            ),
+            complete: true,
+            elapsed: Duration::from_micros(900),
+            sort_pending: false,
+            sort_unavailable: false,
+        }
+    }
+
+    fn remote_event() -> Event {
+        Event::Remote {
+            entries: 18_422_907,
+            report: "NTFS journal".into(),
+        }
+    }
+
+    /// A service-only user (no local index): at every service restart or
+    /// update the engine answers `ServiceLost`, then `NoIndex`. The rows and
+    /// the notice stay; the first-start page is not for this state.
+    #[test]
+    fn a_service_only_user_keeps_the_rows_when_the_service_restarts() {
+        let (mut app, tx) = test_app();
+        feed(&mut app, &tx, vec![remote_event(), service_rows_event()]);
+        assert_eq!(app.row_count(), 2);
+        feed(
+            &mut app,
+            &tx,
+            vec![
+                Event::ServiceLost {
+                    error: "the pipe has been ended. (os error 109)".into(),
+                },
+                Event::NoIndex,
+            ],
+        );
+        assert!(
+            matches!(app.state, State::Ready),
+            "not the first-start page"
+        );
+        assert_eq!(app.row_count(), 2, "the rows stay");
+        let notices = app.notices();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].text.contains("no index of its own yet"),
+            "{}",
+            notices[0].text
+        );
+        assert_eq!(app.chip().unwrap().text, "Own index · none yet");
+        // Nothing is loaded: the empty-query count must not read "0 items".
+        app.query.clear();
+        assert_eq!(app.count_text().0, "");
+        // The service is back: everything returns to normal.
+        feed(&mut app, &tx, vec![remote_event()]);
+        assert!(app.notices().is_empty());
+        assert!(app.chip().unwrap().text.starts_with("Live"));
+    }
+
+    /// With a local index the empty-query count never reads "0 items" while
+    /// the index loads after a lost service.
+    #[test]
+    fn no_zero_count_while_the_own_index_loads() {
+        let (mut app, tx) = test_app();
+        feed(&mut app, &tx, vec![remote_event(), service_rows_event()]);
+        feed(
+            &mut app,
+            &tx,
+            vec![Event::ServiceLost {
+                error: "gone".into(),
+            }],
+        );
+        app.query.clear();
+        assert_eq!(app.count_text().0, "", "the placeholder index has 0 items");
+        feed(&mut app, &tx, vec![loaded(&sample_index())]);
+        assert_eq!(app.count_text().0, "4 items");
+    }
+
+    /// Someone who never had results does see the first-start page, and so
+    /// does a revoked account (its stale rows would never refresh).
+    #[test]
+    fn a_missing_index_is_the_first_start_page_unless_results_are_kept() {
+        let (mut app, tx) = test_app();
+        feed(&mut app, &tx, vec![Event::NoIndex]);
+        assert!(matches!(app.state, State::NoIndex));
+
+        let (mut app, tx) = test_app();
+        feed(&mut app, &tx, vec![remote_event(), service_rows_event()]);
+        feed(
+            &mut app,
+            &tx,
+            vec![
+                Event::ServiceLost {
+                    error: "not allowed".into(),
+                },
+                Event::ServiceGap(ServiceGap::Refused),
+                Event::NoIndex,
+            ],
+        );
+        assert!(matches!(app.state, State::NoIndex));
     }
 }

@@ -145,6 +145,10 @@ pub struct FerrowApp {
     service_problem: Option<ServiceProblem>,
     /// Progress of the running scan, once the first report arrived.
     scan_info: Option<ScanInfo>,
+    /// The service was lost and this app has no index of its own to fall
+    /// back on (yet): the last results stay on screen until the service is
+    /// back or the user builds an index.
+    no_own_index: bool,
     /// Set by the results page to open Settings at a card (the page's title
     /// text, e.g. "Service access"); the Settings page takes it when it
     /// scrolls.
@@ -270,6 +274,7 @@ impl FerrowApp {
             service_entries: None,
             service_problem: None,
             scan_info: None,
+            no_own_index: false,
             settings_scroll_to: None,
             fit_cache: fit::FitCache::default(),
             fit_epoch: 0,
@@ -322,12 +327,25 @@ impl FerrowApp {
                     self.hits = None;
                     self.scan_status = None;
                     self.scan_info = None;
+                    self.no_own_index = false;
                     self.load_time = elapsed;
                     self.index_source = source;
                     self.state = State::Ready;
                     self.sent_query = None; // re-run the current query
                 }
-                Event::NoIndex => self.state = State::NoIndex,
+                Event::NoIndex => {
+                    if matches!(self.service_problem, Some(ServiceProblem::Lost(_)))
+                        && self.hits.is_some()
+                    {
+                        // A service-only user whose service restarts: the
+                        // rows stay, the notice bar says there is no own
+                        // index yet. The first-start page is for people who
+                        // never had results.
+                        self.no_own_index = true;
+                    } else {
+                        self.state = State::NoIndex;
+                    }
+                }
                 Event::ServiceGap(gap) => match gap {
                     ServiceGap::Refused => self.service_problem = Some(ServiceProblem::Refused),
                     // A lost service stays "lost" until it answers again.
@@ -363,6 +381,7 @@ impl FerrowApp {
                 Event::Remote { entries, report } => {
                     let first = self.service_entries.is_none();
                     self.service_problem = None;
+                    self.no_own_index = false;
                     self.service_entries = Some(entries);
                     self.index_source = format!("Ferrow service: {report}");
                     if first {
@@ -934,11 +953,13 @@ impl FerrowApp {
                 .find(|c| c.id == id)
                 .map_or(0.0, |c| (c.right - c.left - inset).max(0.0))
         };
-        let (folder_w, name_w) = (
+        // The cache hands back the whole-pixel widths it is keyed on; text is
+        // fitted to those, never to the fractional width.
+        let (folder_w, name_w) = self.fit_cache.begin(
+            self.fit_epoch,
             width_of(ColumnId::Folder, 16.0),
             width_of(ColumnId::Name, 40.0),
         );
-        self.fit_cache.begin(self.fit_epoch, folder_w, name_w);
         let ctx = ui.ctx().clone();
         let measure = |font: &FontId, text: &str| {
             ctx.fonts_mut(|f| {
@@ -1039,11 +1060,13 @@ impl FerrowApp {
                         if galley.elided {
                             // Too long: cut in the middle so the extension
                             // (and the end of the name) stays visible.
+                            // The first match stays visible, whole.
+                            let first = ranges.iter().min_by_key(|r| r.start).cloned();
                             let fitted = self.fit_cache.name(id, || {
-                                fit::fit_name(&name, name_clip.width(), &|t| measure(&name_font, t))
+                                fit::fit_name(&name, name_w, &|t| measure(&name_font, t), first)
                             });
                             if let Some(fitted) = fitted {
-                                let ranges = fit::remap_ranges(&ranges, name.len(), &fitted);
+                                let ranges = fit::remap_ranges(&ranges, &fitted);
                                 galley = layout(ui, &fitted.text, &ranges);
                             }
                         }
@@ -1063,7 +1086,7 @@ impl FerrowApp {
                             self.fit_cache.folder(parent, || {
                                 fit::fit_path(
                                     &index.path(parent).display().to_string(),
-                                    clip.width(),
+                                    folder_w,
                                     &|t| measure(&sub_font, t),
                                 )
                             })

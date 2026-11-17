@@ -58,6 +58,44 @@ fn spawn_progress_ticker(
         });
 }
 
+/// What a failed call on a connected service means.
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteFailure {
+    /// The service's index has no data for the sort column yet.
+    SortUnavailable,
+    /// The service now refuses this account (access was taken away while the
+    /// app ran): the same state as a refused connect, never a search error.
+    Revoked,
+    /// The service refused the query text.
+    QueryRefused,
+    /// The connection broke or the service went away.
+    Lost,
+}
+
+fn remote_failure(e: &std::io::Error) -> RemoteFailure {
+    if ferrow_ipc::error_code(e) == Some(ferrow_ipc::ErrorCode::Unauthorized) {
+        RemoteFailure::Revoked
+    } else if e.kind() == std::io::ErrorKind::InvalidData
+        && e.to_string().contains("column unavailable")
+    {
+        RemoteFailure::SortUnavailable
+    } else if e.kind() == std::io::ErrorKind::InvalidData {
+        RemoteFailure::QueryRefused
+    } else {
+        RemoteFailure::Lost
+    }
+}
+
+/// Raises its flag when dropped, also when the owner panics, so the
+/// progress ticker never outlives its scan.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Take the single service-probe slot; false when a probe already runs.
 fn claim_probe(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::AcqRel)
@@ -352,6 +390,8 @@ struct Worker<W: Fn()> {
     commands: Option<Sender<Command>>,
     /// A service probe thread is running (one at a time).
     probing: Arc<AtomicBool>,
+    /// Why the service is not in use, as last reported to the UI.
+    gap: Option<ServiceGap>,
 }
 
 impl<W: Fn()> Worker<W> {
@@ -363,6 +403,7 @@ impl<W: Fn()> Worker<W> {
             remote: None,
             commands: None,
             probing: Arc::new(AtomicBool::new(false)),
+            gap: None,
         }
     }
 
@@ -451,6 +492,7 @@ impl<W: Fn()> Worker<W> {
             return;
         }
         let probing = self.probing.clone();
+        let mut reported = self.gap;
         let started = std::thread::Builder::new()
             .name("ferrow-service-probe".into())
             .spawn(move || {
@@ -458,13 +500,30 @@ impl<W: Fn()> Worker<W> {
                 loop {
                     std::thread::sleep(SERVICE_PROBE_INTERVAL);
                     let deadline = Instant::now() + Duration::from_millis(800);
-                    let answers = ferrow_ipc::Client::connect_deadline(&endpoint, deadline)
-                        .and_then(|mut client| client.status())
-                        .is_ok();
-                    if answers {
-                        probing.store(false, Ordering::Release);
-                        let _ = commands.send(Command::ServiceUp);
-                        return;
+                    let result = ferrow_ipc::Client::connect_deadline(&endpoint, deadline)
+                        .and_then(|mut client| client.status());
+                    match result {
+                        Ok(_) => {
+                            probing.store(false, Ordering::Release);
+                            let _ = commands.send(Command::ServiceUp);
+                            return;
+                        }
+                        Err(e) => {
+                            // Tell the UI only when the cause changes (the
+                            // account got refused, or the service is gone):
+                            // one event per change, nothing while it stays.
+                            let gap = service_gap(&e);
+                            if reported != Some(gap) {
+                                reported = Some(gap);
+                                if commands
+                                    .send(Command::Forward(Event::ServiceGap(gap)))
+                                    .is_err()
+                                {
+                                    probing.store(false, Ordering::Release);
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -521,9 +580,10 @@ impl<W: Fn()> Worker<W> {
                 let started = Instant::now();
                 let progress = Arc::new(ferrow_walk::ScanProgress::new());
                 let done = Arc::new(AtomicBool::new(false));
-                spawn_progress_ticker(commands.clone(), progress.clone(), done.clone(), started);
+                let stop = StopOnDrop(done.clone());
+                spawn_progress_ticker(commands.clone(), progress.clone(), done, started);
                 let (index, report) = ferrow_walk::scan_with_progress(&options, &progress);
-                done.store(true, Ordering::Release);
+                drop(stop);
                 if let Some(fatal) = report.fatal_error {
                     let _ = commands.send(Command::Forward(Event::Failed(fatal)));
                     return;
@@ -564,17 +624,18 @@ impl<W: Fn()> Worker<W> {
         let mut client = match connect() {
             Ok(client) => client,
             Err(e) => {
-                self.send(Event::ServiceGap(service_gap(&e)));
+                self.report_gap(service_gap(&e));
                 return false;
             }
         };
         let (entries, _mode, report) = match client.status() {
             Ok(status) => status,
             Err(e) => {
-                self.send(Event::ServiceGap(service_gap(&e)));
+                self.report_gap(service_gap(&e));
                 return false;
             }
         };
+        self.gap = None;
         self.remote = Some(Remote {
             client,
             current: None,
@@ -610,12 +671,39 @@ impl<W: Fn()> Worker<W> {
         true
     }
 
+    fn report_gap(&mut self, gap: ServiceGap) {
+        self.gap = Some(gap);
+        self.send(Event::ServiceGap(gap));
+    }
+
+    /// A call on the connected service failed: what it means decides what
+    /// the app does.
+    fn remote_failed(&mut self, error: std::io::Error) {
+        match remote_failure(&error) {
+            RemoteFailure::Revoked => self.service_revoked(error),
+            _ => self.service_lost(error),
+        }
+    }
+
     /// The service stopped answering: continue with the app's own index.
     fn service_lost(&mut self, error: std::io::Error) {
+        self.remote = None;
+        self.gap = Some(ServiceGap::NotRunning);
+        self.send(Event::ServiceLost {
+            error: error.to_string(),
+        });
+        self.load_default();
+        self.probe_service();
+    }
+
+    /// The service now refuses this account: the same state as a refused
+    /// connect, with the app's own index in the meantime.
+    fn service_revoked(&mut self, error: std::io::Error) {
         self.remote = None;
         self.send(Event::ServiceLost {
             error: error.to_string(),
         });
+        self.report_gap(ServiceGap::Refused);
         self.load_default();
         self.probe_service();
     }
@@ -641,10 +729,7 @@ impl<W: Fn()> Worker<W> {
         });
         let (total, rows, columns, pending) = match result {
             Ok(r) => r,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::InvalidData
-                    && e.to_string().contains("column unavailable") =>
-            {
+            Err(e) if remote_failure(&e) == RemoteFailure::SortUnavailable => {
                 // The service's index has no data for this sort column
                 // (for example while its first scan runs): say so like a
                 // local index does, never as a search-text error.
@@ -667,7 +752,7 @@ impl<W: Fn()> Worker<W> {
                 });
                 return;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(e) if remote_failure(&e) == RemoteFailure::QueryRefused => {
                 // The service refused the query: show its reason, keep the
                 // connection.
                 self.send(Event::QueryError {
@@ -677,7 +762,7 @@ impl<W: Fn()> Worker<W> {
                 });
                 return;
             }
-            Err(e) => return self.service_lost(e),
+            Err(e) => return self.remote_failed(e),
         };
         let mut query = RemoteQuery {
             generation,
@@ -724,7 +809,7 @@ impl<W: Fn()> Worker<W> {
         );
         let (rows, _, pending) = match page {
             Ok(page) => page,
-            Err(e) => return self.service_lost(e),
+            Err(e) => return self.remote_failed(e),
         };
         query.insert(offset, rows);
         let hits = query.hits();
@@ -1259,5 +1344,87 @@ mod tests {
         // A server error that is not about access is not a refusal.
         let busy = ferrow_ipc::server_error(ferrow_ipc::ErrorCode::Internal, "busy");
         assert_eq!(service_gap(&busy), ServiceGap::NotRunning);
+    }
+
+    #[test]
+    fn failed_service_calls_are_told_apart() {
+        let unauthorized = ferrow_ipc::server_error(ferrow_ipc::ErrorCode::Unauthorized, "no");
+        assert_eq!(remote_failure(&unauthorized), RemoteFailure::Revoked);
+        let sort =
+            ferrow_ipc::server_error(ferrow_ipc::ErrorCode::BadRequest, "column unavailable");
+        assert_eq!(remote_failure(&sort), RemoteFailure::SortUnavailable);
+        let query = ferrow_ipc::server_error(ferrow_ipc::ErrorCode::BadRequest, "bad regex");
+        assert_eq!(remote_failure(&query), RemoteFailure::QueryRefused);
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                remote_failure(&std::io::Error::from(kind)),
+                RemoteFailure::Lost
+            );
+        }
+    }
+
+    /// Access taken away while the app runs (an `Unauthorized` answer to a
+    /// search): the app must see a refused account, not a "Check the search
+    /// text" error, and fall back to its own index like after a refused
+    /// connect. On the base commit this was a search-text error.
+    #[test]
+    fn a_service_that_starts_refusing_mid_session_is_a_refused_gap() {
+        let (mut w, rx) = worker();
+        let err = ferrow_ipc::server_error(ferrow_ipc::ErrorCode::Unauthorized, "not allowed");
+        assert_eq!(remote_failure(&err), RemoteFailure::Revoked);
+        w.remote_failed(err);
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(events.first(), Some(Event::ServiceLost { .. })),
+            "the UI learns the service is gone first"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ServiceGap(ServiceGap::Refused))),
+            "then that the account is refused"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::QueryError { .. })),
+            "never as a search-text error"
+        );
+        assert_eq!(w.gap, Some(ServiceGap::Refused));
+        assert!(w.remote.is_none());
+    }
+
+    #[test]
+    fn a_lost_service_is_not_a_refusal() {
+        let (mut w, rx) = worker();
+        w.remote_failed(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(matches!(events.first(), Some(Event::ServiceLost { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::ServiceGap(ServiceGap::Refused)))
+        );
+        assert_eq!(w.gap, Some(ServiceGap::NotRunning));
+    }
+
+    /// The scan's progress ticker stops with the scan, also when the scan
+    /// thread panics.
+    #[test]
+    fn the_progress_ticker_stops_when_the_scan_panics() {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _stop = StopOnDrop(flag);
+            panic!("the walk failed");
+        });
+        assert!(result.is_err());
+        assert!(done.load(Ordering::Acquire));
+        // And normally: dropping the guard raises it.
+        let done = Arc::new(AtomicBool::new(false));
+        drop(StopOnDrop(done.clone()));
+        assert!(done.load(Ordering::Acquire));
     }
 }

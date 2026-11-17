@@ -879,6 +879,18 @@ fn capture_all(out: &Path) {
             s.query("Track 1");
             s.save(28, "japanese-rows");
 
+            // 30 A service-only PC while the service restarts: the engine
+            // reports the loss and that there is no index of its own. The
+            // rows and the notice stay; this is not the first-start page.
+            let mut s = new(false);
+            s.service_results();
+            s.send(Event::ServiceLost {
+                error: "The pipe has been ended. (os error 109)".into(),
+            });
+            s.send(Event::NoIndex);
+            s.frames(3);
+            s.save(30, "service-lost-no-own-index");
+
             // 29 Long names keep their extension; long paths keep the drive
             // and the last folders.
             let mut s = new(true);

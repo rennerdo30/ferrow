@@ -1074,9 +1074,25 @@ fn emit_mft_subtree(
         p.set_location(root_path);
     }
     // Paths are only needed to resolve link targets against excludes.
-    let mut stack: Vec<(u64, u32, Option<PathBuf>)> =
-        vec![(record, root_id, excluding.then(|| root_path.to_path_buf()))];
-    while let Some((dir, dir_id, dir_path)) = stack.pop() {
+    // `top` is the top-level folder of the root a directory lies in (an index
+    // into `top_names`; only kept while progress is reported), so the scan
+    // location can name the folder being read, updated once per folder.
+    let mut top_names: Vec<Vec<u8>> = Vec::new();
+    let mut last_top = usize::MAX;
+    let mut stack: Vec<(u64, u32, Option<PathBuf>, usize)> = vec![(
+        record,
+        root_id,
+        excluding.then(|| root_path.to_path_buf()),
+        usize::MAX,
+    )];
+    while let Some((dir, dir_id, dir_path, top)) = stack.pop() {
+        if let Some(p) = walker.progress
+            && top != last_top
+            && let Some(name) = top_names.get(top)
+        {
+            last_top = top;
+            p.set_location(&root_path.join(ferrow_index::osname::bytes_to_os(name)));
+        }
         for (name, bytes) in volume.children(dir) {
             let Some(info) = volume.info(name.record) else {
                 continue;
@@ -1115,7 +1131,15 @@ fn emit_mft_subtree(
             pairs.push((name.record, id));
             batch.add();
             if is_dir {
-                stack.push((name.record, id, child_path));
+                let child_top = if walker.progress.is_none() {
+                    0
+                } else if dir == record {
+                    top_names.push(bytes.to_vec());
+                    top_names.len() - 1
+                } else {
+                    top
+                };
+                stack.push((name.record, id, child_path, child_top));
             }
         }
     }
