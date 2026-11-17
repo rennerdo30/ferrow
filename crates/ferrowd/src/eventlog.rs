@@ -2,23 +2,32 @@
 //! health report) and a bounded file in the protected state folder.
 //!
 //! Events happen on state changes (a scan finished, a journal reset, a save
-//! failed, a connection ended with an error), never per request and never on a
-//! timer. A repeat of the newest event only raises its count; it is not
-//! written again, so a misbehaving client cannot turn into disk traffic.
+//! failed), never per request and never on a timer. Three limits keep the log
+//! from becoming a load or a place to hide things:
+//!
+//! - a repeat of the newest event only raises its count;
+//! - the file takes at most [`MAX_LINES_PER_MINUTE`] lines a minute; the rest
+//!   are counted and one "N log lines were not written" line follows;
+//! - file I/O never happens under the ring's lock. The ring is a short critical
+//!   section (health and every other event only ever wait for that), and the
+//!   file has a lock of its own that is only *tried*: when another thread is
+//!   writing, the line is counted as not written instead of waiting.
 //!
 //! The file is `service.log`, rotated at [`ROTATE_AT`] to `service.1.log`
 //! (the previous rotation is replaced, so the log is bounded at about 2 MiB).
 //! It is created inside the protected state folder (so it inherits only the
-//! protected grants), opened without following links, and re-validated with
-//! the state-file check after every creation; a file that fails the check is
-//! not written. Texts name no files beyond volume roots and the service's own
-//! paths. A failure to log is remembered for a minute and never reaches the
+//! protected grants), opened without following links (and, on Windows, as the
+//! reparse point itself), and re-validated with the state-file check after every
+//! creation; a file that fails the check is not written. Texts are one line of
+//! visible characters and name no files beyond volume roots and the service's
+//! own paths. A failure to log is remembered for a minute and never reaches the
 //! caller.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrow_ipc::health::{EventInfo, LEVEL_ERROR, LEVEL_INFO, LEVEL_WARN, format_utc};
@@ -27,6 +36,8 @@ use ferrow_ipc::health::{EventInfo, LEVEL_ERROR, LEVEL_INFO, LEVEL_WARN, format_
 pub const RING: usize = 200;
 /// File size at which the log rotates.
 pub const ROTATE_AT: u64 = 1 << 20;
+/// Most lines the file takes in one minute.
+pub const MAX_LINES_PER_MINUTE: u32 = 30;
 pub const FILE_NAME: &str = "service.log";
 pub const ROTATED_NAME: &str = "service.1.log";
 /// Longest event text kept.
@@ -68,15 +79,17 @@ struct FileLog {
     /// The file may be written (it exists and passed the check).
     checked: bool,
     retry_at: Option<Instant>,
-}
-
-struct Inner {
-    ring: VecDeque<Event>,
-    file: Option<FileLog>,
+    /// The current minute's window and the lines written in it.
+    window: Option<(Instant, u32)>,
+    /// Lines left out since the last marker (limit, pause or a busy file).
+    skipped: u32,
 }
 
 pub struct EventLog {
-    inner: Mutex<Inner>,
+    ring: Mutex<VecDeque<Event>>,
+    file: Mutex<Option<FileLog>>,
+    /// Lines dropped because the file was being written by another thread.
+    busy: AtomicU64,
 }
 
 fn now_ms() -> u64 {
@@ -85,16 +98,78 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// One line of text: no control characters, at most [`MAX_TEXT`] characters.
+/// Characters that change how text is laid out or hide it: line and
+/// paragraph separators and the bidirectional controls.
+fn is_hidden(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}'
+            | '\u{2029}'
+            | '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// One line of text: control characters become spaces, layout and direction
+/// characters are dropped, at most [`MAX_TEXT`] characters.
 fn tidy(text: &str) -> String {
     text.chars()
+        .filter(|&c| !is_hidden(c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(MAX_TEXT)
         .collect()
 }
 
 impl FileLog {
-    fn write(&mut self, event: &Event) -> io::Result<()> {
+    /// Append one event, preceded by a marker when lines were left out.
+    fn write(&mut self, event: &Event, now: Instant) {
+        if self.retry_at.is_some_and(|at| now < at) {
+            self.skipped = self.skipped.saturating_add(1);
+            return;
+        }
+        let (start, lines) = match self.window {
+            Some((start, lines)) if now.duration_since(start) < Duration::from_secs(60) => {
+                (start, lines)
+            }
+            _ => (now, 0),
+        };
+        let marker = self.skipped > 0;
+        if lines + 1 + u32::from(marker) > MAX_LINES_PER_MINUTE {
+            self.window = Some((start, lines));
+            self.skipped = self.skipped.saturating_add(1);
+            return;
+        }
+        let mut text = String::new();
+        if marker {
+            text = format!(
+                "{} warn {} log lines were not written (rate limit, busy or unavailable file)\n",
+                format_utc(event.at_ms),
+                self.skipped
+            );
+        }
+        text.push_str(&format!(
+            "{} {} {}\n",
+            format_utc(event.at_ms),
+            event.level.as_str(),
+            event.text
+        ));
+        match self.append(&text) {
+            Ok(()) => {
+                self.skipped = 0;
+                self.retry_at = None;
+                self.window = Some((start, lines + 1 + u32::from(marker)));
+            }
+            Err(_) => {
+                self.retry_at = Some(now + RETRY);
+                self.skipped = self.skipped.saturating_add(1);
+            }
+        }
+    }
+
+    fn append(&mut self, text: &str) -> io::Result<()> {
         if let Ok(meta) = std::fs::metadata(&self.path)
             && meta.len() >= self.rotate_at
         {
@@ -108,89 +183,93 @@ impl FileLog {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself, never followed.
+            options.custom_flags(0x0020_0000);
+        }
         let mut file = options.open(&self.path)?;
         if !self.checked {
             (self.check)(&self.path)?;
             self.checked = true;
         }
-        let line = format!(
-            "{} {} {}\n",
-            format_utc(event.at_ms),
-            event.level.as_str(),
-            event.text
-        );
-        file.write_all(line.as_bytes())
+        file.write_all(text.as_bytes())
     }
 }
 
 impl EventLog {
     pub const fn new() -> EventLog {
         EventLog {
-            inner: Mutex::new(Inner {
-                ring: VecDeque::new(),
-                file: None,
-            }),
+            ring: Mutex::new(VecDeque::new()),
+            file: Mutex::new(None),
+            busy: AtomicU64::new(0),
         }
     }
 
     /// Start appending to `path` (the state folder is validated by the caller).
     pub fn attach(&self, path: PathBuf, rotate_at: u64, check: fn(&Path) -> io::Result<()>) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.file = Some(FileLog {
+        *self.file.lock().unwrap_or_else(|e| e.into_inner()) = Some(FileLog {
             path,
             rotate_at,
             check,
             checked: false,
             retry_at: None,
+            window: None,
+            skipped: 0,
         });
     }
 
     pub fn record(&self, level: Level, text: &str) {
-        let at_ms = now_ms();
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let text = tidy(text);
-        if let Some(last) = inner.ring.back_mut()
-            && last.level == level
-            && last.text == text
-        {
-            last.repeats = last.repeats.saturating_add(1);
-            return;
-        }
         let event = Event {
-            at_ms,
+            at_ms: now_ms(),
             level,
-            text,
+            text: tidy(text),
             repeats: 1,
         };
-        if inner.ring.len() == RING {
-            inner.ring.pop_front();
+        {
+            // The ring's critical section is a few pointer moves.
+            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(last) = ring.back_mut()
+                && last.level == event.level
+                && last.text == event.text
+            {
+                last.repeats = last.repeats.saturating_add(1);
+                return;
+            }
+            if ring.len() == RING {
+                ring.pop_front();
+            }
+            ring.push_back(event.clone());
         }
-        inner.ring.push_back(event.clone());
-        let Some(file) = inner.file.as_mut() else {
-            return;
+        // File I/O happens outside the ring lock, and only when the file is
+        // free: a busy file counts the line as not written instead of waiting.
+        let write = |file: &mut Option<FileLog>| {
+            if let Some(file) = file.as_mut() {
+                file.skipped = file
+                    .skipped
+                    .saturating_add(self.busy.swap(0, Ordering::Relaxed) as u32);
+                file.write(&event, Instant::now());
+            }
         };
-        if file.retry_at.is_some_and(|at| Instant::now() < at) {
-            return;
+        match self.file.try_lock() {
+            Ok(mut guard) => write(&mut guard),
+            Err(std::sync::TryLockError::Poisoned(p)) => write(&mut p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.busy.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        file.retry_at = match file.write(&event) {
-            Ok(()) => None,
-            Err(_) => Some(Instant::now() + RETRY),
-        };
     }
 
     /// The newest `n` events, oldest first.
     pub fn recent(&self, n: usize) -> Vec<Event> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let skip = inner.ring.len().saturating_sub(n);
-        inner.ring.iter().skip(skip).cloned().collect()
+        let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = ring.len().saturating_sub(n);
+        ring.iter().skip(skip).cloned().collect()
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ring
-            .len()
+        self.ring.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -297,12 +376,22 @@ mod tests {
     }
 
     #[test]
-    fn texts_are_one_bounded_line() {
+    fn texts_are_one_bounded_line_of_visible_characters() {
         let log = EventLog::new();
-        log.record(Level::Warn, &format!("a\nb\u{1b}[2J{}", "x".repeat(1000)));
+        log.record(
+            Level::Warn,
+            &format!(
+                "a\nb\u{1b}[2J\u{2028}c\u{2029}d\u{202e}e\u{2066}f\u{200f}{}",
+                "x".repeat(1000)
+            ),
+        );
         let text = log.recent(1).remove(0).text;
         assert!(text.chars().count() <= MAX_TEXT);
-        assert!(!text.contains('\n') && !text.contains('\u{1b}'), "{text:?}");
+        assert!(text.starts_with("a b [2Jcdef"), "{text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() || is_hidden(c)),
+            "{text:?}"
+        );
     }
 
     #[test]
@@ -311,7 +400,7 @@ mod tests {
         let log = EventLog::new();
         log.attach(dir.join(FILE_NAME), ROTATE_AT, accept);
         for _ in 0..5 {
-            log.record(Level::Error, "connection closed: broken pipe");
+            log.record(Level::Error, "same text every time");
         }
         assert_eq!(log.len(), 1);
         let info = to_info(log.recent(10));
@@ -322,11 +411,50 @@ mod tests {
     }
 
     #[test]
+    fn alternating_texts_cannot_turn_into_unbounded_file_writes() {
+        let dir = dir("flood");
+        let log = EventLog::new();
+        log.attach(dir.join(FILE_NAME), ROTATE_AT, accept);
+        // Alternating texts defeat the repeat count; the per-minute cap holds.
+        for n in 0..1000 {
+            log.record(Level::Warn, if n % 2 == 0 { "kind A" } else { "kind B" });
+        }
+        let written = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        let lines = written.lines().count();
+        assert!(lines <= MAX_LINES_PER_MINUTE as usize, "{lines} lines");
+        assert!(lines >= 2, "the first lines are written");
+        assert_eq!(log.len(), RING, "the ring still sees every change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropped_lines_are_followed_by_one_gap_marker() {
+        let dir = dir("gap");
+        let log = EventLog::new();
+        log.attach(dir.join(FILE_NAME), ROTATE_AT, accept);
+        for n in 0..(MAX_LINES_PER_MINUTE + 10) {
+            log.record(Level::Info, &format!("event {n}"));
+        }
+        // Pretend the minute passed: the next event writes the marker first.
+        log.file.lock().unwrap().as_mut().unwrap().window = None;
+        log.record(Level::Info, "after the minute");
+        let written = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        let tail: Vec<&str> = written.lines().rev().take(2).collect();
+        assert!(tail[0].ends_with("info after the minute"), "{tail:?}");
+        assert!(
+            tail[1].contains("10 log lines were not written"),
+            "{tail:?}\n{written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_file_rotates_at_the_limit_and_stays_bounded() {
         let dir = dir("rotate");
         let log = EventLog::new();
         log.attach(dir.join(FILE_NAME), 300, accept);
-        for n in 0..40 {
+        // Fewer lines than the per-minute cap.
+        for n in 0..24 {
             log.record(
                 Level::Info,
                 &format!("event number {n:03} with some padding text"),
@@ -344,14 +472,14 @@ mod tests {
         );
         let last = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
         assert!(
-            last.contains("event number 039"),
+            last.contains("event number 023"),
             "newest event is in the live file"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_log_failure_never_reaches_the_caller_and_recovers() {
+    fn a_log_failure_never_reaches_the_caller_and_leaves_a_gap_marker() {
         let dir = dir("fail");
         let log = EventLog::new();
         // The parent folder does not exist: every write fails.
@@ -371,6 +499,59 @@ mod tests {
         log.record(Level::Info, "refused");
         assert_eq!(std::fs::read(dir.join(FILE_NAME)).unwrap().len(), 0);
         assert_eq!(log.len(), 1);
+        // After the pause the file works again and says what was missed.
+        let log = EventLog::new();
+        log.attach(dir.join("later.log"), ROTATE_AT, accept);
+        log.file.lock().unwrap().as_mut().unwrap().retry_at =
+            Some(Instant::now() + Duration::from_secs(3600));
+        log.record(Level::Info, "during the pause");
+        log.file.lock().unwrap().as_mut().unwrap().retry_at = None;
+        log.record(Level::Info, "after the pause");
+        let written = std::fs::read_to_string(dir.join("later.log")).unwrap();
+        assert!(
+            written.contains("1 log lines were not written"),
+            "{written}"
+        );
+        assert!(!written.contains("during the pause"), "{written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_slow_file_writer_never_blocks_the_ring_or_other_events() {
+        use std::sync::Arc;
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        static ENTERED: Mutex<Option<Sender<()>>> = Mutex::new(None);
+        static RELEASE: Mutex<Option<Receiver<()>>> = Mutex::new(None);
+        let (entered_tx, entered) = channel();
+        let (release_tx, release_rx) = channel();
+        *ENTERED.lock().unwrap() = Some(entered_tx);
+        *RELEASE.lock().unwrap() = Some(release_rx);
+        fn slow(_: &Path) -> io::Result<()> {
+            ENTERED.lock().unwrap().as_ref().unwrap().send(()).unwrap();
+            let rx = RELEASE.lock().unwrap().take().unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+            Ok(())
+        }
+        let dir = dir("slow");
+        let log = Arc::new(EventLog::new());
+        log.attach(dir.join(FILE_NAME), ROTATE_AT, slow);
+        let writer = {
+            let log = log.clone();
+            std::thread::spawn(move || log.record(Level::Info, "stuck in the file check"))
+        };
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The file is busy: neither reading the ring nor recording waits for it.
+        let started = Instant::now();
+        assert_eq!(log.recent(10).len(), 1, "the ring already has the event");
+        log.record(Level::Info, "second event");
+        assert_eq!(log.recent(10).len(), 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "blocked {:?} behind a slow file write",
+            started.elapsed()
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

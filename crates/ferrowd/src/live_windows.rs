@@ -57,8 +57,8 @@ static CONTROL: Mutex<Option<Sender<Message>>> = Mutex::new(None);
 /// limit once). A scan already running, or one already requested, answers
 /// instead of queueing another.
 pub fn request_rescan() -> (bool, String) {
-    if let Err(why) = STATE.claim_rescan() {
-        return (false, why.into());
+    if let Err(why) = STATE.claim_rescan(Instant::now()) {
+        return (false, why);
     }
     let sender = CONTROL.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if sender.is_some_and(|tx| tx.send(Message::RescanNow).is_ok()) {
@@ -314,12 +314,12 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                 } => {
                     eventlog::warn(format!("journal of {device}: {reason}"));
                     STATE.journal_problem(&device, fatal, &reason);
-                    rescan.request(format!("{device}: {reason}"));
-                    STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                    if rescan.request(format!("{device}: {reason}")) {
+                        STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                    }
                     continue;
                 }
                 Batch::RescanNow => {
-                    eventlog::info("rescan requested by an administrator");
                     rescan.force(Instant::now(), "requested by an administrator".into());
                     STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
                     continue;
@@ -330,9 +330,13 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             }
             let outcome = live.apply(&changes, &volumes);
             if let Some(why) = outcome.rescan {
-                eventlog::info(format!("rescan wanted: {why}"));
-                rescan.request(why);
-                STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                // The reason text changes with every batch (it carries the
+                // delta size): only the start of an episode is an event.
+                let wanted = format!("rescan wanted: {why}");
+                if rescan.request(why) {
+                    eventlog::info(wanted);
+                    STATE.set_pending(rescan.pending().map(|why| (why, rescan.earliest())));
+                }
             }
             if outcome.changed == 0 {
                 continue;

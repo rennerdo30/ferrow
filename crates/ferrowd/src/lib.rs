@@ -934,10 +934,10 @@ pub fn serve(
                             CancelToken::from_flag(context.cancellation_flag()),
                         )
                     });
-                    if let Err(error) = result
-                        && !stopping.is_requested()
-                    {
-                        eventlog::warn(format!("connection closed: {error}"));
+                    if result.is_err() && !stopping.is_requested() {
+                        // Counted, not logged: any local account can end a
+                        // connection badly, and must not churn the log.
+                        health::STATE.connection_error();
                     }
                 })?;
             workers.push((control, thread));
