@@ -337,7 +337,9 @@ fn every_way_an_action_can_end_has_its_own_outcome() {
     );
     let failed = o(Ok(1), false);
     assert_eq!(failed.outcome, Outcome::Problem);
-    assert!(failed.text.contains("service restart"));
+    // It names the command for this OS (systemctl on Linux).
+    assert!(failed.text.contains(&Verb::Restart.terminal_command()));
+    assert!(failed.text.contains("administrator terminal"));
     // Even a zero exit is not "done" when the answer does not show it.
     assert_ne!(o(Ok(0), false).outcome, Outcome::Done);
 }
