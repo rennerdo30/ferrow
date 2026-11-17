@@ -2,12 +2,14 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.18
 
-- **You can check the service's health and repair it.** `ferrow service health` shows at a glance whether the service is fine (or what needs attention), how long it has been running, its memory, the index size, the last save, what each drive is doing (live updates, journal state, last scan, a rescan that is waiting) and its recent events; `--json` gives the same for other tools. The service also keeps an event log, `service.log` next to its index (administrators only, at most 2 MiB), which until now only existed on a console it never has.
-  - `ferrow service rescan` scans all drives again now (administrators only; it waits a minute after a scan has just ended and says when it can run).
-  - `ferrow service start | stop | restart` (elevated terminal / sudo) control the Windows service, systemd or launchd.
-  - `ferrow service repair` (elevated) checks the installed program and its registration (re-registering it from the installed folder if it is missing or points elsewhere), the protection of the service's data folder and the saved index (an index that does not load is renamed to `index.bin.bad-<time>`, never deleted, so the service rebuilds it), restarts the service and waits until it answers.
+- **Fixed: the service rescanned every drive while git was busy.** When git, git-lfs or another tool moved a folder into an indexed place, the service could not know what was inside it and read every drive again (about 75 seconds of heavy CPU on a large PC, up to every 11 minutes). Now only that folder is read, in the background at low priority, and its files show up in search within moments. A full rescan happens only for a moved folder with more than about 50,000 files, after 30 seconds, or on an error.
+- **Much less memory while the index is built.** Building the index (at start and on a rescan) used to need about four times the memory it keeps afterwards, roughly 10 GB on a PC with 27 million files. It now needs well under half of that; the memory it keeps afterwards, the saved index and search speed are unchanged, and loading is a little faster.
+- **Service health in Settings.** A new **Service health** section shows at a glance whether the Ferrow service is healthy, stopped, not installed, older than the app or not answering, with its version, uptime, memory, items, last save, every drive's state (live updates, last scan, a rescan that is waiting) and its recent messages. Buttons: **Start**, **Restart**, **Rescan now**, **Repair…** (each asks for administrator approval) and **Copy diagnostics** (a report for bug reports, without file names). The **Fast index** card points here when the service needs attention. It looks at the service at most every 5 seconds and only while Settings is visible; hidden in the tray, Ferrow does not ask at all.
+- **The same from a terminal:** `ferrow service health` (`--json` for tools), `ferrow service rescan`, `ferrow service start | stop | restart` (elevated terminal / sudo) and `ferrow service repair` (elevated). Repair checks the installed program and its registration, the service's data folder and the saved index without loading it; if everything is fine it says **Nothing to repair** and leaves the service running, otherwise it fixes what is wrong (an index that is damaged is renamed to `index.bin.bad-<time>`, never deleted, so the service rebuilds it) and restarts the service.
+- **The service keeps a log** (`service.log` next to its index, administrators only, at most about 2 MiB), including how its memory is used after every scan.
+- **Settings fixes:** the section list on the left highlights the section you are reading (also right after you click one), and content scrolls under a clean edge below the title instead of showing half a line.
 
 ## 0.1.0-beta.17
 
