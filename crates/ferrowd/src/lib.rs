@@ -826,6 +826,8 @@ pub fn serve(
     let system = config.endpoint == Endpoint::default_service();
     // The development endpoint ignores the policy: it serves its owner only.
     let access = if system {
+        // Read what the account rules need (the Unix UID_MIN) now, not on a request.
+        CallerIdentity::prime_account_rules();
         let store = Arc::new(access::PolicyStore::open(access::default_path()?));
         eprintln!("ferrowd: access policy: {}", store.current().mode.as_str());
         Some(store)

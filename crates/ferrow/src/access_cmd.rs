@@ -38,10 +38,15 @@ pub fn parse(args: &[OsString]) -> Result<Cmd, String> {
 }
 
 fn who(user: &AccessUser) -> String {
+    // Names come from the policy file and the OS: never print raw control codes.
     if user.name.is_empty() {
-        user.id.clone()
+        access::printable(&user.id)
     } else {
-        format!("{} ({})", user.name, user.id)
+        format!(
+            "{} ({})",
+            access::printable(&user.name),
+            access::printable(&user.id)
+        )
     }
 }
 
@@ -62,7 +67,7 @@ pub fn apply(
         )),
         Cmd::Everyone => Ok((
             policy(AccessMode::Everyone, vec![]),
-            "Every account on this PC can now use the service and see every file name on it."
+            "Every person who signs in to this PC can now use the service and see every file name on it."
                 .into(),
         )),
         Cmd::Add(name) => {
@@ -70,7 +75,7 @@ pub fn apply(
             if current.mode == AccessMode::Everyone {
                 return Ok((
                     current.clone(),
-                    "Every user is already allowed; nothing to add.".into(),
+                    "Every person who signs in is already allowed; nothing to add.".into(),
                 ));
             }
             let mut users = current.users.clone();
@@ -105,7 +110,7 @@ pub fn apply(
                     .position(|u| u.id.eq_ignore_ascii_case(&id))
             });
             let Some(at) = found else {
-                return Err(format!("{name} is not in the list"));
+                return Err(format!("{} is not in the list", access::printable(name)));
             };
             let mut users = current.users.clone();
             let removed = users.remove(at);
@@ -125,7 +130,7 @@ pub fn apply(
 fn label(mode: AccessMode) -> &'static str {
     match mode {
         AccessMode::Admins => "administrators only",
-        AccessMode::Everyone => "every user on this PC",
+        AccessMode::Everyone => "every person who signs in to this PC",
         AccessMode::Listed => "administrators and the listed users",
     }
 }
@@ -201,12 +206,14 @@ pub fn run(args: &[OsString]) -> Result<(), String> {
         return show();
     }
     let path = access::default_path().map_err(|e| e.to_string())?;
-    let current = access::load_file(&path).unwrap_or_else(|why| {
+    // The stamp is taken before reading: the write refuses if the file changed since.
+    let (stamp, current) = access::load_for_update(&path);
+    let current = current.unwrap_or_else(|why| {
         eprintln!("ferrow: replacing an unusable access policy ({why})");
         Policy::default()
     });
     let (next, message) = apply(&current, &cmd, &ferrowd::accounts::resolve)?;
-    access::write(&path, &next).map_err(|e| format!("{}: {e}", path.display()))?;
+    access::write(&path, &next, &stamp).map_err(|e| format!("{}: {e}", path.display()))?;
     println!("{message}\nThe service applies the change within a second.");
     Ok(())
 }
@@ -364,5 +371,25 @@ mod tests {
         info.users = Some(vec![user("1000", "alice")]);
         let text = format_info(&info);
         assert!(text.contains("- answered") && text.contains("listed user: alice (1000)"));
+    }
+
+    #[test]
+    fn names_with_control_characters_are_never_printed_raw() {
+        let info = AccessInfo {
+            mode: AccessMode::Listed,
+            you_allowed: true,
+            you: user("1000", "evil\u{1b}[2Jname"),
+            users: Some(vec![user("1001", "line\nbreak")]),
+        };
+        let text = format_info(&info);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert_eq!(
+            text.matches('\n').count(),
+            3,
+            "only the line ends: {text:?}"
+        );
+        let listed = listed(&[user("1001", "bad\u{7}name")]);
+        let error = apply(&listed, &Cmd::Remove("x\u{1b}y".into()), &lookup).unwrap_err();
+        assert!(!error.contains('\u{1b}'), "{error:?}");
     }
 }

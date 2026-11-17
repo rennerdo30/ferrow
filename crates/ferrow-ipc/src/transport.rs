@@ -184,6 +184,23 @@ impl CallerIdentity {
         platform::is_unsandboxed(self)
     }
 
+    /// Whether the caller is a person who signs in to this PC (the `everyone`
+    /// access mode): unsandboxed and, on Windows, an interactive (console or
+    /// remote-desktop) sign-in that is not a Guest, so service, virtual and
+    /// network-logon accounts are not; on Unix a regular uid (at or above
+    /// `UID_MIN`, 501 on macOS) other than `nobody`. SYSTEM and root are
+    /// admitted by the administrator rule, not by this one.
+    pub fn is_person(&self) -> bool {
+        platform::is_person(self)
+    }
+
+    /// Read what the account rules need from the system once (the Unix
+    /// `UID_MIN`), so no request thread ever reads a file for them.
+    pub fn prime_account_rules() {
+        #[cfg(unix)]
+        let _ = platform::first_regular_uid();
+    }
+
     /// The account id the access policy matches: the token user SID on
     /// Windows, the decimal uid on Unix.
     pub fn account_id(&self) -> Option<String> {
@@ -415,6 +432,21 @@ mod platform {
 
     pub fn is_unsandboxed(caller: &CallerIdentity) -> bool {
         caller.uid.is_some()
+    }
+
+    /// First regular uid, read once (never on a request thread once primed).
+    pub fn first_regular_uid() -> u32 {
+        static FIRST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *FIRST.get_or_init(|| {
+            let defs = std::fs::read_to_string("/etc/login.defs").ok();
+            crate::account_rules::first_regular_uid(defs.as_deref())
+        })
+    }
+
+    pub fn is_person(caller: &CallerIdentity) -> bool {
+        caller
+            .uid
+            .is_some_and(|uid| crate::account_rules::unix_person(uid, first_regular_uid()))
     }
 
     #[cfg(target_os = "linux")]
@@ -675,9 +707,7 @@ mod platform {
     }
 
     pub fn is_privileged(caller: &CallerIdentity) -> bool {
-        use windows_sys::Win32::Security::{
-            CreateWellKnownSid, EqualSid, TOKEN_GROUPS, TokenGroups, WinBuiltinAdministratorsSid,
-        };
+        use windows_sys::Win32::Security::WinBuiltinAdministratorsSid;
         const SE_GROUP_ENABLED: u32 = 0x4;
         const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
         if !is_unsandboxed(caller) {
@@ -690,23 +720,36 @@ mod platform {
             return false;
         };
         let token = token.as_raw_handle();
-        let mut admins = [0usize; 16];
-        let mut len = std::mem::size_of_val(&admins) as u32;
+        // A UAC-filtered admin token keeps Administrators as deny-only; an
+        // elevated one has it enabled. Either means an admin account.
+        group_attributes(token, WinBuiltinAdministratorsSid)
+            .is_some_and(|a| a & (SE_GROUP_ENABLED | SE_GROUP_USE_FOR_DENY_ONLY) != 0)
+    }
+
+    /// The attributes of the token's group with this well-known SID, if the
+    /// token holds it.
+    fn group_attributes(
+        token: HANDLE,
+        kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE,
+    ) -> Option<u32> {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, EqualSid, TOKEN_GROUPS, TokenGroups,
+        };
+        let mut wanted = [0usize; 16];
+        let mut len = std::mem::size_of_val(&wanted) as u32;
         // SAFETY: aligned SID buffer (128 bytes > SECURITY_MAX_SID_SIZE) and live length.
         if unsafe {
             CreateWellKnownSid(
-                WinBuiltinAdministratorsSid,
+                kind,
                 std::ptr::null_mut(),
-                admins.as_mut_ptr().cast(),
+                wanted.as_mut_ptr().cast(),
                 &raw mut len,
             )
         } == 0
         {
-            return false;
+            return None;
         }
-        let Some(buf) = token_info(token, TokenGroups) else {
-            return false;
-        };
+        let buf = token_info(token, TokenGroups)?;
         // SAFETY: GetTokenInformation(TokenGroups) filled a TOKEN_GROUPS in this
         // pointer-aligned buffer; its group array and SIDs live inside `buf`.
         let groups = unsafe { &*buf.as_ptr().cast::<TOKEN_GROUPS>() };
@@ -714,13 +757,26 @@ mod platform {
         let list = unsafe {
             std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
         };
-        // A UAC-filtered admin token keeps Administrators as deny-only; an
-        // elevated one has it enabled. Either means an admin account.
-        list.iter().any(|g| {
-            g.Attributes & (SE_GROUP_ENABLED | SE_GROUP_USE_FOR_DENY_ONLY) != 0
-                // SAFETY: both SIDs are valid for the duration of the call.
-                && unsafe { EqualSid(g.Sid, admins.as_mut_ptr().cast()) } != 0
-        })
+        list.iter()
+            // SAFETY: both SIDs are valid for the duration of the call.
+            .find(|g| unsafe { EqualSid(g.Sid, wanted.as_mut_ptr().cast()) } != 0)
+            .map(|g| g.Attributes)
+    }
+
+    pub fn is_person(caller: &CallerIdentity) -> bool {
+        use windows_sys::Win32::Security::{WinBuiltinGuestsSid, WinInteractiveSid};
+        if !is_unsandboxed(caller) {
+            return false;
+        }
+        let Some(token) = caller.access_token() else {
+            return false;
+        };
+        let token = token.as_raw_handle();
+        crate::account_rules::windows_person(
+            caller.user_sid.as_deref(),
+            group_attributes(token, WinInteractiveSid),
+            group_attributes(token, WinBuiltinGuestsSid),
+        )
     }
 
     fn is_app_container(token: HANDLE) -> Option<bool> {
@@ -1286,6 +1342,20 @@ mod platform {
         }
 
         #[test]
+        fn the_current_process_token_is_unsandboxed_and_a_person_implies_unsandboxed() {
+            let caller = identity_of(process_token());
+            assert!(is_unsandboxed(&caller), "an ordinary process token");
+            // Whether this session is an interactive sign-in depends on how the
+            // process was started (a CI service session has no INTERACTIVE
+            // group), so only the implication is asserted.
+            eprintln!("current token is a person: {}", is_person(&caller));
+            assert!(!is_person(&caller) || is_unsandboxed(&caller));
+            if is_privileged(&caller) {
+                assert!(is_unsandboxed(&caller), "administrators are unsandboxed");
+            }
+        }
+
+        #[test]
         fn restricted_token_is_refused() {
             use windows_sys::Win32::Security::{
                 CreateRestrictedToken, SID_AND_ATTRIBUTES, WinWorldSid,
@@ -1320,6 +1390,7 @@ mod platform {
                 !is_unsandboxed(&caller),
                 "sandboxed tokens are never unsandboxed"
             );
+            assert!(!is_person(&caller), "sandboxed tokens are never a person");
         }
 
         #[test]
@@ -1368,6 +1439,7 @@ mod platform {
                 !is_unsandboxed(&caller),
                 "sandboxed tokens are never unsandboxed"
             );
+            assert!(!is_person(&caller), "sandboxed tokens are never a person");
         }
     }
 }

@@ -7,6 +7,8 @@
 use ferrow_ipc::AccessUser;
 use ferrow_ipc::protocol::MAX_ACCOUNT_NAME;
 
+use crate::access::printable;
+
 /// An account from a name, a SID (Windows) or a uid (Unix). Groups are
 /// refused: only a user can sign in, so a group in the list would grant nobody.
 pub fn resolve(text: &str) -> Result<AccessUser, String> {
@@ -79,7 +81,7 @@ mod platform {
         if text.bytes().all(|b| b.is_ascii_digit()) {
             let uid: u32 = text
                 .parse()
-                .map_err(|_| format!("not a valid uid: {text}"))?;
+                .map_err(|_| format!("not a valid uid: {}", printable(text)))?;
             let name = entry(Some(uid), "").map(|(_, n)| n).unwrap_or_default();
             return Ok(AccessUser {
                 id: uid.to_string(),
@@ -91,7 +93,7 @@ mod platform {
                 id: uid.to_string(),
                 name: display(name),
             }),
-            None => Err(format!("no such user: {text}")),
+            None => Err(format!("no such user: {}", printable(text))),
         }
     }
 }
@@ -214,15 +216,18 @@ mod platform {
             )
         };
         if ok == 0 {
-            return Err(format!("no such account: {name}"));
+            return Err(format!("no such account: {}", printable(name)));
         }
         sid_text(sid.as_mut_ptr().cast()).ok_or_else(|| "cannot read the account SID".into())
     }
 
     pub fn resolve(text: &str) -> Result<AccessUser, String> {
-        let id = if text.len() > 4 && text[..4].eq_ignore_ascii_case("S-1-") {
+        let id = if text
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("S-1-"))
+        {
             if !valid_id(&text.to_ascii_uppercase()) {
-                return Err(format!("not a valid SID: {text}"));
+                return Err(format!("not a valid SID: {}", printable(text)));
             }
             text.to_ascii_uppercase()
         } else {
@@ -230,7 +235,8 @@ mod platform {
         };
         match describe(&id) {
             Some((_, false)) => Err(format!(
-                "{text} is a group or alias; add individual users, or use `everyone`"
+                "{} is a group or alias; add individual users, or use `everyone`",
+                printable(text)
             )),
             Some((name, true)) => Ok(AccessUser {
                 id,
@@ -254,5 +260,36 @@ mod platform {
     }
     pub fn resolve(_: &str) -> Result<AccessUser, String> {
         Err("account lookup is not supported on this platform".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_ascii_and_odd_names_never_panic() {
+        // A multi-byte name used to be sliced inside a character.
+        for text in [
+            "山田太郎",
+            "S-1-山田",
+            "山S-1-5-21-1-2-3-1001",
+            "é",
+            "S-1",
+            "S",
+            "\u{1b}[31m",
+            "   ",
+            "",
+        ] {
+            let _ = resolve(text);
+        }
+        assert!(resolve("山田太郎").is_err(), "no such account");
+        assert!(resolve("").is_err());
+    }
+
+    #[test]
+    fn errors_never_echo_control_characters() {
+        let error = resolve("x\u{1b}[2Jy").unwrap_err();
+        assert!(!error.contains('\u{1b}'), "{error:?}");
     }
 }

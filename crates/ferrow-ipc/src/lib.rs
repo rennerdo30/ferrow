@@ -13,6 +13,7 @@
 //! - [`Client`] and [`serve_stream`]: the handshake and
 //!   request/response plumbing over any stream.
 
+mod account_rules;
 mod dispatch;
 pub mod protocol;
 pub mod transport;
@@ -472,8 +473,9 @@ impl<S: DeadlineIo> Client<S> {
     }
 
     /// Who may use the service and whether this caller may (answered even to
-    /// refused callers). A service from before this request closes the
-    /// connection instead of answering, so use a connection of its own.
+    /// refused callers). A service from before this request never
+    /// answers it (the connection stays open until the client's deadline), so
+    /// use a connection of its own with a short deadline.
     pub fn access_info(&mut self) -> std::io::Result<AccessInfo> {
         let id = self.send(Request::AccessInfo)?;
         match Self::check(self.expect(id)?)? {

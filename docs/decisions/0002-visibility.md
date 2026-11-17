@@ -425,7 +425,9 @@ review of its own once rules 1–5 work and are measured.
 ## Unix
 
 Unchanged: non-root callers stay `Unauthorized` until a revision covers
-effective groups, ACLs and MAC (review 1 items 5 and 6).
+effective groups, ACLs and MAC (review 1 items 5 and 6), except the accounts
+an administrator allowed with the interim access policy (`access.json`: every
+regular, non-`nobody` uid or a list of uids; `docs/service.md`).
 
 ## Tests (merge gates; disposable Windows CI only)
 

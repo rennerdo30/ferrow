@@ -186,8 +186,8 @@ pub enum Request {
         generation: u64,
     },
     /// Who may use the service and whether this caller may. Added without a
-    /// protocol version bump: an older service drops the connection on the
-    /// unknown kind, so clients ask on a connection of their own.
+    /// protocol version bump: an older service does not know the kind and never
+    /// answers it, so clients ask on a connection of their own with a short deadline.
     AccessInfo,
 }
 
