@@ -113,8 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = runs[runs.len() / 2];
         // Which metadata load path ran; read the arm only after this line.
         println!(
-            "FERROW-METADATA-LOAD-ACTIVE arm={arm} metadata_load={}",
-            t.metadata_load.label()
+            "FERROW-METADATA-LOAD-ACTIVE arm={arm} metadata_load={} core_read_mb_s={:.1}",
+            t.metadata_load.label(),
+            t.core_read_mb_s
         );
         println!(
             "FERROW-LOAD-BREAKDOWN arm={arm} total_ms={:.6} read_ms={:.6} buffer_ms={:.6} checksum_ms={:.6} decode_ms={:.6} structure_ms={:.6} derived_ms={:.6} cleanup_ms={:.6} unattributed_ms={:.6} metadata_read_ms={:.6} metadata_checksum_ms={:.6} metadata_decode_ms={:.6} metadata_wait_ms={:.6}",
