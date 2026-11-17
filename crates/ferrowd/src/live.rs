@@ -41,7 +41,9 @@ pub const MIN_DELTA: usize = 50_000;
 pub const MAX_DELTA_CAP: usize = 250_000;
 /// …or once this share of frozen entries is hidden (1/10)…
 const MAX_REMOVED_DIVISOR: usize = 10;
-/// …or a single folder move would copy more than this many entries.
+/// A folder move copies at most this many entries into the delta; a larger
+/// frozen subtree stays in place, hidden, and a compaction re-attaches it
+/// (see [`Live::move_children`]).
 const MAX_MOVE: usize = 100_000;
 
 /// The size limits of the live layer. They follow the index: a fixed limit
@@ -371,6 +373,11 @@ pub struct Load {
     pub walks: bool,
     /// The index is being saved to disk (the saver holds the old index).
     pub saving: bool,
+    /// A large folder move left entries hidden until a compaction
+    /// ([`Live::adoptions_pending`]): one is wanted as soon as its share of
+    /// the time allows, without the minimum gap, and a waiting rescan does
+    /// not hold it back.
+    pub prompt: bool,
 }
 
 impl Load {
@@ -381,6 +388,7 @@ impl Load {
             severe: delta > hard_delta.saturating_mul(2),
             walks,
             saving,
+            prompt: false,
         }
     }
 }
@@ -395,6 +403,9 @@ pub struct Maintenance {
     rescan: RescanPolicy,
     compact: Option<String>,
     compact_earliest: Instant,
+    /// When the last compaction's share of the time ([`COMPACT_DUTY`]) is
+    /// used up: the earliest a [`Load::prompt`] one may start.
+    duty_earliest: Instant,
     /// Since when the delta has been past its hard limit (without a break).
     urgent_since: Option<Instant>,
 }
@@ -406,6 +417,7 @@ impl Maintenance {
             rescan: RescanPolicy::after_scan(now, took),
             compact: None,
             compact_earliest: now + MIN_COMPACT_GAP,
+            duty_earliest: now,
             urgent_since: None,
         }
     }
@@ -465,9 +477,11 @@ impl Maintenance {
         if let Some(why) = self.rescan.due(now, load.urgent) {
             return Some(Due::Rescan(why));
         }
-        if self.rescan.pending().is_some()
+        if (self.rescan.pending().is_some() && !load.prompt)
             || self.compact.is_none()
-            || !(load.urgent || now >= self.compact_earliest)
+            || !(load.urgent
+                || now >= self.compact_earliest
+                || (load.prompt && now >= self.duty_earliest))
         {
             return None;
         }
@@ -490,6 +504,7 @@ impl Maintenance {
     pub fn compacted(&mut self, now: Instant, took: Duration) {
         let gap = (took * COMPACT_DUTY).clamp(MIN_COMPACT_GAP, MAX_COMPACT_GAP);
         self.compact_earliest = now + gap;
+        self.duty_earliest = now + (took * COMPACT_DUTY).min(MAX_COMPACT_GAP);
         self.urgent_since = None;
     }
 
@@ -498,16 +513,21 @@ impl Maintenance {
     /// wakes it), but an overgrown delta wakes it when its patience ends; a
     /// save is looked at again every [`SAVE_POLL`].
     pub fn wake_at(&self, now: Instant, load: Load) -> Option<Instant> {
-        let compact = (self.compact.is_some() && !self.rescan_waiting())
+        let compact = (self.compact.is_some() && (load.prompt || !self.rescan_waiting()))
             .then(|| {
                 let patience = self.urgent_since.map(|since| since + URGENT_PATIENCE);
+                let earliest = if load.prompt {
+                    self.compact_earliest.min(self.duty_earliest)
+                } else {
+                    self.compact_earliest
+                };
                 match (load.walks, load.saving) {
                     (true, _) => patience,
                     (false, true) => {
-                        let looks = self.compact_earliest.max(now + SAVE_POLL);
+                        let looks = earliest.max(now + SAVE_POLL);
                         Some(patience.map_or(looks, |p| p.min(looks)))
                     }
-                    (false, false) => Some(self.compact_earliest),
+                    (false, false) => Some(earliest),
                 }
             })
             .flatten();
@@ -798,6 +818,21 @@ pub struct Live {
     base_record: Vec<u64>,
     /// Frozen children by parent, built on the first folder move.
     base_children: OnceLock<(Vec<u32>, Vec<u32>)>,
+    /// Frozen folders hidden by a move too large to copy, and the new entry
+    /// of the folder that took over their children (always a delta entry).
+    /// The children stay where they are; the next compaction places them
+    /// under the new entry. See [`Live::move_children`].
+    adopted: HashMap<u32, Loc>,
+    /// The same, by new entry.
+    adopters: HashMap<Loc, Vec<u32>>,
+    /// Frozen entries below an adopted folder (bit set): kept, but hidden
+    /// from searches until the compaction gives them their new path, so a
+    /// search never shows a path that no longer exists. Empty while nothing
+    /// is adopted.
+    hidden: Vec<u64>,
+    /// A folder move copies at most this many entries; larger frozen
+    /// subtrees are adopted instead ([`MAX_MOVE`]; smaller in tests).
+    move_budget: usize,
     /// Folders waiting for their background walk.
     walks: Vec<Walk>,
     next_walk: u64,
@@ -890,6 +925,10 @@ impl Live {
             volumes,
             base_record,
             base_children: OnceLock::new(),
+            adopted: HashMap::new(),
+            adopters: HashMap::new(),
+            hidden: Vec::new(),
+            move_budget: MAX_MOVE,
             walks: Vec::new(),
             next_walk,
             log: HashMap::new(),
@@ -953,7 +992,11 @@ impl Live {
         match loc {
             Loc::Base(id) => {
                 let p = self.base.parent(id);
-                (p != ROOT_PARENT).then_some(Loc::Base(p))
+                if p == ROOT_PARENT {
+                    return None;
+                }
+                // A child of an adopted folder belongs to its new entry.
+                Some(self.adopted.get(&p).copied().unwrap_or(Loc::Base(p)))
             }
             Loc::Delta(d) => Some(self.delta[d as usize].parent),
         }
@@ -1050,6 +1093,10 @@ impl Live {
                 .map(|w| vec_bytes(&w.covered))
                 .sum::<usize>();
         let change_log = table_bytes(self.log.capacity(), size_of::<((usize, u64), Touch)>());
+        let adopted = table_bytes(self.adopted.capacity(), size_of::<(u32, Loc)>())
+            + table_bytes(self.adopters.capacity(), size_of::<(Loc, Vec<u32>)>())
+            + self.adopters.values().map(vec_bytes).sum::<usize>()
+            + vec_bytes(&self.hidden);
         vec![
             Part::new(
                 "live.base_record",
@@ -1075,6 +1122,8 @@ impl Live {
             Part::new("live.base_children", base_children, Kind::Lazy),
             Part::new("live.walks", walks, Kind::Steady),
             Part::new("live.change_log", change_log, Kind::Steady),
+            // A large folder move, until the next compaction.
+            Part::new("live.adopted", adopted, Kind::Steady),
         ]
     }
 
@@ -1091,34 +1140,104 @@ impl Live {
         Breakdown::new(self.base.len(), parts, baseline)
     }
 
+    /// Frozen children of a frozen folder (alive or not).
+    fn base_children_of(&self, id: u32) -> &[u32] {
+        let (first, ids) = self.base_children();
+        &ids[first[id as usize] as usize..first[id as usize + 1] as usize]
+    }
+
+    /// Whether the frozen subtree below `id` holds more than `limit`
+    /// entries (counted without allocating per folder; stops at the limit).
+    fn base_subtree_exceeds(&self, id: u32, limit: usize) -> bool {
+        let mut count = 0usize;
+        let mut stack = vec![id];
+        while let Some(dir) = stack.pop() {
+            for &c in self.base_children_of(dir) {
+                count += 1;
+                if count > limit {
+                    return true;
+                }
+                if self.base.flags(c) & flags::DIR != 0 {
+                    stack.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    /// `to` takes over the frozen children of the frozen folder `dir`
+    /// (already hidden): they stay in place, hidden from searches, until a
+    /// compaction places them under `to`. Costs one bit per frozen entry
+    /// once, and a pass over the subtree.
+    fn adopt(&mut self, dir: u32, to: Loc) {
+        debug_assert!(matches!(to, Loc::Delta(_)));
+        self.adopted.insert(dir, to);
+        self.adopters.entry(to).or_default().push(dir);
+        if self.hidden.is_empty() {
+            self.hidden = vec![0; self.base.len().div_ceil(64)];
+        }
+        let mut hidden = std::mem::take(&mut self.hidden);
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for &c in self.base_children_of(d) {
+                hidden[c as usize / 64] |= 1 << (c % 64);
+                if self.base.flags(c) & flags::DIR != 0 {
+                    stack.push(c);
+                }
+            }
+        }
+        self.hidden = hidden;
+    }
+
+    /// Whether a frozen entry is hidden below an adopted folder.
+    fn is_hidden(&self, id: u32) -> bool {
+        !self.hidden.is_empty() && self.hidden[id as usize / 64] >> (id % 64) & 1 != 0
+    }
+
+    /// Whether a large folder move left frozen entries to re-attach: they
+    /// are hidden from searches until a compaction, which is then wanted
+    /// soon ([`Load::prompt`]).
+    pub fn adoptions_pending(&self) -> bool {
+        !self.adopted.is_empty()
+    }
+
+    fn base_children(&self) -> &(Vec<u32>, Vec<u32>) {
+        self.base_children.get_or_init(|| {
+            let n = self.base.len();
+            let mut first = vec![0u32; n + 1];
+            for c in 0..n as u32 {
+                let p = self.base.parent(c);
+                if p != ROOT_PARENT {
+                    first[p as usize + 1] += 1;
+                }
+            }
+            for i in 1..first.len() {
+                first[i] += first[i - 1];
+            }
+            let mut fill = first.clone();
+            let mut ids = vec![0u32; first[n] as usize];
+            for c in 0..n as u32 {
+                let p = self.base.parent(c);
+                if p != ROOT_PARENT {
+                    ids[fill[p as usize] as usize] = c;
+                    fill[p as usize] += 1;
+                }
+            }
+            (first, ids)
+        })
+    }
+
+    /// The live children of a folder: its frozen children, those of the
+    /// frozen folders it adopted, and its delta children.
     fn children(&self, loc: Loc) -> Vec<Loc> {
         let mut out = Vec::new();
         if let Loc::Base(id) = loc {
-            let (first, ids) = self.base_children.get_or_init(|| {
-                let n = self.base.len();
-                let mut first = vec![0u32; n + 1];
-                for c in 0..n as u32 {
-                    let p = self.base.parent(c);
-                    if p != ROOT_PARENT {
-                        first[p as usize + 1] += 1;
-                    }
-                }
-                for i in 1..first.len() {
-                    first[i] += first[i - 1];
-                }
-                let mut fill = first.clone();
-                let mut ids = vec![0u32; first[n] as usize];
-                for c in 0..n as u32 {
-                    let p = self.base.parent(c);
-                    if p != ROOT_PARENT {
-                        ids[fill[p as usize] as usize] = c;
-                        fill[p as usize] += 1;
-                    }
-                }
-                (first, ids)
-            });
-            let range = first[id as usize] as usize..first[id as usize + 1] as usize;
-            out.extend(ids[range].iter().map(|&c| Loc::Base(c)));
+            out.extend(self.base_children_of(id).iter().map(|&c| Loc::Base(c)));
+        }
+        if let Some(dirs) = self.adopters.get(&loc) {
+            for &dir in dirs {
+                out.extend(self.base_children_of(dir).iter().map(|&c| Loc::Base(c)));
+            }
         }
         if let Some(ids) = self.delta_children.get(&loc) {
             out.extend(ids.iter().map(|&d| Loc::Delta(d)));
@@ -1128,15 +1247,60 @@ impl Live {
     }
 
     /// Move the subtree below `from` under `to` (a folder's new entry).
-    /// Returns the number of entries copied, or `None` past [`MAX_MOVE`].
-    fn move_children(&mut self, from: Loc, to: Loc, budget: &mut usize) -> Option<()> {
+    ///
+    /// Entries are copied into the delta up to `budget`. A frozen folder
+    /// whose subtree is larger than what is left is not copied: its new
+    /// entry adopts its frozen children instead ([`Live::adopt`]), which
+    /// costs a pass over the subtree and no memory per entry, and the
+    /// children are placed by the next compaction. Before compactions
+    /// existed, such a move asked for a full rescan of every volume (over a
+    /// minute of heavy CPU and disk on a PC with 27 million entries), and a
+    /// tool that renames a large folder now and then kept the service
+    /// rescanning. Folders adopted by an entry that moves again go with it.
+    ///
+    /// Returns whether anything was adopted (a compaction is then wanted).
+    fn move_children(&mut self, from: Loc, to: Loc, budget: &mut usize) -> bool {
+        let mut adopted = false;
+        // Once a frozen folder's whole subtree fits, so do the folders below
+        // it: they are not counted again (only delta entries, which the
+        // delta limits bound, come on top).
+        let mut fits = false;
         let mut stack = vec![(from, to)];
         while let Some((old_dir, new_dir)) = stack.pop() {
-            for child in self.children(old_dir) {
-                if *budget == 0 {
-                    return None;
+            if let Some(dirs) = self.adopters.remove(&old_dir) {
+                for &dir in &dirs {
+                    self.adopted.insert(dir, new_dir);
                 }
-                *budget -= 1;
+                self.adopters.entry(new_dir).or_default().extend(dirs);
+                adopted = true;
+            }
+            let large = match old_dir {
+                Loc::Base(id) if !fits => {
+                    let large = self.base_subtree_exceeds(id, *budget);
+                    fits = !large;
+                    large
+                }
+                _ => false,
+            };
+            let children = match old_dir {
+                Loc::Base(id) if large => {
+                    self.adopt(id, new_dir);
+                    adopted = true;
+                    // Only the delta children are copied.
+                    self.delta_children
+                        .get(&old_dir)
+                        .map(|ids| {
+                            ids.iter()
+                                .map(|&d| Loc::Delta(d))
+                                .filter(|&l| self.is_alive(l))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                _ => self.children(old_dir),
+            };
+            for child in children {
+                *budget = budget.saturating_sub(1);
                 let record = self.record_of(child);
                 let entry = DeltaEntry {
                     parent: new_dir,
@@ -1163,7 +1327,7 @@ impl Live {
                 }
             }
         }
-        Some(())
+        adopted
     }
 
     fn locations_raw(&self, volume: usize, record: u64) -> Vec<Loc> {
@@ -1743,10 +1907,9 @@ impl Live {
         let was_dir = old.iter().any(|&l| self.flags_of(l) & flags::DIR != 0);
         match (was_dir, new_locs.first().copied()) {
             (true, Some(to)) if descended => {
-                let mut budget = MAX_MOVE;
-                if self.move_children(old[0], to, &mut budget).is_none() {
-                    self.set_locations(volume, record, new_locs);
-                    return Err(REASON_LARGE_MOVE.into());
+                let mut budget = self.move_budget;
+                if self.move_children(old[0], to, &mut budget) {
+                    applied.ask(Reason::compact(REASON_LARGE_MOVE));
                 }
             }
             (true, _) => self.remove_subtree(old[0]),
@@ -1814,6 +1977,12 @@ impl Live {
             *last &= (1u64 << (n % 64)) - 1;
         }
         let bit = |keep: &[u64], id: u32| keep[id as usize / 64] >> (id % 64) & 1 != 0;
+        // A frozen entry whose parent was adopted by a delta entry (a large
+        // folder move) survives with that entry, which is placed after the
+        // frozen ones; which delta entries are placed depends on the frozen
+        // ones in turn, so with adoptions the passes repeat until nothing
+        // more is dropped.
+        let mut placed_delta = self.placeable_delta(&keep);
         loop {
             let (mut dropped, mut parent_after_child) = (false, false);
             for id in 0..n as u32 {
@@ -1825,16 +1994,25 @@ impl Live {
                     continue;
                 }
                 parent_after_child |= parent > id;
-                if !bit(&keep, parent) {
+                if !bit(&keep, parent)
+                    && !matches!(self.adopted.get(&parent), Some(Loc::Delta(d)) if placed_delta[*d as usize])
+                {
                     keep[id as usize / 64] &= !(1 << (id % 64));
                     dropped = true;
                 }
             }
             // With every parent below its child, one pass is exact.
-            if !dropped || !parent_after_child {
+            if !dropped || (!parent_after_child && self.adopted.is_empty()) {
                 break;
             }
+            placed_delta = self.placeable_delta(&keep);
         }
+        let placed_delta = if self.adopted.is_empty() {
+            self.placeable_delta(&keep)
+        } else {
+            // Unchanged by the last pass, which dropped nothing.
+            placed_delta
+        };
         let (mut kept_base, mut name_bytes) = (0usize, 0usize);
         for id in 0..n as u32 {
             if bit(&keep, id) {
@@ -1855,12 +2033,25 @@ impl Live {
             before[word] + (keep[word] & ((1u64 << (id % 64)) - 1)).count_ones()
         };
 
+        // The new id of each placed delta entry: after the frozen ones, in
+        // delta order (a frozen entry adopted by one refers to it ahead).
+        let mut placed: Vec<u32> = vec![u32::MAX; self.delta.len()];
+        let mut next_delta = kept_base as u32;
+        for (d, ok) in placed_delta.iter().enumerate() {
+            if *ok {
+                placed[d] = next_delta;
+                next_delta += 1;
+            }
+        }
+        drop(placed_delta);
+
         let builder = IndexBuilder::with_columns(self.columns);
         let delta_names: usize = self
             .delta
             .iter()
-            .filter(|e| e.alive)
-            .map(|e| e.name.len())
+            .zip(&placed)
+            .filter(|(_, id)| **id != u32::MAX)
+            .map(|(e, _)| e.name.len())
             .sum();
         builder.reserve(kept_base + self.delta_alive, name_bytes + delta_names);
         let mut records: Vec<u64> = Vec::with_capacity(kept_base + self.delta_alive);
@@ -1872,8 +2063,19 @@ impl Live {
             let parent = self.base.parent(id);
             let parent = if parent == ROOT_PARENT {
                 ROOT_PARENT
-            } else {
+            } else if bit(&keep, parent) {
                 new_id(parent)
+            } else {
+                // Kept with a hidden parent: adopted by a placed delta entry.
+                // (The passes above keep nothing else; a service must not
+                // stop over it, so a release build shows it as a root.)
+                match self.adopted.get(&parent) {
+                    Some(Loc::Delta(d)) if placed[*d as usize] != u32::MAX => placed[*d as usize],
+                    _ => {
+                        debug_assert!(false, "kept without a kept or adopting parent");
+                        ROOT_PARENT
+                    }
+                }
             };
             let metadata = if self.overrides.is_empty() {
                 self.base.metadata(id)
@@ -1890,24 +2092,18 @@ impl Live {
             next += 1;
             records.push(self.base_record[id as usize]);
         }
-        // The live entries follow the frozen ones. A delta entry's parent is
-        // always a lower delta index: `add` takes a parent that was found
-        // among the entries that exist, and asserts it. One whose parent is
-        // gone is skipped.
-        let mut placed: Vec<u32> = vec![u32::MAX; self.delta.len()];
+        // The live entries follow the frozen ones, those placeable in
+        // `placed` (see [`Live::placeable_delta`]).
         for (d, e) in self.delta.iter().enumerate() {
-            if !e.alive {
+            if placed[d] == u32::MAX {
                 continue;
             }
             let parent = match e.parent {
-                Loc::Base(b) if bit(&keep, b) => new_id(b),
-                Loc::Base(_) => continue,
-                Loc::Delta(p) => match placed.get(p as usize) {
-                    Some(&id) if id != u32::MAX => id,
-                    _ => continue,
-                },
+                Loc::Base(b) => new_id(b),
+                Loc::Delta(p) => placed[p as usize],
             };
-            placed[d] = builder.add_with_metadata(parent, &e.name, e.flags, e.metadata);
+            let added = builder.add_with_metadata(parent, &e.name, e.flags, e.metadata);
+            debug_assert_eq!(added, placed[d]);
             records.push(if e.record == u64::MAX {
                 u64::MAX
             } else {
@@ -1943,6 +2139,23 @@ impl Live {
         Some(Live::assemble(index, records, volumes, self.next_walk))
     }
 
+    /// Which delta entries a compaction places, given the frozen entries it
+    /// keeps: alive, with a kept frozen parent or a placed delta parent. A
+    /// delta entry's parent is always a lower delta index (`add` takes a
+    /// parent that was found among the entries that exist, and asserts it),
+    /// so one pass in order is exact.
+    fn placeable_delta(&self, keep: &[u64]) -> Vec<bool> {
+        let mut ok = vec![false; self.delta.len()];
+        for (d, e) in self.delta.iter().enumerate() {
+            ok[d] = e.alive
+                && match e.parent {
+                    Loc::Base(b) => keep[b as usize / 64] >> (b % 64) & 1 != 0,
+                    Loc::Delta(p) => ok[p as usize],
+                };
+        }
+        ok
+    }
+
     /// Build the searchable view of the current state.
     pub fn view(&self) -> LiveView {
         let allowed: Vec<u64> = {
@@ -1953,7 +2166,16 @@ impl Live {
             {
                 *last &= (1u64 << (n % 64)) - 1;
             }
+            // Entries below an adopted folder wait for the compaction.
+            for (w, h) in words.iter_mut().zip(&self.hidden) {
+                *w &= !h;
+            }
             words
+        };
+        let base_shown = if self.hidden.is_empty() {
+            self.base.len() - self.removed_count
+        } else {
+            allowed.iter().map(|w| w.count_ones() as usize).sum()
         };
         let builder = IndexBuilder::with_columns(self.columns);
         let mut shadows: HashMap<u32, u32> = HashMap::new();
@@ -1966,7 +2188,7 @@ impl Live {
             }
             let parent = match e.parent {
                 Loc::Base(b) => {
-                    if !self.is_alive(Loc::Base(b)) {
+                    if !self.is_alive(Loc::Base(b)) || self.is_hidden(b) {
                         continue;
                     }
                     *shadows.entry(b).or_insert_with(|| {
@@ -1990,7 +2212,7 @@ impl Live {
         }
         let shown_delta = delta.len() - shadow_ids.len();
         LiveView {
-            entries: self.base.len() - self.removed_count + shown_delta,
+            entries: base_shown + shown_delta,
             allowed: Arc::new(allowed),
             delta: Arc::new(delta),
             delta_allowed: Arc::new(delta_allowed),
@@ -4584,5 +4806,166 @@ mod tests {
             new.metadata_order(SortKey::Modified, false).is_none(),
             "an order nobody used is not built"
         );
+    }
+
+    /// root(5)/Docs(20)/{a.txt(21), Sub(23)/{c.txt(24)}}, root/b.txt(22),
+    /// with a folder move budget of one entry: any move of Docs is large.
+    fn large_move_fixture() -> (Live, Arc<Index>, Fake) {
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let dir = DIR_INFO.metadata(ColumnSet::DEFAULT);
+        let root = b.add_root(b"C:", flags::DIR);
+        let docs = b.add_with_metadata(root, b"Docs", flags::DIR, dir);
+        let a = b.add_with_metadata(docs, b"a.txt", 0, file_info(1).metadata(ColumnSet::DEFAULT));
+        let bb = b.add_with_metadata(root, b"b.txt", 0, file_info(2).metadata(ColumnSet::DEFAULT));
+        let sub = b.add_with_metadata(docs, b"Sub", flags::DIR, dir);
+        let c = b.add_with_metadata(sub, b"c.txt", 0, file_info(3).metadata(ColumnSet::DEFAULT));
+        let map = VolumeMap {
+            entries: vec![(5, root), (20, docs), (21, a), (22, bb), (23, sub), (24, c)],
+            excluded: vec![30],
+            roots: vec![(5, root)],
+            ..VolumeMap::default()
+        };
+        let base = Arc::new(b.freeze());
+        let mut live = Live::new(base.clone(), &[map]);
+        live.move_budget = 1;
+        let mut f = initial();
+        f.set(23, DIR_INFO, &[(20, "Sub")]);
+        f.set(24, file_info(3), &[(23, "c.txt")]);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        (live, base, f)
+    }
+
+    /// What the live index shows after a compaction.
+    fn shown_compacted(live: &mut Live) -> Vec<String> {
+        let new = live.compact().expect("no folder reads");
+        assert!(!new.adoptions_pending());
+        assert!(new.hidden.is_empty());
+        shown(&new, &new.base().clone())
+    }
+
+    #[test]
+    fn a_large_folder_move_is_merged_in_memory_instead_of_rescanning() {
+        let (mut live, base, mut f) = large_move_fixture();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        let r = live.apply(&[change(20, false)], &f);
+        let why = r.rescan.expect("a compaction is asked for");
+        assert_eq!(why.kind(), ReasonKind::Compact, "no disk read: {why}");
+        assert_eq!(&*why, REASON_LARGE_MOVE);
+        assert!(live.adoptions_pending());
+        assert_eq!(live.delta_len(), 1, "only the folder itself was copied");
+        // Until the compaction the contents are hidden, never shown under
+        // the old path.
+        assert_eq!(shown(&live, &base), ["C:", r"C:\Papers", r"C:\b.txt"]);
+        // Changes inside keep being applied meanwhile.
+        f.set(24, file_info(7), &[(23, "c2.txt")]);
+        f.set(25, file_info(8), &[(23, "new.txt")]);
+        let r = live.apply(&[change(24, false), change(25, true)], &f);
+        assert!(r.rescan.is_none(), "{r:?}");
+        assert_eq!(shown(&live, &base), ["C:", r"C:\Papers", r"C:\b.txt"]);
+        // A folder's own dates follow too.
+        f.set(
+            23,
+            RecordInfo {
+                modified: 99,
+                ..DIR_INFO
+            },
+            &[(20, "Sub")],
+        );
+        live.apply(&[change(23, false)], &f);
+        assert_eq!(shown_compacted(&mut live), oracle(&f));
+    }
+
+    #[test]
+    fn an_adopting_folder_that_moves_again_takes_its_contents_along() {
+        let (mut live, _, mut f) = large_move_fixture();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        live.apply(&[change(20, false)], &f);
+        // Renamed again before the compaction, then moved below b's sibling.
+        f.set(40, DIR_INFO, &[(5, "Archive")]);
+        f.set(20, DIR_INFO, &[(40, "Old papers")]);
+        let r = live.apply(&[change(40, true), change(20, false)], &f);
+        assert_eq!(
+            r.rescan.as_ref().map(|r| r.kind()),
+            Some(ReasonKind::Compact)
+        );
+        assert_eq!(shown_compacted(&mut live), oracle(&f));
+    }
+
+    #[test]
+    fn a_large_folder_moved_below_a_moved_folder_is_placed() {
+        // Docs is moved into a folder that was renamed (a delta entry), and
+        // a new file in Docs moves with it.
+        let (mut live, _, mut f) = large_move_fixture();
+        f.set(26, file_info(5), &[(20, "fresh.txt")]);
+        live.apply(&[change(26, true)], &f);
+        f.set(40, DIR_INFO, &[(5, "Archive")]);
+        live.apply(&[change(40, true)], &f);
+        f.set(20, DIR_INFO, &[(40, "Docs")]);
+        live.apply(&[change(20, false)], &f);
+        assert!(live.adoptions_pending());
+        assert!(
+            shown(&live, &live.base().clone()).contains(&r"C:\Archive\Docs\fresh.txt".to_string()),
+            "delta children are copied"
+        );
+        assert_eq!(shown_compacted(&mut live), oracle(&f));
+    }
+
+    #[test]
+    fn deleting_an_adopting_folder_deletes_what_it_adopted() {
+        let (mut live, base, mut f) = large_move_fixture();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        live.apply(&[change(20, false)], &f);
+        for r in [20, 21, 23, 24] {
+            f.0.remove(&r);
+        }
+        // The journal may report only the folder.
+        live.apply(&[change(20, false)], &f);
+        assert_eq!(shown(&live, &base), oracle(&f));
+        assert_eq!(shown_compacted(&mut live), oracle(&f));
+    }
+
+    #[test]
+    fn a_small_folder_move_is_still_copied_at_once() {
+        let (mut live, base, mut f) = large_move_fixture();
+        live.move_budget = MAX_MOVE;
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        let r = live.apply(&[change(20, false)], &f);
+        assert!(r.rescan.is_none(), "{r:?}");
+        assert!(!live.adoptions_pending());
+        assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    #[test]
+    fn a_large_move_compaction_waits_only_for_its_share_of_time() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut m = Maintenance::after_scan(t0, s(60));
+        let prompt = Load {
+            prompt: true,
+            ..Load::default()
+        };
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert_eq!(m.due(t0 + s(1), Load::default()), None, "the usual gap");
+        assert_eq!(m.wake_at(t0 + s(1), prompt), Some(t0), "no minimum gap");
+        assert_eq!(
+            m.due(t0 + s(1), prompt),
+            Some(Due::Compact(REASON_LARGE_MOVE.into()))
+        );
+        // A 4 s compaction: the next prompt one waits 5 times that.
+        let t1 = t0 + s(5);
+        m.compacted(t1, s(4));
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert_eq!(m.due(t1 + s(19), prompt), None);
+        assert_eq!(m.wake_at(t1 + s(19), prompt), Some(t1 + s(20)));
+        // A waiting rescan does not hold it back (it may be half an hour off).
+        m.request(Reason::disk("Volume{1}: change journal reset"));
+        assert!(matches!(m.due(t1 + s(20), prompt), Some(Due::Compact(_))));
+        // Folder reads still go first.
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        let reading = Load {
+            walks: true,
+            ..prompt
+        };
+        assert_eq!(m.due(t1 + s(21), reading), None);
     }
 }

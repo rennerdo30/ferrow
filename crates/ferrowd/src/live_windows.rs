@@ -514,12 +514,15 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         let mut base = base;
         let mut gate = PublishGate::new();
         reason = loop {
-            let load = Load::of(
-                live.delta_len(),
-                hard_delta,
-                live.walks_outstanding(),
-                STATE.is_saving(),
-            );
+            let load = Load {
+                prompt: live.adoptions_pending(),
+                ..Load::of(
+                    live.delta_len(),
+                    hard_delta,
+                    live.walks_outstanding(),
+                    STATE.is_saving(),
+                )
+            };
             match rescan.due(Instant::now(), load) {
                 Some(Due::Rescan(why)) => {
                     // The fullest the live layer gets: what it holds before
