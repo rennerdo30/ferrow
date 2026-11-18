@@ -71,52 +71,98 @@ PC = {
     "target_bytes": 512 * MIB,
 }
 
-# PROVISIONAL (calibration run): every limit below is replaced with the CI numbers.
+# Every limit is a number from the hosted `memory breakdown (windows 5M)` job
+# (windows-latest, release build, 8 MiB spill budget) plus a margin. Ten runs of
+# each size on this gate's branch (2026-11-18 10:37 to 10:54 UTC, jobs of five
+# runs each) set the numbers below; where the earlier runs of the 32 MiB budget
+# or the first six compaction runs were used, it says so. Run to run the 1 ms
+# sampled peaks differ by up to about 10 % for the parse and by 1 to 4 % for the
+# others; every absolute limit is at least 23 % above the highest value seen.
+#
 # unit "MiB": the growth of a `FERROW-MEMORY-PEAK` line; "B/entry": the same
 # divided by the entries of the run.
 #
 # (id, phase line, what it is, unit, limit, floor, where the limit comes from)
-# A floor is the least a phase must grow: below it the sampler or the phase did
-# not run (a dead sampler reads as no growth and would pass every limit).
+# A floor is the least a phase must grow, in both runs: below it the sampler or
+# the phase did not run (a dead sampler reads as no growth and would pass every
+# limit). Each is about half of the lowest value seen.
 CHECKS = [
     # (a) the full scan path, from the bounded build (the path the service takes)
     ("scan.parse", "bounded.parse", "parse chunks into the file-backed volume builder",
-     "MiB", 22, 0, "provisional"),
+     "MiB", 20, 5,
+     "measured 13.1-16.0 MiB at 5 M, 6.9-8.3 at 1 M (the 16 MiB chunk buffers, and the synthetic "
+     "source's own table of directories, about 1.7 B/entry), +25 %"),
     ("scan.join", "bounded.from_parsed", "join of names, records and the grouping by parent",
-     "MiB", 2, None, "provisional"),
+     "MiB", 2, None,
+     "measured 0-0.23 MiB, everything is written to temporary files; +1.8 MiB"),
     ("scan.emit", "bounded.emit", "emission through the spilling builder and the record map file",
-     "MiB", 80, 0, "provisional"),
+     "MiB", 20, 8,
+     "measured 14.4-15.4 MiB at 5 M and 14.9-15.2 at 1 M = the 8 MiB spill budget x 1.6 (shard heap "
+     "while entries are added) plus the working set, +30 %; raising the budget raises this "
+     "(32 MiB: 58-65 MiB)"),
     ("scan.freeze", "bounded.freeze", "freeze into the index file (place, fold, sort, checksum in the map)",
-     "MiB", 8, None, "provisional"),
+     "MiB", 4, None,
+     "measured 1.1-1.4 MiB at 5 M (4.0-5.0 with the 32 MiB budget: it follows the shards), +185 %"),
     ("scan.live_new", "bounded.live_new", "the live layer's tables built in temporary files",
-     "MiB", 8, None, "provisional"),
+     "MiB", 7, None,
+     "measured 4.0-4.6 MiB, +52 %"),
     ("scan.children", "bounded.children", "the frozen children table for the saved tables",
-     "MiB", 1, None, "provisional"),
+     "MiB", 1, None,
+     "measured 0.07-0.08 MiB"),
 ]
 
+# The same peaks, taken together: the highest point of the whole scan above
+# where it started. (ADR 0007 budget: about 60 MB working set with the 32 MiB
+# budget plus the 16 MiB read buffers the example does not have.)
 SCAN_PHASES = [c[1] for c in CHECKS if c[0].startswith("scan.")]
-SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 84, None, "provisional")
+SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 22, None,
+              "measured 14.3-16.1 MiB at 5 M, 13.6-15.2 at 1 M (the emit's shards are still alive "
+              "in the freeze, so the highest point is the freeze's: emit + freeze), +37 %")
 STEADY = ("steady.private", "steady", "private bytes after the scan, heap builds dropped, nothing given back",
-          "MiB", 16, None, "provisional")
+          "MiB", 16, None,
+          "measured 6.9-8.6 MiB at 5 M (1.4-1.7 B/entry: the runtime, thread stacks and the allocator's "
+          "free memory; a HeapCompact takes off only 0-0.7 MiB of it), 2 x the highest value; "
+          "2 B/entry more heap would add 10 MiB")
 STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record tables are mapped)",
-               "B/entry", 1.0, None, "provisional")
+               "B/entry", 1.0, None,
+               "measured 0.35 B/entry (removed bits 0.125, record_base remainder 0.23); "
+               "a heap table of 1 B/entry or more is a regression")
 COMPACT = ("compact.file", "compact.file", "compaction into the index file (Live::compact_into)",
-           "B/entry", 26, None, "provisional")
+           "B/entry", 26, 10,
+           "measured 18.5-21.2 B/entry at 5 M over eleven runs (1 M: 66-68; about 60 MiB fixed + the "
+           "new live tables in the heap, decision 6, still to do), +23 %")
 SAVE_TABLES = ("restart.save_tables", "restart.save_tables", "restart: stream the live tables to live.bin",
-               "MiB", 4, None, "provisional")
+               "MiB", 4, None,
+               "measured 1.07-1.16 MiB (the write buffers), +250 %")
 RESTART = ("restart.load", "restart.load", "restart: map index and tables, restore the live layer",
-           "MiB", 6, None, "provisional")
+           "MiB", 4, None,
+           "measured 0.75-1.37 MiB at 5 M (the tables are mapped, only the maps' bookkeeping and "
+           "the live layer's bit sets are in the heap), +190 %")
 RESTARTED = ("restart.private", "restarted", "private bytes after a restart from the saved files",
-             "MiB", 14, None, "provisional")
+             "MiB", 14, None,
+             "measured 5.6-6.8 MiB at 5 M, +100 %")
 SORT = ("restart.sort", "restart.sort_orders", "first sort orders (size, date) on the mapped index",
-        "MiB", 16, None, "provisional")
+        "MiB", 2, None,
+        "measured 0.22-0.24 MiB at 5 M (ids, merge scratch and orders are temporary files, ADR 0007 "
+        "decision 9; a heap order is 4 B/entry = 19 MiB each), +750 %")
 
 # The slope checks: (id, measure, what, limit in B/entry, where the limit comes from)
+# A limit is the highest slope seen over every pair of a 5 M and a 1 M run (twenty-five
+# pairs per job) plus a margin of about 0.6 B/entry, which is also how much room a
+# +2 B/entry regression has to trip it when the run is a low one.
 SLOPES = [
-    ("slope.parse", "parse", "scan parse, growth per entry between 1 M and 5 M", 100.0, "provisional"),
-    ("slope.emit", "emit", "scan emit, growth per entry between 1 M and 5 M", 100.0, "provisional"),
-    ("slope.total", "total", "scan total, growth per entry between 1 M and 5 M", 100.0, "provisional"),
-    ("slope.compact", "compact", "compaction, growth per entry between 1 M and 5 M", 100.0, "provisional"),
+    ("slope.parse", "parse", "scan parse, growth per entry between 1 M and 5 M", 3.0,
+     "measured 1.4-2.3 B/entry (the source's own directory table is in it), +0.7"),
+    ("slope.emit", "emit", "scan emit, growth per entry between 1 M and 5 M", 1.0,
+     "measured -0.22 to 0.13 B/entry: with the 8 MiB budget the fixed part is the same at both sizes"),
+    ("slope.total", "total", "scan total, growth per entry between 1 M and 5 M", 1.2,
+     "measured -0.22 to 0.60 B/entry, +0.6"),
+    ("slope.compact", "compact", "compaction, growth per entry between 1 M and 5 M", 10.5,
+     "measured 6.1-9.7 B/entry (typically 9.0-9.4: the one low sample in ten is a 5 M run whose start "
+     "was 12 MiB higher with the same peak, so it can only hide, never invent, growth), +0.8; a "
+     "regression of 2 B/entry reads 11.0-11.4 on a typical run"),
+    ("slope.sort", "sort", "first sort orders on the mapped index, growth per entry", 0.5,
+     "measured 0.03 B/entry (0.12 and 0.23 MiB at 1 M and 5 M)"),
 ]
 
 
@@ -204,6 +250,7 @@ class Run:
             "compact": lambda: self.growth("compact.file"),
             "steady": lambda: self.steady("mapped"),
             "restart": self.restart_peak,
+            "sort": lambda: self.growth("restart.sort_orders"),
         }[name]()
 
     def credibility(self):

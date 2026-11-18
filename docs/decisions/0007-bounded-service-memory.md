@@ -193,21 +193,45 @@ reader of the diagnostics sees both.
 4. Names stored once.
 5. Bounded rebuilds (done: FR-46 phase 5).
 6. Sort orders in the file (done: temporary files beside the index).
-7. CI gate (done): the Windows memory-breakdown job (5 million synthetic
-   entries) runs `scripts/memory-gate.py` and fails when a phase is over its
-   limit, naming the phase and the number: the full scan's peak growth (per
-   phase and in total, a fixed amount), the steady state after the heap builds
-   are dropped (private bytes, and the live layer's own heap in bytes per
-   entry), a compaction (bytes per entry) and a restart from the saved files
-   (peak and private bytes after). It prints one table and extrapolates each
-   figure to the owner's 27.2 M entry PC against the 1 GB limit and the 512 MB
-   target. The limits are in that script, each with the measured numbers it was
-   set from (first hosted run: full scan at most 63 MiB above its start,
-   steady state 7 MiB private, restart 6 MiB, compaction 21 B/entry; scaled to
-   27.2 M entries the compaction is the one figure over the 512 MB target, 588
-   MiB with the steady state, so it only warns until decision 6 moves its live
-   tables into the file). Not covered: real raw-volume reads and the service's own process on
-   a real PC (the example is synthetic); see `docs/service.md`.
+7. CI gate (done): the Windows memory-breakdown job runs the example with 5
+   million and with 1 million synthetic entries (an 8 MiB spill budget) and
+   `scripts/memory-gate.py` on both outputs, and fails, naming the phase and
+   the number, when:
+   - a phase is over its absolute limit: the full scan's peak growth (per
+     phase and in total, a fixed amount), the steady state after the heap
+     builds are dropped (private bytes, as the service holds them: the
+     service never calls `HeapCompact`; and the live layer's own heap in bytes
+     per entry), a compaction (bytes per entry), a restart from the saved
+     files (the live tables' save, the load's peak, the private bytes after)
+     and the first sort orders on the mapped index;
+   - the **slope** is over its limit: the growth per entry between the two
+     sizes, for the scan's parse, emit and total, the compaction and the sort
+     orders. A fixed working set and the runner's noise leave 3 to 5 B/entry of
+     room under an absolute limit (a compaction 4 B/entry over its measured
+     value, 19 MiB at 5 million entries, stayed under its limit), and the
+     slope sees them: the fixed part cancels in the difference, so +2 B/entry
+     in a phase moves its slope by 2 (tested by replaying a real run's output
+     with +2 B/entry injected);
+   - a peak is not credible: a failed sampler self-check, a peak of 0 or below
+     its start, or a growth below the floor of a phase that must grow (a dead
+     sampler reads as no growth).
+
+   It prints the tables and a fit to the owner's 27.2 M entry PC (fixed part
+   + slope × entries, against the 1 GB limit and the 512 MB target). Measured on the hosted
+   runner (8 MiB budget, ten runs of each size): scan 14 to 16 MiB in total
+   (the service's 32 MiB budget adds about 52), steady state 7 to 9 MiB, restart 6 to
+   7 MiB, compaction 18.5 to 21 B/entry with a slope of about 9 B/entry (about
+   60 MiB fixed). Fitted to 27.2 M entries: steady state 18 MiB, steady state
+   plus a rescan 90 MiB, plus a compaction 316 MiB, a restart 12 MiB. All are
+   under the 512 MB target; the compaction would be the largest, and it only
+   warns until decision 6 moves its live tables into the file. (The first
+   version scaled every figure by the entry count and read 527 to 590 MiB for
+   the compaction: that counted its 60 MiB fixed part 5.4 times.) The limits are
+   in that script, each with the measured numbers it was set from. Not covered:
+   real raw-volume reads and the service's own process on a real PC (the
+   example is synthetic, calls the building blocks directly, and measures a
+   steady state without changes or a view); per-change heap growth is not
+   gated; see `docs/service.md`.
 8. Bounded scan: the MFT read and the live tables a scan builds in
    temporary files (done: FR-46 phase 7; not yet measured on a 27 M entry
    PC; a compaction's own tables are still in the heap).

@@ -122,41 +122,66 @@ class RealOutput(unittest.TestCase):
             self.assertIn(r.status, ("ok", "info", "over target"), ident)
 
 
-class SlopeCatchesWhatTheAbsoluteLimitsLet(unittest.TestCase):
+class SlopeCatchesPerEntryGrowth(unittest.TestCase):
     """The reviewer's finding: +4 B/entry in the emit or the compaction passed.
 
-    The absolute limits sit well above the measured values (a fixed part and
-    the runner's noise), so a small table per entry hides under them. Each of
-    these replays the real output with +2 B/entry and needs the gate to fail
-    on the slope, with every absolute limit still satisfied.
+    The old limits (emit 80 MiB, compaction 26 B/entry) sat 3 to 5 B/entry above
+    the measured values, because of a fixed 51 MiB part and the runner's noise.
+    Each of these replays the real output with +2 B/entry in a phase and needs
+    the gate to fail on the slope, which sees the growth per entry between the
+    two sizes whatever the fixed part is.
     """
 
-    def assert_caught_by_slope_only(self, large, small, ident):
+    def assert_caught(self, large, small, ident):
         by = rows(large, small)
-        absolute = [r for i, r in by.items() if not i.startswith(("slope.", "pc."))]
-        self.assertTrue(all(r.status in ("ok", "info") for r in absolute),
-                        [(r.ident, r.status) for r in absolute if r.status not in ("ok", "info")])
         self.assertEqual(by[ident].status, "FAIL", f"{ident}: {by[ident].measured}")
         code, _, err, _ = run(large, small)
         self.assertEqual(code, 1)
         self.assertIn(ident, err)
         self.assertIn("MEMORY GATE FAILED", err)
+        return by
 
     def test_two_bytes_per_entry_in_the_emit(self):
         large, small = regress("bounded.emit", 2.0, alive_in=("bounded.freeze",))
-        self.assert_caught_by_slope_only(large, small, "slope.emit")
+        by = self.assert_caught(large, small, "slope.emit")
+        self.assertEqual(by["slope.total"].status, "FAIL")  # the scan's total follows
 
-    def test_two_bytes_per_entry_in_the_emit_total_follows(self):
-        large, small = regress("bounded.emit", 2.0, alive_in=("bounded.freeze",))
-        self.assertEqual(rows(large, small)["slope.total"].status, "FAIL")
-
-    def test_two_bytes_per_entry_in_the_compaction(self):
+    def test_two_bytes_per_entry_in_the_compaction_is_below_every_absolute_limit(self):
+        # The compaction's absolute limit alone lets +2 B/entry through (measured
+        # 18.5 to 21.2, limit 26); only the slope sees it.
         large, small = regress("compact.file", 2.0)
-        self.assert_caught_by_slope_only(large, small, "slope.compact")
+        by = self.assert_caught(large, small, "slope.compact")
+        absolute = [r for i, r in by.items() if not i.startswith(("slope.", "pc."))]
+        self.assertTrue(all(r.status in ("ok", "info") for r in absolute),
+                        [(r.ident, r.status) for r in absolute if r.status not in ("ok", "info")])
 
     def test_two_bytes_per_entry_in_the_parse(self):
         large, small = regress("bounded.parse", 2.0)
-        self.assert_caught_by_slope_only(large, small, "slope.parse")
+        self.assert_caught(large, small, "slope.parse")
+
+    def test_without_the_slope_checks_the_compaction_regression_passes(self):
+        # The test can fail: take the slope checks away and the same replay is green.
+        large, small = regress("compact.file", 2.0)
+        saved = gate.SLOPES
+        try:
+            gate.SLOPES = []
+            code, out, err, _ = run(large, small)
+        finally:
+            gate.SLOPES = saved
+        self.assertEqual(code, 0, err)
+        self.assertIn("MEMORY GATE PASSED", out)
+
+    def test_one_and_a_half_bytes_per_entry_in_the_emit(self):
+        large, small = regress("bounded.emit", 1.5, alive_in=("bounded.freeze",))
+        self.assert_caught(large, small, "slope.emit")
+
+    def test_the_reviewers_replay_only_the_large_output_is_mutated(self):
+        # +2 B/entry at 5 M entries, the small run untouched: the slope grows by
+        # more than 2, so it fails too.
+        for phase, alive, ident in (("bounded.emit", ("bounded.freeze",), "slope.emit"),
+                                    ("compact.file", (), "slope.compact")):
+            large, small = regress(phase, 2.0, alive_in=alive, both=False)
+            self.assertEqual(rows(large, small)[ident].status, "FAIL", ident)
 
     def test_the_reviewers_replay_only_the_large_output_is_mutated(self):
         # +2 B/entry at 5 M entries, the small run untouched: the slope grows by
@@ -166,12 +191,12 @@ class SlopeCatchesWhatTheAbsoluteLimitsLet(unittest.TestCase):
         large, small = regress("compact.file", 2.0, both=False)
         self.assertEqual(rows(large, small)["slope.compact"].status, "FAIL")
 
-    def test_the_real_slopes_are_not_negative_noise_hiding_a_regression(self):
-        # Every slope check has a limit that +2 B/entry crosses, whatever the measured value.
+    def test_every_slope_limit_is_crossed_by_two_bytes_per_entry_on_the_real_output(self):
         by = rows()
-        for ident, measure, _what, limit, _source in gate.SLOPES:
-            self.assertLess(by[ident].measured + 2.0 - 1e-9, by[ident].measured + 2.0)  # arithmetic guard
-            self.assertGreater(by[ident].measured + 2.0, limit, ident)
+        for ident, _measure, _what, limit, _source in gate.SLOPES:
+            if ident != "slope.sort":  # the sort's own limit is 0.5 B/entry, tighter than +2
+                self.assertGreater(by[ident].measured + 2.0, limit, ident)
+            self.assertLess(by[ident].measured, limit, ident)
 
 
 class AbsoluteLimits(unittest.TestCase):

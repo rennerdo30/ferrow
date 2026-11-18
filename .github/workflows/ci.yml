@@ -581,7 +581,6 @@ jobs:
           FERROW_DELTA_BASE=20000 FERROW_DELTA_CHECKPOINTS=2000,8000 timeout -k 5s 120s target/release/examples/delta_limit_bench > /dev/null
           FERROW_DELTA_BASE=1000000 FERROW_DELTA_CHECKPOINTS=50000,250000 timeout -k 10s 420s target/release/examples/delta_limit_bench 2>&1 | tee delta-limit-windows-output.txt
       - name: Test the memory gate on synthetic outputs
-        if: false # TEMPORARY (calibration run), restored next
         run: python -I -m unittest discover -s scripts -p 'test_memory_gate.py'
       # Two sizes, so the gate can see growth per entry above the fixed part
       # and the runner's noise: 1 M first (about 15 s), then 5 M. Both with an
@@ -594,12 +593,8 @@ jobs:
         run: |
           git rev-parse HEAD
           FERROW_BENCH_ENTRIES=20000 FERROW_MEMORY_CHANGES=500 timeout -k 5s 120s target/release/examples/memory_breakdown > /dev/null
-          for i in 1 2 3 4 5; do
-            FERROW_BENCH_ENTRIES=1000000 timeout -k 10s 600s target/release/examples/memory_breakdown > memory-breakdown-windows-1m-$i.txt 2>&1
-            timeout -k 10s 1200s target/release/examples/memory_breakdown > memory-breakdown-windows-5m-$i.txt 2>&1
-          done
-          cp memory-breakdown-windows-1m-1.txt memory-breakdown-windows-1m-output.txt
-          cp memory-breakdown-windows-5m-1.txt memory-breakdown-windows-output.txt
+          FERROW_BENCH_ENTRIES=1000000 timeout -k 10s 600s target/release/examples/memory_breakdown 2>&1 | tee memory-breakdown-windows-1m-output.txt > /dev/null
+          FERROW_MEMORY_SUMMARY="$GITHUB_STEP_SUMMARY" timeout -k 10s 1200s target/release/examples/memory_breakdown 2>&1 | tee memory-breakdown-windows-output.txt
       # The gate: the limits per phase (scan, steady state, compaction,
       # restart) and their extrapolation to the owner's 27.2 M entry PC are
       # in scripts/memory-gate.py. It runs after the measurement, so the
@@ -614,8 +609,6 @@ jobs:
           path: |
             memory-breakdown-windows-output.txt
             memory-breakdown-windows-1m-output.txt
-            memory-breakdown-windows-1m-?.txt
-            memory-breakdown-windows-5m-?.txt
             memory-gate-windows-output.txt
             delta-limit-windows-output.txt
           if-no-files-found: warn
