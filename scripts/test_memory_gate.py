@@ -26,8 +26,8 @@ def output(entries=N, overrides=None, drop=None, done=True):
     """What a passing run prints, with some values replaced or lines removed."""
     o = {
         "bounded.parse": 15, "bounded.from_parsed": 0.1, "bounded.emit": 59, "bounded.freeze": 4.5,
-        "bounded.live_new": 4.5, "bounded.children": 0.1, "compact.file": 100, "restart.load": 0.2,
-        "steady": 20, "restarted": 20, "heap_per_entry": 0.36,
+        "bounded.live_new": 4.5, "bounded.children": 0.1, "compact.file": 100, "restart.load": 1.4,
+        "steady": 7, "restarted": 6, "heap_per_entry": 0.36,
     }
     o.update(overrides or {})
     lines = [f"FERROW-MEMORY-ACTIVE example=memory_breakdown entries={entries} changes=20000 seed=2026"]
@@ -80,9 +80,9 @@ class MemoryGate(unittest.TestCase):
             "bounded.emit": ("scan.emit", 90),
             "bounded.freeze": ("scan.freeze", 12),
             "compact.file": ("compact.file", 5_000_000 * 30 / MIB),
-            "restart.load": ("restart.load", 40),
-            "steady": ("steady.private", 200),
-            "restarted": ("restart.private", 200),
+            "restart.load": ("restart.load", 10),
+            "steady": ("steady.private", 30),
+            "restarted": ("restart.private", 30),
             "heap_per_entry": ("steady.heap", 4.0),
         }
         for key, (ident, value) in cases.items():
@@ -103,7 +103,7 @@ class MemoryGate(unittest.TestCase):
     def test_extrapolation_over_hard_limit_fails_over_target_warns_for_compaction(self):
         # A steady state that is inside its own limit but, scaled to 27.2 M
         # entries and with a rescan on top, is over the 512 MB target.
-        code, _, err, _ = run(output(overrides={"steady": 40}))
+        code, _, err, _ = run(output(overrides={"steady": 16, "bounded.emit": 75, "bounded.freeze": 4}))
         self.assertEqual(code, 1)
         self.assertIn("pc.scan", err)
         # A compaction over the target only warns (its tables are in the heap, decision 6).

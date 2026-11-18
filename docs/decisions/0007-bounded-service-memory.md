@@ -1,6 +1,6 @@
 # 0007: Bounded service memory (mapped and compressed index)
 
-Status: accepted (owner, 2026-11-18). Tracked as FR-46. Decision 8 (bounded rebuilds): built in FR-46 phase 5, on top of the mapped index (decisions 1 to 4). Decision 10 (bounded scan): built in FR-46 phase 7.
+Status: accepted (owner, 2026-11-18). Tracked as FR-46. Decision 8 (bounded rebuilds): built in FR-46 phase 5, on top of the mapped index (decisions 1 to 4). Decision 10 (bounded scan): built in FR-46 phase 7. CI gate (order of work, step 7): built, so these budgets are checked on every pull request.
 
 ## Context
 
@@ -193,8 +193,21 @@ reader of the diagnostics sees both.
 4. Names stored once.
 5. Bounded rebuilds (done: FR-46 phase 5).
 6. Sort orders in the file (done: temporary files beside the index).
-7. CI gate: the Windows memory-breakdown job asserts private bytes per
-   entry, so a later change cannot quietly grow it again.
+7. CI gate (done): the Windows memory-breakdown job (5 million synthetic
+   entries) runs `scripts/memory-gate.py` and fails when a phase is over its
+   limit, naming the phase and the number: the full scan's peak growth (per
+   phase and in total, a fixed amount), the steady state after the heap builds
+   are dropped (private bytes, and the live layer's own heap in bytes per
+   entry), a compaction (bytes per entry) and a restart from the saved files
+   (peak and private bytes after). It prints one table and extrapolates each
+   figure to the owner's 27.2 M entry PC against the 1 GB limit and the 512 MB
+   target. The limits are in that script, each with the measured numbers it was
+   set from (first hosted run: full scan at most 63 MiB above its start,
+   steady state 7 MiB private, restart 6 MiB, compaction 21 B/entry; scaled to
+   27.2 M entries the compaction is the one figure over the 512 MB target, 588
+   MiB with the steady state, so it only warns until decision 6 moves its live
+   tables into the file). Not covered: real raw-volume reads and the service's own process on
+   a real PC (the example is synthetic); see `docs/service.md`.
 8. Bounded scan: the MFT read and the live tables a scan builds in
    temporary files (done: FR-46 phase 7; not yet measured on a 27 M entry
    PC; a compaction's own tables are still in the heap).

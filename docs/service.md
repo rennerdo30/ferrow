@@ -483,6 +483,35 @@ service-only: the index lists every file name on the machine.
 - **Otherwise it scans**, with the reason in the log: "startup scan: …".
 - **Crash safety:** a crash between writing the two files leaves a mismatch, so the next start scans. Every value of `live.bin` is checked when it is read.
 
+**The memory gate (ADR 0007, step 7).**
+
+The service's memory is checked on every pull request, so a later change cannot quietly bring it back above the budget (never more than 1 GB, target 512 MB, as Task Manager shows it, on a PC with 27.2 million entries).
+
+- **Where:** the CI job "memory breakdown (windows 5M)" runs `examples/memory_breakdown` on a hosted Windows runner (the service's own allocator and counters, 5 million synthetic MFT entries) and then `scripts/memory-gate.py` on its output. The job is red when a limit is exceeded; the table is in the job's summary and in the kept output file (`memory-gate-windows-output.txt`). The script's own tests run first (`scripts/test_memory_gate.py`).
+- **What it checks** (private bytes: the mapped index and the temporary files are file cache and not counted):
+  - **Full scan** (first start, journal reset, **Rescan now**): the growth above the start of the scan for each phase (parse, join, emit, freeze, the live layer's tables, the children table) and the highest point of the whole scan. It is a fixed working set, so the limits are in MiB, not per entry; a per-entry table coming back is about 19 MiB per 4 bytes per entry at 5 million entries and trips them.
+  - **Steady state:** the private bytes that remain after the scan once the heap builds are dropped (`FERROW-MEMORY-STEADY phase=mapped`), and the live layer's own heap in bytes per entry (the record tables are mapped, so it is the removed bits and the part of the record table that changed).
+  - **Compaction** (`Live::compact_into`): the growth in bytes per entry. Its new live tables are still in the heap (ADR 0007 decision 6), which is why it is the only per-entry growth left.
+  - **Restart from the saved files:** the live tables are saved beside the index, everything is dropped, and the index and the tables are mapped and the live layer restored as at the service's start (`restart.load` peak) and the private bytes afterwards (`FERROW-MEMORY-STEADY phase=restarted`).
+- **Extrapolation:** every figure is also scaled to 27.2 million entries (steady state; steady state plus a rescan; plus a compaction; a restart) and compared with the 1 GB limit (fails) and the 512 MB target (fails, except for the compaction, which only warns while its tables are in the heap). Scaling the whole growth by the entry count is an upper bound: the scan's working set is fixed.
+- **Measured and limited** (hosted Windows runner, 5 million entries; the scan figures are the spread of six runs, the others one run):
+
+  | Check | Measured | Limit |
+  |---|---|---|
+  | Scan, parse | 14.4 to 15.3 MiB | 22 MiB |
+  | Scan, join | 0 to 0.23 MiB | 2 MiB |
+  | Scan, emit (32 MiB shard budget) | 58.3 to 59.4 MiB | 76 MiB |
+  | Scan, freeze / live tables / children | 4.0 to 5.0 / 4.6 / 0.07 MiB | 8 / 8 / 1 MiB |
+  | Scan, highest point in total | 63.2 to 63.8 MiB (about 13 B/entry) | 80 MiB |
+  | Steady state, private bytes | 6.95 MiB (1.4 B/entry) | 16 MiB |
+  | Steady state, live layer's own heap | 0.35 B/entry | 1 B/entry |
+  | Compaction | 18.7 to 21.2 B/entry (about 105 MB) | 26 B/entry |
+  | Restart, peak growth / private afterwards | 1.4 / 5.8 MiB | 6 / 14 MiB |
+
+  Scaled to 27.2 million entries (upper bounds): steady state 38 MiB (the owner's PC showed 34 MiB private after start with beta.21), steady state plus a rescan 382 MiB, a restart 39 MiB, steady state plus a compaction 588 MiB. The compaction is the one figure over the 512 MB target (under the 1 GB limit): it is the known leftover, its new live tables are in the heap until decision 6 moves them into the file, so the gate warns instead of failing.
+- **Limits:** all in `scripts/memory-gate.py`, each with the measured numbers it was set from and a margin well above the run-to-run noise of the hosted runner (about 1 %). Raise one only with new measurements, in the same commit; a limit that is no longer needed is lowered the same way. The check runs on 5 million entries only (the script refuses another count).
+- **Not covered:** a real PC (raw volume reads, the real MFT, 27 million entries, the service process itself: the example is synthetic and in one process); the read buffers of the real scan (up to four 16 MiB reads in flight, not in the synthetic stream); Linux and macOS (the job is Windows only; the Linux bench job shows the same example's numbers without a gate); page-cache (file cache) size, which is reported but not limited; search speed (the bench job gates that).
+
 ## Development: `ferrow service run`
 
 ```sh

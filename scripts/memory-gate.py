@@ -89,8 +89,9 @@ SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 8
               "measured 63.8 MiB (the emit's shards are still alive in the freeze, so the highest "
               "point is the freeze's: emit + freeze), +25 %")
 STEADY = ("steady.private", "steady", "private bytes after the scan, heap builds dropped",
-          "MiB", 48,
-          "PROVISIONAL, set from the first CI run of this gate")
+          "MiB", 16,
+          "measured 6.95 MiB in the first hosted run (the allocator's free memory, 28 MB held, "
+          "and the runtime; 1.4 B/entry), +130 %: 2 B/entry more heap would trip it")
 STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record tables are mapped)",
                "B/entry", 1.0,
                "measured 0.36 B/entry (removed bits 0.125, record_base remainder 0.23); "
@@ -100,11 +101,12 @@ COMPACT = ("compact.file", "compact.file", "compaction into the index file (Live
            "measured 18.7-21.2 B/entry over six runs (about 60 MB fixed + the new live tables in "
            "the heap, decision 6, still to do), +23 %")
 RESTART = ("restart.load", "restart.load", "restart: map index and tables, restore the live layer",
-           "MiB", 8,
-           "PROVISIONAL, set from the first CI run of this gate")
+           "MiB", 6,
+           "measured 1.36 MiB in the first hosted run (the tables are mapped, only the maps' "
+           "bookkeeping and the live layer's bit sets are in the heap), +340 %")
 RESTARTED = ("restart.private", "restarted", "private bytes after a restart from the saved files",
-             "MiB", 48,
-             "PROVISIONAL, set from the first CI run of this gate")
+             "MiB", 14,
+             "measured 5.83 MiB in the first hosted run, +140 %")
 
 
 def fields(line):
