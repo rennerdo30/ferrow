@@ -47,9 +47,11 @@ slower. The owner chose to do both: map the index and compress it.
    - Owned (heap) columns stay for builders, tests and platforms where mapping
      fails.
 2. **The file format allows mapping (version 4).**
-   - Every section starts at an 8-byte boundary.
-   - Integers are stored little-endian, as before. A big-endian build decodes
-     into owned columns.
+   - Every column is aligned for its type: `u32` sections on 4 bytes, `u16`
+     on 2 (version 3 plus up to 2 zero bytes before the name order).
+   - Integers are stored little-endian, as before. A big-endian target does
+     not build (none is supported).
+   - A file that cannot be mapped is read into the heap.
    - Loading checks the header, the lengths, the checksum and every offset, as
      today, but reads through the map instead of copying.
 3. **A mapped file is never written in place.**
@@ -62,7 +64,11 @@ slower. The owner chose to do both: map the index and compress it.
    - The heap index the builder made is dropped, so the steady state holds no
      heap copy.
    - The save after a scan already exists (about 3.5 s at 27 M). It now happens
-     right away, not on the 30-minute schedule.
+     right away, not on the 30-minute schedule, at background priority.
+   - The file just written is mapped without being checked again (its header,
+     length and checksum field are compared with what was written); a full
+     check would read gigabytes once more after every save.
+   - From then on the live maintainer is the only writer of the file.
 5. **No full scan at start (ADR 0005's restart plan, now built).**
    - The saved file carries, per volume:
      - the journal id;

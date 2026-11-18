@@ -140,9 +140,12 @@ impl<T: Plain> Deref for Col<T> {
         // elements of `backing`: an owned vector (refreshed after every
         // write through `OwnedMut`), or a range `mapped` checked to be
         // inside the map and aligned; `T: Plain` accepts any bytes. The map
-        // is read-only and kept alive by the `Arc`; its file is opened
-        // without write sharing and never written in place (a save replaces
-        // it by renaming a new file over it).
+        // is read-only and kept alive by the `Arc`; Ferrow never writes a
+        // saved index in place (a save renames a new file over it). On
+        // Windows the file is opened without write sharing, so no one else
+        // can either; on Unix it relies on the file's 0600 owner-only mode.
+        // A disk error on a mapped page stops the process, as a failed read
+        // of the heap's own pages would.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }

@@ -304,8 +304,16 @@ impl Index {
         persist::save(self, path)
     }
 
+    /// Save, then read the same index from the file just written through a
+    /// memory map, without checking the file again (only its header, length
+    /// and checksum field against what was written). See ADR 0007.
+    pub fn save_and_map(&self, path: &std::path::Path) -> Result<Index, SaveError> {
+        persist::save_and_map(self, path)
+    }
+
     /// Load from the versioned binary format. See [`persist`]. A current
-    /// (version 4) file is memory-mapped, not read into the heap.
+    /// (version 4) file is memory-mapped, not read into the heap (read
+    /// into it when the file cannot be mapped).
     pub fn load(path: &std::path::Path) -> Result<Index, LoadError> {
         persist::load(path)
     }

@@ -58,10 +58,18 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
     };
     rows.push(("Memory", memory, None));
     if h.index_mapped_bytes > 0 {
+        // Windows reports the private working set, which leaves the mapped
+        // file out; elsewhere "in use" is the resident size, which counts
+        // whatever of the file is in memory.
+        let counted = if h.private_working_set.is_some() {
+            "not counted above"
+        } else {
+            "counted above while in memory"
+        };
         rows.push((
             "Index file",
             format!(
-                "{} read from disk through the Windows file cache (not counted above)",
+                "{} read from the saved file through the file cache ({counted})",
                 service::memory_text(h.index_mapped_bytes)
             ),
             None,

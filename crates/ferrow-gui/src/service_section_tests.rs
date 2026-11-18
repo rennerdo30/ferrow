@@ -383,7 +383,11 @@ fn memory_in_use_is_the_task_manager_figure_and_the_index_file_is_apart() {
         "400 MB in use, 420 MB private"
     );
     let file = &row(&rows, "Index file").unwrap().1;
-    assert!(file.starts_with("2900 MB read from disk"), "{file}");
+    assert!(
+        file.starts_with("2900 MB read from the saved file"),
+        "{file}"
+    );
+    assert!(file.ends_with("(not counted above)"), "{file}");
     // An older service without these figures: as before, no file row.
     assert!(row(&details(&report(), &scm(Some(2))), "Index file").is_none());
 }
