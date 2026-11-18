@@ -23,6 +23,7 @@ use crate::live::{
     WalkJob, compact_and_publish, index_parts, walk_limits_text,
 };
 use crate::memory::Breakdown;
+use crate::persistence::IndexFile;
 use crate::{Snapshot, SnapshotStore, eventlog};
 
 /// How long changes are collected after the first one of a batch.
@@ -275,7 +276,7 @@ pub fn will_run(options: &WalkOptions) -> bool {
     !options.follow_symlinks && options.roots.iter().any(|r| fast(r))
 }
 
-pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
+pub fn start(store: SnapshotStore, options: WalkOptions, file: Option<IndexFile>) {
     // Without raw volume access (not elevated) there is nothing live to
     // keep; the initial walk stands.
     if !will_run(&options) {
@@ -283,7 +284,7 @@ pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist
     }
     let spawned = std::thread::Builder::new()
         .name("index-live".into())
-        .spawn(move || maintain(store, options, persist));
+        .spawn(move || maintain(store, options, file));
     if let Err(error) = spawned {
         eventlog::error(format!("live updates unavailable: {error}"));
     }
@@ -396,19 +397,48 @@ fn background_pool() -> Option<rayon::ThreadPool> {
         .ok()
 }
 
-/// Saves a new frozen index and maps it back from the file (ADR 0007); see
-/// `persistence::save_and_map`. `None` from it: no index file.
-pub type Persist =
-    Arc<dyn Fn(&ferrow_index::Index) -> Option<std::io::Result<ferrow_index::Index>> + Send + Sync>;
+/// The index file a build may write into: `file`, once its directory is
+/// ready (a failure is logged and the build is made in memory: correct, only
+/// larger).
+fn ready(file: Option<&IndexFile>) -> Option<&IndexFile> {
+    let file = file?;
+    match file.prepare() {
+        Ok(()) => Some(file),
+        Err(error) => {
+            eventlog::warn(format!(
+                "the index directory is not ready ({error}); the new index is built in memory"
+            ));
+            None
+        }
+    }
+}
 
-/// The same index read from its saved file instead of the heap, when
-/// `persist` can save and map it; `None` otherwise (a failure is logged and
-/// the caller keeps its heap index: correct, only larger).
-fn map_saved(
-    index: &ferrow_index::Index,
-    persist: Option<&Persist>,
-) -> Option<ferrow_index::Index> {
-    match persist.and_then(|persist| persist(index))? {
+/// A scan, built straight into the index file when there is one (ADR 0007,
+/// step 8): its private memory is then a fixed working set, not a builder
+/// and a second copy of every column. The index it returns reads the file.
+fn scan_into(
+    options: &WalkOptions,
+    file: Option<&IndexFile>,
+) -> (ferrow_index::Index, ferrow_walk::ScanReport, Vec<VolumeMap>) {
+    match ready(file) {
+        Some(file) => {
+            let out = ferrow_walk::scan_with_maps_to_file(options, &file.target());
+            file.built(&out.1.index_file);
+            out
+        }
+        None => ferrow_walk::scan_with_maps(options),
+    }
+}
+
+/// The same index read from its saved file instead of the heap, when `file`
+/// can save and map it; `None` otherwise (a failure is logged and the caller
+/// keeps its heap index: correct, only larger). For an index that could not be
+/// built into the file.
+fn map_saved(index: &ferrow_index::Index, file: Option<&IndexFile>) -> Option<ferrow_index::Index> {
+    if index.is_mapped() {
+        return None;
+    }
+    match file.and_then(|file| file.save_and_map(index))? {
         Ok(mapped) => Some(mapped),
         Err(error) => {
             eventlog::warn(format!(
@@ -419,7 +449,7 @@ fn map_saved(
     }
 }
 
-fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
+fn maintain(store: SnapshotStore, options: WalkOptions, file: Option<IndexFile>) {
     let (tx, rx) = channel::<Message>();
     *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let mut readers: HashMap<String, ()> = HashMap::new();
@@ -433,7 +463,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
         STATE.scan_started();
         STATE.count_scan(&reason);
         let started = Instant::now();
-        let scan = || ferrow_walk::scan_with_maps(&options);
+        let scan = || scan_into(&options, file.as_ref());
         let (index, report, maps) = match (&pool, background) {
             (Some(pool), true) => {
                 // This thread runs the MFT reads; live batches after the
@@ -452,9 +482,10 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             STATE.scan_failed();
             return;
         }
-        // Saved and mapped before it is published: the heap copy goes now,
-        // and the file is the one the next start loads.
-        let base = Arc::new(map_saved(&index, persist.as_ref()).unwrap_or(index));
+        // Built in its file and mapped before it is published (or, when that
+        // was not possible, saved and mapped now): the file is the one the
+        // next start loads, and no heap copy is kept.
+        let base = Arc::new(map_saved(&index, file.as_ref()).unwrap_or(index));
         let live_volumes: Vec<&VolumeMap> = maps.iter().filter(|m| m.journal.is_some()).collect();
         let summary = format!(
             "{} ({} after {reason}, {:.1} s)",
@@ -578,13 +609,26 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                         &store,
                         report,
                         |live| {
-                            let mut new = match &pool {
-                                Some(pool) => pool.install(|| live.compact()),
+                            // The merged index is built in the index file and
+                            // read from it: no builder, no second copy of the
+                            // columns in the heap.
+                            let build = |live: &mut Live| match ready(file.as_ref()) {
+                                Some(file) => {
+                                    live.compact_into(Some(&file.target()))
+                                        .map(|(new, report)| {
+                                            file.built(&report);
+                                            new
+                                        })
+                                }
                                 None => live.compact(),
+                            };
+                            let mut new = match &pool {
+                                Some(pool) => pool.install(|| build(live)),
+                                None => build(live),
                             }?;
-                            // The merged index replaces the file and is read
-                            // from it, so its heap copy goes at once.
-                            if let Some(mapped) = map_saved(new.base(), persist.as_ref()) {
+                            // Built in memory after all (no index file, or it
+                            // could not be built): saved and mapped now.
+                            if let Some(mapped) = map_saved(new.base(), file.as_ref()) {
                                 new.replace_base(Arc::new(mapped));
                             }
                             Some(new)
@@ -607,7 +651,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                         rescan.compacted(Instant::now(), took);
                         STATE.compaction_done(&why, took);
                         eventlog::info(format!(
-                            "merged the live changes into the index in memory ({why}) in {:.1} s: {} entries, no disk read",
+                            "merged the live changes into the index ({why}) in {:.1} s: {} entries, no disk read",
                             took.as_secs_f64(),
                             base.len()
                         ));

@@ -75,6 +75,93 @@ pub fn save_and_map(
     )
 }
 
+/// The index file as the live maintainer builds it (ADR 0007, step 8): a scan
+/// or a compaction writes its new index straight into the file instead of
+/// building it in the heap and saving it. One writer of the file at a time:
+/// the build holds [`SAVE_LOCK`] while the new file replaces the old one.
+#[derive(Clone)]
+pub struct IndexFile {
+    config: Arc<DaemonConfig>,
+    path: std::path::PathBuf,
+}
+
+impl IndexFile {
+    /// `None` without an index path (a service that does not save).
+    pub fn new(config: &DaemonConfig) -> Option<IndexFile> {
+        Some(IndexFile {
+            path: config.index_path.clone()?,
+            config: Arc::new(config.clone()),
+        })
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Make the state directory ready for a build that writes beside the index
+    /// (its temporary file and the spilled shards): created, and protected as
+    /// a save protects it.
+    pub fn prepare(&self) -> io::Result<()> {
+        prepare_state(&self.config)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    }
+
+    /// Where a build puts its index, replacing the file under [`SAVE_LOCK`].
+    pub fn target(&self) -> ferrow_index::FileTarget<'_> {
+        ferrow_index::FileTarget {
+            path: &self.path,
+            lock: Some(&SAVE_LOCK),
+        }
+    }
+
+    /// Report a finished build: health and the event log, as a save reports,
+    /// and the protection of the new file. `report` is what the build
+    /// returned; a failed file build or spill is logged, not hidden.
+    pub fn built(&self, report: &ferrow_walk::IndexFileReport) {
+        if let Some(t) = &report.timings {
+            // What a save would have taken: the checksum, the write and the
+            // replacement. The parts before are the build itself.
+            let wrote = t.checksum + t.flush + t.replace;
+            crate::health::STATE.save_done(wrote, None);
+            if let Err(error) = prepare_state(&self.config) {
+                crate::eventlog::warn(format!("could not protect the new index file: {error}"));
+            }
+            crate::eventlog::info(format!("index saved in {:.1} s", wrote.as_secs_f64()));
+            crate::eventlog::info(format!(
+                "index built into its file in {:.1} s ({:.1} s placing entries, {:.1} s folding names, {:.1} s sorting; {:.0} MB spilled while building)",
+                t.total.as_secs_f64(),
+                t.scatter.as_secs_f64(),
+                t.fold.as_secs_f64(),
+                t.sort.as_secs_f64(),
+                t.spilled_bytes as f64 / 1e6,
+            ));
+        }
+        if let Some(error) = &report.error {
+            crate::health::STATE.save_done(Duration::ZERO, Some(error.clone()));
+            crate::eventlog::warn(format!(
+                "could not build the new index in its file ({error}); it was built in memory"
+            ));
+        }
+        if let Some(error) = &report.spill_failure {
+            crate::eventlog::warn(format!(
+                "could not spill the build to disk ({error}); it stayed in memory"
+            ));
+        }
+    }
+
+    /// Save a heap index and map it back from the file (the fallback when a
+    /// build could not go straight into the file); see [`save_and_map`].
+    pub fn save_and_map(
+        &self,
+        index: &ferrow_index::Index,
+    ) -> Option<io::Result<ferrow_index::Index>> {
+        save_and_map(&self.config, index)
+    }
+}
+
 impl Persistence {
     pub fn start(
         config: &DaemonConfig,

@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrow_index::osname::name_to_bytes;
-use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, flags, metadata_timestamp};
+use ferrow_index::{
+    ColumnSet, EntryMetadata, FileFreezeTimings, FileTarget, Index, IndexBuilder, flags,
+    metadata_timestamp,
+};
 
 mod identity;
 pub mod ntfs;
@@ -73,6 +76,22 @@ pub struct ScanReport {
     /// walked instead, with the error the read gave: `(root, error)`.
     pub fast_read_errors: Vec<(PathBuf, String)>,
     pub elapsed: Duration,
+    /// How the index file was built, for [`scan_with_maps_to_file`].
+    pub index_file: IndexFileReport,
+}
+
+/// What building the index straight into its file did (see
+/// [`scan_with_maps_to_file`]); all empty for a scan that builds in the heap.
+#[derive(Debug, Clone, Default)]
+pub struct IndexFileReport {
+    /// The parts of the file build; `None` when the index was not built into
+    /// the file.
+    pub timings: Option<FileFreezeTimings>,
+    /// The first failure to spill a shard to disk: the scan then kept it in
+    /// memory (correct, larger).
+    pub spill_failure: Option<String>,
+    /// The file build failed and the index was built in the heap instead.
+    pub error: Option<String>,
 }
 
 impl ScanReport {
@@ -706,22 +725,48 @@ pub fn scan(options: &WalkOptions) -> (Index, ScanReport) {
 /// [`scan`], also returning the record-to-entry maps of every volume
 /// that was read through its MFT.
 pub fn scan_with_maps(options: &WalkOptions) -> (Index, ScanReport, Vec<VolumeMap>) {
-    scan_inner(options, None)
+    scan_inner(options, None, None)
+}
+
+/// [`scan_with_maps`] that builds the index straight into the file at
+/// `target` (ADR 0007): the scan's shards spill to temporary files beside it
+/// once they hold a fixed budget, and the freeze writes, sorts and checksums
+/// the new file in a memory map, then renames it over the destination. The
+/// returned index reads that file, so the scan's private memory is a fixed
+/// working set plus the record maps, whatever the number of entries. When the
+/// file cannot be built (a full disk) the index is built in the heap
+/// instead and the report says why; either way the result is a complete
+/// index. An index that is not mapped (`Index::is_mapped`) was not written.
+pub fn scan_with_maps_to_file(
+    options: &WalkOptions,
+    target: &FileTarget<'_>,
+) -> (Index, ScanReport, Vec<VolumeMap>) {
+    scan_inner(options, None, Some(target))
 }
 
 /// [`scan`], publishing its progress to `progress` as it runs (read it from
 /// another thread; see [`ScanProgress`]).
 pub fn scan_with_progress(options: &WalkOptions, progress: &ScanProgress) -> (Index, ScanReport) {
-    let (index, report, _) = scan_inner(options, Some(progress));
+    let (index, report, _) = scan_inner(options, Some(progress), None);
     (index, report)
 }
 
 fn scan_inner(
     options: &WalkOptions,
     progress: Option<&ScanProgress>,
+    target: Option<&FileTarget<'_>>,
 ) -> (Index, ScanReport, Vec<VolumeMap>) {
     let started = Instant::now();
-    let builder = IndexBuilder::with_columns(options.columns);
+    let builder = match target {
+        Some(target) => {
+            let dir = match target.path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => Path::new("."),
+            };
+            IndexBuilder::with_spill(options.columns, dir, ferrow_index::DEFAULT_SPILL_BUDGET)
+        }
+        None => IndexBuilder::with_columns(options.columns),
+    };
     let errors = Errors::new();
     let excludes = match resolve_excludes(&options.excludes, &errors) {
         Ok(set) => set,
@@ -739,6 +784,7 @@ fn scan_inner(
                 fatal_error: Some(fatal),
                 fast_read_errors: Vec::new(),
                 elapsed: started.elapsed(),
+                index_file: IndexFileReport::default(),
             };
             return (builder.freeze(), report, Vec::new());
         }
@@ -879,7 +925,14 @@ fn scan_inner(
     });
 
     let entries = builder.len();
-    let index = builder.freeze();
+    let (index, index_file, fatal_error) = match freeze_builder(builder, target) {
+        Ok((index, report)) => (index, report, None),
+        Err(fatal) => (
+            IndexBuilder::with_columns(options.columns).freeze(),
+            IndexFileReport::default(),
+            Some(fatal),
+        ),
+    };
     if modes.is_empty() {
         modes.push("parallel read_dir".to_string());
     }
@@ -889,11 +942,48 @@ fn scan_inner(
         entries,
         errors: errors.count.load(Ordering::Relaxed),
         error_samples: errors.samples.into_inner().expect("error samples poisoned"),
-        fatal_error: None,
+        fatal_error,
         fast_read_errors,
         elapsed: started.elapsed(),
+        index_file,
     };
     (index, report, maps)
+}
+
+/// Freeze a builder: into the index file when there is a target (falling
+/// back to the heap, with the reason in the report, when that fails), else
+/// into the heap. `Err` only when the heap fallback could not read the
+/// builder's spilled shards back either (a failing disk): there is no index.
+pub fn freeze_builder(
+    builder: IndexBuilder,
+    target: Option<&FileTarget<'_>>,
+) -> Result<(Index, IndexFileReport), String> {
+    let Some(target) = target else {
+        return Ok((builder.freeze(), IndexFileReport::default()));
+    };
+    let spill_failure = builder.spill_failure();
+    match builder.freeze_to_file_with(target) {
+        Ok((index, timings)) => Ok((
+            index,
+            IndexFileReport {
+                timings: Some(timings),
+                spill_failure,
+                error: None,
+            },
+        )),
+        Err(failed) => {
+            let report = IndexFileReport {
+                timings: None,
+                spill_failure: spill_failure.or_else(|| failed.builder.spill_failure()),
+                error: Some(failed.error.to_string()),
+            };
+            failed
+                .builder
+                .freeze_checked()
+                .map(|(index, _)| (index, report))
+                .map_err(|e| format!("the index could not be built: {e}"))
+        }
+    }
 }
 
 /// Fill every root on a readable NTFS volume from its MFT (one read per
