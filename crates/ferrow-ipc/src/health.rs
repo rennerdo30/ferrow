@@ -52,6 +52,13 @@ pub struct Health {
     /// `working_set` and `None` for private bytes.
     pub working_set: u64,
     pub private_bytes: Option<u64>,
+    /// Windows: the private part of the working set, which Task Manager's
+    /// Memory column shows. `None` on other platforms and older services.
+    pub private_working_set: Option<u64>,
+    /// Bytes of the saved index file the service reads through a memory map
+    /// (ADR 0007): the operating system's file cache, shared and
+    /// reclaimable, in `working_set` while resident but not private.
+    pub index_mapped_bytes: u64,
     /// Entries a search can return.
     pub entries: u64,
     /// The snapshot's mode label (`live`, `walk`, `indexing`, `empty`, …).

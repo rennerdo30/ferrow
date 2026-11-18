@@ -1,5 +1,7 @@
 //! Packed optional metadata, exact overflows and background sort preparation.
 use crate::LoadError;
+use crate::store::Col;
+use memmap2::Mmap;
 use std::cmp::Ordering;
 use std::sync::{
     Arc, Condvar, Mutex, OnceLock,
@@ -243,8 +245,8 @@ impl Value for u32 {
 }
 #[derive(Debug)]
 struct Column<T> {
-    packed: Vec<u8>,
-    valid: Vec<u8>,
+    packed: Col<u8>,
+    valid: Col<u8>,
     overflow_ids: Vec<u32>,
     overflow_values: Vec<T>,
     order: OnceLock<PackedIds>,
@@ -451,8 +453,8 @@ impl<T: Value> Column<T> {
     /// An all-absent column of `n` entries, filled by [`Column::scatter`].
     fn with_len(n: usize) -> Self {
         Self {
-            packed: vec![0; n * T::WIDTH],
-            valid: vec![0; n.div_ceil(8)],
+            packed: vec![0; n * T::WIDTH].into(),
+            valid: vec![0; n.div_ceil(8)].into(),
             overflow_ids: Vec::new(),
             overflow_values: Vec::new(),
             order: OnceLock::new(),
@@ -462,12 +464,14 @@ impl<T: Value> Column<T> {
     /// Place a shard's values at their entry ids (`ids[k]` is the entry the
     /// shard's k-th value belongs to).
     fn scatter(&mut self, part: &ShardColumn<T>, ids: &[u32]) {
+        let mut packed = self.packed.owned_mut();
+        let mut valid = self.valid.owned_mut();
         for (k, &id) in ids.iter().enumerate() {
             let i = id as usize;
-            self.packed[i * T::WIDTH..(i + 1) * T::WIDTH]
+            packed[i * T::WIDTH..(i + 1) * T::WIDTH]
                 .copy_from_slice(&part.packed[k * T::WIDTH..(k + 1) * T::WIDTH]);
             if part.valid[k / 8] & (1 << (k % 8)) != 0 {
-                self.valid[i / 8] |= 1 << (i % 8);
+                valid[i / 8] |= 1 << (i % 8);
             }
         }
         for &(k, value) in &part.overflow {
@@ -518,20 +522,20 @@ impl<T: Value> Column<T> {
         }
     }
     #[cfg(test)]
-    fn request(self: &Arc<Self>, names: Arc<Vec<u32>>) -> SortStatus {
+    fn request(self: &Arc<Self>, names: Arc<Col<u32>>) -> SortStatus {
         self.request_using(names, || {})
     }
     #[cfg(any(test, feature = "test-hooks"))]
     fn request_using(
         self: &Arc<Self>,
-        names: Arc<Vec<u32>>,
+        names: Arc<Col<u32>>,
         before: impl FnOnce() + Send + 'static,
     ) -> SortStatus {
         self.request_for(names, None, before)
     }
     fn request_for(
         self: &Arc<Self>,
-        names: Arc<Vec<u32>>,
+        names: Arc<Col<u32>>,
         cancel: Option<Arc<AtomicBool>>,
         before: impl FnOnce() + Send + 'static,
     ) -> SortStatus {
@@ -652,8 +656,8 @@ impl<T: Value> Column<T> {
     /// prepared) and the fixed objects.
     fn heap_parts(&self) -> [(&'static str, usize); 5] {
         [
-            ("values", self.packed.capacity()),
-            ("validity", self.valid.capacity()),
+            ("values", self.packed.heap_bytes()),
+            ("validity", self.valid.heap_bytes()),
             (
                 "overflow",
                 self.overflow_ids.capacity() * 4 + self.overflow_values.capacity() * T::RAW,
@@ -674,27 +678,57 @@ impl<T: Value> Column<T> {
             ),
         ]
     }
+    fn mapped_bytes(&self) -> usize {
+        self.packed.mapped_bytes() + self.valid.mapped_bytes()
+    }
     fn serialized_len(&self) -> usize {
         4 + self.packed.len() + self.valid.len() + self.overflow_ids.len() * (4 + T::RAW)
     }
-    fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(self.overflow_ids.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.packed);
-        out.extend_from_slice(&self.valid);
+    fn write(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        out.write_all(&(self.overflow_ids.len() as u32).to_le_bytes())?;
+        out.write_all(&self.packed)?;
+        out.write_all(&self.valid)?;
+        let mut small = Vec::with_capacity(4096);
         for id in &self.overflow_ids {
-            out.extend_from_slice(&id.to_le_bytes());
+            small.extend_from_slice(&id.to_le_bytes());
+            if small.len() >= 4096 - 8 {
+                out.write_all(&small)?;
+                small.clear();
+            }
         }
         for value in &self.overflow_values {
-            value.write(out);
+            value.write(&mut small);
+            if small.len() >= 4096 - 16 {
+                out.write_all(&small)?;
+                small.clear();
+            }
         }
+        out.write_all(&small)
     }
-    fn read(data: &[u8], at: &mut usize, n: usize) -> Result<Arc<Self>, LoadError> {
+    /// Read one column from `data` at `at`. With `map` (whose bytes `data`
+    /// is), the packed values and the validity bitmap stay in the map.
+    fn read(
+        data: &[u8],
+        at: &mut usize,
+        n: usize,
+        map: Option<&Arc<Mmap>>,
+    ) -> Result<Arc<Self>, LoadError> {
         let k = u32::from_le_bytes(take(data, at, 4)?.try_into().expect("checked width")) as usize;
         if k > n {
             return Err(LoadError::Corrupt("too many metadata overflows"));
         }
-        let packed = take(data, at, n * T::WIDTH)?.to_vec();
-        let valid = take(data, at, n.div_ceil(8))?.to_vec();
+        let section = |at: &mut usize, len: usize| -> Result<Col<u8>, LoadError> {
+            let start = *at;
+            let bytes = take(data, at, len)?;
+            Ok(match map {
+                Some(map) => {
+                    Col::mapped(map, start, len).ok_or(LoadError::Corrupt("misaligned section"))?
+                }
+                None => bytes.to_vec().into(),
+            })
+        };
+        let packed = section(at, n * T::WIDTH)?;
+        let valid = section(at, n.div_ceil(8))?;
         let overflow_ids: Vec<_> = take(data, at, k * 4)?
             .as_chunks::<4>()
             .0
@@ -767,7 +801,7 @@ impl MetadataColumns {
     pub(crate) fn request_with_hook(
         &self,
         key: SortKey,
-        names: Arc<Vec<u32>>,
+        names: Arc<Col<u32>>,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> SortStatus {
         match key {
@@ -793,7 +827,7 @@ impl MetadataColumns {
     pub(crate) fn request_starting(
         &self,
         key: SortKey,
-        names: Arc<Vec<u32>>,
+        names: Arc<Col<u32>>,
         start: impl FnOnce() + Send + 'static,
     ) -> SortStatus {
         match key {
@@ -845,7 +879,7 @@ impl MetadataColumns {
     pub(crate) fn request(
         &self,
         key: SortKey,
-        names: Arc<Vec<u32>>,
+        names: Arc<Col<u32>>,
         cancel: Option<Arc<AtomicBool>>,
     ) -> SortStatus {
         match key {
@@ -943,6 +977,15 @@ impl MetadataColumns {
                 .map(|c| c.heap_bytes())
                 .sum::<usize>()
     }
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.size.as_ref().map_or(0, |c| c.mapped_bytes())
+            + self.attributes.as_ref().map_or(0, |c| c.mapped_bytes())
+            + [&self.modified, &self.created, &self.accessed]
+                .into_iter()
+                .flatten()
+                .map(|c| c.mapped_bytes())
+                .sum::<usize>()
+    }
     pub(crate) fn serialized_len(&self) -> usize {
         self.size.as_ref().map_or(0, |c| c.serialized_len())
             + self.attributes.as_ref().map_or(0, |c| c.serialized_len())
@@ -952,49 +995,53 @@ impl MetadataColumns {
                 .map(|c| c.serialized_len())
                 .sum::<usize>()
     }
-    pub(crate) fn write(&self, out: &mut Vec<u8>) {
+    pub(crate) fn write(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
         if let Some(c) = &self.size {
-            c.write(out);
+            c.write(out)?;
         }
         for c in [&self.modified, &self.created, &self.accessed]
             .into_iter()
             .flatten()
         {
-            c.write(out);
+            c.write(out)?;
         }
         if let Some(c) = &self.attributes {
-            c.write(out);
+            c.write(out)?;
         }
+        Ok(())
     }
+    /// Read the present columns from `data` at `at`; with `map` (whose
+    /// bytes `data` is) their values stay in the map.
     pub(crate) fn read(
         data: &[u8],
         at: &mut usize,
         n: usize,
         set: ColumnSet,
+        map: Option<&Arc<Mmap>>,
     ) -> Result<Self, LoadError> {
         Ok(Self {
             size: if set.contains(ColumnSet::SIZE) {
-                Some(Column::read(data, at, n)?)
+                Some(Column::read(data, at, n, map)?)
             } else {
                 None
             },
             modified: if set.contains(ColumnSet::MODIFIED) {
-                Some(Column::read(data, at, n)?)
+                Some(Column::read(data, at, n, map)?)
             } else {
                 None
             },
             created: if set.contains(ColumnSet::CREATED) {
-                Some(Column::read(data, at, n)?)
+                Some(Column::read(data, at, n, map)?)
             } else {
                 None
             },
             accessed: if set.contains(ColumnSet::ACCESSED) {
-                Some(Column::read(data, at, n)?)
+                Some(Column::read(data, at, n, map)?)
             } else {
                 None
             },
             attributes: if set.contains(ColumnSet::ATTRIBUTES) {
-                Some(Column::read(data, at, n)?)
+                Some(Column::read(data, at, n, map)?)
             } else {
                 None
             },
@@ -1125,7 +1172,7 @@ mod tests {
             assert_eq!(ids, expected, "len={len}");
             assert_eq!(scratch.capacity(), len / 2);
         }
-        let mut ids = (*index.sorted).clone();
+        let mut ids = index.sorted.to_vec();
         let mut calls = 0;
         let result = column.sort_ids(&mut ids, &mut Vec::new(), &mut || {
             calls += 1;
@@ -1306,13 +1353,13 @@ mod tests {
     #[test]
     fn failed_preparation_is_explicit_and_not_retried() {
         let column = Arc::new(Column::<u64>::with_len(0));
-        column.request_using(Arc::new(Vec::new()), || panic!("mock sort failure"));
+        column.request_using(Arc::new(Col::default()), || panic!("mock sort failure"));
         let ticket = SortTicket(column.signal.clone());
         assert_eq!(
             ticket.wait_timeout(Duration::from_secs(2)),
             SortStatus::Failed
         );
-        assert_eq!(column.request(Arc::new(Vec::new())), SortStatus::Failed);
+        assert_eq!(column.request(Arc::new(Col::default())), SortStatus::Failed);
         assert!(column.order.get().is_none());
     }
 }

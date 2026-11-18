@@ -367,3 +367,27 @@ fn a_live_volume_that_could_not_re_check_its_journal_shows_the_warning() {
     };
     assert_eq!(volume_lines(&clean).1, Level::Good);
 }
+
+#[test]
+fn memory_in_use_is_the_task_manager_figure_and_the_index_file_is_apart() {
+    let mut h = report();
+    // A service that maps its index: the working set holds the resident
+    // file pages, the private working set does not.
+    h.working_set = 3_000 << 20;
+    h.private_working_set = Some(400 << 20);
+    h.private_bytes = Some(420 << 20);
+    h.index_mapped_bytes = 2_900 << 20;
+    let rows = details(&h, &scm(Some(2)));
+    assert_eq!(
+        row(&rows, "Memory").unwrap().1,
+        "400 MB in use, 420 MB private"
+    );
+    let file = &row(&rows, "Index file").unwrap().1;
+    assert!(
+        file.starts_with("2900 MB read from the saved file"),
+        "{file}"
+    );
+    assert!(file.ends_with("(not counted above)"), "{file}");
+    // An older service without these figures: as before, no file row.
+    assert!(row(&details(&report(), &scm(Some(2))), "Index file").is_none());
+}

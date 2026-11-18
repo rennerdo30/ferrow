@@ -330,6 +330,7 @@ impl State {
             None => (now, 0),
         };
         let (working_set, private_bytes) = memory();
+        let private_working_set = private_working_set();
         // The ring has a lock of its own: read it before taking this state's.
         let events = eventlog::to_info(eventlog::global().recent(MAX_EVENTS));
         let inner = self.lock();
@@ -355,6 +356,8 @@ impl State {
             uptime_s,
             working_set,
             private_bytes,
+            private_working_set,
+            index_mapped_bytes: snapshot.index.mapped_bytes() as u64,
             entries: snapshot.entries() as u64,
             mode: snapshot.mode.clone(),
             access: policy.mode.as_str().into(),
@@ -444,6 +447,38 @@ pub fn answer(
             code: ErrorCode::BadRequest,
             msg: "not a health request".into(),
         }],
+    }
+}
+
+/// The private part of this process's working set (Windows 10 1809 and
+/// later; what Task Manager's Memory column shows): pages of the mapped
+/// index file are in the working set but not in this figure.
+pub fn private_working_set() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: all-zero is a valid PROCESS_MEMORY_COUNTERS_EX2 (integers).
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX2 = unsafe { std::mem::zeroed() };
+        counters.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        // SAFETY: the pseudo handle of this process and a correctly sized,
+        // writable PROCESS_MEMORY_COUNTERS_EX2 (its layout begins with the
+        // PROCESS_MEMORY_COUNTERS fields, as the API documents). An older
+        // Windows rejects the size and the call fails.
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+                counters.cb,
+            )
+        };
+        (ok != 0).then_some(counters.PrivateWorkingSetSize as u64)
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 

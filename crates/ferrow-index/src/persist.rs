@@ -5,7 +5,7 @@
 //! | Field | Type | Notes |
 //! |---|---|---|
 //! | magic | `[u8; 8]` | `FERROWID` |
-//! | version | `u32` | writes 3; reads core v1 and v3 |
+//! | version | `u32` | writes 4; reads core v1, v3 and v4 |
 //! | entry_count | `u32` | |
 //! | arena_len | `u32` | both arenas have this length |
 //! | checksum | `u32` | CRC-32 (IEEE) over everything after this field |
@@ -17,10 +17,17 @@
 //! | flags | `u16` × n | |
 //! | arena | `u8` × arena_len | |
 //! | folded_arena | `u8` × arena_len | |
+//! | pad | 0 or 2 zero bytes | v4: `sorted` starts 4-byte aligned |
 //! | sorted | `u32` × n | |
+//! | metadata | metadata_len bytes | v3/v4 |
 //!
-//! Loading reads the header, checks the file length against it, then
-//! reads each section sequentially straight into its column (v3; v1 files
+//! Version 4 differs from version 3 only by that padding, so every `u32`
+//! and `u16` column is aligned in the file: a v4 file at a path is
+//! memory-mapped and its columns are read in place (ADR 0007). It is still
+//! fully checked first (length, checksum, every offset).
+//!
+//! Loading a v3 file reads the header, checks the file length against it,
+//! then reads each section sequentially straight into its column (v1 files
 //! go through one buffer), checks the checksum, validates every offset and
 //! never panics on bad input.
 
@@ -34,10 +41,11 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::metadata::MetadataColumns;
+use crate::store::Col;
 use crate::{ColumnSet, Index, OwnedColumns, ROOT_PARENT, fold_name};
 
 pub const MAGIC: [u8; 8] = *b"FERROWID";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 const HEADER_LEN: usize = 32;
 const CHECKSUM_START: usize = 24;
 /// Sane ceiling for one index file (16 GiB). A header claiming more is
@@ -45,6 +53,7 @@ const CHECKSUM_START: usize = 24;
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 struct Header {
+    version: u32,
     header_len: usize,
     metadata_len: u32,
     columns: ColumnSet,
@@ -55,8 +64,19 @@ struct Header {
 
 /// Exact total file length for the given counts, in `u64` so the math is
 /// overflow-free on 32-bit targets too.
-fn expected_len(n: u32, arena: u32, metadata: u32, header: usize) -> u64 {
-    header as u64 + n as u64 * 16 + arena as u64 * 2 + metadata as u64
+fn expected_len(n: u32, arena: u32, metadata: u32, header: usize, version: u32) -> u64 {
+    header as u64 + n as u64 * 16 + arena as u64 * 2 + sorted_pad(arena, version) + metadata as u64
+}
+
+/// The zero bytes before `sorted` (v4): the sections before it are the
+/// 32-byte header, 12 bytes per entry and the two arenas, so only the
+/// arenas can leave it 2 bytes off a 4-byte boundary.
+fn sorted_pad(arena: u32, version: u32) -> u64 {
+    if version >= 4 {
+        (arena as u64 * 2) % 4
+    } else {
+        0
+    }
 }
 
 fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
@@ -71,7 +91,7 @@ fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
     }
     let at = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().expect("bounded header"));
     let version = at(8);
-    if version != 1 && version != VERSION {
+    if version != 1 && version != 3 && version != VERSION {
         return Err(LoadError::UnsupportedVersion(version));
     }
     let header_len = if version == 1 { 24 } else { HEADER_LEN };
@@ -85,6 +105,7 @@ fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
     };
     let metadata_len = if version == 1 { 0 } else { at(28) };
     let header = Header {
+        version,
         header_len,
         metadata_len,
         columns,
@@ -104,6 +125,7 @@ fn parse_header(data: &[u8]) -> Result<Header, LoadError> {
         header.arena_len,
         metadata_len,
         header_len,
+        version,
     ) > MAX_INDEX_BYTES
     {
         return Err(LoadError::Corrupt("index size exceeds limit"));
@@ -145,7 +167,7 @@ impl fmt::Display for LoadError {
             LoadError::UnsupportedVersion(v) => {
                 write!(
                     f,
-                    "unsupported index version {v} (this build reads 1 and {VERSION}); rebuild the index"
+                    "unsupported index version {v} (this build reads 1, 3 and {VERSION}); rebuild the index"
                 )
             }
             LoadError::Truncated => write!(f, "index file is truncated"),
@@ -170,61 +192,174 @@ pub(crate) fn serialized_len(index: &Index) -> Result<usize, SaveError> {
     let arena32 = u32::try_from(c.arena.len()).map_err(|_| SaveError::TooLarge("name arena"))?;
     let metadata_len = u32::try_from(index.metadata.serialized_len())
         .map_err(|_| SaveError::TooLarge("metadata columns"))?;
-    usize::try_from(expected_len(n32, arena32, metadata_len, HEADER_LEN))
-        .map_err(|_| SaveError::TooLarge("metadata columns"))
+    usize::try_from(expected_len(
+        n32,
+        arena32,
+        metadata_len,
+        HEADER_LEN,
+        VERSION,
+    ))
+    .map_err(|_| SaveError::TooLarge("metadata columns"))
 }
 
 pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
+    save_with_checksum(index, path).map(|_| ())
+}
+
+/// Save `index` to `path` and map the file back without checking it again
+/// (ADR 0007): this process just wrote it, so the header, the length and the
+/// checksum field are compared with what was written, and the columns are
+/// read in place. A full load would read the whole file once more (seconds
+/// for gigabytes, on every core) after every scan and merge.
+pub(crate) fn save_and_map(index: &Index, path: &Path) -> Result<Index, SaveError> {
+    let sum = save_with_checksum(index, path)?;
+    let not_ours = || {
+        SaveError::Io(std::io::Error::other(
+            "the saved index changed before it was mapped",
+        ))
+    };
+    let map = crate::store::map_file(path).map_err(SaveError::Io)?;
+    let header = parse_header(&map).map_err(|_| not_ours())?;
+    let expected = serialized_len(index)? as u64;
+    if header.version != VERSION
+        || header.checksum != sum
+        || map.len() as u64 != expected
+        || header.entry_count as usize != index.len()
+    {
+        return Err(not_ours());
+    }
+    from_bytes_with(
+        &map,
+        Some(&map),
+        Check::Trusted,
+        &mut LoadTimings::default(),
+    )
+    .map_err(|_| not_ours())
+}
+
+/// How much of a file [`from_bytes_with`] checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Everything: checksum, structure and derived data.
+    Full,
+    /// Lengths and alignment only: a file this process just wrote and
+    /// whose checksum field it compared.
+    Trusted,
+}
+
+fn save_with_checksum(index: &Index, path: &Path) -> Result<u32, SaveError> {
     let c = index.columns();
     let n = c.parent.len();
     let n32 = u32::try_from(n).map_err(|_| SaveError::TooLarge("entry count"))?;
     let arena32 = u32::try_from(c.arena.len()).map_err(|_| SaveError::TooLarge("name arena"))?;
-
     let metadata_len = u32::try_from(index.metadata.serialized_len())
         .map_err(|_| SaveError::TooLarge("metadata columns"))?;
-    let payload_len = serialized_len(index)? - HEADER_LEN;
-    let mut buf = Vec::with_capacity(HEADER_LEN + payload_len);
-    buf.extend_from_slice(&MAGIC);
-    buf.extend_from_slice(&VERSION.to_le_bytes());
-    buf.extend_from_slice(&n32.to_le_bytes());
-    buf.extend_from_slice(&arena32.to_le_bytes());
-    let checksum_at = buf.len();
-    buf.extend_from_slice(&0u32.to_le_bytes()); // patched below
-    buf.extend_from_slice(&index.columns_present().bits().to_le_bytes());
-    buf.extend_from_slice(&metadata_len.to_le_bytes());
+    let total = serialized_len(index)? as u64;
 
-    for v in c.parent {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in c.name_off {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in c.name_len {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in c.flags {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    buf.extend_from_slice(c.arena);
-    buf.extend_from_slice(c.folded_arena);
-    for v in c.sorted {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
+    // Streamed through a small buffer: a save holds no copy of the index
+    // (it used to fill one buffer the size of the file first).
+    let mut checksum = 0;
+    write_atomically(path, |file| {
+        let mut out = CrcWriter::new(std::io::BufWriter::with_capacity(SAVE_BUFFER, file));
+        out.write_raw(&MAGIC)?;
+        out.write_raw(&VERSION.to_le_bytes())?;
+        out.write_raw(&n32.to_le_bytes())?;
+        out.write_raw(&arena32.to_le_bytes())?;
+        out.write_raw(&0u32.to_le_bytes())?; // checksum, patched below
+        out.write_all(&index.columns_present().bits().to_le_bytes())?;
+        out.write_all(&metadata_len.to_le_bytes())?;
+        write_le(&mut out, c.parent, u32::to_le_bytes)?;
+        write_le(&mut out, c.name_off, u32::to_le_bytes)?;
+        write_le(&mut out, c.name_len, u16::to_le_bytes)?;
+        write_le(&mut out, c.flags, u16::to_le_bytes)?;
+        out.write_all(c.arena)?;
+        out.write_all(c.folded_arena)?;
+        out.write_all(&[0u8; 2][..sorted_pad(arena32, VERSION) as usize])?;
+        write_le(&mut out, c.sorted, u32::to_le_bytes)?;
+        index.metadata.write(&mut out)?;
+        if out.written != total {
+            return Err(std::io::Error::other("index size changed while saving"));
+        }
+        let sum = out.crc.finalize();
+        checksum = sum;
+        let mut file = out.inner.into_inner().map_err(|e| e.into_error())?;
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(20))?;
+        file.write_all(&sum.to_le_bytes())?;
+        Ok(file)
+    })
+    .map_err(SaveError::Io)?;
+    Ok(checksum)
+}
 
-    index.metadata.write(&mut buf);
-    let sum = crc32(&buf[CHECKSUM_START..]);
-    buf[checksum_at..checksum_at + 4].copy_from_slice(&sum.to_le_bytes());
+/// The save's write buffer.
+const SAVE_BUFFER: usize = 1 << 20;
 
-    write_atomically(path, &buf).map_err(SaveError::Io)
+/// Counts what is written and checksums everything after the checksum
+/// field (the bytes written with [`CrcWriter::write_raw`] are before it).
+struct CrcWriter<W> {
+    inner: W,
+    crc: crc32fast::Hasher,
+    written: u64,
+}
+
+impl<W: Write> CrcWriter<W> {
+    fn new(inner: W) -> Self {
+        CrcWriter {
+            inner,
+            crc: crc32fast::Hasher::new(),
+            written: 0,
+        }
+    }
+    fn write_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for CrcWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        self.crc.update(&bytes[..n]);
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write `values` little-endian in batches (no per-value write call).
+fn write_le<T: Copy, const N: usize>(
+    out: &mut impl Write,
+    values: &[T],
+    to_le: fn(T) -> [u8; N],
+) -> std::io::Result<()> {
+    let mut batch = Vec::with_capacity(8192 * N);
+    for chunk in values.chunks(8192) {
+        batch.clear();
+        for &v in chunk {
+            batch.extend_from_slice(&to_le(v));
+        }
+        out.write_all(&batch)?;
+    }
+    Ok(())
 }
 
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Write `bytes` to `path` atomically: a unique temp file is created
-/// exclusively beside the destination, written and synced, then renamed
-/// over the destination. The temp file is removed on any error. On Unix
-/// the temp file is mode 0600, so the replaced index stays private.
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write `path` atomically: a unique temp file is created exclusively
+/// beside the destination, filled by `fill` (which hands the file back),
+/// synced, then renamed over the destination. The temp file is removed on
+/// any error. On Unix the temp file is mode 0600, so the replaced index
+/// stays private. A destination that is memory-mapped (opened with delete
+/// sharing, see `store::map_file`) is replaced too; its map keeps the old
+/// contents.
+fn write_atomically(
+    path: &Path,
+    fill: impl FnOnce(std::fs::File) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => std::path::PathBuf::from("."),
@@ -247,13 +382,13 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = match opts.open(&tmp) {
+        let file = match opts.open(&tmp) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
         let written = (|| -> std::io::Result<()> {
-            file.write_all(bytes)?;
+            let file = fill(file)?;
             file.sync_all()?;
             drop(file);
             std::fs::rename(&tmp, path)
@@ -372,6 +507,9 @@ pub enum MetadataLoad {
     SerialReopenMismatch,
     /// Serial: the operating system refused to start the metadata thread.
     SerialSpawnFailed,
+    /// Version 4: the whole file is memory-mapped; nothing is read into
+    /// the heap.
+    Mapped,
 }
 
 impl MetadataLoad {
@@ -386,6 +524,7 @@ impl MetadataLoad {
             Self::SerialReopenFailed => "serial-reopen-failed",
             Self::SerialReopenMismatch => "serial-reopen-mismatch",
             Self::SerialSpawnFailed => "serial-spawn-failed",
+            Self::Mapped => "mapped",
         }
     }
 }
@@ -414,6 +553,25 @@ pub(crate) fn load_with_timings(path: &Path) -> Result<(Index, LoadTimings), Loa
     let started = Instant::now();
     let mut file = std::fs::File::open(path).map_err(LoadError::Io)?;
     let file_len = file.metadata().map_err(LoadError::Io)?.len();
+    if file_len >= HEADER_LEN as u64 {
+        let mut head = [0u8; HEADER_LEN];
+        use std::io::{Read, Seek};
+        file.read_exact(&mut head).map_err(LoadError::Io)?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(LoadError::Io)?;
+        if parse_header(&head)?.version >= 4 {
+            match load_mapped(path) {
+                Ok((index, mut timings)) => {
+                    timings.total = started.elapsed();
+                    return Ok((index, timings));
+                }
+                // The file cannot be mapped (no address space, a file
+                // system that refuses): read it into the heap instead.
+                Err(LoadError::Io(_)) => {}
+                Err(other) => return Err(other),
+            }
+        }
+    }
     let (index, mut timings) = load_from(&mut file, file_len, &Overlap::new(Some(path)))?;
     drop(file);
     // Include open/metadata, temporary payload disposal and file close in
@@ -450,6 +608,7 @@ fn load_from<R: std::io::Read>(
         header.arena_len,
         header.metadata_len,
         header.header_len,
+        header.version,
     );
     if file_len < expected {
         return Err(LoadError::Truncated);
@@ -458,7 +617,7 @@ fn load_from<R: std::io::Read>(
         return Err(LoadError::Corrupt("unexpected trailing bytes"));
     }
     let total = usize::try_from(expected).map_err(|_| LoadError::Corrupt("size overflow"))?;
-    if header.header_len == HEADER_LEN && head_len == HEADER_LEN {
+    if header.version == 3 && head_len == HEADER_LEN {
         // v3: read every section straight into its final column.
         let index = stream_sections(reader, &data, &header, expected, overlap, &mut timings)?;
         timings.total = started.elapsed();
@@ -718,7 +877,7 @@ fn read_metadata(
     timings.metadata_checksum = timings.checksum;
     let t = Instant::now();
     let mut at = 0;
-    let columns = MetadataColumns::read(&bytes, &mut at, n, set).and_then(|columns| {
+    let columns = MetadataColumns::read(&bytes, &mut at, n, set, None).and_then(|columns| {
         if at == bytes.len() {
             Ok(columns)
         } else {
@@ -791,6 +950,7 @@ fn stream_sections<R: std::io::Read>(
     let arena_len = header.arena_len as usize;
     let metadata_len = header.metadata_len as usize;
     let metadata_at = expected - u64::from(header.metadata_len);
+    debug_assert_eq!(header.version, 3, "v4 files are mapped or read whole");
     debug_assert_eq!(
         metadata_at,
         HEADER_LEN as u64 + n as u64 * 16 + arena_len as u64 * 2
@@ -901,7 +1061,7 @@ fn stream_sections<R: std::io::Read>(
                     let bytes = serial.unwrap_or_default();
                     let t = Instant::now();
                     let mut at = 0;
-                    let metadata = MetadataColumns::read(&bytes, &mut at, n, header.columns)?;
+                    let metadata = MetadataColumns::read(&bytes, &mut at, n, header.columns, None)?;
                     if at != bytes.len() {
                         return Err(LoadError::Corrupt("unexpected metadata bytes"));
                     }
@@ -912,13 +1072,13 @@ fn stream_sections<R: std::io::Read>(
                 }
             };
             Ok(Parts {
-                parent,
-                name_off,
-                name_len,
-                flags,
-                arena,
-                folded_arena,
-                sorted,
+                parent: parent.into(),
+                name_off: name_off.into(),
+                name_len: name_len.into(),
+                flags: flags.into(),
+                arena: arena.into(),
+                folded_arena: folded_arena.into(),
+                sorted: sorted.into(),
                 metadata,
             })
         })();
@@ -934,13 +1094,13 @@ fn stream_sections<R: std::io::Read>(
 
 /// Decoded sections, not yet validated.
 struct Parts {
-    parent: Vec<u32>,
-    name_off: Vec<u32>,
-    name_len: Vec<u16>,
-    flags: Vec<u16>,
-    arena: Vec<u8>,
-    folded_arena: Vec<u8>,
-    sorted: Vec<u32>,
+    parent: Col<u32>,
+    name_off: Col<u32>,
+    name_len: Col<u16>,
+    flags: Col<u16>,
+    arena: Col<u8>,
+    folded_arena: Col<u8>,
+    sorted: Col<u32>,
     metadata: MetadataColumns,
 }
 
@@ -950,7 +1110,35 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
 }
 
 fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, LoadError> {
+    from_bytes_with(data, None, Check::Full, timings)
+}
+
+/// Map a v4 file and check it as [`from_bytes`] checks bytes; the columns
+/// stay in the map (no copy into the heap).
+fn load_mapped(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
+    let mut timings = LoadTimings::default();
+    let t = Instant::now();
+    let map = crate::store::map_file(path).map_err(LoadError::Io)?;
+    timings.read += t.elapsed();
+    let index = from_bytes_with(&map, Some(&map), Check::Full, &mut timings)?;
+    timings.metadata_load = if index.columns_present().bits() == 0 {
+        MetadataLoad::Absent
+    } else {
+        MetadataLoad::Mapped
+    };
+    Ok((index, timings))
+}
+
+/// Parse an index from `data`. With `map` (whose bytes `data` is, v4), the
+/// columns are slices of the map instead of copies.
+fn from_bytes_with(
+    data: &[u8],
+    map: Option<&std::sync::Arc<memmap2::Mmap>>,
+    check: Check,
+    timings: &mut LoadTimings,
+) -> Result<Index, LoadError> {
     let header = parse_header(data)?;
+    let map = map.filter(|_| header.version >= 4);
     let n = header.entry_count as usize;
     let arena_len = header.arena_len as usize;
     let expected = expected_len(
@@ -958,6 +1146,7 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
         header.arena_len,
         header.metadata_len,
         header.header_len,
+        header.version,
     );
     if (data.len() as u64) < expected {
         return Err(LoadError::Truncated);
@@ -970,40 +1159,79 @@ fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, Loa
     } else {
         MetadataLoad::SerialReader
     };
-    let t = Instant::now();
-    let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
-    timings.checksum += t.elapsed();
-    if !sum_ok {
-        return Err(LoadError::ChecksumMismatch);
+    if check == Check::Full {
+        let t = Instant::now();
+        let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
+        timings.checksum += t.elapsed();
+        if !sum_ok {
+            return Err(LoadError::ChecksumMismatch);
+        }
     }
 
     let t = Instant::now();
     let mut at = header.header_len;
-    let parent = read_u32s(data, &mut at, n)?;
-    let name_off = read_u32s(data, &mut at, n)?;
-    let name_len = read_u16s(data, &mut at, n)?;
-    let ent_flags = read_u16s(data, &mut at, n)?;
-    let arena = take(data, &mut at, arena_len)?.to_vec();
-    let folded_arena = take(data, &mut at, arena_len)?.to_vec();
-    let sorted = read_u32s(data, &mut at, n)?;
-    let metadata = MetadataColumns::read(data, &mut at, n, header.columns)?;
+    let (parent, name_off, name_len, ent_flags, arena, folded_arena, sorted);
+    match map {
+        Some(map) => {
+            fn col<T: crate::store::Plain>(
+                data: &[u8],
+                map: &std::sync::Arc<memmap2::Mmap>,
+                at: &mut usize,
+                n: usize,
+            ) -> Result<Col<T>, LoadError> {
+                let start = *at;
+                take(data, at, n.saturating_mul(size_of::<T>()))?;
+                Col::mapped(map, start, n).ok_or(LoadError::Corrupt("misaligned section"))
+            }
+            parent = col(data, map, &mut at, n)?;
+            name_off = col(data, map, &mut at, n)?;
+            name_len = col(data, map, &mut at, n)?;
+            ent_flags = col(data, map, &mut at, n)?;
+            arena = col(data, map, &mut at, arena_len)?;
+            folded_arena = col(data, map, &mut at, arena_len)?;
+            skip_pad(data, &mut at, &header)?;
+            sorted = col(data, map, &mut at, n)?;
+        }
+        None => {
+            parent = read_u32s(data, &mut at, n)?.into();
+            name_off = read_u32s(data, &mut at, n)?.into();
+            name_len = read_u16s(data, &mut at, n)?.into();
+            ent_flags = read_u16s(data, &mut at, n)?.into();
+            arena = take(data, &mut at, arena_len)?.to_vec().into();
+            folded_arena = take(data, &mut at, arena_len)?.to_vec().into();
+            skip_pad(data, &mut at, &header)?;
+            sorted = read_u32s(data, &mut at, n)?.into();
+        }
+    }
+    let metadata = MetadataColumns::read(data, &mut at, n, header.columns, map)?;
     if at != data.len() {
         return Err(LoadError::Corrupt("unexpected metadata bytes"));
     }
     timings.decode += t.elapsed();
-    validate(
-        Parts {
-            parent,
-            name_off,
-            name_len,
-            flags: ent_flags,
-            arena,
-            folded_arena,
-            sorted,
-            metadata,
-        },
-        timings,
-    )
+    let parts = Parts {
+        parent,
+        name_off,
+        name_len,
+        flags: ent_flags,
+        arena,
+        folded_arena,
+        sorted,
+        metadata,
+    };
+    match check {
+        Check::Full => validate(parts, timings),
+        Check::Trusted => Ok(assemble(parts)),
+    }
+}
+
+/// Step over the zero bytes before `sorted` (v4); anything else there is
+/// corruption.
+fn skip_pad(data: &[u8], at: &mut usize, header: &Header) -> Result<(), LoadError> {
+    let pad = sorted_pad(header.arena_len, header.version) as usize;
+    if take(data, at, pad)?.iter().any(|&b| b != 0) {
+        return Err(LoadError::Corrupt("nonzero padding"));
+    }
+    Ok(())
 }
 
 /// Structural and derived-data validation shared by both load paths;
@@ -1251,7 +1479,7 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
     timings.derived += derived_started.elapsed();
     timings.derived_sort = timings.derived - timings.derived_fold;
 
-    let mut index = Index::from_columns(OwnedColumns {
+    Ok(assemble(Parts {
         parent,
         name_off,
         name_len,
@@ -1259,9 +1487,22 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
         arena,
         folded_arena,
         sorted,
+        metadata,
+    }))
+}
+
+fn assemble(parts: Parts) -> Index {
+    let mut index = Index::from_columns(OwnedColumns {
+        parent: parts.parent,
+        name_off: parts.name_off,
+        name_len: parts.name_len,
+        flags: parts.flags,
+        arena: parts.arena,
+        folded_arena: parts.folded_arena,
+        sorted: parts.sorted,
     });
-    index.metadata = metadata;
-    Ok(index)
+    index.metadata = parts.metadata;
+    index
 }
 
 /// What a streaming check of a saved index found.
@@ -1295,6 +1536,7 @@ pub(crate) fn verify_reader<R: std::io::Read>(
         header.arena_len,
         header.metadata_len,
         header.header_len,
+        header.version,
     );
     if file_len < expected {
         return Err(LoadError::Truncated);
@@ -1540,6 +1782,27 @@ mod tests {
         bytes[20..24].copy_from_slice(&sum.to_le_bytes());
     }
 
+    /// The same index as a version-3 file (no padding before `sorted`):
+    /// the streamed heap load reads those.
+    fn to_v3(bytes: &[u8]) -> Vec<u8> {
+        let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        assert_eq!(word(8), 4);
+        let (n, a) = (word(12), word(16));
+        let pad_at = HEADER_LEN + 12 * n + 2 * a;
+        let pad = (2 * a) % 4;
+        let mut out = bytes[..pad_at].to_vec();
+        out.extend_from_slice(&bytes[pad_at + pad..]);
+        out[8..12].copy_from_slice(&3u32.to_le_bytes());
+        fix_checksum(&mut out);
+        out
+    }
+
+    /// Rewrite the v4 file at `path` as version 3.
+    fn rewrite_v3(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, to_v3(&bytes)).unwrap();
+    }
+
     #[test]
     fn rejects_duplicate_sort_ids_with_valid_checksum() {
         let mut bytes = three_entry_bytes();
@@ -1592,7 +1855,7 @@ mod tests {
         let a = 255u32;
         let mut b = Vec::new();
         b.extend_from_slice(b"FERROWID");
-        for v in [VERSION, n, a, 0, 0, 0] {
+        for v in [3, n, a, 0, 0, 0] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         for _ in 0..n {
@@ -1731,6 +1994,7 @@ mod tests {
             );
         }
         b.freeze().save(&path).unwrap();
+        rewrite_v3(&path);
         let bytes = std::fs::read(&path).unwrap();
         assert!(
             bytes.len() > 4 * STREAM_CHUNK,
@@ -2058,6 +2322,8 @@ mod tests {
         }
         let index = b.freeze();
         index.save(&path).unwrap();
+        // These files exercise the streamed (version 3) heap load.
+        rewrite_v3(&path);
         (dir, path, index)
     }
 
@@ -2396,5 +2662,147 @@ mod tests {
             }
             assert_eq!(crc32(bytes), !expected);
         }
+    }
+
+    /// A saved index of `n` names (an odd arena gets the padding).
+    fn names_index(n: u32, odd: bool) -> Index {
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let root = b.add_root(b"root", flags::DIR);
+        for i in 0..n {
+            let meta = crate::EntryMetadata {
+                size: Some(u64::from(i) * 3),
+                ..Default::default()
+            };
+            b.add_with_metadata(
+                root,
+                format!("Name-{:05}.txt", i * 7 % n).as_bytes(),
+                0,
+                meta,
+            );
+        }
+        if odd {
+            b.add(root, b"x", 0);
+        }
+        b.freeze()
+    }
+
+    #[test]
+    fn a_current_file_is_mapped_not_copied_and_reads_the_same() {
+        for odd in [false, true] {
+            let dir = test_dir(if odd { "mapped-odd" } else { "mapped-even" });
+            let path = dir.join("index.bin");
+            let built = names_index(5000, odd);
+            built.save(&path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes.len(), serialized_len(&built).unwrap());
+            let (mapped, t) = load_with_timings(&path).unwrap();
+            assert_eq!(t.metadata_load, MetadataLoad::Mapped);
+            assert!(mapped.is_mapped());
+            let parsed = from_bytes(&bytes).unwrap();
+            assert!(!parsed.is_mapped());
+            assert_eq!(mapped.len(), built.len());
+            assert_eq!(mapped.sorted(), built.sorted());
+            for id in 0..built.len() as u32 {
+                assert_eq!(mapped.name(id), built.name(id));
+                assert_eq!(mapped.folded_name(id), parsed.folded_name(id));
+                assert_eq!(mapped.parent(id), built.parent(id));
+                assert_eq!(mapped.flags(id), built.flags(id));
+                assert_eq!(mapped.metadata(id), built.metadata(id));
+            }
+            // Only the small fixed parts are on the heap; the columns are
+            // in the file's map.
+            assert!(mapped.heap_bytes() < 4096, "{}", mapped.heap_bytes());
+            assert!(mapped.mapped_bytes() > bytes.len() / 2);
+            // A mapped index saves the same bytes it was read from.
+            let again = dir.join("again.bin");
+            mapped.save(&again).unwrap();
+            assert_eq!(std::fs::read(&again).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn a_mapped_file_can_be_replaced_while_its_map_still_reads_the_old_one() {
+        let dir = test_dir("mapped-replace");
+        let path = dir.join("index.bin");
+        names_index(2000, false).save(&path).unwrap();
+        let old = Index::load(&path).unwrap();
+        assert!(old.is_mapped());
+        let newer = names_index(3000, true);
+        newer
+            .save(&path)
+            .expect("a save replaces a mapped index file");
+        assert_eq!(old.len(), 2001, "the old map still reads the old file");
+        assert_eq!(old.name(1), names_index(2000, false).name(1));
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.len(), newer.len());
+        drop(old);
+        drop(loaded);
+    }
+
+    #[test]
+    fn a_mapped_load_checks_the_file_like_any_other() {
+        let dir = test_dir("mapped-corrupt");
+        let path = dir.join("index.bin");
+        names_index(3000, true).save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // A flipped byte anywhere fails the checksum.
+        for at in [HEADER_LEN + 3, bytes.len() / 2, bytes.len() - 1] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0x10;
+            std::fs::write(&path, &bad).unwrap();
+            assert!(
+                matches!(Index::load(&path), Err(LoadError::ChecksumMismatch)),
+                "flip at {at}"
+            );
+        }
+        // Nonzero padding with a valid checksum is corrupt.
+        let n = 3002;
+        let a = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        assert_eq!((2 * a) % 4, 2, "this file has padding");
+        let mut bad = bytes.clone();
+        bad[HEADER_LEN + 12 * n + 2 * a] = 1;
+        fix_checksum(&mut bad);
+        std::fs::write(&path, &bad).unwrap();
+        assert!(matches!(Index::load(&path), Err(LoadError::Corrupt(_))));
+        // A truncated or extended file is refused before mapping is used.
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(matches!(Index::load(&path), Err(LoadError::Truncated)));
+        let mut long = bytes.clone();
+        long.push(0);
+        std::fs::write(&path, &long).unwrap();
+        assert!(matches!(Index::load(&path), Err(LoadError::Corrupt(_))));
+    }
+
+    #[test]
+    fn version_3_files_still_load_into_the_heap() {
+        let dir = test_dir("v3-still");
+        let path = dir.join("index.bin");
+        let built = names_index(4000, true);
+        built.save(&path).unwrap();
+        rewrite_v3(&path);
+        let loaded = Index::load(&path).unwrap();
+        assert!(!loaded.is_mapped());
+        assert_eq!(loaded.sorted(), built.sorted());
+        assert_eq!(loaded.metadata(17), built.metadata(17));
+        assert!(verify_file(&path).is_ok());
+    }
+
+    #[test]
+    fn save_and_map_reads_the_file_it_just_wrote_without_a_second_check() {
+        let dir = test_dir("save-and-map");
+        let path = dir.join("index.bin");
+        let built = names_index(3000, true);
+        let mapped = built.save_and_map(&path).unwrap();
+        assert!(mapped.is_mapped());
+        assert_eq!(mapped.sorted(), built.sorted());
+        assert_eq!(mapped.name(1234), built.name(1234));
+        assert_eq!(mapped.metadata(17), built.metadata(17));
+        // The same bytes a full load accepts.
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.sorted(), mapped.sorted());
+        // Again over the mapped file: replaced, the old map still reads.
+        let again = names_index(10, false).save_and_map(&path).unwrap();
+        assert_eq!(again.len(), 11);
+        assert_eq!(mapped.len(), 3002);
     }
 }

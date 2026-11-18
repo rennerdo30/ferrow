@@ -210,6 +210,8 @@ impl Snapshot {
                 items_text(h.entries),
                 memory_text(h.working_set),
                 h.private_bytes.map(memory_text),
+                h.private_working_set.map(memory_text),
+                memory_text(h.index_mapped_bytes),
             ),
             (&h.last_save, volumes, &h.events),
         );

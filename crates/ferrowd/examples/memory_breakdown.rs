@@ -20,7 +20,10 @@
 //! 5. live changes through `Live::apply` in batches, with `Live::view()` after
 //!    each batch (only the last view is kept),
 //! 6. both default metadata sort orders, built on first use,
-//! 7. an index save (the one in-memory file buffer),
+//! 7. an index save (streamed through a 1 MiB buffer), then the saved file
+//!    mapped back in place of the heap index, as the service does after every
+//!    scan and compaction (ADR 0007): the `scan1.mapped` phase is the steady
+//!    state the service keeps,
 //! 8. a second scan while the old index and its published view are still held
 //!    (a rescan; the old `Live` is dropped first, as `maintain` does).
 //!
@@ -774,7 +777,7 @@ fn main() {
     );
 
     // Round 1: the first scan and a live session on top of it.
-    let one = session("scan1", n, changes, &mut report, None);
+    let mut one = session("scan1", n, changes, &mut report, None);
 
     // Sort orders are built by the first sorted query; both defaults here.
     let before = memory::process().bytes();
@@ -809,27 +812,40 @@ fn main() {
         println!("FERROW-MEMORY-TRIM reclaimed_bytes=na note=no allocator trim on this platform");
     }
 
-    // Save: the file is built in one buffer first.
+    // Save: streamed to the file through a small buffer.
     let path = std::env::temp_dir().join(format!("ferrow-memory-{}.bin", std::process::id()));
     let file_len = one.live.base().serialized_len().expect("size");
     let before = memory::process().bytes();
     memory::reset_peak();
     let started = Instant::now();
     one.live.base().save(&path).expect("save");
-    let _ = std::fs::remove_file(&path);
     println!(
-        "FERROW-MEMORY-TIMING round=scan1 step=save ms={:.1}",
+        "FERROW-MEMORY-TIMING round=scan1 step=save ms={:.1} file_bytes={file_len}",
         started.elapsed().as_secs_f64() * 1000.0
-    );
-    println!(
-        "FERROW-MEMORY component=persist.save_buffer bytes={file_len} per_entry={:.3} kind=transient note=one Vec the size of the file, alive only while saving",
-        file_len as f64 / report.entries as f64
     );
     report.peak(
         "scan1.save",
         before,
         memory::process().peak,
-        "growth should equal persist.save_buffer",
+        "streamed: growth should be about the 1 MiB write buffer, not the file",
+    );
+
+    // Map the saved file back in place of the heap index, as the service
+    // does after every scan and compaction (ADR 0007).
+    let started = Instant::now();
+    let mapped = Arc::new(ferrow_index::Index::load(&path).expect("map the saved index"));
+    assert!(mapped.is_mapped(), "a current file is mapped");
+    println!(
+        "FERROW-MEMORY-TIMING round=scan1 step=map ms={:.1} mapped_bytes={}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        mapped.mapped_bytes()
+    );
+    one.live.replace_base(mapped);
+    report.show("scan1.mapped", steady(&one));
+    println!(
+        "FERROW-MEMORY component=index.mapped bytes={} per_entry={:.3} kind=steady note=file cache, not private bytes",
+        one.live.base().mapped_bytes(),
+        one.live.base().mapped_bytes() as f64 / report.entries as f64
     );
 
     // Round 2: a rescan while the old snapshot (index and view) is still in the
@@ -861,7 +877,7 @@ fn main() {
     let mut summary = String::from("## Ferrow service memory breakdown (synthetic MFT build)\n\n");
     summary.push_str(&markdown_phases(&report));
     summary.push('\n');
-    for phase in ["scan1.steady", "scan2.after_swap"] {
+    for phase in ["scan1.steady", "scan1.mapped", "scan2.after_swap"] {
         summary.push_str(&markdown(&report, phase));
         summary.push('\n');
     }
@@ -877,4 +893,6 @@ fn main() {
         file.write_all(summary.as_bytes()).expect("summary write");
     }
     println!("{summary}");
+    drop(two);
+    let _ = std::fs::remove_file(&path);
 }

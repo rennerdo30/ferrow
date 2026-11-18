@@ -91,8 +91,9 @@ Windows MFT/USN journal).
     dates); right after the swap the ones that were ready on the old index
     are prepared again in the background, one thread each at the lowest
     priority (about 0.13 s at 1 million entries), and a sorted search
-    answers in name order until then. The saved index file is written as
-    before, at most every 30 minutes, when a new index exists. Health keeps
+    answers in name order until then. The merged index is saved at once and
+    read back from its file (see "The index is read from its file" below).
+    Health keeps
     it apart from the scans: `live_stats` has `compactions`, `compaction_ms`
     and `last_compaction` (when, how long; a later scan clears it), and it is
     not in `scans_by_reason`, and never shows "scanning". The log carries
@@ -413,6 +414,18 @@ is root-owned 0700 and the index is root-owned 0600. Build an index with
 `ferrow index <roots> --out <that path>` from an elevated shell,
 or pass roots in the service command line. Keep that directory
 service-only: the index lists every file name on the machine.
+
+**The index is read from its file (ADR 0007).**
+
+- **When it is saved and mapped:** after every scan and every in-memory merge, the live maintainer saves the new index to `index.bin` and maps the file back read-only. It then drops the copy it built in its own memory.
+- **Where the index lives:** its columns are read through the map. They sit in the operating system's file cache, shared and reclaimable, and are not part of the service's private memory. Health reports the two apart:
+  - `private_working_set`: what Task Manager's Memory column shows.
+  - `index_mapped_bytes`: the mapped file.
+- **Format:** version 4, which is version 3 with every column aligned in the file. A save writes the file in 1 MiB pieces through a temporary file and renames it over `index.bin`.
+- **Replacing a mapped file:** on Windows the map's handle allows delete sharing, so the rename succeeds while the old map still serves the old contents. Old pages go when the last search that holds the old snapshot ends.
+- **Version 3 files:** they are still read, into the heap, once.
+- **If saving or mapping fails:** the index stays in memory (correct, only larger), with a warning in the log.
+- **No duplicate saves:** the background saver skips an index that is already mapped. One lock keeps it and the maintainer from writing the file at the same time.
 
 ## Development: `ferrow service run`
 

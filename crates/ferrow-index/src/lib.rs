@@ -15,11 +15,13 @@ use rayon::prelude::*;
 mod metadata;
 pub mod osname;
 pub mod persist;
+mod store;
 pub use metadata::{
     ColumnSet, EntryMetadata, MetadataOrder, SortKey, SortStatus, SortTicket, metadata_timestamp,
     timestamp_ticks,
 };
 use metadata::{MetadataColumns, ShardMeta};
+use store::Col;
 
 pub use persist::{LoadError, LoadTimings, MetadataLoad, SaveError, VERIFY_BUFFER, Verified};
 
@@ -80,13 +82,13 @@ pub fn fold_name(name: &[u8], out: &mut Vec<u8>) {
 #[derive(Debug)]
 pub struct Index {
     metadata: MetadataColumns,
-    parent: Vec<u32>,
-    name_off: Vec<u32>,
-    name_len: Vec<u16>,
-    flags: Vec<u16>,
-    arena: Vec<u8>,
-    folded_arena: Vec<u8>,
-    sorted: Arc<Vec<u32>>,
+    parent: Col<u32>,
+    name_off: Col<u32>,
+    name_len: Col<u16>,
+    flags: Col<u16>,
+    arena: Col<u8>,
+    folded_arena: Col<u8>,
+    sorted: Arc<Col<u32>>,
 }
 
 impl Index {
@@ -228,18 +230,38 @@ impl Index {
         osname::path_from_bytes(&buf)
     }
 
-    /// Bytes held on the heap by all columns and arenas.
+    /// Bytes held on the heap by all columns and arenas (a column mapped
+    /// from the saved file holds none; see [`Index::mapped_bytes`]).
     pub fn heap_bytes(&self) -> usize {
-        self.parent.capacity() * 4
-            + self.name_off.capacity() * 4
-            + self.name_len.capacity() * 2
-            + self.flags.capacity() * 2
-            + self.arena.capacity()
-            + self.folded_arena.capacity()
-            + self.sorted.capacity() * 4
+        self.parent.heap_bytes()
+            + self.name_off.heap_bytes()
+            + self.name_len.heap_bytes()
+            + self.flags.heap_bytes()
+            + self.arena.heap_bytes()
+            + self.folded_arena.heap_bytes()
+            + self.sorted.heap_bytes()
             + self.metadata.heap_bytes()
             + std::mem::size_of::<Vec<u32>>()
             + 2 * std::mem::size_of::<usize>()
+    }
+
+    /// Bytes of the saved file this index reads through a memory map: the
+    /// operating system's file cache, not this process's private memory.
+    pub fn mapped_bytes(&self) -> usize {
+        self.parent.mapped_bytes()
+            + self.name_off.mapped_bytes()
+            + self.name_len.mapped_bytes()
+            + self.flags.mapped_bytes()
+            + self.arena.mapped_bytes()
+            + self.folded_arena.mapped_bytes()
+            + self.sorted.mapped_bytes()
+            + self.metadata.mapped_bytes()
+    }
+
+    /// Whether the columns are read from the saved file (it is on disk
+    /// already: saving it again would write the same bytes).
+    pub fn is_mapped(&self) -> bool {
+        self.parent.is_mapped()
     }
 
     /// [`Index::heap_bytes`] split into named parts (capacity, not length):
@@ -249,13 +271,13 @@ impl Index {
     /// `heap_bytes()` exactly. Memory accounting only; allocates a short list.
     pub fn heap_parts(&self) -> Vec<(String, usize)> {
         let mut out: Vec<(String, usize)> = vec![
-            ("parent".into(), self.parent.capacity() * 4),
-            ("name_off".into(), self.name_off.capacity() * 4),
-            ("name_len".into(), self.name_len.capacity() * 2),
-            ("flags".into(), self.flags.capacity() * 2),
-            ("name_arena".into(), self.arena.capacity()),
-            ("folded_arena".into(), self.folded_arena.capacity()),
-            ("name_order".into(), self.sorted.capacity() * 4),
+            ("parent".into(), self.parent.heap_bytes()),
+            ("name_off".into(), self.name_off.heap_bytes()),
+            ("name_len".into(), self.name_len.heap_bytes()),
+            ("flags".into(), self.flags.heap_bytes()),
+            ("name_arena".into(), self.arena.heap_bytes()),
+            ("folded_arena".into(), self.folded_arena.heap_bytes()),
+            ("name_order".into(), self.sorted.heap_bytes()),
         ];
         let mut columns = Vec::new();
         self.metadata.heap_parts(&mut columns);
@@ -282,7 +304,16 @@ impl Index {
         persist::save(self, path)
     }
 
-    /// Load from the versioned binary format. See [`persist`].
+    /// Save, then read the same index from the file just written through a
+    /// memory map, without checking the file again (only its header, length
+    /// and checksum field against what was written). See ADR 0007.
+    pub fn save_and_map(&self, path: &std::path::Path) -> Result<Index, SaveError> {
+        persist::save_and_map(self, path)
+    }
+
+    /// Load from the versioned binary format. See [`persist`]. A current
+    /// (version 4) file is memory-mapped, not read into the heap (read
+    /// into it when the file cannot be mapped).
     pub fn load(path: &std::path::Path) -> Result<Index, LoadError> {
         persist::load(path)
     }
@@ -338,14 +369,15 @@ pub(crate) struct PersistColumns<'a> {
     pub sorted: &'a [u32],
 }
 
+/// The columns of an index, owned or mapped.
 pub(crate) struct OwnedColumns {
-    pub parent: Vec<u32>,
-    pub name_off: Vec<u32>,
-    pub name_len: Vec<u16>,
-    pub flags: Vec<u16>,
-    pub arena: Vec<u8>,
-    pub folded_arena: Vec<u8>,
-    pub sorted: Vec<u32>,
+    pub parent: Col<u32>,
+    pub name_off: Col<u32>,
+    pub name_len: Col<u16>,
+    pub flags: Col<u16>,
+    pub arena: Col<u8>,
+    pub folded_arena: Col<u8>,
+    pub sorted: Col<u32>,
 }
 
 /// What one builder shard has collected, column by column in arrival order:
@@ -617,13 +649,13 @@ impl IndexBuilder {
         let metadata_sort = std::time::Duration::ZERO;
         let index = Index {
             metadata,
-            parent,
-            name_off,
-            name_len,
-            flags: ent_flags,
-            arena,
-            folded_arena,
-            sorted: Arc::new(sorted),
+            parent: parent.into(),
+            name_off: name_off.into(),
+            name_len: name_len.into(),
+            flags: ent_flags.into(),
+            arena: arena.into(),
+            folded_arena: folded_arena.into(),
+            sorted: Arc::new(sorted.into()),
         };
         (
             index,
@@ -1092,30 +1124,32 @@ mod tests {
         // capacity and len differ everywhere: a heap_bytes() that used
         // len() instead of capacity() (or dropped a column) cannot
         // accidentally produce the same total.
-        idx.parent.reserve(37);
-        idx.name_off.reserve(41);
-        idx.name_len.reserve(43);
-        idx.flags.reserve(47);
-        idx.arena.reserve(53);
-        idx.folded_arena.reserve(59);
-        Arc::get_mut(&mut idx.sorted).unwrap().reserve(61);
-        assert!(idx.parent.capacity() > idx.parent.len());
-        assert!(idx.name_off.capacity() > idx.name_off.len());
-        assert!(idx.name_len.capacity() > idx.name_len.len());
-        assert!(idx.flags.capacity() > idx.flags.len());
-        assert!(idx.arena.capacity() > idx.arena.len());
-        assert!(idx.folded_arena.capacity() > idx.folded_arena.len());
-        assert!(idx.sorted.capacity() > idx.sorted.len());
-        // Exact per-column capacity accounting: 4+4+2+2 bytes of fixed
-        // columns plus 4 bytes of sort order per entry, plus both
-        // arenas.
-        let expected = idx.parent.capacity() * 4
-            + idx.name_off.capacity() * 4
-            + idx.name_len.capacity() * 2
-            + idx.flags.capacity() * 2
-            + idx.arena.capacity()
-            + idx.folded_arena.capacity()
-            + idx.sorted.capacity() * 4
+        idx.parent.owned_mut().reserve(37);
+        idx.name_off.owned_mut().reserve(41);
+        idx.name_len.owned_mut().reserve(43);
+        idx.flags.owned_mut().reserve(47);
+        idx.arena.owned_mut().reserve(53);
+        idx.folded_arena.owned_mut().reserve(59);
+        Arc::get_mut(&mut idx.sorted)
+            .unwrap()
+            .owned_mut()
+            .reserve(61);
+        assert!(idx.parent.heap_bytes() > idx.parent.len() * 4);
+        assert!(idx.name_off.heap_bytes() > idx.name_off.len() * 4);
+        assert!(idx.name_len.heap_bytes() > idx.name_len.len() * 2);
+        assert!(idx.flags.heap_bytes() > idx.flags.len() * 2);
+        assert!(idx.arena.heap_bytes() > idx.arena.len());
+        assert!(idx.folded_arena.heap_bytes() > idx.folded_arena.len());
+        assert!(idx.sorted.heap_bytes() > idx.sorted.len() * 4);
+        // Exact per-column capacity accounting: every column and both
+        // arenas, by capacity.
+        let expected = idx.parent.heap_bytes()
+            + idx.name_off.heap_bytes()
+            + idx.name_len.heap_bytes()
+            + idx.flags.heap_bytes()
+            + idx.arena.heap_bytes()
+            + idx.folded_arena.heap_bytes()
+            + idx.sorted.heap_bytes()
             + std::mem::size_of::<Vec<u32>>()
             + 2 * std::mem::size_of::<usize>();
         assert_eq!(idx.heap_bytes(), expected);

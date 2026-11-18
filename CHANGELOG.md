@@ -2,6 +2,13 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Much less service memory: the index is read from its file.** The service used to keep its whole index in its own memory: about 3.7 GB on a PC with 27 million files. After every scan and every in-memory merge it now saves the index and reads it back through a memory map, so the index lives in Windows' file cache, which other programs can take back at any time, instead of in the service's own memory. Searches are as fast as before while the file is cached. The first search after Windows has dropped it from the cache reads from disk. Task Manager should show well under 1 GB for the service after its first scan (estimated, not yet measured on a real PC). Starting, rescans and merges still need extra memory for now; the next steps of this work (ADR 0007) remove that.
+- **Saving the index no longer builds the whole file in memory first** (a peak as large as the file, about 3 GB with 27 million files); it is written in small pieces.
+- **Service health tells the two apart:** "Memory … in use" is now the figure Task Manager shows, and a new "Index file" line shows how much of the index is read through the file cache. `ferrow service health` shows the same.
+- Index files are now saved as version 4. Older versions of Ferrow cannot read them (they rebuild the index); this version still reads the old files once.
+
 ## 0.1.0-beta.20
 
 - **Fixed: renaming or moving a large folder still rescanned every drive.** When a folder with more than about 100,000 files and folders below it was renamed or moved (a tool that swaps or cleans up a large folder does this often), the service read every drive again: about 55 s of heavy CPU and disk on a PC with 27 million files, up to every few minutes. It now merges the move into the index in memory instead, with no disk reads. The folder shows up under its new name at once. The files inside show up under the new path once the merge is done, and are never shown under the old path meanwhile. The merge usually starts at once and takes a few seconds on a PC with tens of millions of files (estimated, not yet measured there); right after another merge, or while the index is being saved or moved-in folders are being read, it can take longer.

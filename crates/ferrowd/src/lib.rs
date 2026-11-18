@@ -95,6 +95,14 @@ impl Snapshot {
     /// Load a snapshot from a saved index file.
     pub fn from_file(path: &std::path::Path) -> std::io::Result<Snapshot> {
         let index = Index::load(path).map_err(std::io::Error::other)?;
+        if !index.is_mapped() && !index.is_empty() {
+            // An older file version, or a file that could not be mapped:
+            // correct, but held in private memory until the next save.
+            eventlog::warn(format!(
+                "the saved index is read into memory ({} entries), not mapped from its file",
+                index.len()
+            ));
+        }
         Ok(Snapshot {
             report: format!("loaded {} entries from {}", index.len(), path.display()),
             index: Arc::new(index),
@@ -325,7 +333,7 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
 /// the volumes cannot be read directly. `serve` calls this itself.
 pub fn start_live(store: &SnapshotStore, options: WalkOptions) {
     #[cfg(windows)]
-    live_windows::start(store.clone(), options);
+    live_windows::start(store.clone(), options, None);
     #[cfg(not(windows))]
     let _ = (store, options);
 }
@@ -898,7 +906,14 @@ pub fn serve(
     let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
     #[cfg(windows)]
     if !config.roots.is_empty() {
-        live_windows::start(store.clone(), config.walk_options());
+        let persist_config = config.clone();
+        live_windows::start(
+            store.clone(),
+            config.walk_options(),
+            Some(Arc::new(move |index: &Index| {
+                persistence::save_and_map(&persist_config, index)
+            })),
+        );
     }
     eventlog::info(format!("listening on {}", config.endpoint));
     let budget = admission::Admission::new(32);
