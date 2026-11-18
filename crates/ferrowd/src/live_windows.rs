@@ -212,6 +212,12 @@ fn log_memory(when: &str, live: Option<&Live>, base: &ferrow_index::Index, store
     for line in breakdown.event_lines(when) {
         eventlog::info(line);
     }
+    if base.is_mapped() {
+        eventlog::info(format!(
+            "memory {when}: the index is read from its saved file: {} MiB mapped (file cache, not private memory)",
+            base.mapped_bytes() >> 20
+        ));
+    }
 }
 
 struct Volumes {
@@ -269,7 +275,7 @@ pub fn will_run(options: &WalkOptions) -> bool {
     !options.follow_symlinks && options.roots.iter().any(|r| fast(r))
 }
 
-pub fn start(store: SnapshotStore, options: WalkOptions) {
+pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
     // Without raw volume access (not elevated) there is nothing live to
     // keep; the initial walk stands.
     if !will_run(&options) {
@@ -277,7 +283,7 @@ pub fn start(store: SnapshotStore, options: WalkOptions) {
     }
     let spawned = std::thread::Builder::new()
         .name("index-live".into())
-        .spawn(move || maintain(store, options));
+        .spawn(move || maintain(store, options, persist));
     if let Err(error) = spawned {
         eventlog::error(format!("live updates unavailable: {error}"));
     }
@@ -390,7 +396,30 @@ fn background_pool() -> Option<rayon::ThreadPool> {
         .ok()
 }
 
-fn maintain(store: SnapshotStore, options: WalkOptions) {
+/// Saves a new frozen index and maps it back from the file (ADR 0007); see
+/// `persistence::save_and_map`. `None` from it: no index file.
+pub type Persist =
+    Arc<dyn Fn(&ferrow_index::Index) -> Option<std::io::Result<ferrow_index::Index>> + Send + Sync>;
+
+/// The same index read from its saved file instead of the heap, when
+/// `persist` can save and map it; `None` otherwise (a failure is logged and
+/// the caller keeps its heap index: correct, only larger).
+fn map_saved(
+    index: &ferrow_index::Index,
+    persist: Option<&Persist>,
+) -> Option<ferrow_index::Index> {
+    match persist.and_then(|persist| persist(index))? {
+        Ok(mapped) => Some(mapped),
+        Err(error) => {
+            eventlog::warn(format!(
+                "could not save and map the new index ({error}); it stays in memory"
+            ));
+            None
+        }
+    }
+}
+
+fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
     let (tx, rx) = channel::<Message>();
     *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let mut readers: HashMap<String, ()> = HashMap::new();
@@ -423,7 +452,9 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
             STATE.scan_failed();
             return;
         }
-        let base = Arc::new(index);
+        // Saved and mapped before it is published: the heap copy goes now,
+        // and the file is the one the next start loads.
+        let base = Arc::new(map_saved(&index, persist.as_ref()).unwrap_or(index));
         let live_volumes: Vec<&VolumeMap> = maps.iter().filter(|m| m.journal.is_some()).collect();
         let summary = format!(
             "{} ({} after {reason}, {:.1} s)",
@@ -546,9 +577,17 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
                         &mut live,
                         &store,
                         report,
-                        |live| match &pool {
-                            Some(pool) => pool.install(|| live.compact()),
-                            None => live.compact(),
+                        |live| {
+                            let mut new = match &pool {
+                                Some(pool) => pool.install(|| live.compact()),
+                                None => live.compact(),
+                            }?;
+                            // The merged index replaces the file and is read
+                            // from it, so its heap copy goes at once.
+                            if let Some(mapped) = map_saved(new.base(), persist.as_ref()) {
+                                new.replace_base(Arc::new(mapped));
+                            }
+                            Some(new)
                         },
                         // The sort orders the old index had ready are built
                         // again by one background thread each, at the lowest

@@ -259,11 +259,21 @@ pub fn render(h: &Health, json: bool) -> String {
         p(&h.access)
     ));
     out.push_str(&format!(
-        "memory: {} working set{}\n",
+        "memory: {}{} working set{}\n",
+        h.private_working_set.map_or(String::new(), |bytes| format!(
+            "{} in use (private working set), ",
+            mb(bytes)
+        )),
         mb(h.working_set),
         h.private_bytes
             .map_or(String::new(), |bytes| format!(", {} private", mb(bytes)))
     ));
+    if h.index_mapped_bytes > 0 {
+        out.push_str(&format!(
+            "index file: {} read through a memory map (file cache, not private memory)\n",
+            mb(h.index_mapped_bytes)
+        ));
+    }
     out.push_str(&format!(
         "live changes applied: {}; connection errors: {}\n",
         h.live_changes, h.connection_errors

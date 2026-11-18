@@ -986,6 +986,14 @@ impl Live {
         &self.base
     }
 
+    /// Read the frozen index from `base` instead: the same entries with the
+    /// same ids, typically the copy saved and mapped back from its file
+    /// (ADR 0007). Nothing else changes.
+    pub fn replace_base(&mut self, base: Arc<Index>) {
+        assert_eq!(base.len(), self.base.len(), "the same index");
+        self.base = base;
+    }
+
     /// The size limits of this layer (they follow the frozen index).
     pub fn limits(&self) -> DeltaLimits {
         self.limits

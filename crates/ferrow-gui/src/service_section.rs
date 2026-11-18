@@ -45,15 +45,28 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
         ),
         None,
     ));
+    // "In use" is what Task Manager shows: the private working set when the
+    // service reports it (the mapped index file is file cache, shown apart).
+    let in_use = h.private_working_set.unwrap_or(h.working_set);
     let memory = match h.private_bytes {
         Some(private) => format!(
             "{} in use, {} private",
-            service::memory_text(h.working_set),
+            service::memory_text(in_use),
             service::memory_text(private)
         ),
-        None => format!("{} in use", service::memory_text(h.working_set)),
+        None => format!("{} in use", service::memory_text(in_use)),
     };
     rows.push(("Memory", memory, None));
+    if h.index_mapped_bytes > 0 {
+        rows.push((
+            "Index file",
+            format!(
+                "{} read from disk through the Windows file cache (not counted above)",
+                service::memory_text(h.index_mapped_bytes)
+            ),
+            None,
+        ));
+    }
     rows.push(("Items", service::items_text(h.entries), None));
     if h.connection_errors > 0 {
         rows.push((
