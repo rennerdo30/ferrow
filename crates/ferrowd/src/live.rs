@@ -29,10 +29,13 @@ use std::time::{Duration, Instant};
 
 use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
 use ferrow_index::store::Col;
-use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, SortKey, flags};
-use ferrow_walk::VolumeMap;
+use ferrow_index::{
+    ColumnSet, DEFAULT_SPILL_BUDGET, EntryMetadata, FileTarget, Index, IndexBuilder, ROOT_PARENT,
+    SortKey, flags,
+};
 use ferrow_walk::ntfs::RecordInfo;
 use ferrow_walk::subtree::{Limits, Subtree, WalkError};
+use ferrow_walk::{IndexFileReport, VolumeMap};
 
 /// Ask for a compaction once the overlay holds more live delta entries than
 /// [`DeltaLimits::max_delta`] (about 1 % of the index, never less than this)…
@@ -2202,8 +2205,27 @@ impl Live {
     /// Memory: the builder (about 87 bytes per entry while it is fed and
     /// frozen) and the new tables come on top of the old index, which stays
     /// until the caller publishes the result and the last search drops the
-    /// old snapshot. No disk is read.
+    /// old snapshot. No disk is read. [`Live::compact_into`] builds the new
+    /// index in its file instead, which bounds the builder.
     pub fn compact(&mut self) -> Option<Live> {
+        self.compact_into(None).map(|(live, _)| live)
+    }
+
+    /// [`Live::compact`], building the new index straight into the index file
+    /// at `target` (ADR 0007, step 8) when there is one: the builder's shards
+    /// spill to temporary files beside it past a fixed budget, and the freeze
+    /// writes, sorts and checksums the file in a memory map and renames it
+    /// over the old file. The new index reads that file, so the compaction's
+    /// private memory is a fixed working set plus the new tables, not the
+    /// builder and a second copy of every column. When the file cannot be
+    /// built the index is built in the heap instead (the report says why);
+    /// the result is the same entries either way. `None` as for
+    /// [`Live::compact`], and when not even the heap build could read the
+    /// spilled shards back (a failing disk; the live state is untouched).
+    pub fn compact_into(
+        &mut self,
+        target: Option<&FileTarget<'_>>,
+    ) -> Option<(Live, IndexFileReport)> {
         if self.walks_outstanding() {
             return None;
         }
@@ -2302,7 +2324,16 @@ impl Live {
         }
         drop(placed_delta);
 
-        let builder = IndexBuilder::with_columns(self.columns);
+        let builder = match target {
+            Some(target) => {
+                let dir = match target.path.parent() {
+                    Some(dir) if !dir.as_os_str().is_empty() => dir,
+                    _ => std::path::Path::new("."),
+                };
+                IndexBuilder::with_spill(self.columns, dir, DEFAULT_SPILL_BUDGET)
+            }
+            None => IndexBuilder::with_columns(self.columns),
+        };
         let delta_names: usize = self
             .delta
             .iter()
@@ -2370,7 +2401,14 @@ impl Live {
         drop(keep);
         drop(before);
         drop(placed);
-        let index = Arc::new(builder.freeze());
+        let (index, file_report) = match ferrow_walk::freeze_builder(builder, target) {
+            Ok(done) => done,
+            Err(error) => {
+                crate::eventlog::error(format!("compaction failed: {error}"));
+                return None;
+            }
+        };
+        let index = Arc::new(index);
         debug_assert_eq!(index.len(), records.len());
 
         // The tables of the new layer, after the builder has been freed.
@@ -2393,11 +2431,9 @@ impl Live {
             .filter(|(_, p)| **p != u64::MAX)
             .map(|(id, &p)| ((p >> 48) as usize, p & RECORD_MASK, id as u32));
         let volumes = Live::volumes(seeds, entries);
-        Some(Live::assemble(
-            index,
-            records.into(),
-            volumes,
-            self.next_walk,
+        Some((
+            Live::assemble(index, records.into(), volumes, self.next_walk),
+            file_report,
         ))
     }
 
@@ -4533,6 +4569,80 @@ mod tests {
         assert_eq!(bytes(&new, "live.delta_children"), 0);
         assert_eq!(new.base().len(), 4 + 200);
         assert_eq!(new.limits(), DeltaLimits::for_base(204));
+    }
+
+    /// A live layer with a moved-in folder (200 new entries) and a few
+    /// changes, built twice the same way.
+    fn busy_live() -> (Live, Fake) {
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        let mut f = initial();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        for i in 0..200u64 {
+            f.set(500 + i, file_info(1 + i), &[(20, &format!("n{i}.txt"))]);
+        }
+        let changes: Vec<Change> = (0..200u64)
+            .map(|i| change(500 + i, true))
+            .chain([change(20, false)])
+            .collect();
+        live.apply(&changes, &f);
+        (live, f)
+    }
+
+    #[test]
+    fn compaction_into_the_index_file_gives_the_heap_compactions_index_and_tables() {
+        let dir = std::env::temp_dir().join(format!("ferrow-compact-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.bin");
+        // The file being replaced is mapped, as the service's is.
+        busy_live().0.base().save(&path).unwrap();
+        let old = Index::load(&path).unwrap();
+        assert!(old.is_mapped());
+
+        let (mut heap_live, _) = busy_live();
+        let by_heap = heap_live.compact().unwrap();
+        let (mut file_live, _) = busy_live();
+        let lock = std::sync::Mutex::new(());
+        let (mut by_file, report) = file_live
+            .compact_into(Some(&FileTarget {
+                path: &path,
+                lock: Some(&lock),
+            }))
+            .unwrap();
+        assert!(
+            report.error.is_none() && report.timings.is_some(),
+            "{report:?}"
+        );
+        assert!(by_file.base().is_mapped(), "the new index reads its file");
+        assert!(!by_heap.base().is_mapped());
+
+        // The same entries in the same order, byte for byte.
+        let expected = dir.join("expected.bin");
+        by_heap.base().save(&expected).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&expected).unwrap(),
+            "the file is what saving the heap compaction writes"
+        );
+        assert_eq!(
+            listing(by_file.base(), &by_file.view()),
+            listing(by_heap.base(), &by_heap.view())
+        );
+        assert_eq!(by_file.base().len(), 4 + 200);
+        assert_eq!(by_file.limits(), by_heap.limits());
+        // The tables behind it work: a change to a moved-in entry finds it.
+        let mut by_heap = by_heap;
+        let mut again = initial();
+        again.set(500, file_info(777), &[(20, "n0.txt")]);
+        for live in [&mut by_file, &mut by_heap] {
+            live.apply(&[change(500, false)], &again);
+        }
+        assert_eq!(
+            listing(by_file.base(), &by_file.view()),
+            listing(by_heap.base(), &by_heap.view())
+        );
+        drop((old, by_file, by_heap));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

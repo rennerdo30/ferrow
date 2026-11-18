@@ -291,6 +291,79 @@ impl<T: Value> ShardColumn<T> {
             + self.valid.capacity()
             + self.overflow.capacity() * size_of::<(u32, T)>()
     }
+    /// Forget the values, keep the allocations (a recycled shard).
+    fn clear(&mut self) {
+        self.packed.clear();
+        self.valid.clear();
+        self.overflow.clear();
+        self.len = 0;
+    }
+    /// The values as a spilled run: packed values, validity bitmap, the
+    /// overflow count and the overflows (arrival index and exact value).
+    fn write_run(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        out.write_all(&self.packed)?;
+        out.write_all(&self.valid)?;
+        out.write_all(&(self.overflow.len() as u32).to_le_bytes())?;
+        let mut small = Vec::with_capacity(4096);
+        for &(k, value) in &self.overflow {
+            small.extend_from_slice(&k.to_le_bytes());
+            value.write(&mut small);
+            if small.len() >= 4096 - 16 {
+                out.write_all(&small)?;
+                small.clear();
+            }
+        }
+        out.write_all(&small)
+    }
+    /// Read back what [`Self::write_run`] wrote for `k` entries.
+    fn read_run(k: usize, from: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let mut packed = vec![0u8; k * T::WIDTH];
+        from.read_exact(&mut packed)?;
+        let mut valid = vec![0u8; k.div_ceil(8)];
+        from.read_exact(&mut valid)?;
+        let mut count = [0u8; 4];
+        from.read_exact(&mut count)?;
+        let count = u32::from_le_bytes(count) as usize;
+        if count > k {
+            return Err(std::io::Error::other("spilled run is corrupt"));
+        }
+        let mut raw = vec![0u8; count * (4 + T::RAW)];
+        from.read_exact(&mut raw)?;
+        let overflow = raw
+            .chunks_exact(4 + T::RAW)
+            .map(|c| {
+                (
+                    u32::from_le_bytes(c[..4].try_into().expect("checked width")),
+                    T::read(&c[4..]),
+                )
+            })
+            .collect();
+        Ok(Self {
+            packed,
+            valid,
+            overflow,
+            len: k,
+        })
+    }
+}
+
+/// Place a shard's values at their entry ids in `packed` and `valid`
+/// (`ids[k]` is the entry the shard's k-th value belongs to); every id must
+/// be inside the columns.
+fn scatter_values<T: Value>(
+    packed: &mut [u8],
+    valid: &mut [u8],
+    part: &ShardColumn<T>,
+    ids: &[u32],
+) {
+    for (k, &id) in ids.iter().enumerate() {
+        let i = id as usize;
+        packed[i * T::WIDTH..(i + 1) * T::WIDTH]
+            .copy_from_slice(&part.packed[k * T::WIDTH..(k + 1) * T::WIDTH]);
+        if part.valid[k / 8] & (1 << (k % 8)) != 0 {
+            valid[i / 8] |= 1 << (i % 8);
+        }
+    }
 }
 
 /// The selected metadata columns of one builder shard.
@@ -348,6 +421,244 @@ impl ShardMeta {
             + self.created.as_ref().map_or(0, ShardColumn::heap_bytes)
             + self.accessed.as_ref().map_or(0, ShardColumn::heap_bytes)
             + self.attributes.as_ref().map_or(0, ShardColumn::heap_bytes)
+    }
+    /// Forget the values, keep the allocations (a recycled shard).
+    pub(crate) fn clear(&mut self) {
+        fn wipe<T: Value>(c: &mut Option<ShardColumn<T>>) {
+            if let Some(c) = c {
+                c.clear();
+            }
+        }
+        wipe(&mut self.size);
+        wipe(&mut self.modified);
+        wipe(&mut self.created);
+        wipe(&mut self.accessed);
+        wipe(&mut self.attributes);
+    }
+    /// How many values of each column do not fit the packed width, in column
+    /// bit order (size, modified, created, accessed, attributes; 0 for a
+    /// column that is not collected).
+    pub(crate) fn overflow_counts(&self) -> [usize; 5] {
+        fn count<T>(c: &Option<ShardColumn<T>>) -> usize {
+            c.as_ref().map_or(0, |c| c.overflow.len())
+        }
+        [
+            count(&self.size),
+            count(&self.modified),
+            count(&self.created),
+            count(&self.accessed),
+            count(&self.attributes),
+        ]
+    }
+    /// The selected columns as a spilled run, in column bit order.
+    pub(crate) fn write_run(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        fn put<T: Value>(
+            c: &Option<ShardColumn<T>>,
+            out: &mut impl std::io::Write,
+        ) -> std::io::Result<()> {
+            c.as_ref().map_or(Ok(()), |c| c.write_run(out))
+        }
+        put(&self.size, out)?;
+        put(&self.modified, out)?;
+        put(&self.created, out)?;
+        put(&self.accessed, out)?;
+        put(&self.attributes, out)
+    }
+    /// Read back what [`Self::write_run`] wrote for `k` entries of `set`.
+    pub(crate) fn read_run(
+        set: ColumnSet,
+        k: usize,
+        from: &mut impl std::io::Read,
+    ) -> std::io::Result<Self> {
+        fn get<T: Value>(
+            on: bool,
+            k: usize,
+            from: &mut impl std::io::Read,
+        ) -> std::io::Result<Option<ShardColumn<T>>> {
+            on.then(|| ShardColumn::read_run(k, from)).transpose()
+        }
+        Ok(Self {
+            size: get(set.contains(ColumnSet::SIZE), k, from)?,
+            modified: get(set.contains(ColumnSet::MODIFIED), k, from)?,
+            created: get(set.contains(ColumnSet::CREATED), k, from)?,
+            accessed: get(set.contains(ColumnSet::ACCESSED), k, from)?,
+            attributes: get(set.contains(ColumnSet::ATTRIBUTES), k, from)?,
+        })
+    }
+}
+
+/// One metadata column of an index file that is being built: its packed
+/// values and validity bitmap are regions of the file, and the exact
+/// overflows (few) wait in the heap until every shard is placed.
+struct FileColumn<'a, T> {
+    count: &'a mut [u8],
+    packed: &'a mut [u8],
+    valid: &'a mut [u8],
+    tail: &'a mut [u8],
+    overflow: Vec<(u32, T)>,
+}
+impl<'a, T: Value> FileColumn<'a, T> {
+    /// Split this column's region (see [`Column::write`]) for `n` entries
+    /// and `k` overflows; `region` is exactly `column_len::<T>(n, k)` long.
+    fn split(region: &'a mut [u8], n: usize, k: usize) -> Self {
+        let (count, rest) = region.split_at_mut(4);
+        let (packed, rest) = rest.split_at_mut(n * T::WIDTH);
+        let (valid, tail) = rest.split_at_mut(n.div_ceil(8));
+        debug_assert_eq!(tail.len(), k * (4 + T::RAW));
+        Self {
+            count,
+            packed,
+            valid,
+            tail,
+            overflow: Vec::with_capacity(k),
+        }
+    }
+    fn scatter(&mut self, part: &ShardColumn<T>, ids: &[u32]) {
+        scatter_values(self.packed, self.valid, part, ids);
+        for &(k, value) in &part.overflow {
+            self.overflow.push((ids[k as usize], value));
+        }
+    }
+    /// Write the overflows (by entry id, as [`Column::seal`] orders them);
+    /// `false` when their number is not the one the region was sized for.
+    fn finish(mut self) -> bool {
+        self.overflow.sort_unstable_by_key(|p| p.0);
+        let k = self.overflow.len();
+        if k * (4 + T::RAW) != self.tail.len() {
+            return false;
+        }
+        self.count.copy_from_slice(&(k as u32).to_le_bytes());
+        let (ids, values) = self.tail.split_at_mut(k * 4);
+        for (slot, &(id, _)) in ids.as_chunks_mut::<4>().0.iter_mut().zip(&self.overflow) {
+            slot.copy_from_slice(&id.to_le_bytes());
+        }
+        let mut raw = Vec::with_capacity(T::RAW);
+        for (slot, &(_, value)) in values.chunks_exact_mut(T::RAW).zip(&self.overflow) {
+            raw.clear();
+            value.write(&mut raw);
+            slot.copy_from_slice(&raw);
+        }
+        true
+    }
+}
+
+/// Bytes of one column in a saved file: the overflow count, the packed
+/// values, the validity bitmap and `k` overflows.
+fn column_len<T: Value>(n: usize, k: usize) -> usize {
+    4 + n * T::WIDTH + n.div_ceil(8) + k * (4 + T::RAW)
+}
+
+/// Bytes of the metadata payload of a saved file for `n` entries of `set`,
+/// given each column's overflow count (column bit order).
+pub(crate) fn payload_len(n: usize, set: ColumnSet, overflows: [usize; 5]) -> usize {
+    let on = |bit| set.contains(bit);
+    let mut total = 0;
+    if on(ColumnSet::SIZE) {
+        total += column_len::<u64>(n, overflows[0]);
+    }
+    if on(ColumnSet::MODIFIED) {
+        total += column_len::<i64>(n, overflows[1]);
+    }
+    if on(ColumnSet::CREATED) {
+        total += column_len::<i64>(n, overflows[2]);
+    }
+    if on(ColumnSet::ACCESSED) {
+        total += column_len::<i64>(n, overflows[3]);
+    }
+    if on(ColumnSet::ATTRIBUTES) {
+        total += column_len::<u32>(n, overflows[4]);
+    }
+    total
+}
+
+/// The metadata payload of an index file that is being built: the selected
+/// columns, placed shard by shard straight into the file's region.
+pub(crate) struct FileMeta<'a> {
+    size: Option<FileColumn<'a, u64>>,
+    modified: Option<FileColumn<'a, i64>>,
+    created: Option<FileColumn<'a, i64>>,
+    accessed: Option<FileColumn<'a, i64>>,
+    attributes: Option<FileColumn<'a, u32>>,
+}
+impl<'a> FileMeta<'a> {
+    /// Split `region` (exactly [`payload_len`] bytes, zeroed) into columns.
+    pub(crate) fn split(
+        region: &'a mut [u8],
+        n: usize,
+        set: ColumnSet,
+        overflows: [usize; 5],
+    ) -> Self {
+        fn take<'a, T: Value>(
+            on: bool,
+            rest: &mut &'a mut [u8],
+            n: usize,
+            k: usize,
+        ) -> Option<FileColumn<'a, T>> {
+            on.then(|| {
+                let (mine, tail) = std::mem::take(rest).split_at_mut(column_len::<T>(n, k));
+                *rest = tail;
+                FileColumn::split(mine, n, k)
+            })
+        }
+        let mut rest = region;
+        let size = take(set.contains(ColumnSet::SIZE), &mut rest, n, overflows[0]);
+        let modified = take(
+            set.contains(ColumnSet::MODIFIED),
+            &mut rest,
+            n,
+            overflows[1],
+        );
+        let created = take(set.contains(ColumnSet::CREATED), &mut rest, n, overflows[2]);
+        let accessed = take(
+            set.contains(ColumnSet::ACCESSED),
+            &mut rest,
+            n,
+            overflows[3],
+        );
+        let attributes = take(
+            set.contains(ColumnSet::ATTRIBUTES),
+            &mut rest,
+            n,
+            overflows[4],
+        );
+        debug_assert!(rest.is_empty());
+        Self {
+            size,
+            modified,
+            created,
+            accessed,
+            attributes,
+        }
+    }
+    /// Place one shard's values; `ids[k]` is the entry its k-th value is
+    /// for, and every id must be inside the columns.
+    pub(crate) fn scatter(&mut self, shard: &ShardMeta, ids: &[u32]) {
+        fn put<T: Value>(
+            to: &mut Option<FileColumn<'_, T>>,
+            from: &Option<ShardColumn<T>>,
+            ids: &[u32],
+        ) {
+            if let (Some(to), Some(from)) = (to, from) {
+                to.scatter(from, ids);
+            }
+        }
+        put(&mut self.size, &shard.size, ids);
+        put(&mut self.modified, &shard.modified, ids);
+        put(&mut self.created, &shard.created, ids);
+        put(&mut self.accessed, &shard.accessed, ids);
+        put(&mut self.attributes, &shard.attributes, ids);
+    }
+    /// Write the overflows; `false` when a column got a different number of
+    /// them than its region was sized for.
+    pub(crate) fn finish(self) -> bool {
+        fn end<T: Value>(c: Option<FileColumn<'_, T>>) -> bool {
+            c.is_none_or(FileColumn::finish)
+        }
+        end(self.size)
+            & end(self.modified)
+            & end(self.created)
+            & end(self.accessed)
+            & end(self.attributes)
     }
 }
 
@@ -464,16 +775,12 @@ impl<T: Value> Column<T> {
     /// Place a shard's values at their entry ids (`ids[k]` is the entry the
     /// shard's k-th value belongs to).
     fn scatter(&mut self, part: &ShardColumn<T>, ids: &[u32]) {
-        let mut packed = self.packed.owned_mut();
-        let mut valid = self.valid.owned_mut();
-        for (k, &id) in ids.iter().enumerate() {
-            let i = id as usize;
-            packed[i * T::WIDTH..(i + 1) * T::WIDTH]
-                .copy_from_slice(&part.packed[k * T::WIDTH..(k + 1) * T::WIDTH]);
-            if part.valid[k / 8] & (1 << (k % 8)) != 0 {
-                valid[i / 8] |= 1 << (i % 8);
-            }
-        }
+        scatter_values(
+            &mut self.packed.owned_mut(),
+            &mut self.valid.owned_mut(),
+            part,
+            ids,
+        );
         for &(k, value) in &part.overflow {
             self.overflow_ids.push(ids[k as usize]);
             self.overflow_values.push(value);

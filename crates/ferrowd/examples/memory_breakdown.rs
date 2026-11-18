@@ -25,14 +25,25 @@
 //!    scan and compaction (ADR 0007): the `scan1.mapped` phase is the steady
 //!    state the service keeps,
 //! 8. a second scan while the old index and its published view are still held
-//!    (a rescan; the old `Live` is dropped first, as `maintain` does).
+//!    (a rescan; the old `Live` is dropped first, as `maintain` does),
+//! 9. the same build as the service makes it since ADR 0007 step 8 (`bounded`):
+//!    the builder's shards spill to temporary files past a 32 MiB budget and
+//!    the freeze writes the index file in place (`freeze_to_file`), with its
+//!    own `bounded.emit` and `bounded.freeze` peaks beside the heap build's
+//!    `scan2.emit` and `scan2.freeze`. It is checked against the heap build's
+//!    index entry for entry,
+//! 10. the merge of the live changes into a new index (`compact`), in the heap
+//!     (`Live::compact`) and into the index file (`Live::compact_into`), each
+//!     with its peak.
 //!
 //! Assumptions are printed as `FERROW-MEMORY-CONFIG`: free-record share,
 //! hard-link share, change mix and count. Change them with the environment
 //! variables below and the output follows.
 //!
 //! `FERROW_BENCH_ENTRIES` (default 5000000), `FERROW_MEMORY_CHANGES`
-//! (default 20000), `FERROW_MEMORY_SUMMARY` (a file to also append the Markdown
+//! (default 20000), `FERROW_MEMORY_SPILL_BUDGET` (bytes the bounded build's
+//! shards hold before they spill, default 32 MiB; a small value makes a small
+//! run spill), `FERROW_MEMORY_SUMMARY` (a file to also append the Markdown
 //! tables to; CI passes `$GITHUB_STEP_SUMMARY`; they are printed either way).
 
 use std::collections::HashMap;
@@ -41,7 +52,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ferrow_fixture::Rng;
-use ferrow_index::{ColumnSet, Index, IndexBuilder, SortKey, SortStatus, flags};
+use ferrow_index::{
+    ColumnSet, DEFAULT_SPILL_BUDGET, FileTarget, Index, IndexBuilder, SortKey, SortStatus, flags,
+};
 use ferrow_walk::ntfs::{self, NameRecord, Parsed, RecordInfo, Volume, VolumeBuilder};
 use ferrowd::live::{Change, Live, LiveView, RecordSource, RecordState, index_parts};
 use ferrowd::memory::{self, Breakdown, Kind, Part};
@@ -743,6 +756,188 @@ fn markdown_phases(report: &Report) -> String {
     out
 }
 
+/// The build the service makes since ADR 0007 step 8: the same record stream as
+/// a `session`, but the builder spills its shards to temporary files and the
+/// freeze writes the index file in place. Its peaks are the ones to compare with
+/// the heap build's `emit` and `freeze`; `reference` is the heap build of the
+/// same stream, which the result must equal entry for entry.
+fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
+    let round = "bounded";
+    let dir = std::env::temp_dir().join(format!("ferrow-memory-bounded-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("bounded build directory");
+    let _ = memory::release_free_heap();
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let (synth, parsed) = synth_stream(n, VolumeBuilder::new, |b, chunk| b.push(chunk));
+    report.peak(
+        &format!("{round}.parse"),
+        before,
+        memory::process().peak,
+        "parse chunks pushed into the volume builder; peak since this phase began",
+    );
+    let volume: Volume = parsed.finish(0xFE77);
+    report.entries = synth.entries as u64;
+
+    let budget = env_usize("FERROW_MEMORY_SPILL_BUDGET", DEFAULT_SPILL_BUDGET);
+    println!("FERROW-MEMORY-CONFIG round={round} spill_budget_bytes={budget}");
+    let builder = IndexBuilder::with_spill(ColumnSet::DEFAULT, &dir, budget);
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let map = ferrow_walk::emit_parsed_volume(
+        &volume,
+        ntfs::ROOT_RECORD,
+        b"C:",
+        &builder,
+        ColumnSet::DEFAULT,
+    );
+    report.peak(
+        &format!("{round}.emit"),
+        before,
+        memory::process().peak,
+        "volume, spilling builder (default budget) and record map while the subtree is emitted; peak since this phase began",
+    );
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=emit ms={:.1} spilled_bytes={} spill_write_ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        builder.spilled_bytes(),
+        builder.spill_time().as_secs_f64() * 1000.0
+    );
+    let mut parts = transient(&volume.heap_parts());
+    parts.extend(
+        builder
+            .memory_parts()
+            .into_iter()
+            .map(|(name, bytes)| Part::new(name, bytes, Kind::Transient)),
+    );
+    parts.push(Part::new(
+        "scan.volume_map",
+        map.heap_bytes(),
+        Kind::Transient,
+    ));
+    report.show(&format!("{round}.emitted"), parts);
+    drop(volume);
+
+    let path = dir.join("index.bin");
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let (index, t) = builder
+        .freeze_to_file_with(&FileTarget {
+            path: &path,
+            lock: None,
+        })
+        .expect("freeze into the index file");
+    report.peak(
+        &format!("{round}.freeze"),
+        before,
+        memory::process().peak,
+        "spilled shards placed in the index file, names folded, order sorted and file checksummed inside its memory map; peak since this phase began",
+    );
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=freeze ms={:.1} scatter_ms={:.1} fold_ms={:.1} sort_ms={:.1} checksum_ms={:.1} flush_ms={:.1} replace_ms={:.1} file_bytes={} spilled_bytes={}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        ms(t.scatter),
+        ms(t.fold),
+        ms(t.sort),
+        ms(t.checksum),
+        ms(t.flush),
+        ms(t.replace),
+        t.file_bytes,
+        t.spilled_bytes,
+    );
+    assert_eq!(index.len(), synth.entries, "every name became an entry");
+    assert!(index.is_mapped(), "the result reads its file");
+    assert_eq!(index.len(), reference.len());
+    assert_eq!(
+        index.sorted(),
+        reference.sorted(),
+        "same name order as the heap build"
+    );
+    for id in (0..index.len() as u32).step_by((index.len() / 997).max(1)) {
+        assert_eq!(index.name(id), reference.name(id));
+        assert_eq!(index.parent(id), reference.parent(id));
+        assert_eq!(index.metadata(id), reference.metadata(id));
+    }
+    let mut parts = index_parts(&index, "index");
+    parts.push(Part::new(
+        "scan.volume_map",
+        map.heap_bytes(),
+        Kind::Transient,
+    ));
+    report.show(&format!("{round}.built"), parts);
+    drop((index, map));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The merge of the live changes into a new index, in the heap
+/// (`Live::compact`) and straight into the index file (`Live::compact_into`,
+/// what the service does since ADR 0007 step 8), each with its own peak. The
+/// live layer is the one `scan2` left, with its changes applied.
+fn compaction_round(live: &mut Live, report: &mut Report) {
+    let dir = std::env::temp_dir().join(format!("ferrow-memory-compaction-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("compaction directory");
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+
+    let _ = memory::release_free_heap();
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let heap = live.compact().expect("no folder read is outstanding");
+    let took = started.elapsed();
+    report.peak(
+        "compact.heap",
+        before,
+        memory::process().peak,
+        "Live::compact in the heap: builder, then every column beside it, plus the new tables; peak since this phase began",
+    );
+    println!(
+        "FERROW-MEMORY-TIMING round=compact step=heap ms={:.1} entries={}",
+        ms(took),
+        heap.base().len()
+    );
+    let entries = heap.base().len();
+    drop(heap);
+
+    let path = dir.join("index.bin");
+    let _ = memory::release_free_heap();
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let (filed, built) = live
+        .compact_into(Some(&FileTarget {
+            path: &path,
+            lock: None,
+        }))
+        .expect("no folder read is outstanding");
+    let took = started.elapsed();
+    report.peak(
+        "compact.file",
+        before,
+        memory::process().peak,
+        "Live::compact_into the index file: spilling builder, file freeze in a map, plus the new tables; peak since this phase began",
+    );
+    let t = built.timings.expect("built into the file");
+    println!(
+        "FERROW-MEMORY-TIMING round=compact step=file ms={:.1} freeze_ms={:.1} scatter_ms={:.1} fold_ms={:.1} sort_ms={:.1} checksum_ms={:.1} flush_ms={:.1} replace_ms={:.1} spilled_bytes={} entries={}",
+        ms(took),
+        ms(t.total),
+        ms(t.scatter),
+        ms(t.fold),
+        ms(t.sort),
+        ms(t.checksum),
+        ms(t.flush),
+        ms(t.replace),
+        t.spilled_bytes,
+        filed.base().len(),
+    );
+    assert_eq!(filed.base().len(), entries, "the same entries either way");
+    assert!(filed.base().is_mapped(), "the new index reads its file");
+    drop(filed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let n = env_usize("FERROW_BENCH_ENTRIES", 5_000_000);
     let changes = env_usize("FERROW_MEMORY_CHANGES", 20_000);
@@ -857,7 +1052,7 @@ fn main() {
     };
     drop(live);
     let before = memory::process();
-    let two = session("scan2", n, changes, &mut report, Some(&old));
+    let mut two = session("scan2", n, changes, &mut report, Some(&old));
     let during = memory::process();
     println!(
         "FERROW-MEMORY-PEAK phase=rescan_old_and_new_held before_bytes={} now_bytes={} growth_bytes={} growth_per_entry={:.3} note=old index and view stay in the store while the scan builds the next; the old live layer is already dropped",
@@ -872,12 +1067,21 @@ fn main() {
         report.show("scan2.after_swap_trimmed", steady(&two));
     }
 
+    // The bounded build, against the heap build of the same stream.
+    bounded_round(n, &mut report, two.live.base());
+    compaction_round(&mut two.live, &mut report);
+
     // The result: the table to read.
     println!("FERROW-MEMORY-DONE");
     let mut summary = String::from("## Ferrow service memory breakdown (synthetic MFT build)\n\n");
     summary.push_str(&markdown_phases(&report));
     summary.push('\n');
-    for phase in ["scan1.steady", "scan1.mapped", "scan2.after_swap"] {
+    for phase in [
+        "scan1.steady",
+        "scan1.mapped",
+        "scan2.after_swap",
+        "bounded.built",
+    ] {
         summary.push_str(&markdown(&report, phase));
         summary.push('\n');
     }

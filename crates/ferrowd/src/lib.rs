@@ -907,13 +907,10 @@ pub fn serve(
     let persistence = persistence::Persistence::start(config, &store, &shutdown)?;
     #[cfg(windows)]
     if !config.roots.is_empty() {
-        let persist_config = config.clone();
         live_windows::start(
             store.clone(),
             config.walk_options(),
-            Some(Arc::new(move |index: &Index| {
-                persistence::save_and_map(&persist_config, index)
-            })),
+            persistence::IndexFile::new(config),
             config.index_path.as_deref().map(saved::path_beside),
         );
     }

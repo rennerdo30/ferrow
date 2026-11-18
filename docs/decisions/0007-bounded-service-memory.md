@@ -1,6 +1,6 @@
 # 0007: Bounded service memory (mapped and compressed index)
 
-Status: accepted (owner, 2026-11-18). Tracked as FR-46.
+Status: accepted (owner, 2026-11-18). Tracked as FR-46. Decision 8 (bounded rebuilds): built in FR-46 phase 5, on top of the mapped index (decisions 1 to 4).
 
 ## Context
 
@@ -95,12 +95,22 @@ slower. The owner chose to do both: map the index and compress it.
      build.
    - Case-sensitive matching checks the rebuilt name only for candidates that
      already matched case-insensitively.
-8. **Rebuilds are bounded.**
-   - Rescans and compactions write the new index to a file section by section
-     (names and columns spill to disk) instead of holding a second index in
-     the heap.
-   - The heap peak of a rebuild is a fixed working set plus the name-order
-     permutation (4 B/entry).
+8. **Rebuilds are bounded** (built, FR-46 phase 5).
+   - Rescans and compactions write the new index straight into its file
+     instead of holding a second index in the heap.
+     `IndexBuilder::freeze_to_file` sizes the file exactly, maps it writable,
+     places the columns, folds the names, sorts the name order and
+     computes the checksum inside the map, flushes, renames it over
+     `index.bin` and maps it read-only. The bytes are those of
+     `Index::save`.
+   - The builder's shards spill to anonymous temporary files beside the
+     index once they hold a fixed budget (32 MiB; the heap holds about 1.6
+     times that while entries are added).
+   - The name-order permutation is sorted in the file's map, so it is not in
+     the heap either: the heap growth of the freeze is a fixed working set
+     (4.9 MB at 2 M entries, measured), not 4 B/entry.
+   - Not covered here: the scan's record map and parsed volume, and the new
+     live tables of a compaction (decision 6).
 9. **Metadata sort orders go to the file.**
    - A sort order prepared on request (size, dates) is written beside the
      index and mapped, not kept in the heap (4 B/entry each).
@@ -111,7 +121,7 @@ slower. The owner chose to do both: map the index and compress it.
 |---|---|---|
 | Steady | 3.7 GB | 150–400 MB |
 | Start | 6.2 GB | the steady figure plus replay (no scan) |
-| Rescan or compaction | +2.3–4.4 GB | +110 MB name order + fixed buffers |
+| Rescan or compaction | +2.3–4.4 GB | about 60 MB (shards, working set) + the scan's record map and the new live tables until decision 6 |
 
 The file cache holding the mapped index is not counted against the budget,
 but it is reported. Service health shows "mapped" next to "private" so that a
@@ -124,7 +134,7 @@ reader of the diagnostics sees both.
 2. Journal replay at start.
 3. Record maps and overlay in the file.
 4. Names stored once.
-5. Bounded rebuilds.
+5. Bounded rebuilds (done: FR-46 phase 5).
 6. Sort orders in the file.
 7. CI gate: the Windows memory-breakdown job asserts private bytes per
    entry, so a later change cannot quietly grow it again.

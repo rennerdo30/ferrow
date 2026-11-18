@@ -28,6 +28,36 @@ unsafe impl Plain for u32 {}
 // SAFETY: as above.
 unsafe impl Plain for u64 {}
 
+/// The bytes of a slice of plain values (little-endian on every supported
+/// target), for writing a column to a file without a per-value encode.
+pub(crate) fn as_bytes<T: Plain>(values: &[T]) -> &[u8] {
+    // SAFETY: `T: Plain` has no padding and no invalid bit patterns; the
+    // byte view covers exactly the slice's memory.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
+}
+
+/// The same, writable: a column is filled straight from a file read.
+pub(crate) fn as_bytes_mut<T: Plain>(values: &mut [T]) -> &mut [u8] {
+    // SAFETY: as in `as_bytes`; any bytes written are valid values of `T`.
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), size_of_val(values)) }
+}
+
+/// A writable byte region as a slice of plain values.
+///
+/// # Panics
+/// When the region is not aligned for `T` or its length is not a multiple of
+/// `size_of::<T>()`: the file layout places every column on its boundary.
+pub(crate) fn cast_mut<T: Plain>(bytes: &mut [u8]) -> &mut [T] {
+    // SAFETY: `T: Plain` accepts any bytes; the checks below reject a region
+    // that does not split exactly into aligned elements.
+    let (head, mid, tail) = unsafe { bytes.align_to_mut::<T>() };
+    assert!(
+        head.is_empty() && tail.is_empty(),
+        "a file region must be aligned for its column"
+    );
+    mid
+}
+
 /// What keeps a column's elements alive.
 enum Backing<T> {
     Owned(Vec<T>),

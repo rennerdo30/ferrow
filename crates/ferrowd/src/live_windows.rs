@@ -407,10 +407,42 @@ fn background_pool() -> Option<rayon::ThreadPool> {
         .ok()
 }
 
-/// Saves a new frozen index and maps it back from the file (ADR 0007); see
-/// `persistence::save_and_map`. `None` from it: no index file.
-pub type Persist =
-    Arc<dyn Fn(&ferrow_index::Index) -> Option<std::io::Result<ferrow_index::Index>> + Send + Sync>;
+/// The index file: where a build writes and a heap index is saved and
+/// mapped back (ADR 0007; see `persistence::IndexFile`).
+pub type Persist = crate::persistence::IndexFile;
+
+/// The index file a build may write into: `file`, once its directory is
+/// ready (a failure is logged and the build is made in memory: correct, only
+/// larger).
+fn ready(file: Option<&Persist>) -> Option<(&Persist, crate::persistence::Building)> {
+    let file = file?;
+    match file.prepare() {
+        Ok(building) => Some((file, building)),
+        Err(error) => {
+            eventlog::warn(format!(
+                "the index directory is not ready ({error}); the new index is built in memory"
+            ));
+            None
+        }
+    }
+}
+
+/// A scan, built straight into the index file when there is one (ADR 0007,
+/// step 8): its private memory is then a fixed working set, not a builder
+/// and a second copy of every column. The index it returns reads the file.
+fn scan_into(
+    options: &WalkOptions,
+    file: Option<&Persist>,
+) -> (ferrow_index::Index, ferrow_walk::ScanReport, Vec<VolumeMap>) {
+    match ready(file) {
+        Some((file, _building)) => {
+            let out = ferrow_walk::scan_with_maps_to_file(options, &file.target());
+            file.built(&out.1.index_file);
+            out
+        }
+        None => ferrow_walk::scan_with_maps(options),
+    }
+}
 
 /// The same index read from its saved file instead of the heap, when
 /// `persist` can save and map it; `None` otherwise (a failure is logged and
@@ -437,10 +469,14 @@ fn map_saved(
     index: &ferrow_index::Index,
     persist: Option<&Persist>,
 ) -> Option<ferrow_index::Index> {
+    // Built into the file already: nothing to save.
+    if index.is_mapped() {
+        return None;
+    }
     // Background work: the thread's background mode lowers its CPU, disk
     // and memory priority, so writing gigabytes does not compete with
     // searches (which may read the mapped file meanwhile).
-    let saved = background_io(|| persist.and_then(|persist| persist(index)));
+    let saved = background_io(|| persist.and_then(|file| file.save_and_map(index)));
     match saved? {
         Ok(mapped) => Some(mapped),
         Err(error) => {
@@ -478,6 +514,10 @@ fn options_fingerprint(options: &WalkOptions) -> u64 {
     let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
     saved::fingerprint(&refs)
 }
+
+/// How long a scan whose index could not be built waits before it runs
+/// again.
+const BUILD_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// The most change journal (bytes of USN records) a start replays instead of
 /// scanning: about a million changed files.
@@ -813,7 +853,7 @@ fn maintain(
         }
         STATE.scan_started();
         STATE.count_scan(&reason);
-        let scan = || ferrow_walk::scan_with_maps(&options);
+        let scan = || scan_into(&options, persist.as_ref());
         let (index, report, maps) = match (&pool, background) {
             (Some(pool), true) => {
                 // This thread runs the MFT reads; live batches after the
@@ -828,6 +868,42 @@ fn maintain(
         background = true;
         let took = started.elapsed();
         if let Some(fatal) = &report.fatal_error {
+            // A build that could not read its spilled shards back (a failing
+            // disk, a file taken away) may work later: try again then
+            // instead of ending live updates. Other fatal errors (an exclude
+            // that cannot be resolved) stop them, as before.
+            if fatal.starts_with(ferrow_walk::BUILD_FAILED) {
+                eventlog::warn(format!(
+                    "scan failed: {fatal}; trying again in {} min",
+                    BUILD_RETRY.as_secs() / 60
+                ));
+                STATE.scan_failed();
+                // Wait, dropping the journals' records (the next scan reads
+                // everything again); an administrator's rescan ends the wait.
+                let until = Instant::now() + BUILD_RETRY;
+                while let Some(left) = until.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(left) {
+                        Ok(Message::RescanNow) => {
+                            reason = REASON_ADMIN.into();
+                            break;
+                        }
+                        // A reader that stopped for good is reported now:
+                        // the next session does not start it again.
+                        Ok(Message::Reset {
+                            device,
+                            reason: why,
+                            fatal: true,
+                        }) => {
+                            eventlog::warn(format!("journal of {device}: {why}"));
+                            STATE.journal_problem(&device, true, &why);
+                        }
+                        Ok(_) => {}
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                continue;
+            }
             eventlog::error(format!("scan failed: {fatal}"));
             STATE.scan_failed();
             STATE.set_tables_mapped(0);
@@ -1158,37 +1234,62 @@ fn run_session(
                         store,
                         report,
                         |live| {
-                            let mut new = match &pool {
-                                Some(pool) => pool.install(|| live.compact()),
+                            // The merged index is built in the index file and
+                            // read from it: no builder, no second copy of the
+                            // columns in the heap.
+                            let build = |live: &mut Live| match ready(persist) {
+                                Some((file, _building)) => {
+                                    let built = live.compact_into(Some(&file.target()));
+                                    // Declined (folder reads): the build ends
+                                    // without a file.
+                                    let report = built
+                                        .as_ref()
+                                        .map(|(_, report)| report.clone())
+                                        .unwrap_or_default();
+                                    file.built(&report);
+                                    built.map(|(new, _)| new)
+                                }
                                 None => live.compact(),
+                            };
+                            let mut new = match &pool {
+                                Some(pool) => pool.install(|| build(live)),
+                                None => build(live),
                             }?;
-                            // The merged index replaces the file and is read
-                            // from it, so its heap copy goes at once.
-                            if let Some(mapped) = map_saved(new.base(), persist) {
-                                if !new.replace_base(Arc::new(mapped)) {
-                                    eventlog::warn(
-                                        "the saved index does not match the merged one; it stays in memory",
-                                    );
-                                } else if save_now && let Some(path) = tables {
-                                    // Its live tables too, with the journal
-                                    // positions every merged change is up to,
-                                    // unless the index is known to miss
-                                    // changes (a rescan waits): then the next
-                                    // start scans.
-                                    let facts: Vec<saved::VolumeFacts> = facts
-                                        .iter()
-                                        .zip(&applied)
-                                        .map(|(f, &journal)| saved::VolumeFacts {
-                                            journal: Some(journal),
-                                            ..f.clone()
-                                        })
-                                        .collect();
-                                    if let Some(saved) =
-                                        save_tables(path, &new, fingerprint, &facts)
-                                    {
-                                        new.replace_tables(saved);
-                                        tables_written = true;
+                            // Built in memory after all (no index file, or it
+                            // could not be built): saved and mapped now.
+                            let in_file = match map_saved(new.base(), persist) {
+                                _ if new.base().is_mapped() => true,
+                                Some(mapped) => {
+                                    let replaced = new.replace_base(Arc::new(mapped));
+                                    if !replaced {
+                                        eventlog::warn(
+                                            "the saved index does not match the merged one; it stays in memory",
+                                        );
                                     }
+                                    replaced
+                                }
+                                None => false,
+                            };
+                            if in_file
+                                && save_now
+                                && let Some(path) = tables
+                            {
+                                // Its live tables too, with the journal
+                                // positions every merged change is up to,
+                                // unless the index is known to miss
+                                // changes (a rescan waits): then the next
+                                // start scans.
+                                let facts: Vec<saved::VolumeFacts> = facts
+                                    .iter()
+                                    .zip(&applied)
+                                    .map(|(f, &journal)| saved::VolumeFacts {
+                                        journal: Some(journal),
+                                        ..f.clone()
+                                    })
+                                    .collect();
+                                if let Some(saved) = save_tables(path, &new, fingerprint, &facts) {
+                                    new.replace_tables(saved);
+                                    tables_written = true;
                                 }
                             }
                             Some(new)

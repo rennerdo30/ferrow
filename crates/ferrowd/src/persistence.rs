@@ -35,6 +35,12 @@ static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// maintainer saved and is about to publish.
 static MAINTAINER_SAVED: AtomicBool = AtomicBool::new(false);
 
+/// Set while the live maintainer builds an index into the file: the
+/// background saver writes nothing meanwhile (the build renames its file
+/// into place before the new index is published). Cleared when the build
+/// ends, whatever its outcome.
+static BUILDING: AtomicBool = AtomicBool::new(false);
+
 fn save(config: &DaemonConfig, snapshot: Arc<Snapshot>) -> io::Result<()> {
     save_index(config, &snapshot.index)
 }
@@ -85,6 +91,205 @@ pub fn save_and_map(
     Some(saved)
 }
 
+/// The index file as the live maintainer builds it (ADR 0007, step 8): a scan
+/// or a compaction writes its new index straight into the file instead of
+/// building it in the heap and saving it. One writer of the file at a time:
+/// the build holds [`SAVE_LOCK`] while the new file replaces the old one.
+#[derive(Clone)]
+pub struct IndexFile {
+    config: Arc<DaemonConfig>,
+    path: std::path::PathBuf,
+}
+
+/// A build into the index file is running (see [`IndexFile::prepare`]).
+#[must_use = "the saver waits only while this lives"]
+pub struct Building(());
+
+impl Building {
+    fn start() -> Building {
+        BUILDING.store(true, Ordering::Release);
+        Building(())
+    }
+}
+
+impl Drop for Building {
+    fn drop(&mut self) {
+        BUILDING.store(false, Ordering::Release);
+    }
+}
+
+/// Temporary files a save or build of another process left beside the index
+/// (a crash or a power loss mid-way; a file build's is the size of the index)
+/// are removed once they are this old.
+const STALE_TEMPORARY: Duration = Duration::from_secs(60 * 60);
+
+/// Whether the process that named a temporary file (`.ferrow[-kind]-<pid>-…`)
+/// still runs. Unknown counts as running.
+fn writer_alive(name: &str) -> bool {
+    let Some(pid) = name
+        .strip_prefix(".ferrow-")
+        .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == '-'))
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+    else {
+        return true;
+    };
+    process_alive(pid)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: plain query of another process; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // Gone, or not ours to ask: only a missing process is certain.
+        return std::io::Error::last_os_error().raw_os_error() != Some(87);
+    }
+    let mut code = 0u32;
+    // SAFETY: a live handle and a writable code.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+    // SAFETY: the handle opened above.
+    unsafe { CloseHandle(handle) };
+    !ok || code == STILL_ACTIVE
+}
+
+#[cfg(not(windows))]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove `.ferrow-<pid>-….tmp` files in `dir` of another process (this
+/// one's may be in use) that nobody wrote for [`STALE_TEMPORARY`].
+fn remove_stale_temporaries(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let own = format!("-{}-", std::process::id());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let ours = name
+            .strip_prefix(".ferrow-")
+            .is_some_and(|rest| rest.ends_with(".tmp"));
+        let this_process = name.starts_with(&format!(".ferrow{own}"))
+            || name.starts_with(&format!(".ferrow-live{own}"))
+            || name.starts_with(&format!(".ferrow-spill{own}"));
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age >= STALE_TEMPORARY));
+        // A file whose writer still runs may be in use (a mapped build
+        // writes without touching the file's time).
+        if ours && !this_process && old && !writer_alive(name) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => crate::eventlog::info(format!(
+                    "removed a temporary file left by an interrupted save: {name}"
+                )),
+                Err(error) => crate::eventlog::warn(format!(
+                    "could not remove a temporary file left by an interrupted save ({name}): {error}"
+                )),
+            }
+        }
+    }
+}
+
+impl IndexFile {
+    /// `None` without an index path (a service that does not save).
+    pub fn new(config: &DaemonConfig) -> Option<IndexFile> {
+        Some(IndexFile {
+            path: config.index_path.clone()?,
+            config: Arc::new(config.clone()),
+        })
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Make the state directory ready for a build that writes beside the index
+    /// (its temporary file and the spilled shards): created, and protected as
+    /// a save protects it.
+    ///
+    /// The background saver writes nothing until the returned guard is
+    /// dropped (the build renames its file into place before the new index
+    /// is published): keep it for the whole build, `built()` included. An
+    /// error, or a panic in the build, drops it too.
+    pub fn prepare(&self) -> io::Result<Building> {
+        let building = Building::start();
+        prepare_state(&self.config)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+            remove_stale_temporaries(parent);
+        }
+        Ok(building)
+    }
+
+    /// Where a build puts its index, replacing the file under [`SAVE_LOCK`].
+    pub fn target(&self) -> ferrow_index::FileTarget<'_> {
+        ferrow_index::FileTarget {
+            path: &self.path,
+            lock: Some(&SAVE_LOCK),
+        }
+    }
+
+    /// Report a finished build: health and the event log, as a save reports,
+    /// and the protection of the new file. `report` is what the build
+    /// returned; a failed file build or spill is logged, not hidden.
+    pub fn built(&self, report: &ferrow_walk::IndexFileReport) {
+        // A build that replaced the file makes the maintainer its writer; one
+        // that fell back to memory leaves its index to `save_and_map`, and to
+        // the background saver if that fails too.
+        if report.timings.is_some() {
+            MAINTAINER_SAVED.store(true, Ordering::Release);
+        }
+        if let Some(t) = &report.timings {
+            // What a save would have taken: the checksum, the write and the
+            // replacement. The parts before are the build itself.
+            let wrote = t.checksum + t.flush + t.replace;
+            crate::health::STATE.save_done(wrote, None);
+            if let Err(error) = prepare_state(&self.config) {
+                crate::eventlog::warn(format!("could not protect the new index file: {error}"));
+            }
+            crate::eventlog::info(format!("index saved in {:.1} s", wrote.as_secs_f64()));
+            crate::eventlog::info(format!(
+                "index built into its file in {:.1} s ({:.1} s placing entries, {:.1} s folding names, {:.1} s sorting; {:.0} MB spilled while building)",
+                t.total.as_secs_f64(),
+                t.scatter.as_secs_f64(),
+                t.fold.as_secs_f64(),
+                t.sort.as_secs_f64(),
+                t.spilled_bytes as f64 / 1e6,
+            ));
+        }
+        if let Some(error) = &report.error {
+            crate::health::STATE.save_done(Duration::ZERO, Some(error.clone()));
+            crate::eventlog::warn(format!(
+                "could not build the new index in its file ({error}); it was built in memory"
+            ));
+        }
+        if let Some(error) = &report.spill_failure {
+            crate::eventlog::warn(format!(
+                "could not spill the build to disk ({error}); it stayed in memory"
+            ));
+        }
+    }
+
+    /// Save a heap index and map it back from the file (the fallback when a
+    /// build could not go straight into the file); see [`save_and_map`].
+    pub fn save_and_map(
+        &self,
+        index: &ferrow_index::Index,
+    ) -> Option<io::Result<ferrow_index::Index>> {
+        save_and_map(&self.config, index)
+    }
+}
+
 impl Persistence {
     pub fn start(
         config: &DaemonConfig,
@@ -115,6 +320,7 @@ impl Persistence {
                 // leave the older one on disk.
                 if snapshot.index.is_mapped()
                     || MAINTAINER_SAVED.load(Ordering::Acquire)
+                    || BUILDING.load(Ordering::Acquire)
                     || !Arc::ptr_eq(&published.get().index, &snapshot.index)
                 {
                     return Ok(());
@@ -267,6 +473,86 @@ impl Drop for Persistence {
 mod tests {
     use super::*;
 
+    /// Tests that start a build hold this: the state they check is global.
+    static BUILDING_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_saver_waits_exactly_while_a_build_runs() {
+        let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ferrowd-building-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = |path: std::path::PathBuf| DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-building-unused"),
+            index_path: Some(path),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let good = IndexFile::new(&config(dir.join("index.bin"))).unwrap();
+        {
+            let _building = good.prepare().unwrap();
+            assert!(BUILDING.load(Ordering::Acquire));
+        }
+        assert!(!BUILDING.load(Ordering::Acquire), "held only by the guard");
+        // A directory that cannot be made (its parent is a file): the error
+        // does not leave the saver held back.
+        std::fs::write(dir.join("a-file"), b"x").unwrap();
+        let bad =
+            IndexFile::new(&config(dir.join("a-file").join("sub").join("index.bin"))).unwrap();
+        assert!(bad.prepare().is_err());
+        assert!(!BUILDING.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writer_that_still_runs_keeps_its_temporary_file() {
+        assert!(writer_alive(&format!(
+            ".ferrow-{}-1-2.tmp",
+            std::process::id()
+        )));
+        assert!(!writer_alive(".ferrow-4294967-1-2.tmp"));
+        assert!(!writer_alive(".ferrow-spill-4294967-3.tmp"));
+        assert!(writer_alive(".ferrow-odd.tmp"), "unknown counts as running");
+    }
+
+    #[test]
+    fn stale_temporary_files_of_other_processes_are_removed() {
+        let dir = std::env::temp_dir().join(format!("ferrowd-stale-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        let make = |name: &str, aged: bool| {
+            let file = std::fs::File::create(dir.join(name)).unwrap();
+            if aged {
+                file.set_modified(old).unwrap();
+            }
+        };
+        let own = std::process::id();
+        make(".ferrow-4294967-2-3.tmp", true); // a process gone, old: removed
+        make(".ferrow-live-4294967-abc.tmp", true); // the same for live tables
+        make(".ferrow-spill-4294967-9.tmp", true); // and spilled shards
+        make(".ferrow-4294967-2-4.tmp", false); // recent: may be in use
+        make(&format!(".ferrow-{own}-3-1.tmp"), true); // this process, old
+        make(&format!(".ferrow-{own}-2-5.tmp"), true); // this process
+        make("index.bin", true); // not a temporary file
+        remove_stale_temporaries(&dir);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![
+            ".ferrow-4294967-2-4.tmp".to_string(),
+            format!(".ferrow-{own}-3-1.tmp"),
+            format!(".ferrow-{own}-2-5.tmp"),
+            "index.bin".to_string(),
+        ];
+        want.sort();
+        assert_eq!(left, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_new_index_is_saved_and_read_back_from_its_file() {
         let dir = std::env::temp_dir().join(format!("ferrowd-save-map-{}", std::process::id()));
@@ -300,6 +586,69 @@ mod tests {
             ..config
         };
         assert!(save_and_map(&none, &heap).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_into_the_index_file_replaces_it_and_leaves_the_save_lock_free() {
+        let dir = std::env::temp_dir().join(format!("ferrowd-build-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state").join("index.bin");
+        let config = DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-build-file-unused"),
+            index_path: Some(path.clone()),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let file = IndexFile::new(&config).unwrap();
+        assert!(
+            IndexFile::new(&DaemonConfig {
+                index_path: None,
+                ..config.clone()
+            })
+            .is_none()
+        );
+        // The state directory does not exist yet: preparing it creates it.
+        let _building = {
+            let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            file.prepare().unwrap()
+        };
+        drop(_building);
+
+        let build = |entries: usize| {
+            let b = ferrow_index::IndexBuilder::with_spill(
+                ferrow_index::ColumnSet::DEFAULT,
+                path.parent().unwrap(),
+                16 * 1024,
+            );
+            let root = b.add_root(b"C:", ferrow_index::flags::DIR);
+            for i in 0..entries {
+                b.add(root, format!("file {i}.txt").as_bytes(), 0);
+            }
+            b.freeze_to_file_with(&file.target()).unwrap()
+        };
+        let (first, timings) = build(3_000);
+        assert!(first.is_mapped());
+        assert!(timings.spilled_bytes > 0, "the build spilled");
+        file.built(&ferrow_walk::IndexFileReport {
+            timings: Some(timings),
+            ..Default::default()
+        });
+        assert!(SAVE_LOCK.try_lock().is_ok(), "the lock is released");
+
+        // A second build replaces the file while the first is mapped.
+        let (second, _) = build(4_000);
+        assert_eq!(first.len(), 3_001);
+        assert_eq!(second.len(), 4_001);
+        assert_eq!(ferrow_index::Index::load(&path).unwrap().len(), 4_001);
+        drop((first, second));
+        let mut left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["index.bin"], "no temporary or spill file is left");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

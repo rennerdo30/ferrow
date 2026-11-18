@@ -46,8 +46,8 @@ use crate::{ColumnSet, Index, OwnedColumns, ROOT_PARENT, fold_name};
 
 pub const MAGIC: [u8; 8] = *b"FERROWID";
 pub const VERSION: u32 = 4;
-const HEADER_LEN: usize = 32;
-const CHECKSUM_START: usize = 24;
+pub(crate) const HEADER_LEN: usize = 32;
+pub(crate) const CHECKSUM_START: usize = 24;
 /// Sane ceiling for one index file (16 GiB). A header claiming more is
 /// rejected before any payload is read or allocated.
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -64,14 +64,14 @@ struct Header {
 
 /// Exact total file length for the given counts, in `u64` so the math is
 /// overflow-free on 32-bit targets too.
-fn expected_len(n: u32, arena: u32, metadata: u32, header: usize, version: u32) -> u64 {
+pub(crate) fn expected_len(n: u32, arena: u32, metadata: u32, header: usize, version: u32) -> u64 {
     header as u64 + n as u64 * 16 + arena as u64 * 2 + sorted_pad(arena, version) + metadata as u64
 }
 
 /// The zero bytes before `sorted` (v4): the sections before it are the
 /// 32-byte header, 12 bytes per entry and the two arenas, so only the
 /// arenas can leave it 2 bytes off a 4-byte boundary.
-fn sorted_pad(arena: u32, version: u32) -> u64 {
+pub(crate) fn sorted_pad(arena: u32, version: u32) -> u64 {
     if version >= 4 {
         (arena as u64 * 2) % 4
     } else {
@@ -148,6 +148,11 @@ impl fmt::Display for SaveError {
     }
 }
 impl std::error::Error for SaveError {}
+impl From<std::io::Error> for SaveError {
+    fn from(e: std::io::Error) -> Self {
+        SaveError::Io(e)
+    }
+}
 
 #[derive(Debug)]
 pub enum LoadError {
@@ -362,6 +367,27 @@ fn write_atomically(
     path: &Path,
     fill: impl FnOnce(std::fs::File) -> std::io::Result<std::fs::File>,
 ) -> std::io::Result<()> {
+    let (file, tmp) = create_temp(path, false)?;
+    let written = (|| -> std::io::Result<()> {
+        let file = fill(file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Create a unique temporary file beside `path` (exclusively; mode 0600 on
+/// Unix). With `readable` the file is also opened for reading, which a
+/// writable memory map of it needs.
+pub(crate) fn create_temp(
+    path: &Path,
+    readable: bool,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => std::path::PathBuf::from("."),
@@ -378,28 +404,17 @@ fn write_atomically(
         // filesystem component limit.
         let tmp = parent.join(format!(".ferrow-{pid}-{seq}-{nonce:016x}.tmp"));
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
+        opts.write(true).create_new(true).read(readable);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = match opts.open(&tmp) {
-            Ok(f) => f,
+        match opts.open(&tmp) {
+            Ok(f) => return Ok((f, tmp)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
-        };
-        let written = (|| -> std::io::Result<()> {
-            let file = fill(file)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp, path)
-        })();
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
         }
-        return Ok(());
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
@@ -1144,8 +1159,6 @@ fn from_bytes_with(
 ) -> Result<Index, LoadError> {
     let header = parse_header(data)?;
     let map = map.filter(|_| header.version >= 4);
-    let n = header.entry_count as usize;
-    let arena_len = header.arena_len as usize;
     let expected = expected_len(
         header.entry_count,
         header.arena_len,
@@ -1174,6 +1187,23 @@ fn from_bytes_with(
     }
 
     let t = Instant::now();
+    let parts = read_sections(data, map, &header)?;
+    timings.decode += t.elapsed();
+    match check {
+        Check::Full => validate(parts, timings),
+        Check::Trusted => Ok(assemble(parts)),
+    }
+}
+
+/// Decode (or, with `map`, point at) every section of `data`, whose length
+/// and header are already checked.
+fn read_sections(
+    data: &[u8],
+    map: Option<&std::sync::Arc<memmap2::Mmap>>,
+    header: &Header,
+) -> Result<Parts, LoadError> {
+    let n = header.entry_count as usize;
+    let arena_len = header.arena_len as usize;
     let mut at = header.header_len;
     let (parent, name_off, name_len, ent_flags, arena, folded_arena, sorted);
     match map {
@@ -1194,7 +1224,7 @@ fn from_bytes_with(
             ent_flags = col(data, map, &mut at, n)?;
             arena = col(data, map, &mut at, arena_len)?;
             folded_arena = col(data, map, &mut at, arena_len)?;
-            skip_pad(data, &mut at, &header)?;
+            skip_pad(data, &mut at, header)?;
             sorted = col(data, map, &mut at, n)?;
         }
         None => {
@@ -1204,7 +1234,7 @@ fn from_bytes_with(
             ent_flags = read_u16s(data, &mut at, n)?.into();
             arena = take(data, &mut at, arena_len)?.to_vec().into();
             folded_arena = take(data, &mut at, arena_len)?.to_vec().into();
-            skip_pad(data, &mut at, &header)?;
+            skip_pad(data, &mut at, header)?;
             sorted = read_u32s(data, &mut at, n)?.into();
         }
     }
@@ -1212,8 +1242,7 @@ fn from_bytes_with(
     if at != data.len() {
         return Err(LoadError::Corrupt("unexpected metadata bytes"));
     }
-    timings.decode += t.elapsed();
-    let parts = Parts {
+    Ok(Parts {
         parent,
         name_off,
         name_len,
@@ -1222,11 +1251,40 @@ fn from_bytes_with(
         folded_arena,
         sorted,
         metadata,
-    };
-    match check {
-        Check::Full => validate(parts, timings),
-        Check::Trusted => Ok(assemble(parts)),
+    })
+}
+
+/// The index of a v4 file that Ferrow has just written and checksummed
+/// itself (a file-backed build): its columns are slices of `map`, with the
+/// header, the length and the offsets of every section checked but neither
+/// the checksum nor the derived data, which the writer made. Debug builds
+/// run the whole load check instead, so every test of a file build verifies
+/// it.
+pub(crate) fn index_from_own_map(map: &std::sync::Arc<memmap2::Mmap>) -> Result<Index, LoadError> {
+    if cfg!(debug_assertions) {
+        let mut index = from_bytes_with(map, Some(map), Check::Full, &mut LoadTimings::default())?;
+        index.file_checksum = Some(parse_header(map)?.checksum);
+        return Ok(index);
     }
+    let header = parse_header(map)?;
+    if header.version < 4 {
+        return Err(LoadError::UnsupportedVersion(header.version));
+    }
+    let expected = expected_len(
+        header.entry_count,
+        header.arena_len,
+        header.metadata_len,
+        header.header_len,
+        header.version,
+    );
+    if map.len() as u64 != expected {
+        return Err(LoadError::Corrupt(
+            "index file length differs from its header",
+        ));
+    }
+    let mut index = assemble(read_sections(map, Some(map), &header)?);
+    index.file_checksum = Some(header.checksum);
+    Ok(index)
 }
 
 /// Step over the zero bytes before `sorted` (v4); anything else there is

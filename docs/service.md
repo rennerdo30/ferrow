@@ -85,14 +85,20 @@ Windows MFT/USN journal).
     moved-in folder that could not be read, a request by an administrator,
     and the start of the service.
 
-    A compaction's memory: the builder and the new tables add about 85
-    bytes per entry on top of the old index while it runs (a rescan adds
-    about 161). The new index starts without its cached metadata sort orders (size,
+    A compaction's memory: it builds the new index straight in its file
+    (see "Rescans and merges are built in the file" below), so the builder
+    and a second copy of every column are not in the heap: what a
+    compaction adds in private memory is a fixed working set (about 55 MB
+    of spilling shards and 5 MB while the file is placed, measured at 2
+    million entries) plus the new live tables (about 22 bytes per entry,
+    until ADR 0007 decision 6 moves them into the file). The in-memory
+    build it replaced added about 85 bytes per entry (a rescan added about
+    161). The new index starts without its cached metadata sort orders (size,
     dates); right after the swap the ones that were ready on the old index
     are prepared again in the background, one thread each at the lowest
     priority (about 0.13 s at 1 million entries), and a sorted search
-    answers in name order until then. The merged index is saved at once and
-    read back from its file (see "The index is read from its file" below).
+    answers in name order until then. The merged index replaces the file
+    and is read from it (see "The index is read from its file" below).
     Health keeps
     it apart from the scans: `live_stats` has `compactions`, `compaction_ms`
     and `last_compaction` (when, how long; a later scan clears it), and it is
@@ -417,7 +423,7 @@ service-only: the index lists every file name on the machine.
 
 **The index is read from its file (ADR 0007).**
 
-- **When it is saved and mapped:** after every scan and every in-memory merge, the live maintainer saves the new index to `index.bin` and maps the file back read-only. It then drops the copy it built in its own memory.
+- **When it is saved and mapped:** after every scan and every in-memory merge, the new index is in `index.bin` and mapped read-only. The live maintainer builds it in that file in the first place (next section); only when that fails does it build in memory, save, map the file back and drop the copy.
 - **Where the index lives:** its columns are read through the map. They sit in the operating system's file cache, shared and reclaimable, and are not part of the service's private memory. Health reports the two apart:
   - `private_working_set`: what Task Manager's Memory column shows.
   - `index_mapped_bytes`: the mapped file.
@@ -426,6 +432,16 @@ service-only: the index lists every file name on the machine.
 - **Version 3 files:** they are still read, into the heap, once.
 - **If saving or mapping fails:** the index stays in memory (correct, only larger), with a warning in the log.
 - **No duplicate saves:** the background saver skips an index that is already mapped. One lock keeps it and the maintainer from writing the file at the same time.
+
+**Rescans and merges are built in the file (ADR 0007, step 8).**
+
+- **What it replaces:** a rescan or merge built its index in the heap (the builder's shards, about 50 to 64 bytes per entry, then every final column, both name arenas and the name order, about 110 more) and then saved it. At 27 million entries that was several GB on top of the running index, far over the 1 GB limit.
+- **While entries are added:** the builder's shards hold at most a fixed share of 32 MiB; a full shard is written to an anonymous temporary file beside `index.bin` (deleted when closed, so a failed or killed build leaves nothing) and its memory is reused. The heap holds about 1.6 times that budget at most (measured), whatever the number of entries.
+- **The freeze:** the new file is sized exactly and mapped writable. The shards' columns, names and metadata are placed in it (a spilled run is read back twice: 12 bytes per entry for the columns, then the names), the names are folded, the name order is sorted in place and the checksum is computed, all inside the map. The pages are file cache, not private memory: freezing 2 million entries grew the process by 4.9 MB (measured), and the figure stays fixed as the index grows because it depends on the shard budget, not on the entry count. The file is flushed, renamed over `index.bin` under the save lock and mapped read-only; its bytes are exactly what a save of the same index writes.
+- **Failure:** a temporary file that cannot be created or written (a full disk) leaves `index.bin` as it was and no temporary file behind. The scan or merge then builds in memory instead and saves and maps as before, with a warning in the log; a shard that cannot be spilled stays in memory (correct, only larger).
+- **Disk:** during a rescan or merge the disk holds the old index, the new file being built (about the index size) and the spilled shards (about 60 bytes per entry with names averaging 42 bytes, estimated; gone when the build ends).
+- **Time:** the freeze, the save and the map-back became one step. In the synthetic benchmark the whole rescan build (emit, freeze, save, map) took the same time at 1 million entries and about 15 % longer at 2 million. Writing the spilled shards cost about 25 ms for 67 MB; part of the rest is the order the benchmark runs in (a plain in-heap builder run third was also about 100 ms slower than the same one run second). At 27 million entries it should be neutral to a little slower (estimated, not measured).
+- **Not part of this step:** the scan's own tables (the record map, 16 bytes per entry, and the parsed volume) and the live layer's new tables stay in the heap; ADR 0007 decision 6 moves them.
 
 **Restart without a scan (ADR 0007).**
 
