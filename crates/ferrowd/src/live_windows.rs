@@ -515,9 +515,34 @@ fn options_fingerprint(options: &WalkOptions) -> u64 {
     saved::fingerprint(&refs)
 }
 
-/// How long a scan whose index could not be built waits before it runs
-/// again.
-const BUILD_RETRY: Duration = Duration::from_secs(5 * 60);
+/// Wait `gap` before a scan is tried again, dropping the journals' records
+/// (the next scan reads everything again). An administrator's rescan ends
+/// the wait (and becomes the reason); a reader that stopped for good is
+/// reported. `false` when the channel closed (the service stops).
+fn wait_to_retry(rx: &Receiver<Message>, gap: Duration, reason: &mut String) -> bool {
+    let until = Instant::now() + gap;
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(Message::RescanNow) => {
+                *reason = REASON_ADMIN.into();
+                break;
+            }
+            // The next session does not start a stopped reader again.
+            Ok(Message::Reset {
+                device,
+                reason: why,
+                fatal: true,
+            }) => {
+                eventlog::warn(format!("journal of {device}: {why}"));
+                STATE.journal_problem(&device, true, &why);
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    true
+}
 
 /// The most change journal (bytes of USN records) a start replays instead of
 /// scanning: about a million changed files.
@@ -778,6 +803,8 @@ fn maintain(
     // Only the first session may come from the saved files; a rescan reads
     // the drives.
     let mut first = true;
+    // Scans in a row whose index could not be built (or had no room).
+    let mut build_failures: u32 = 0;
     loop {
         let started = Instant::now();
         let restored = if std::mem::take(&mut first) {
@@ -851,6 +878,26 @@ fn maintain(
             };
             continue;
         }
+        // A rescan needs room for the new index file beside the old one:
+        // without it, it would read every drive only to fail at the end.
+        // The index served now stays until there is room.
+        if !store.get().index.is_empty()
+            && let Some(file) = &persist
+            && let Err(why) = file.has_room()
+        {
+            build_failures += 1;
+            let gap = refresh_retry(build_failures);
+            if build_failures == 1 {
+                eventlog::warn(format!(
+                    "no rescan now: {why}; tried again in {} min",
+                    gap.as_secs() / 60
+                ));
+            }
+            if !wait_to_retry(&rx, gap, &mut reason) {
+                return;
+            }
+            continue;
+        }
         STATE.scan_started();
         STATE.count_scan(&reason);
         let scan = || scan_into(&options, persist.as_ref());
@@ -867,40 +914,24 @@ fn maintain(
         };
         background = true;
         let took = started.elapsed();
+        if report.fatal_error.is_none() {
+            build_failures = 0;
+        }
         if let Some(fatal) = &report.fatal_error {
             // A build that could not read its spilled shards back (a failing
             // disk, a file taken away) may work later: try again then
             // instead of ending live updates. Other fatal errors (an exclude
             // that cannot be resolved) stop them, as before.
             if fatal.starts_with(ferrow_walk::BUILD_FAILED) {
+                build_failures += 1;
+                let gap = refresh_retry(build_failures);
                 eventlog::warn(format!(
                     "scan failed: {fatal}; trying again in {} min",
-                    BUILD_RETRY.as_secs() / 60
+                    gap.as_secs() / 60
                 ));
                 STATE.scan_failed();
-                // Wait, dropping the journals' records (the next scan reads
-                // everything again); an administrator's rescan ends the wait.
-                let until = Instant::now() + BUILD_RETRY;
-                while let Some(left) = until.checked_duration_since(Instant::now()) {
-                    match rx.recv_timeout(left) {
-                        Ok(Message::RescanNow) => {
-                            reason = REASON_ADMIN.into();
-                            break;
-                        }
-                        // A reader that stopped for good is reported now:
-                        // the next session does not start it again.
-                        Ok(Message::Reset {
-                            device,
-                            reason: why,
-                            fatal: true,
-                        }) => {
-                            eventlog::warn(format!("journal of {device}: {why}"));
-                            STATE.journal_problem(&device, true, &why);
-                        }
-                        Ok(_) => {}
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
+                if !wait_to_retry(&rx, gap, &mut reason) {
+                    return;
                 }
                 continue;
             }
@@ -1236,11 +1267,10 @@ fn run_session(
                     log_memory("before compaction", Some(&live), &base, store);
                     let save_now = can_save_tables && !rescan.rescan_waiting();
                     let mut tables_written = false;
-                    // A merge declines only while folders are read; otherwise
-                    // a missing result is a failure (the index file could
-                    // not be built: a full disk), which waits its gap.
-                    let merge_started = Instant::now();
-                    let reading = live.walks_outstanding();
+                    // A merge is only due with no folder read outstanding, and
+                    // none can start during it (this thread starts them): a
+                    // missing result is a failure (the index file could not
+                    // be built: a full disk), which blocks merges for a gap.
                     let report = format!("{summary}; {applied_total} live changes");
                     // Single writer: this thread, on the low-priority pool.
                     // Journal changes queue in the channel meanwhile, and
@@ -1358,13 +1388,22 @@ fn run_session(
                             base.len()
                         ));
                         log_memory("after compaction", Some(&live), &base, store);
-                    } else if !reading {
-                        rescan.compacted(Instant::now(), merge_started.elapsed());
+                    } else {
                         refresh_failures += 1;
-                        next_refresh = Instant::now() + refresh_retry(refresh_failures);
-                        eventlog::warn(format!(
-                            "the merge in memory ({why}) failed; the index stays as it is and the merge is tried again later"
-                        ));
+                        let gap = refresh_retry(refresh_failures);
+                        next_refresh = Instant::now() + gap;
+                        rescan.failed(Instant::now(), gap, why.clone());
+                        STATE.merge_blocked(Some(format!(
+                            "the merge in memory failed ({why}); tried again in {} min",
+                            gap.as_secs() / 60
+                        )));
+                        // Once per episode, not per attempt.
+                        if refresh_failures == 1 {
+                            eventlog::warn(format!(
+                                "the merge in memory ({why}) failed; the index stays as it is and the merge is tried again in {} min",
+                                gap.as_secs() / 60
+                            ));
+                        }
                     }
                     continue;
                 }

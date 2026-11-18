@@ -313,10 +313,20 @@ pub(crate) fn reserve(file: &std::fs::File, bytes: u64) -> std::io::Result<()> {
         // and extends the file, or returns an error number.
         match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
             0 => Ok(()),
+            // A file system without it: write the zeros instead.
+            libc::EOPNOTSUPP => write_zeros(file, bytes),
             errno => Err(std::io::Error::from_raw_os_error(errno)),
         }
     }
     #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        write_zeros(file, bytes)
+    }
+}
+
+/// Write `bytes` zeros at the start of `file` (its real disk space).
+#[cfg(not(windows))]
+fn write_zeros(file: &std::fs::File, bytes: u64) -> std::io::Result<()> {
     {
         use std::io::Write;
         let zeros = vec![0u8; 1 << 20];
