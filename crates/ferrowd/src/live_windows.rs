@@ -23,6 +23,7 @@ use crate::live::{
     WalkJob, compact_and_publish, index_parts, walk_limits_text,
 };
 use crate::memory::Breakdown;
+use crate::saved;
 use crate::{Snapshot, SnapshotStore, eventlog};
 
 /// How long changes are collected after the first one of a batch.
@@ -34,6 +35,9 @@ enum Message {
     Records {
         device: String,
         records: Vec<(u64, u32)>,
+        /// The journal id and the position the reader continues from: once
+        /// these records are applied, the index holds every change before it.
+        position: (u64, i64),
     },
     /// The journal was deleted, recreated or overrun: rescan. `fatal`: the
     /// reader has stopped and is not restarted until the service restarts.
@@ -78,6 +82,8 @@ enum Batch {
     Changes {
         changes: Vec<Change>,
         events: Vec<WalkEvent>,
+        /// Per volume, the journal position the batch's changes reach.
+        positions: Vec<(usize, (u64, i64))>,
     },
     Reset {
         device: String,
@@ -275,7 +281,12 @@ pub fn will_run(options: &WalkOptions) -> bool {
     !options.follow_symlinks && options.roots.iter().any(|r| fast(r))
 }
 
-pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
+pub fn start(
+    store: SnapshotStore,
+    options: WalkOptions,
+    persist: Option<Persist>,
+    tables: Option<std::path::PathBuf>,
+) {
     // Without raw volume access (not elevated) there is nothing live to
     // keep; the initial walk stands.
     if !will_run(&options) {
@@ -283,7 +294,7 @@ pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist
     }
     let spawned = std::thread::Builder::new()
         .name("index-live".into())
-        .spawn(move || maintain(store, options, persist));
+        .spawn(move || maintain(store, options, persist, tables));
     if let Err(error) = spawned {
         eventlog::error(format!("live updates unavailable: {error}"));
     }
@@ -441,7 +452,279 @@ fn map_saved(
     }
 }
 
-fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
+/// What the saved live tables must have been made with (see
+/// [`crate::saved::fingerprint`]).
+fn options_fingerprint(options: &WalkOptions) -> u64 {
+    let roots: Vec<String> = options
+        .roots
+        .iter()
+        .map(|r| root_key(&r.display().to_string()))
+        .collect();
+    let excludes: Vec<String> = options
+        .excludes
+        .iter()
+        .map(|r| root_key(&r.display().to_string()))
+        .collect();
+    let mut parts: Vec<Vec<u8>> = vec![
+        b"roots".to_vec(),
+        roots.join("\n").into_bytes(),
+        b"excludes".to_vec(),
+        excludes.join("\n").into_bytes(),
+        options.columns.bits().to_le_bytes().to_vec(),
+        vec![u8::from(options.follow_symlinks)],
+        format!("{:?}", options.ntfs).into_bytes(),
+    ];
+    parts.push(env!("CARGO_PKG_VERSION").as_bytes().to_vec());
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    saved::fingerprint(&refs)
+}
+
+/// The most change journal (bytes of USN records) a start replays instead of
+/// scanning: about a million changed files.
+const MAX_REPLAY_BYTES: i64 = 256 << 20;
+
+/// How far (bytes of change journal) the saved state may lag behind what is
+/// applied before its tables alone are saved again (nothing changed: the
+/// index file stays); otherwise a session leaves the saved position behind
+/// until a start must scan (MAX_REPLAY_BYTES, or the journal wrapping past
+/// it). A quarter of what a start replays, and never more than a quarter of
+/// the journal itself.
+const TABLES_LAG_BYTES: i64 = MAX_REPLAY_BYTES / 4;
+/// …and before a merge brings the saved index up to date when something
+/// changed. A merge writes the whole index file (gigabytes on a large PC),
+/// so it waits for three quarters of what a start replays, or half the
+/// journal.
+const MERGE_LAG_BYTES: i64 = MAX_REPLAY_BYTES / 4 * 3;
+/// …or how long the saved state may lag at all.
+const TABLES_REFRESH: Duration = Duration::from_secs(12 * 60 * 60);
+/// After an attempt to bring the saved state up to date (it may have
+/// failed: a full disk), the next waits at least this long, doubled after
+/// each attempt that did not save the tables, up to TABLES_REFRESH.
+const REFRESH_RETRY: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait before the next attempt after `failures` attempts in a
+/// row that did not save the tables (0: the last one did).
+fn refresh_retry(failures: u32) -> Duration {
+    (REFRESH_RETRY * 2u32.pow(failures.saturating_sub(1).min(6))).min(TABLES_REFRESH)
+}
+
+/// The smallest journal size the lag limits scale down to: a journal that
+/// reports less (just created) is treated as this large.
+const MIN_JOURNAL_SPAN: i64 = 4 << 20;
+/// Why such a merge runs.
+const REASON_REFRESH: &str = "bring the saved index up to date";
+
+/// Whether a start may replay a volume's journal from `saved` (journal id,
+/// position) given the journal as it is now (`id`, first and next USN), or
+/// why it must scan.
+fn replay_verdict(saved: (u64, i64), now: (u64, i64, i64)) -> Result<(), &'static str> {
+    let (saved_id, at) = saved;
+    let (id, first, next) = now;
+    if id != saved_id {
+        return Err("was replaced");
+    }
+    if at < first || at > next {
+        return Err("no longer holds every change since the index was saved");
+    }
+    // Replaying more than this would take longer than the scan it saves
+    // (one record read per changed file).
+    if next - at > MAX_REPLAY_BYTES {
+        return Err("has too many changes since the index was saved");
+    }
+    Ok(())
+}
+
+/// Per volume, how far the applied journal position is ahead of the saved
+/// one, in journal bytes (a replaced journal, or saved tables that are not
+/// current, count as far ahead).
+fn saved_lags(applied: &[(u64, i64)], saved: &[(u64, i64)]) -> Vec<i64> {
+    applied
+        .iter()
+        .zip(saved)
+        .map(|(&(id, at), &(saved_id, saved_at))| {
+            if id == saved_id {
+                at.saturating_sub(saved_at).max(0)
+            } else {
+                i64::MAX
+            }
+        })
+        .collect()
+}
+
+/// Whether the saved state should be brought up to date now, by a merge
+/// (`merge`: something changed) or by saving its tables. Per volume, `lags`
+/// and `spans` (the journal's configured maximum size, 0 when unknown): due
+/// when a volume lags by its limit (see TABLES_LAG_BYTES and
+/// MERGE_LAG_BYTES; at most a quarter or half of a small journal, which
+/// would otherwise wrap past the saved position first), or by anything
+/// for TABLES_REFRESH.
+fn refresh_due(lags: &[i64], spans: &[i64], since_saved: Duration, merge: bool) -> bool {
+    let (limit, share) = if merge {
+        (MERGE_LAG_BYTES, 2)
+    } else {
+        (TABLES_LAG_BYTES, 4)
+    };
+    lags.iter().zip(spans).any(|(&lag, &span)| {
+        let limit = if span > 0 {
+            limit.min(span / share)
+        } else {
+            limit
+        };
+        lag > 0 && (lag >= limit || since_saved >= TABLES_REFRESH)
+    })
+}
+
+/// Whether `device` names a volume (`\\?\Volume{…}`, one optional trailing
+/// separator) and nothing else.
+fn is_volume_device(device: &str) -> bool {
+    device
+        .strip_prefix(r"\\?\Volume{")
+        .map(|rest| rest.strip_suffix('\\').unwrap_or(rest))
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|guid| {
+            !guid.is_empty() && guid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        })
+}
+
+/// The saved index and its live tables, when they can replace the startup
+/// scan: the loaded index is the mapped `index.bin` the tables were saved
+/// for, with the same roots and options, and every volume's change journal
+/// still holds every change since (same journal, saved position inside it).
+/// Otherwise `None`, with the reason in the log.
+fn try_restore(
+    store: &SnapshotStore,
+    tables: &std::path::Path,
+    fingerprint: u64,
+) -> Option<(Arc<ferrow_index::Index>, saved::Saved)> {
+    let base = store.get().index.clone();
+    let checksum = base.file_checksum()?;
+    let refuse = |why: String| {
+        eventlog::info(format!("startup scan: {why}"));
+    };
+    let saved = match saved::read(tables, checksum, base.len(), fingerprint) {
+        Ok(saved) => saved,
+        Err(why) => {
+            refuse(why.to_string());
+            return None;
+        }
+    };
+    for v in &saved.volumes {
+        // Only a volume device is opened (the name comes from a file).
+        if !is_volume_device(&v.device) {
+            refuse("the saved live tables name an unexpected device".into());
+            return None;
+        }
+        let Ok(file) = ntfs::open_volume(&v.device) else {
+            refuse(format!("{} cannot be opened", v.device));
+            return None;
+        };
+        if ntfs::volume_serial(&file) != Some(v.serial) {
+            refuse(format!("{} is another volume now", v.device));
+            return None;
+        }
+        let Some((id, first, next)) = ntfs::query_journal(&file) else {
+            refuse(format!("{} has no change journal now", v.device));
+            return None;
+        };
+        if let Err(why) = replay_verdict(v.journal, (id, first, next)) {
+            refuse(format!("the change journal of {} {why}", v.device));
+            return None;
+        }
+    }
+    Some((base, saved))
+}
+
+/// Health's volume rows for an index restored from its saved tables: each
+/// configured root, live on the volume that holds it.
+fn restored_volumes(
+    options: &WalkOptions,
+    base: &ferrow_index::Index,
+    saved: &saved::Saved,
+) -> Vec<VolumeState> {
+    let mut buf = Vec::new();
+    let found: Vec<(Vec<String>, &saved::SavedVolume)> = saved
+        .volumes
+        .iter()
+        .map(|v| {
+            let roots = v
+                .roots
+                .iter()
+                .filter_map(|&record| {
+                    let id = *v.record_base.get(record as usize)?;
+                    ((id as usize) < base.len()).then(|| {
+                        base.path_bytes(id, &mut buf);
+                        root_key(&String::from_utf8_lossy(&buf))
+                    })
+                })
+                .collect();
+            (roots, v)
+        })
+        .collect();
+    options
+        .roots
+        .iter()
+        .map(|root| {
+            let text = root.display().to_string();
+            let key = root_key(&text);
+            match found.iter().find(|(roots, _)| roots.contains(&key)) {
+                Some((_, v)) => VolumeState {
+                    root: text,
+                    device: Some(v.device.clone()),
+                    mode: MODE_LIVE,
+                    reason: String::new(),
+                    entries: Some(v.entries),
+                    journal: JOURNAL_OK,
+                    journal_detail: String::new(),
+                },
+                None => VolumeState::walked(text, ""),
+            }
+        })
+        .collect()
+}
+
+/// Save `live`'s frozen tables beside its index and read them back mapped:
+/// `None` (with a warning) when its index is not the mapped file or the
+/// write fails, and then the next start scans.
+fn save_tables(
+    path: &std::path::Path,
+    live: &Live,
+    fingerprint: u64,
+    facts: &[saved::VolumeFacts],
+) -> Option<saved::Saved> {
+    let checksum = live.base().file_checksum()?;
+    let started = Instant::now();
+    // Background mode, like the index save.
+    let written = background_io(|| {
+        saved::write(path, &live.saved_ref(checksum, fingerprint, facts))
+            .map_err(|e| e.to_string())
+            .and_then(|()| {
+                saved::read(path, checksum, live.base().len(), fingerprint)
+                    .map_err(|e| e.to_string())
+            })
+    });
+    match written {
+        Ok(saved) => {
+            eventlog::info(format!(
+                "live tables saved in {:.1} s (the next start replays the change journal instead of scanning)",
+                started.elapsed().as_secs_f64()
+            ));
+            Some(saved)
+        }
+        Err(error) => {
+            eventlog::warn(format!(
+                "could not save the live tables ({error}); the next start scans"
+            ));
+            None
+        }
+    }
+}
+
+fn maintain(
+    store: SnapshotStore,
+    options: WalkOptions,
+    persist: Option<Persist>,
+    tables: Option<std::path::PathBuf>,
+) {
     let (tx, rx) = channel::<Message>();
     *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let mut readers: HashMap<String, ()> = HashMap::new();
@@ -451,10 +734,85 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
     // With a saved index loaded, even the startup scan is background work:
     // that index answers searches meanwhile.
     let mut background = !store.get().index.is_empty();
+    let fingerprint = options_fingerprint(&options);
+    // Only the first session may come from the saved files; a rescan reads
+    // the drives.
+    let mut first = true;
     loop {
+        let started = Instant::now();
+        let restored = if std::mem::take(&mut first) {
+            tables
+                .as_deref()
+                .and_then(|path| try_restore(&store, path, fingerprint))
+        } else {
+            None
+        };
+        if let Some((base, saved)) = restored {
+            let facts: Vec<saved::VolumeFacts> = saved
+                .volumes
+                .iter()
+                .map(|v| saved::VolumeFacts {
+                    device: v.device.clone(),
+                    serial: v.serial,
+                    journal: Some(v.journal),
+                    record_size: v.record_size,
+                })
+                .collect();
+            let volumes = restored_volumes(&options, &base, &saved);
+            // Each root must still be on the volume its tables are for
+            // (a drive letter can move to another volume).
+            if let Some(moved) = volumes.iter().find(|v| {
+                v.device.as_deref().is_none_or(|device| {
+                    ntfs::volume_device(std::path::Path::new(&v.root))
+                        .ok()
+                        .as_deref()
+                        != Some(device)
+                })
+            }) {
+                eventlog::info(format!(
+                    "startup scan: {} is not on the volume its saved tables are for",
+                    moved.root
+                ));
+                drop((base, saved));
+                continue;
+            }
+            let live = Live::restore(base.clone(), saved);
+            let took = started.elapsed();
+            let summary = format!(
+                "loaded the saved index ({} entries) and replays the change journal since it was saved; no scan ({:.1} s)",
+                base.len(),
+                took.as_secs_f64()
+            );
+            eventlog::info(&summary);
+            STATE.scan_finished("restart: no scan", took, volumes);
+            reason = match run_session(
+                &store,
+                &options,
+                &tx,
+                &rx,
+                &mut readers,
+                &mut generation,
+                &pool,
+                persist.as_ref(),
+                tables.as_deref(),
+                fingerprint,
+                Session {
+                    base,
+                    live,
+                    facts,
+                    can_save_tables: true,
+                    tables_current: true,
+                    summary,
+                    took,
+                },
+            ) {
+                Some(why) => why,
+                None => return,
+            };
+            continue;
+        }
         STATE.scan_started();
         STATE.count_scan(&reason);
-        let started = Instant::now();
         let scan = || ferrow_walk::scan_with_maps(&options);
         let (index, report, maps) = match (&pool, background) {
             (Some(pool), true) => {
@@ -472,6 +830,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
         if let Some(fatal) = &report.fatal_error {
             eventlog::error(format!("scan failed: {fatal}"));
             STATE.scan_failed();
+            STATE.set_tables_mapped(0);
             return;
         }
         // Saved and mapped before it is published: the heap copy goes now,
@@ -497,6 +856,11 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 eventlog::warn(format!("{}: {}", v.root, v.journal_detail));
             }
         }
+        // Every root read through its MFT, with a journal that could be
+        // re-read right after: what saved tables need to stand for a scan.
+        let every_root_live = volumes
+            .iter()
+            .all(|v| v.mode == MODE_LIVE && v.journal_detail.is_empty());
         STATE.scan_finished(&reason, took, volumes);
         store.swap(Snapshot {
             index: base.clone(),
@@ -510,6 +874,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             report: summary.clone(),
         });
         if live_volumes.is_empty() {
+            STATE.set_tables_mapped(0);
             log_memory("after scan", None, &base, &store);
             return;
         }
@@ -530,48 +895,238 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 Err(e) => eventlog::error(format!("journal reader for {}: {e}", map.device)),
             }
         }
-        let volumes = Volumes {
-            handles: maps
-                .iter()
-                .filter_map(|m| {
-                    ntfs::open_volume(&m.device)
-                        .ok()
-                        .map(|f| (f, m.record_size))
-                })
-                .collect(),
-        };
-        if volumes.handles.len() != maps.len() {
-            eventlog::error("cannot reopen every volume; live updates stopped");
-            return;
-        }
-        let device_index: HashMap<String, usize> = maps
+        // The saved tables can replace the next startup scan only when every
+        // root is a volume read through its MFT, with a change journal.
+        let can_save_tables = maps.len() == live_volumes.len() && every_root_live;
+        let facts: Vec<saved::VolumeFacts> = maps
             .iter()
-            .enumerate()
-            .map(|(i, m)| (m.device.clone(), i))
+            .map(|m| saved::VolumeFacts {
+                device: m.device.clone(),
+                serial: m.serial,
+                journal: m.journal,
+                record_size: m.record_size as u32,
+            })
             .collect();
         let mut live = Live::new(base.clone(), &maps);
-        let devices: Vec<String> = maps.iter().map(|m| m.device.clone()).collect();
         // The record maps (16 bytes per entry) are only needed to build
         // the overlay; do not keep them for the whole live session.
         drop(maps);
-        generation += 1;
+        let mut tables_current = false;
+        if can_save_tables
+            && let Some(path) = tables.as_deref()
+            && let Some(saved) = save_tables(path, &live, fingerprint, &facts)
+        {
+            live.replace_tables(saved);
+            tables_current = true;
+        }
+        reason = match run_session(
+            &store,
+            &options,
+            &tx,
+            &rx,
+            &mut readers,
+            &mut generation,
+            &pool,
+            persist.as_ref(),
+            tables.as_deref(),
+            fingerprint,
+            Session {
+                base,
+                live,
+                facts,
+                can_save_tables,
+                tables_current,
+                summary,
+                took,
+            },
+        ) {
+            Some(why) => why,
+            None => return,
+        };
+    }
+}
+
+/// A frozen index and the live layer over it, from a scan or from the saved
+/// files, ready to follow the change journals.
+struct Session {
+    base: Arc<ferrow_index::Index>,
+    live: Live,
+    /// Per volume, in the live layer's volume order.
+    facts: Vec<saved::VolumeFacts>,
+    /// Whether the live tables may be saved for the next start.
+    can_save_tables: bool,
+    /// Whether `live.bin` holds this session's tables now.
+    tables_current: bool,
+    summary: String,
+    took: Duration,
+}
+
+/// Follow the change journals over `session` until a rescan is due: its
+/// reason, or `None` when live updates stopped.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    store: &SnapshotStore,
+    options: &WalkOptions,
+    tx: &Sender<Message>,
+    rx: &Receiver<Message>,
+    readers: &mut HashMap<String, ()>,
+    generation: &mut u64,
+    pool: &Option<rayon::ThreadPool>,
+    persist: Option<&Persist>,
+    tables: Option<&std::path::Path>,
+    fingerprint: u64,
+    session: Session,
+) -> Option<String> {
+    let _ = options;
+    let Session {
+        base,
+        mut live,
+        facts,
+        can_save_tables,
+        tables_current,
+        summary,
+        took,
+    } = session;
+    store.swap(Snapshot {
+        index: base.clone(),
+        live: None,
+        mode: "live".into(),
+        report: summary.clone(),
+    });
+    for fact in &facts {
+        if readers.contains_key(&fact.device) {
+            continue;
+        }
+        let device = fact.device.clone();
+        // A volume without a change journal is read once and not followed.
+        let Some(journal) = fact.journal else {
+            continue;
+        };
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("usn-reader".into())
+            .spawn(move || read_journal(device, journal, tx));
+        match spawned {
+            Ok(_) => {
+                readers.insert(fact.device.clone(), ());
+            }
+            Err(e) => eventlog::error(format!("journal reader for {}: {e}", fact.device)),
+        }
+    }
+    let volumes = Volumes {
+        handles: facts
+            .iter()
+            .filter_map(|f| {
+                ntfs::open_volume(&f.device)
+                    .ok()
+                    .map(|file| (file, f.record_size as usize))
+            })
+            .collect(),
+    };
+    if volumes.handles.len() != facts.len() {
+        eventlog::error("cannot reopen every volume; live updates stopped");
+        STATE.set_tables_mapped(0);
+        return None;
+    }
+    let device_index: HashMap<String, usize> = facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.device.clone(), i))
+        .collect();
+    // Where each journal's changes are applied up to: what saved tables
+    // may claim.
+    let mut applied: Vec<(u64, i64)> = facts.iter().map(|f| f.journal.unwrap_or((0, 0))).collect();
+    // What the saved tables claim (positions) and when they were saved;
+    // tables that could not be saved claim nothing (an impossible journal),
+    // so bringing them up to date is due at once.
+    let mut saved_at = if tables_current {
+        applied.clone()
+    } else {
+        vec![(u64::MAX, 0); applied.len()]
+    };
+    let mut tables_saved = Instant::now();
+    // Attempts in a row that did not save the tables, and when the next may
+    // run: tables that could not be saved at the start wait one retry gap.
+    let mut refresh_failures: u32 = u32::from(!tables_current);
+    let mut next_refresh = Instant::now() + refresh_retry(refresh_failures);
+    let refresh_possible = can_save_tables && tables.is_some() && persist.is_some();
+    // Each journal's size, which bounds how far the saved position may lag.
+    // Each journal's configured maximum size (what it keeps before dropping
+    // its oldest records), not what it holds now: a journal created a moment
+    // ago is small but will grow.
+    let spans: Vec<i64> = volumes
+        .handles
+        .iter()
+        .map(|(file, _)| {
+            ntfs::journal_capacity(file).map_or(0, |max| {
+                i64::try_from(max).unwrap_or(i64::MAX).max(MIN_JOURNAL_SPAN)
+            })
+        })
+        .collect();
+    let devices: Vec<String> = facts.iter().map(|f| f.device.clone()).collect();
+    let (tx, rx) = (tx.clone(), rx);
+    let pool = pool.as_ref();
+    let generation = {
+        *generation += 1;
+        *generation
+    };
+    {
         let mut walker = Walker::start(generation, devices.clone(), tx.clone());
         eventlog::info(format!(
             "folders moved into the index are read in the background ({}), not rescanned",
             walk_limits_text(base.len())
         ));
-        log_memory("after scan", Some(&live), &base, &store);
+        STATE.set_tables_mapped(live.mapped_bytes());
+        log_memory("live updates start", Some(&live), &base, store);
         let mut applied_total = 0usize;
         let mut rescan = Maintenance::after_scan(Instant::now(), took);
         let mut hard_delta = live.limits().hard_delta;
         let mut base = base;
         let mut gate = PublishGate::new();
-        reason = loop {
+        let reason = loop {
             // A batch keeps one reason; a disk reason in the same batch as a
             // large move must not leave its hidden entries without the
             // compaction that shows them (a request is kept only once).
             if live.adoptions_pending() {
                 rescan.request(Reason::compact(REASON_LARGE_MOVE));
+            }
+            // Keep the saved index and its journal positions from falling
+            // far behind. With changes, a merge brings both up to date;
+            // without any, only the tables are saved again (the index is
+            // unchanged).
+            let lags = saved_lags(&applied, &saved_at);
+            let lagging = lags.iter().any(|&lag| lag > 0);
+            let changed = live.has_changes();
+            if refresh_possible
+                && !rescan.rescan_waiting()
+                && Instant::now() >= next_refresh
+                && refresh_due(&lags, &spans, tables_saved.elapsed(), changed)
+            {
+                // One attempt per retry gap, whatever its outcome (a merge
+                // reports its own below).
+                next_refresh = Instant::now() + refresh_retry(refresh_failures + 1);
+                if changed {
+                    rescan.request(Reason::compact(REASON_REFRESH));
+                } else if let Some(path) = tables {
+                    let facts: Vec<saved::VolumeFacts> = facts
+                        .iter()
+                        .zip(&applied)
+                        .map(|(f, &journal)| saved::VolumeFacts {
+                            journal: Some(journal),
+                            ..f.clone()
+                        })
+                        .collect();
+                    if let Some(saved) = save_tables(path, &live, fingerprint, &facts) {
+                        live.replace_tables(saved);
+                        saved_at = applied.clone();
+                        tables_saved = Instant::now();
+                        refresh_failures = 0;
+                        next_refresh = Instant::now() + refresh_retry(0);
+                    } else {
+                        refresh_failures += 1;
+                        next_refresh = Instant::now() + refresh_retry(refresh_failures);
+                    }
+                }
             }
             let load = Load {
                 prompt: live.adoptions_pending(),
@@ -586,18 +1141,21 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 Some(Due::Rescan(why)) => {
                     // The fullest the live layer gets: what it holds before
                     // the rescan replaces it.
-                    log_memory("before rescan", Some(&live), &base, &store);
+                    log_memory("before rescan", Some(&live), &base, store);
+                    STATE.set_tables_mapped(0);
                     break why;
                 }
                 Some(Due::Compact(why)) => {
-                    log_memory("before compaction", Some(&live), &base, &store);
+                    log_memory("before compaction", Some(&live), &base, store);
+                    let save_now = can_save_tables && !rescan.rescan_waiting();
+                    let mut tables_written = false;
                     let report = format!("{summary}; {applied_total} live changes");
                     // Single writer: this thread, on the low-priority pool.
                     // Journal changes queue in the channel meanwhile, and
                     // searches read the snapshot published before.
                     let took = compact_and_publish(
                         &mut live,
-                        &store,
+                        store,
                         report,
                         |live| {
                             let mut new = match &pool {
@@ -606,12 +1164,32 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                             }?;
                             // The merged index replaces the file and is read
                             // from it, so its heap copy goes at once.
-                            if let Some(mapped) = map_saved(new.base(), persist.as_ref())
-                                && !new.replace_base(Arc::new(mapped))
-                            {
-                                eventlog::warn(
-                                    "the saved index does not match the merged one; it stays in memory",
-                                );
+                            if let Some(mapped) = map_saved(new.base(), persist) {
+                                if !new.replace_base(Arc::new(mapped)) {
+                                    eventlog::warn(
+                                        "the saved index does not match the merged one; it stays in memory",
+                                    );
+                                } else if save_now && let Some(path) = tables {
+                                    // Its live tables too, with the journal
+                                    // positions every merged change is up to,
+                                    // unless the index is known to miss
+                                    // changes (a rescan waits): then the next
+                                    // start scans.
+                                    let facts: Vec<saved::VolumeFacts> = facts
+                                        .iter()
+                                        .zip(&applied)
+                                        .map(|(f, &journal)| saved::VolumeFacts {
+                                            journal: Some(journal),
+                                            ..f.clone()
+                                        })
+                                        .collect();
+                                    if let Some(saved) =
+                                        save_tables(path, &new, fingerprint, &facts)
+                                    {
+                                        new.replace_tables(saved);
+                                        tables_written = true;
+                                    }
+                                }
                             }
                             Some(new)
                         },
@@ -627,6 +1205,22 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                         },
                     );
                     if let Some(took) = took {
+                        // The merged index replaced the file: tables saved
+                        // for the old one no longer match it.
+                        if tables_written {
+                            saved_at = applied.clone();
+                            tables_saved = Instant::now();
+                            refresh_failures = 0;
+                            next_refresh = Instant::now() + refresh_retry(0);
+                        } else {
+                            // Not saved: retried after a gap that grows
+                            // with each miss (each retry may be a merge
+                            // that rewrites the index file).
+                            saved_at = vec![(u64::MAX, 0); applied.len()];
+                            refresh_failures += 1;
+                            next_refresh = Instant::now() + refresh_retry(refresh_failures);
+                        }
+                        STATE.set_tables_mapped(live.mapped_bytes());
                         base = live.base().clone();
                         hard_delta = live.limits().hard_delta;
                         gate = PublishGate::new();
@@ -637,7 +1231,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                             took.as_secs_f64(),
                             base.len()
                         ));
-                        log_memory("after compaction", Some(&live), &base, &store);
+                        log_memory("after compaction", Some(&live), &base, store);
                     }
                     continue;
                 }
@@ -650,15 +1244,32 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 rescan.wake_at(Instant::now(), load),
                 gate.wake_at(),
                 live.next_walk_deadline(),
+                // Only a deadline ahead: once due, the refresh was asked for
+                // (a merge then wakes the maintainer itself).
+                (refresh_possible && lagging)
+                    .then(|| {
+                        // A limit already met waits only for the retry gap.
+                        if refresh_due(&lags, &spans, Duration::ZERO, changed) {
+                            next_refresh
+                        } else {
+                            (tables_saved + TABLES_REFRESH).max(next_refresh)
+                        }
+                    })
+                    .filter(|&at| at > Instant::now()),
             ]
             .into_iter()
             .flatten()
             .min();
-            let Some(batch) = next_batch(&rx, &device_index, wake) else {
-                return;
+            let Some(batch) = next_batch(rx, &device_index, wake) else {
+                STATE.set_tables_mapped(0);
+                return None;
             };
-            let (changes, events) = match batch {
-                Batch::Changes { changes, events } => (changes, events),
+            let (changes, events, positions) = match batch {
+                Batch::Changes {
+                    changes,
+                    events,
+                    positions,
+                } => (changes, events, positions),
                 Batch::Reset {
                     device,
                     reason,
@@ -726,6 +1337,10 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             if !changes.is_empty() {
                 outcome.absorb(live.apply(&changes, &volumes));
             }
+            // Applied: the index now holds every change before these.
+            for (volume, position) in positions {
+                applied[volume] = position;
+            }
             for job in std::mem::take(&mut outcome.walks) {
                 let id = job.id;
                 if !walker.send(job) {
@@ -781,6 +1396,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             });
             gate.published(Instant::now(), build);
         };
+        Some(reason)
     }
 }
 
@@ -800,6 +1416,7 @@ fn next_batch(
                 return Some(Batch::Changes {
                     changes: Vec::new(),
                     events: Vec::new(),
+                    positions: Vec::new(),
                 });
             }
             Err(RecvTimeoutError::Disconnected) => return None,
@@ -808,6 +1425,7 @@ fn next_batch(
     let deadline = Instant::now() + BATCH;
     let mut changes: HashMap<(usize, u64), bool> = HashMap::new();
     let mut events: Vec<WalkEvent> = Vec::new();
+    let mut positions: HashMap<usize, (u64, i64)> = HashMap::new();
     let mut take = |message: Message| -> Result<(), Batch> {
         match message {
             // Kept with the batch: returning early would drop the changes
@@ -826,12 +1444,18 @@ fn next_batch(
                 fatal,
             }),
             Message::RescanNow => Err(Batch::RescanNow),
-            Message::Records { device, records } => {
+            Message::Records {
+                device,
+                records,
+                position,
+            } => {
                 if let Some(&volume) = device_index.get(&device) {
                     for (record, reason) in records {
                         *changes.entry((volume, record)).or_default() |=
                             reason & REASON_CREATE != 0;
                     }
+                    // Messages of one reader arrive in order: the last wins.
+                    positions.insert(volume, position);
                 }
                 Ok(())
             }
@@ -864,6 +1488,7 @@ fn next_batch(
     Some(Batch::Changes {
         changes: out,
         events,
+        positions: positions.into_iter().collect(),
     })
 }
 
@@ -894,6 +1519,7 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
                     .send(Message::Records {
                         device: device.clone(),
                         records,
+                        position: (id, next),
                     })
                     .is_err()
                 {
@@ -940,6 +1566,139 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_start_replays_only_a_journal_that_holds_every_change_and_not_too_many() {
+        let mb = 1i64 << 20;
+        assert_eq!(
+            replay_verdict((7, 100 * mb), (7, 10 * mb, 150 * mb)),
+            Ok(())
+        );
+        assert!(
+            replay_verdict((7, 100 * mb), (8, 10 * mb, 150 * mb)).is_err(),
+            "replaced"
+        );
+        assert!(
+            replay_verdict((7, 5 * mb), (7, 10 * mb, 150 * mb)).is_err(),
+            "wrapped past"
+        );
+        assert!(
+            replay_verdict((7, 200 * mb), (7, 10 * mb, 150 * mb)).is_err(),
+            "ahead of it"
+        );
+        assert!(
+            replay_verdict((7, 0), (7, 0, 300 * mb)).is_err(),
+            "too many changes"
+        );
+        assert_eq!(
+            replay_verdict((7, 0), (7, 0, 256 * mb)),
+            Ok(()),
+            "up to the limit"
+        );
+    }
+
+    #[test]
+    fn failed_refreshes_wait_longer_each_time_up_to_twelve_hours() {
+        let min = Duration::from_secs(60);
+        assert_eq!(refresh_retry(0), 15 * min);
+        assert_eq!(refresh_retry(1), 15 * min);
+        assert_eq!(refresh_retry(2), 30 * min);
+        assert_eq!(refresh_retry(4), 120 * min);
+        assert_eq!(refresh_retry(6), 480 * min);
+        assert_eq!(refresh_retry(7), TABLES_REFRESH);
+        assert_eq!(refresh_retry(u32::MAX), TABLES_REFRESH);
+    }
+
+    #[test]
+    fn the_saved_state_is_refreshed_when_it_lags_far_or_long() {
+        let mb = 1i64 << 20;
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            saved_lags(&[(1, 90 * mb), (2, 5)], &[(1, 10 * mb), (2, 5)]),
+            [80 * mb, 0]
+        );
+        assert_eq!(
+            saved_lags(&[(3, 1)], &[(1, 1)]),
+            [i64::MAX],
+            "a replaced journal"
+        );
+        assert_eq!(saved_lags(&[(1, 1)], &[(1, 9)]), [0]);
+        let unknown = [0];
+        // Tables alone: from 64 MiB; a merge: from 192 MiB.
+        assert!(refresh_due(&[64 * mb], &unknown, Duration::ZERO, false));
+        assert!(!refresh_due(&[63 * mb], &unknown, 11 * hour, false));
+        assert!(!refresh_due(&[100 * mb], &unknown, Duration::ZERO, true));
+        assert!(refresh_due(&[192 * mb], &unknown, Duration::ZERO, true));
+        // Anything, after 12 hours; nothing, never.
+        assert!(refresh_due(&[1], &unknown, 12 * hour, true));
+        assert!(!refresh_due(&[0], &unknown, 100 * hour, false));
+        // A small journal (32 MiB): a quarter or half of it.
+        assert!(refresh_due(&[8 * mb], &[32 * mb], Duration::ZERO, false));
+        assert!(refresh_due(&[16 * mb], &[32 * mb], Duration::ZERO, true));
+        assert!(!refresh_due(&[15 * mb], &[32 * mb], Duration::ZERO, true));
+        // Tables not current: due at once.
+        assert!(refresh_due(&[i64::MAX], &unknown, Duration::ZERO, true));
+    }
+
+    #[test]
+    fn only_a_volume_device_is_opened() {
+        assert!(is_volume_device(r"\\?\Volume{0123-abcd}"));
+        assert!(is_volume_device(r"\\?\Volume{0123-abcd}\"));
+        assert!(!is_volume_device(r"\\?\Volume{}"));
+        assert!(!is_volume_device(r"\\?\Volume{x}}"));
+        assert!(!is_volume_device(r"\\?\Volume{x}\path\file}"));
+        assert!(!is_volume_device(r"C:\Windows"));
+        assert!(!is_volume_device(r"\\?\Volume{x}/y}"));
+    }
+
+    #[test]
+    fn a_batch_reports_how_far_each_journal_was_read() {
+        let (tx, rx) = channel::<Message>();
+        let devices: HashMap<String, usize> = [("A".to_string(), 0), ("B".to_string(), 1)]
+            .into_iter()
+            .collect();
+        for (device, record, at) in [("A", 5, 100), ("B", 7, 50), ("A", 6, 180), ("X", 1, 9)] {
+            tx.send(Message::Records {
+                device: device.into(),
+                records: vec![(record, REASON_CREATE)],
+                position: (1, at),
+            })
+            .unwrap();
+        }
+        let Some(Batch::Changes {
+            changes,
+            mut positions,
+            ..
+        }) = next_batch(&rx, &devices, None)
+        else {
+            panic!("a batch of changes");
+        };
+        assert_eq!(changes.len(), 3, "the unknown device is ignored");
+        positions.sort();
+        assert_eq!(
+            positions,
+            [(0, (1, 180)), (1, (1, 50))],
+            "the last position per journal"
+        );
+        // A reset ends the batch without positions: what it collected is
+        // not claimed as applied.
+        tx.send(Message::Records {
+            device: "A".into(),
+            records: vec![(8, 0)],
+            position: (1, 300),
+        })
+        .unwrap();
+        tx.send(Message::Reset {
+            device: "A".into(),
+            reason: "journal reset".into(),
+            fatal: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            next_batch(&rx, &devices, None),
+            Some(Batch::Reset { .. })
+        ));
+    }
 
     #[test]
     fn a_walked_volume_shows_the_error_the_fast_read_gave() {

@@ -28,6 +28,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
+use ferrow_index::store::Col;
 use ferrow_index::{ColumnSet, EntryMetadata, Index, IndexBuilder, ROOT_PARENT, SortKey, flags};
 use ferrow_walk::VolumeMap;
 use ferrow_walk::ntfs::RecordInfo;
@@ -684,10 +685,19 @@ struct VolumeSeed {
     roots: HashSet<u64>,
 }
 
+use crate::saved::MULTI;
+
 struct Volume {
-    /// Frozen entry of each record (`u32::MAX`: none); hard links and
-    /// moved records live in `overlay` instead.
-    record_base: Vec<u32>,
+    /// Frozen entry of each record (`u32::MAX`: none, [`MULTI`]: several,
+    /// see `link_records`). Read-only: built by a scan, or mapped from the
+    /// saved file (ADR 0007).
+    record_base: Col<u32>,
+    /// The frozen entries of records with several names, as pairs sorted by
+    /// record (each record's entries in id order).
+    link_records: Col<u64>,
+    link_ids: Col<u32>,
+    /// Records changed since the frozen index: their locations, which
+    /// replace the frozen ones.
     overlay: HashMap<u64, Vec<Loc>>,
     excluded: Arc<HashSet<u64>>,
     /// Configured roots: their entries never move (their own parent may be
@@ -859,9 +869,10 @@ pub struct Live {
     overrides: HashMap<u32, EntryMetadata>,
     volumes: Vec<Volume>,
     /// Frozen id → `(volume << 48) | record`, `u64::MAX` when unmapped.
-    base_record: Vec<u64>,
-    /// Frozen children by parent, built on the first folder move.
-    base_children: OnceLock<(Vec<u32>, Vec<u32>)>,
+    base_record: Col<u64>,
+    /// Frozen children by parent, built on the first folder move (or mapped
+    /// from the saved file).
+    base_children: OnceLock<(Col<u32>, Col<u32>)>,
     /// Frozen folders hidden by a move too large to copy, and the new entry
     /// of the folder that took over their children (always a delta entry).
     /// The children stay where they are; the next compaction places them
@@ -912,7 +923,7 @@ impl Live {
             .enumerate()
             .flat_map(|(v, map)| map.entries.iter().map(move |&(record, id)| (v, record, id)));
         let volumes = Live::volumes(seeds, entries);
-        Live::assemble(base, base_record, volumes, 0)
+        Live::assemble(base, base_record.into(), volumes, 0)
     }
 
     /// The per-volume record tables from `(volume, record, frozen id)`.
@@ -920,31 +931,44 @@ impl Live {
         seeds: Vec<VolumeSeed>,
         entries: impl Iterator<Item = (usize, u64, u32)>,
     ) -> Vec<Volume> {
-        let mut volumes: Vec<Volume> = seeds
-            .into_iter()
-            .map(|seed| Volume {
-                record_base: vec![u32::MAX; seed.records as usize],
-                overlay: HashMap::new(),
-                excluded: seed.excluded,
-                roots: seed.roots,
-            })
+        // Per volume: the record → entry table and the link pairs.
+        type Tables = (Vec<u32>, Vec<(u64, u32)>);
+        let mut tables: Vec<Tables> = seeds
+            .iter()
+            .map(|seed| (vec![u32::MAX; seed.records as usize], Vec::new()))
             .collect();
         for (v, record, id) in entries {
-            let volume = &mut volumes[v];
-            let slot = &mut volume.record_base[record as usize];
-            if *slot == u32::MAX && !volume.overlay.contains_key(&record) {
-                *slot = id;
-            } else {
-                // A second name: keep every location in the overlay.
-                let list = volume.overlay.entry(record).or_default();
-                if *slot != u32::MAX {
-                    list.push(Loc::Base(*slot));
-                    *slot = u32::MAX;
+            let (record_base, links) = &mut tables[v];
+            let slot = &mut record_base[record as usize];
+            match *slot {
+                u32::MAX => *slot = id,
+                MULTI => links.push((record, id)),
+                first => {
+                    // A second name: every entry of the record goes to the
+                    // link table.
+                    links.push((record, first));
+                    links.push((record, id));
+                    *slot = MULTI;
                 }
-                list.push(Loc::Base(id));
             }
         }
-        volumes
+        seeds
+            .into_iter()
+            .zip(tables)
+            .map(|(seed, (record_base, mut links))| {
+                // Stable: each record's entries stay in the order they came.
+                links.sort_by_key(|&(record, _)| record);
+                let (link_records, link_ids): (Vec<u64>, Vec<u32>) = links.into_iter().unzip();
+                Volume {
+                    record_base: record_base.into(),
+                    link_records: link_records.into(),
+                    link_ids: link_ids.into(),
+                    overlay: HashMap::new(),
+                    excluded: seed.excluded,
+                    roots: seed.roots,
+                }
+            })
+            .collect()
     }
 
     /// A live layer over `base` with nothing changed yet. `next_walk`: the id
@@ -952,7 +976,7 @@ impl Live {
     /// late answer of an abandoned reader cannot be taken for a new read).
     fn assemble(
         base: Arc<Index>,
-        base_record: Vec<u64>,
+        base_record: Col<u64>,
         volumes: Vec<Volume>,
         next_walk: u64,
     ) -> Live {
@@ -986,6 +1010,134 @@ impl Live {
         &self.base
     }
 
+    /// A live layer over `base` from tables saved for it (ADR 0007), with
+    /// nothing changed yet: its record tables are read through the saved
+    /// file's map. The caller has checked that `saved` belongs to `base`.
+    pub fn restore(base: Arc<Index>, saved: crate::saved::Saved) -> Live {
+        assert_eq!(saved.base_record.len(), base.len(), "tables for this index");
+        let crate::saved::Saved {
+            base_record,
+            children_first,
+            children_ids,
+            volumes,
+            ..
+        } = saved;
+        let volumes = volumes
+            .into_iter()
+            .map(|v| Volume {
+                record_base: v.record_base,
+                link_records: v.link_records,
+                link_ids: v.link_ids,
+                overlay: HashMap::new(),
+                excluded: Arc::new(v.excluded.into_iter().collect()),
+                roots: v.roots.into_iter().collect(),
+            })
+            .collect();
+        let live = Live::assemble(base, base_record, volumes, 0);
+        let _ = live.base_children.set((children_first, children_ids));
+        live
+    }
+
+    /// The frozen tables to save beside the index (see [`crate::saved`]),
+    /// with each volume's device facts from `volumes` (in volume order).
+    /// Builds the frozen children table if no folder move has yet.
+    pub fn saved_ref<'a>(
+        &'a self,
+        index_checksum: u32,
+        fingerprint: u64,
+        volumes: &'a [crate::saved::VolumeFacts],
+    ) -> crate::saved::SavedRef<'a> {
+        assert_eq!(volumes.len(), self.volumes.len(), "facts for every volume");
+        let mut entries = vec![0u64; self.volumes.len()];
+        for &packed in self.base_record.iter() {
+            if packed != u64::MAX {
+                entries[(packed >> 48) as usize] += 1;
+            }
+        }
+        let (first, ids) = self.base_children();
+        crate::saved::SavedRef {
+            index_checksum,
+            fingerprint,
+            base_record: &self.base_record,
+            children_first: first,
+            children_ids: ids,
+            volumes: self
+                .volumes
+                .iter()
+                .zip(volumes)
+                .zip(entries)
+                .map(|((v, facts), entries)| crate::saved::SavedVolumeRef {
+                    device: &facts.device,
+                    serial: facts.serial,
+                    journal: facts.journal.unwrap_or((0, 0)),
+                    record_size: facts.record_size,
+                    entries,
+                    excluded: {
+                        let mut e: Vec<u64> = v.excluded.iter().copied().collect();
+                        e.sort_unstable();
+                        e
+                    },
+                    roots: {
+                        let mut r: Vec<u64> = v.roots.iter().copied().collect();
+                        r.sort_unstable();
+                        r
+                    },
+                    record_base: &v.record_base,
+                    link_records: &v.link_records,
+                    link_ids: &v.link_ids,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether anything changed since the frozen index: an entry added,
+    /// hidden or with new metadata, or a record moved.
+    pub fn has_changes(&self) -> bool {
+        !self.delta.is_empty()
+            || self.removed_count > 0
+            || !self.overrides.is_empty()
+            || self.volumes.iter().any(|v| !v.overlay.is_empty())
+    }
+
+    /// Bytes of the saved live tables this layer reads through a map.
+    pub fn mapped_bytes(&self) -> usize {
+        let children = self
+            .base_children
+            .get()
+            .map_or(0, |(first, ids)| first.mapped_bytes() + ids.mapped_bytes());
+        self.base_record.mapped_bytes()
+            + children
+            + self
+                .volumes
+                .iter()
+                .map(|v| {
+                    v.record_base.mapped_bytes()
+                        + v.link_records.mapped_bytes()
+                        + v.link_ids.mapped_bytes()
+                })
+                .sum::<usize>()
+    }
+
+    /// Read the frozen record tables from `saved` instead: the same tables,
+    /// written by [`Live::saved_ref`] from this layer and mapped back, so
+    /// their heap copies go. Changes applied since are kept (they are in the
+    /// overlay and the delta, not in these tables).
+    pub fn replace_tables(&mut self, saved: crate::saved::Saved) {
+        assert_eq!(saved.base_record.len(), self.base_record.len());
+        assert_eq!(saved.volumes.len(), self.volumes.len());
+        self.base_record = saved.base_record;
+        self.base_children = OnceLock::new();
+        let _ = self
+            .base_children
+            .set((saved.children_first, saved.children_ids));
+        for (v, s) in self.volumes.iter_mut().zip(saved.volumes) {
+            assert_eq!(v.record_base.len(), s.record_base.len());
+            v.record_base = s.record_base;
+            v.link_records = s.link_records;
+            v.link_ids = s.link_ids;
+        }
+    }
+
     /// Read the frozen index from `base` instead: the same entries with the
     /// same ids, typically the copy saved and mapped back from its file
     /// (ADR 0007). Nothing else changes. `false` (and nothing replaced) for
@@ -1011,23 +1163,35 @@ impl Live {
     }
 
     fn locations(&self, volume: usize, record: u64) -> Vec<Loc> {
-        let v = &self.volumes[volume];
-        let all = match v.overlay.get(&record) {
-            Some(list) => list.clone(),
-            None => match v.record_base.get(record as usize) {
-                Some(&id) if id != u32::MAX => vec![Loc::Base(id)],
-                _ => Vec::new(),
-            },
-        };
-        all.into_iter().filter(|&l| self.is_alive(l)).collect()
+        let mut all = self.locations_raw(volume, record);
+        all.retain(|&l| self.is_alive(l));
+        all
     }
 
-    fn set_locations(&mut self, volume: usize, record: u64, locs: Vec<Loc>) {
-        let v = &mut self.volumes[volume];
-        if let Some(slot) = v.record_base.get_mut(record as usize) {
-            *slot = u32::MAX;
+    /// Every location of a record, alive or not: its changed locations, or
+    /// else its frozen entries.
+    fn locations_raw(&self, volume: usize, record: u64) -> Vec<Loc> {
+        let v = &self.volumes[volume];
+        if let Some(list) = v.overlay.get(&record) {
+            return list.clone();
         }
-        v.overlay.insert(record, locs);
+        match v.record_base.get(record as usize) {
+            Some(&MULTI) => {
+                let from = v.link_records.partition_point(|&r| r < record);
+                let to = v.link_records.partition_point(|&r| r <= record);
+                v.link_ids[from..to]
+                    .iter()
+                    .map(|&id| Loc::Base(id))
+                    .collect()
+            }
+            Some(&id) if id != u32::MAX => vec![Loc::Base(id)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The record's locations from now on (they replace the frozen ones).
+    fn set_locations(&mut self, volume: usize, record: u64, locs: Vec<Loc>) {
+        self.volumes[volume].overlay.insert(record, locs);
     }
 
     fn flags_of(&self, loc: Loc) -> u16 {
@@ -1126,7 +1290,8 @@ impl Live {
         let mut overlay = 0;
         let mut sets = 0;
         for v in &self.volumes {
-            record_base += vec_bytes(&v.record_base);
+            record_base +=
+                v.record_base.heap_bytes() + v.link_records.heap_bytes() + v.link_ids.heap_bytes();
             overlay += table_bytes(v.overlay.capacity(), size_of::<(u64, Vec<Loc>)>())
                 + v.overlay.values().map(vec_bytes).sum::<usize>();
             sets += table_bytes(v.excluded.capacity(), size_of::<u64>())
@@ -1139,7 +1304,7 @@ impl Live {
         let base_children = self
             .base_children
             .get()
-            .map_or(0, |(first, ids)| vec_bytes(first) + vec_bytes(ids));
+            .map_or(0, |(first, ids)| first.heap_bytes() + ids.heap_bytes());
         // Folders waiting for or being read, and the records reported
         // meanwhile (empty, and freed, while no walk is outstanding).
         let walks = vec_bytes(&self.walks)
@@ -1156,7 +1321,7 @@ impl Live {
         vec![
             Part::new(
                 "live.base_record",
-                vec_bytes(&self.base_record),
+                self.base_record.heap_bytes(),
                 Kind::Steady,
             ),
             Part::new("live.record_base", record_base, Kind::Steady),
@@ -1257,7 +1422,7 @@ impl Live {
         !self.adopted.is_empty()
     }
 
-    fn base_children(&self) -> &(Vec<u32>, Vec<u32>) {
+    fn base_children(&self) -> &(Col<u32>, Col<u32>) {
         self.base_children.get_or_init(|| {
             let n = self.base.len();
             let mut first = vec![0u32; n + 1];
@@ -1270,16 +1435,21 @@ impl Live {
             for i in 1..first.len() {
                 first[i] += first[i - 1];
             }
-            let mut fill = first.clone();
+            // Fill by advancing each parent's start, then shift the starts
+            // back (no second table of n entries).
             let mut ids = vec![0u32; first[n] as usize];
             for c in 0..n as u32 {
                 let p = self.base.parent(c);
                 if p != ROOT_PARENT {
-                    ids[fill[p as usize] as usize] = c;
-                    fill[p as usize] += 1;
+                    ids[first[p as usize] as usize] = c;
+                    first[p as usize] += 1;
                 }
             }
-            (first, ids)
+            for i in (1..=n).rev() {
+                first[i] = first[i - 1];
+            }
+            first[0] = 0;
+            (first.into(), ids.into())
         })
     }
 
@@ -1384,17 +1554,6 @@ impl Live {
             }
         }
         adopted
-    }
-
-    fn locations_raw(&self, volume: usize, record: u64) -> Vec<Loc> {
-        let v = &self.volumes[volume];
-        match v.overlay.get(&record) {
-            Some(list) => list.clone(),
-            None => match v.record_base.get(record as usize) {
-                Some(&id) if id != u32::MAX => vec![Loc::Base(id)],
-                _ => Vec::new(),
-            },
-        }
     }
 
     fn remove_subtree(&mut self, loc: Loc) {
@@ -2234,7 +2393,12 @@ impl Live {
             .filter(|(_, p)| **p != u64::MAX)
             .map(|(id, &p)| ((p >> 48) as usize, p & RECORD_MASK, id as u32));
         let volumes = Live::volumes(seeds, entries);
-        Some(Live::assemble(index, records, volumes, self.next_walk))
+        Some(Live::assemble(
+            index,
+            records.into(),
+            volumes,
+            self.next_walk,
+        ))
     }
 
     /// Which delta entries a compaction places, given the frozen entries it
@@ -5230,5 +5394,108 @@ mod tests {
             m.due(t + s(102), prompt_only()),
             Some(Due::Compact(_))
         ));
+    }
+
+    fn facts(n: usize) -> Vec<crate::saved::VolumeFacts> {
+        (0..n)
+            .map(|v| crate::saved::VolumeFacts {
+                device: format!(r"\?\Volume{{{v}}}"),
+                serial: v as u64,
+                journal: Some((7, 1000 + v as i64)),
+                record_size: 1024,
+            })
+            .collect()
+    }
+
+    /// Save `live`'s frozen tables to a temporary file and map them back.
+    fn save_and_read(live: &Live, tag: &str) -> crate::saved::Saved {
+        let dir = std::env::temp_dir().join(format!("ferrowd-live-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("live.bin");
+        let facts = facts(live.volumes.len());
+        crate::saved::write(&path, &live.saved_ref(5, 6, &facts)).unwrap();
+        let saved = crate::saved::read(&path, 5, live.base().len(), 6).unwrap();
+        assert_eq!(saved.volumes[0].journal, (7, 1000));
+        saved
+    }
+
+    #[test]
+    fn a_restored_layer_follows_changes_like_the_one_it_was_saved_from() {
+        let (base, map) = fixture();
+        let mut f = initial();
+        // A hard link: record 21 has a second name.
+        f.set(21, file_info(1), &[(20, "a.txt"), (5, "a-link.txt")]);
+        let mut map = map;
+        let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let root = b.add_root(b"C:", flags::DIR);
+        let docs = b.add_with_metadata(
+            root,
+            b"Docs",
+            flags::DIR,
+            DIR_INFO.metadata(ColumnSet::DEFAULT),
+        );
+        let a = b.add_with_metadata(docs, b"a.txt", 0, file_info(1).metadata(ColumnSet::DEFAULT));
+        let bb = b.add_with_metadata(root, b"b.txt", 0, file_info(2).metadata(ColumnSet::DEFAULT));
+        let link = b.add_with_metadata(
+            root,
+            b"a-link.txt",
+            0,
+            file_info(1).metadata(ColumnSet::DEFAULT),
+        );
+        let base = {
+            let _ = base;
+            Arc::new(b.freeze())
+        };
+        map.entries = vec![(5, root), (20, docs), (21, a), (22, bb), (21, link)];
+        let original = Live::new(base.clone(), &[map]);
+        let saved = save_and_read(&original, "restore");
+        let mut restored = Live::restore(base.clone(), saved);
+        let mut original = original;
+        assert_eq!(shown(&restored, &base), shown(&original, &base));
+        assert_eq!(shown(&restored, &base), oracle(&f));
+        // The same changes give the same result on both.
+        f.set(21, file_info(9), &[(20, "a.txt")]); // one name removed
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        f.set(40, file_info(3), &[(20, "new.txt")]);
+        let changes = [change(20, false), change(21, false), change(40, true)];
+        original.apply(&changes, &f);
+        restored.apply(&changes, &f);
+        assert_eq!(shown(&restored, &base), shown(&original, &base));
+        assert_eq!(shown(&restored, &base), oracle(&f));
+        // And both compact to the same index.
+        let a = original.compact().unwrap();
+        let b = restored.compact().unwrap();
+        assert_eq!(shown(&a, &a.base().clone()), shown(&b, &b.base().clone()));
+    }
+
+    #[test]
+    fn mapped_tables_replace_the_heap_ones_and_keep_the_changes() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        let mut f = initial();
+        f.set(22, file_info(5), &[(5, "b2.txt")]);
+        live.apply(&[change(22, false)], &f);
+        let before = shown(&live, &base);
+        let heap = live
+            .memory_parts()
+            .into_iter()
+            .find(|p| p.name == "live.record_base")
+            .unwrap()
+            .bytes;
+        assert!(heap > 0);
+        let saved = save_and_read(&live, "replace");
+        live.replace_tables(saved);
+        assert_eq!(shown(&live, &base), before);
+        let after = live
+            .memory_parts()
+            .into_iter()
+            .find(|p| p.name == "live.record_base")
+            .unwrap()
+            .bytes;
+        assert_eq!(after, 0, "read from the file now");
+        f.set(21, file_info(6), &[(5, "moved.txt")]);
+        live.apply(&[change(21, false)], &f);
+        assert_eq!(shown(&live, &base), oracle(&f));
     }
 }

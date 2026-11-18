@@ -427,6 +427,25 @@ service-only: the index lists every file name on the machine.
 - **If saving or mapping fails:** the index stays in memory (correct, only larger), with a warning in the log.
 - **No duplicate saves:** the background saver skips an index that is already mapped. One lock keeps it and the maintainer from writing the file at the same time.
 
+**Restart without a scan (ADR 0007).**
+
+- **What is saved:** after each scan and each in-memory merge, the maintainer also writes `live.bin` beside `index.bin` (module `saved`), then maps it back so the live layer reads its record tables from it. The file holds:
+  - the frozen entry → record table;
+  - the frozen children table;
+  - each volume's record → entry table and hard links;
+  - each volume's device, change journal id and the USN every saved change is up to: the scan's starting position after a scan, the last applied batch's position after a merge.
+- **How it is tied to its index:** it carries the checksum field of the `index.bin` it belongs to, its entry count, and a fingerprint of the roots, excludes, options and Ferrow version.
+- **When it is saved:** only when every root is a volume read through its MFT whose journal could be re-read right after the read. It is not saved after a merge while a rescan is waiting, because the index is then known to miss changes.
+- **At start:** the service uses the mapped `index.bin` with `live.bin` instead of scanning when:
+  - the checksum, the entry count and the fingerprint match;
+  - every volume opens;
+  - its change journal has the same id;
+  - the saved position is still inside the journal.
+
+  The journal readers then start at the saved positions, and the changes since the save are applied like any other batch.
+- **Otherwise it scans**, with the reason in the log: "startup scan: …".
+- **Crash safety:** a crash between writing the two files leaves a mismatch, so the next start scans. Every value of `live.bin` is checked when it is read.
+
 ## Development: `ferrow service run`
 
 ```sh

@@ -15,7 +15,7 @@ use rayon::prelude::*;
 mod metadata;
 pub mod osname;
 pub mod persist;
-mod store;
+pub mod store;
 pub use metadata::{
     ColumnSet, EntryMetadata, MetadataOrder, SortKey, SortStatus, SortTicket, metadata_timestamp,
     timestamp_ticks,
@@ -89,6 +89,8 @@ pub struct Index {
     arena: Col<u8>,
     folded_arena: Col<u8>,
     sorted: Arc<Col<u32>>,
+    /// The checksum field of the file this index is mapped from.
+    file_checksum: Option<u32>,
 }
 
 impl Index {
@@ -258,6 +260,12 @@ impl Index {
             + self.metadata.mapped_bytes()
     }
 
+    /// The checksum field of the saved file this index is mapped from (it
+    /// names that file's contents); `None` for an index in the heap.
+    pub fn file_checksum(&self) -> Option<u32> {
+        self.file_checksum
+    }
+
     /// Whether the columns are read from the saved file (it is on disk
     /// already: saving it again would write the same bytes).
     pub fn is_mapped(&self) -> bool {
@@ -355,6 +363,7 @@ impl Index {
             arena: c.arena,
             folded_arena: c.folded_arena,
             sorted: Arc::new(c.sorted),
+            file_checksum: None,
         }
     }
 }
@@ -656,6 +665,7 @@ impl IndexBuilder {
             arena: arena.into(),
             folded_arena: folded_arena.into(),
             sorted: Arc::new(sorted.into()),
+            file_checksum: None,
         };
         (
             index,

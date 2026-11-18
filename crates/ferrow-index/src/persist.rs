@@ -228,13 +228,15 @@ pub(crate) fn save_and_map(index: &Index, path: &Path) -> Result<Index, SaveErro
     {
         return Err(not_ours());
     }
-    from_bytes_with(
+    let mut mapped = from_bytes_with(
         &map,
         Some(&map),
         Check::Trusted,
         &mut LoadTimings::default(),
     )
-    .map_err(|_| not_ours())
+    .map_err(|_| not_ours())?;
+    mapped.file_checksum = Some(sum);
+    Ok(mapped)
 }
 
 /// How much of a file [`from_bytes_with`] checks.
@@ -1120,7 +1122,10 @@ fn load_mapped(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
     let t = Instant::now();
     let map = crate::store::map_file(path).map_err(LoadError::Io)?;
     timings.read += t.elapsed();
-    let index = from_bytes_with(&map, Some(&map), Check::Full, &mut timings)?;
+    let mut index = from_bytes_with(&map, Some(&map), Check::Full, &mut timings)?;
+    index.file_checksum = Some(u32::from_le_bytes(
+        map[20..24].try_into().expect("header checked"),
+    ));
     timings.metadata_load = if index.columns_present().bits() == 0 {
         MetadataLoad::Absent
     } else {
