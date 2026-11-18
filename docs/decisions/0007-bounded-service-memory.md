@@ -141,10 +141,15 @@ slower. The owner chose to do both: map the index and compress it.
       `Scratch::try_zeroed` above `HEAP_FALLBACK_ENTRIES` elements, so a missing
       file is an error, not about 0.5 GB of heap at 27 M entries. The service
       then serves the new index without live updates (the event log, the
-      snapshot and health say why) and scans again after its own back-off; a
-      small table still falls back, counted. With no room for the children
-      table the tables are not saved, and a move of a frozen folder is not
-      applied but asks for a rescan.
+      snapshot and health say why: each volume is listed as unavailable with the
+      reason) and scans again after its own back-off; the saved tables of the
+      old index are deleted; a small table still falls back, counted. With no
+      room for the children table the tables are not saved, and a move of a
+      frozen folder is not applied but asks for a rescan; that refusal is
+      remembered for a minute (no repeated pass over the index) and a large
+      table checks for room (about 8 B/entry) first. The layer a merge makes
+      carries the same placement, so its children table is refused too; its
+      own record tables stay in the heap (decision 6).
     - **No large silent heap fallback** (the lesson of FR-47). Before a
       volume's MFT is read the scan estimates what it will write (160 B per MFT
       record for the read's files, 130 for the shards and the new index;
@@ -245,7 +250,7 @@ reader of the diagnostics sees both.
    gated; see `docs/service.md`.
 8. Bounded scan: the MFT read and the live tables a scan builds in
    temporary files (done: FR-46 phase 7; not yet measured on a 27 M entry
-   PC; a compaction's own tables are still in the heap).
+   PC; a compaction's own record tables are still in the heap).
 
 Each step is its own PR, with the `docs/SPEC.md` §3 numbers from the CI
 bench, and is reviewed for search speed.

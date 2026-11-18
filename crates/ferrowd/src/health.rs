@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrow_ipc::health::{
-    Health, JOURNAL_ERROR, JOURNAL_NONE, JOURNAL_RESET, LiveStats, MAX_EVENTS, MODE_UNAVAILABLE,
-    MODE_WALK, RescanInfo, SaveInfo, ScanInfo, VolumeHealth, format_duration,
+    Health, JOURNAL_ERROR, JOURNAL_NONE, JOURNAL_RESET, LiveStats, MAX_EVENTS, MODE_LIVE,
+    MODE_UNAVAILABLE, MODE_WALK, RescanInfo, SaveInfo, ScanInfo, VolumeHealth, format_duration,
 };
 use ferrow_ipc::{ErrorCode, Request, Response};
 
@@ -194,6 +194,20 @@ impl State {
         });
         drop(inner);
         self.scanning.store(false, Ordering::Release);
+    }
+
+    /// The scan that just finished built its index, but the live layer over
+    /// it could not be built (no room for its tables): every volume it read
+    /// live is served as scanned, without live updates, and says why. Called
+    /// after [`State::scan_finished`], which listed them as live.
+    pub fn live_refused(&self, why: &str) {
+        let mut inner = self.lock();
+        for volume in inner.volumes.iter_mut().filter(|v| v.mode == MODE_LIVE) {
+            volume.mode = MODE_UNAVAILABLE;
+            volume.reason = why.into();
+            volume.journal = JOURNAL_NONE;
+            volume.journal_detail.clear();
+        }
     }
 
     /// A journal reset (rescan due) or a stopped reader (`fatal`).
@@ -831,6 +845,35 @@ mod tests {
         ] {
             assert!(json.contains(key), "{key} missing from {json}");
         }
+    }
+
+    #[test]
+    fn a_refused_live_layer_shows_its_volumes_without_live_updates_and_why() {
+        let state = State::new();
+        let walked = VolumeState::walked("D:\\data".into(), "");
+        state.scan_finished("startup", Duration::ZERO, vec![live_volume(), walked]);
+        state.live_refused("the record-to-entry table cannot be built");
+        let store = SnapshotStore::new(Snapshot::empty());
+        let report = state.report(&store, &Policy::default());
+        let [live, walked] = &report.volumes[..] else {
+            panic!("{:?}", report.volumes)
+        };
+        assert_eq!(live.mode, MODE_UNAVAILABLE);
+        assert_eq!(live.reason, "the record-to-entry table cannot be built");
+        assert_eq!(live.journal, JOURNAL_NONE);
+        assert_eq!(live.entries, Some(1234), "what the scan read stays");
+        // A walked root was never live: untouched.
+        assert_eq!(walked.mode, MODE_WALK);
+        // Where the app and the command line start: the problem list.
+        assert_eq!(
+            report.problems(),
+            vec!["C:\\: no live updates (the record-to-entry table cannot be built)".to_string()]
+        );
+        // The next scan lists its volumes afresh.
+        state.scan_finished("rescan", Duration::ZERO, vec![live_volume()]);
+        let report = state.report(&store, &Policy::default());
+        assert_eq!(report.volumes[0].mode, MODE_LIVE);
+        assert!(report.problems().is_empty());
     }
 
     #[test]

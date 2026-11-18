@@ -761,7 +761,9 @@ fn save_tables(
 ) -> Option<saved::Saved> {
     let checksum = live.base().file_checksum()?;
     // The children table is part of the file; a large one that has no room
-    // in a file is not built in the heap for it (ADR 0007).
+    // in a file is not built in the heap for it (ADR 0007). Both the layer a
+    // scan made and the one a merge made refuse; a merge's record tables
+    // stay in the heap, only this table is refused there.
     if let Err(error) = live.ensure_children() {
         eventlog::warn(format!(
             "could not save the live tables ({error}); the next start scans"
@@ -985,16 +987,7 @@ fn maintain(
         // and the file is the one the next start loads.
         let base = Arc::new(map_saved(&index, persist.as_ref()).unwrap_or(index));
         let live_volumes: Vec<&VolumeMap> = maps.iter().filter(|m| m.journal.is_some()).collect();
-        let summary = format!(
-            "{} ({} after {reason}, {:.1} s)",
-            report.summary(),
-            if live_volumes.is_empty() {
-                "no live updates"
-            } else {
-                "live"
-            },
-            took.as_secs_f64()
-        );
+        let summary = scan_summary(&report.summary(), !live_volumes.is_empty(), &reason, took);
         eventlog::info(&summary);
         let volumes = describe_volumes(&options, &base, &maps, &report.fast_read_errors);
         // A volume that is live but could not re-check its change journal
@@ -1080,19 +1073,19 @@ fn maintain(
                 // room first), or when an administrator asks for one.
                 table_failures += 1;
                 let gap = refresh_retry(table_failures);
-                let why = format!("no live updates: {error}");
                 eventlog::warn(format!(
-                    "{why}; the index is served as scanned and the scan is tried again in {} min",
+                    "no live updates: {error}; the index is served as scanned and the scan is tried again in {} min",
                     gap.as_secs() / 60
                 ));
-                STATE.set_tables_mapped(0);
-                STATE.set_pending(Some((&why, Instant::now() + gap)));
-                store.swap(Snapshot {
-                    index: base,
-                    live: None,
-                    mode: "scan".into(),
-                    report: format!("{summary}; {why}"),
-                });
+                serve_without_live(
+                    &STATE,
+                    &store,
+                    tables.as_deref(),
+                    base,
+                    &scan_summary(&report.summary(), false, &reason, took),
+                    &error.to_string(),
+                    Instant::now() + gap,
+                );
                 if !wait_to_retry(&rx, gap, &mut reason) {
                     return;
                 }
@@ -1119,6 +1112,59 @@ fn maintain(
             resume: None,
         });
     }
+}
+
+/// The line the event log, the snapshot and health carry for a finished
+/// scan: what it read, whether live updates follow, and why it ran.
+fn scan_summary(report: &str, live: bool, reason: &str, took: Duration) -> String {
+    format!(
+        "{report} ({} after {reason}, {:.1} s)",
+        if live { "live" } else { "no live updates" },
+        took.as_secs_f64()
+    )
+}
+
+/// A scan built its index but the live layer over it could not be built (no
+/// room for its tables): serve the index as scanned, without live updates,
+/// and say so everywhere the scan said "live":
+///
+/// - health lists the volumes it read live as unavailable, with `why`, and
+///   the scan that tries again;
+/// - the snapshot's mode is "scan" and its report carries `scan` and `why`;
+/// - the saved tables file belongs to the index before the scan, is no use to
+///   the next start and takes room the retry needs: it is deleted (a missing
+///   file is fine; any other failure is logged).
+///
+/// `scan` is [`scan_summary`] of the scan without live updates. Returns the
+/// snapshot's report.
+fn serve_without_live(
+    state: &crate::health::State,
+    store: &SnapshotStore,
+    tables: Option<&std::path::Path>,
+    base: Arc<ferrow_index::Index>,
+    scan: &str,
+    why: &str,
+    retry_at: Instant,
+) -> String {
+    if let Some(path) = tables
+        && let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eventlog::warn(format!(
+            "could not delete the saved live tables of the old index ({error})"
+        ));
+    }
+    state.set_tables_mapped(0);
+    state.live_refused(why);
+    state.set_pending(Some((&format!("no live updates: {why}"), retry_at)));
+    let report = format!("{scan}: {why}");
+    store.swap(Snapshot {
+        index: base,
+        live: None,
+        mode: "scan".into(),
+        report: report.clone(),
+    });
+    report
 }
 
 /// What a failed rescan's log line says about live updates meanwhile.
@@ -2550,6 +2596,97 @@ mod tests {
         assert!(drop_paused(&mut paused));
         assert!(paused.is_none(), "it followed the index that was replaced");
         assert!(!drop_paused(&mut paused));
+    }
+
+    /// FR-47 review: a scan whose live tables were refused says so in health
+    /// (volumes, problems, the retry), in the snapshot, and drops the stale
+    /// saved tables that belong to the old index.
+    #[test]
+    fn a_scan_whose_live_layer_was_refused_is_served_without_live_updates_everywhere() {
+        let dir = std::env::temp_dir().join(format!("ferrowd-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tables = dir.join("live.bin");
+        std::fs::write(&tables, b"tables of the index before the scan").unwrap();
+
+        let state = crate::health::State::new();
+        let volume = VolumeState {
+            root: "C:\\".into(),
+            device: Some("\\\\?\\Volume{1}".into()),
+            mode: MODE_LIVE,
+            reason: String::new(),
+            entries: Some(4),
+            journal: JOURNAL_OK,
+            journal_detail: String::new(),
+        };
+        // What `maintain` has done by then: the scan finished, listed live.
+        state.scan_finished("startup", Duration::from_secs(2), vec![volume]);
+        let store = SnapshotStore::new(Snapshot::empty());
+        let base = layer_with(0).base().clone();
+        let scan = scan_summary("4 entries", false, "startup", Duration::from_secs(2));
+        assert_eq!(scan, "4 entries (no live updates after startup, 2.0 s)");
+
+        let retry_at = Instant::now() + Duration::from_secs(900);
+        let report = serve_without_live(
+            &state,
+            &store,
+            Some(&tables),
+            base.clone(),
+            &scan,
+            "the entry-to-record table cannot be built",
+            retry_at,
+        );
+
+        // The saved tables of the old index are gone.
+        assert!(!tables.exists());
+        // The snapshot: the index as scanned, no live layer, and the reason.
+        let served = store.get();
+        assert!(Arc::ptr_eq(&served.index, &base) && served.live.is_none());
+        assert_eq!(served.mode, "scan");
+        assert_eq!(served.report, report);
+        assert!(report.contains("no live updates") && !report.contains("(live"));
+        assert!(report.ends_with("the entry-to-record table cannot be built"));
+        // Health: no volume reads "live"; the problem and the retry say why.
+        let health = state.report(&store, &crate::access::Policy::default());
+        let [v] = &health.volumes[..] else {
+            panic!("{:?}", health.volumes)
+        };
+        assert_eq!(v.mode, MODE_UNAVAILABLE);
+        assert_eq!(v.reason, "the entry-to-record table cannot be built");
+        assert_eq!(v.journal, JOURNAL_NONE);
+        let pending = v.rescan_pending.as_ref().expect("the retry is shown");
+        assert!(pending.reason.starts_with("no live updates:"));
+        assert!(pending.earliest_ms > health.now_ms);
+        assert_eq!(
+            health.problems(),
+            vec!["C:\\: no live updates (the entry-to-record table cannot be built)".to_string()]
+        );
+
+        // A second refusal with no file to delete (or no path) is the same.
+        serve_without_live(
+            &state,
+            &store,
+            Some(&tables),
+            base.clone(),
+            &scan,
+            "x",
+            retry_at,
+        );
+        serve_without_live(&state, &store, None, base, &scan, "x", retry_at);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_scan_summary_says_whether_live_updates_follow() {
+        let took = Duration::from_millis(3_200);
+        assert_eq!(
+            scan_summary("5 entries", true, "startup", took),
+            "5 entries (live after startup, 3.2 s)"
+        );
+        assert_eq!(
+            scan_summary("5 entries", false, "startup", took),
+            "5 entries (no live updates after startup, 3.2 s)"
+        );
     }
 
     #[test]
