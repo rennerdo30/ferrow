@@ -146,6 +146,16 @@ slower. The owner chose to do both: map the index and compress it.
       than reading it back (a read-back is capped at 128 MB in any case). A
       small volume falls back to the heap; every fallback bumps
       `scratch_in_heap()`, which the service reports.
+    - **A failed scan does not stop live updates** (FR-47 review). The live
+      layer of the session a rescan interrupts is kept through the scan only
+      when its heap is at most 32 MiB (`KEPT_LIVE_HEAP`; about 291 B per change,
+      measured), so the scan's bound above holds with at most that much more;
+      a larger layer is dropped before the scan, as before. If the scan fails,
+      the kept layer goes on over the index served, and the retry is its own
+      timer (the back-off of the failures is unchanged). The journal readers
+      are never stopped, so nothing is replayed from `live.bin`; a rescan that
+      waits for its retry is not started early by an outgrown delta, and a
+      layer that reaches its hard limit meanwhile is dropped.
     - Chosen over shrinking the tables only (the per-record table is 1.1 GB
       at 27 M even at 48 B per record, and the names are 0.9 GB) and over a
       streaming emission (entry ids and their order, hence the saved bytes,

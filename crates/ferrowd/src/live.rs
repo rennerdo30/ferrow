@@ -181,6 +181,9 @@ const MAX_RESCAN_GAP: Duration = Duration::from_secs(30 * 60);
 pub struct RescanPolicy {
     pending: Option<String>,
     earliest: Instant,
+    /// The last attempt failed (no room, a build that could not be written)
+    /// and `earliest` is its back-off: an outgrown delta does not end it.
+    blocked: bool,
 }
 
 impl RescanPolicy {
@@ -190,7 +193,16 @@ impl RescanPolicy {
         RescanPolicy {
             pending: None,
             earliest: now + gap,
+            blocked: false,
         }
+    }
+
+    /// An attempt failed at `now`: the rescan stays wanted (`reason` unless
+    /// one is pending) and waits `gap`, whatever the delta's size.
+    fn defer(&mut self, now: Instant, gap: Duration, reason: String) {
+        self.pending.get_or_insert(reason);
+        self.earliest = now + gap;
+        self.blocked = true;
     }
 
     /// Ask for a rescan; the first reason is kept. True when this started a
@@ -206,6 +218,7 @@ impl RescanPolicy {
     pub fn force(&mut self, now: Instant, reason: String) {
         self.pending = Some(reason);
         self.earliest = now;
+        self.blocked = false;
     }
 
     pub fn pending(&self) -> Option<&str> {
@@ -218,9 +231,11 @@ impl RescanPolicy {
     }
 
     /// The reason to rescan now: one is pending and its gap has passed, or
-    /// `urgent` (the delta outgrew [`DeltaLimits::hard_delta`]).
+    /// `urgent` (the delta outgrew [`DeltaLimits::hard_delta`]) and the last
+    /// attempt did not just fail (retrying at once would only fail again, at
+    /// the cost of reading the drives).
     pub fn due(&mut self, now: Instant, urgent: bool) -> Option<String> {
-        if self.pending.is_some() && (urgent || now >= self.earliest) {
+        if self.pending.is_some() && ((urgent && !self.blocked) || now >= self.earliest) {
             self.pending.take()
         } else {
             None
@@ -460,6 +475,23 @@ impl Maintenance {
         self.rescan.force(now, reason);
     }
 
+    /// A rescan was tried at `now` and failed (no room for the new index, a
+    /// build that could not be written) while the live layer goes on over
+    /// the index it has: the rescan stays wanted and is tried again after
+    /// `gap`. Neither an outgrown delta nor folder reads shorten that wait
+    /// (an administrator's request does: [`Maintenance::force`]).
+    pub fn rescan_failed(&mut self, now: Instant, gap: Duration, reason: String) {
+        self.rescan.defer(now, gap, reason);
+    }
+
+    /// Whether the live layer has outgrown what a session may hold while a
+    /// failed rescan waits for its retry: it cannot be shed by a rescan now,
+    /// so the caller stops following the journal (the pre-failure state of
+    /// affairs: the index is served as it is until a rescan works).
+    pub fn outgrown_while_blocked(&self, load: Load) -> bool {
+        self.rescan.blocked && self.rescan.pending().is_some() && load.urgent
+    }
+
     /// The rescan waiting for its time (a waiting compaction is not one).
     pub fn rescan_pending(&self) -> Option<(&str, Instant)> {
         self.rescan
@@ -532,7 +564,7 @@ impl Maintenance {
         }
         let overdue = self.overdue(now, load);
         if load.walks {
-            if self.urgent_overdue(now, load) {
+            if self.urgent_overdue(now, load) && !self.rescan.blocked {
                 return self.compact.take().map(Due::Rescan);
             }
             // Hidden entries cost no memory, and a rescan (over a minute of
@@ -1218,6 +1250,14 @@ impl Live {
         self.limits
     }
 
+    /// Smaller limits, so a test needs no hundreds of thousands of changes.
+    /// Only the Windows maintainer tests use it.
+    #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn set_limits(&mut self, limits: DeltaLimits) {
+        self.limits = limits;
+    }
+
     fn is_alive(&self, loc: Loc) -> bool {
         match loc {
             Loc::Base(id) => self.removed[id as usize / 64] >> (id % 64) & 1 == 0,
@@ -1409,6 +1449,12 @@ impl Live {
             // A large folder move, until the next compaction.
             Part::new("live.adopted", adopted, Kind::Steady),
         ]
+    }
+
+    /// What this layer holds in the heap beyond the frozen index (what its
+    /// tables read through a map cost nothing here), by capacity.
+    pub fn heap_bytes(&self) -> u64 {
+        self.memory_parts().iter().map(|p| p.bytes).sum()
     }
 
     /// The whole retained picture of a live session: the frozen index's parts
@@ -1936,14 +1982,23 @@ impl Live {
         if !self.next_walk_deadline().is_some_and(|at| at <= now) {
             return applied;
         }
-        applied.abandoned = self.walks.len();
+        applied.abandoned = self.abandon_walks(now);
         applied.rescan = Some(Reason::disk(format!(
             "{REASON_MOVED_IN} (reading its contents did not finish in time)"
         )));
+        applied
+    }
+
+    /// Drop every outstanding walk and the log of records reported meanwhile
+    /// (their reader is gone: the session that queued them ended). The
+    /// folders stay as far as they were read; a rescan completes them.
+    /// Returns how many walks were dropped.
+    pub fn abandon_walks(&mut self, now: Instant) -> usize {
+        let dropped = self.walks.len();
         self.walks = Vec::new();
         self.log = HashMap::new();
         self.progress = now;
-        applied
+        dropped
     }
 
     /// Merge the result of a [`WalkJob`].
@@ -4932,6 +4987,75 @@ mod tests {
         drop(now);
         drop(base);
         assert!(weak_old.upgrade().is_none(), "the old index is freed");
+    }
+
+    #[test]
+    fn a_failed_rescan_waits_for_its_retry_whatever_the_delta_and_an_admin_ends_the_wait() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let calm = Load::default();
+        let urgent = Load::of(1000, 10, false, false);
+        let reason = "Volume{1}: change journal reset";
+        // Without a failure an outgrown delta starts the rescan at once …
+        let mut m = Maintenance::after_scan(t0, s(60));
+        m.request(Reason::disk(reason));
+        assert!(!m.outgrown_while_blocked(urgent));
+        assert_eq!(m.due(t0, urgent), Some(Due::Rescan(reason.into())));
+        // … after a failure it waits its back-off, urgent or not, and the
+        // caller is told when the layer outgrew what it may hold meanwhile.
+        let t1 = t0 + s(100);
+        m.rescan_failed(t1, s(900), reason.into());
+        assert_eq!(m.rescan_pending().map(|(why, _)| why), Some(reason));
+        assert!(m.outgrown_while_blocked(urgent));
+        assert!(!m.outgrown_while_blocked(calm));
+        for load in [calm, urgent] {
+            assert_eq!(m.due(t1 + s(899), load), None);
+            assert_eq!(
+                m.wake_at(t1 + s(1), load),
+                Some(t1 + s(900)),
+                "no busy wake"
+            );
+        }
+        // Folder reads do not turn a held-back compaction into a rescan
+        // either (an overdue delta does that when no rescan failed).
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        let reading = Load {
+            walks: true,
+            prompt: true,
+            ..urgent
+        };
+        assert_eq!(m.due(t1 + s(899), reading), None);
+        assert_eq!(m.due(t1 + s(900), calm), Some(Due::Rescan(reason.into())));
+        // Another failure doubles nothing here (the caller picks the gap)
+        // and waits again.
+        m.rescan_failed(t1 + s(901), s(1800), reason.into());
+        assert_eq!(m.due(t1 + s(901 + 1799), calm), None);
+        assert_eq!(
+            m.due(t1 + s(901 + 1800), calm),
+            Some(Due::Rescan(reason.into()))
+        );
+        // An administrator's request ends the wait at once and lifts the
+        // block (and replaces the reason, as in a session without a rescan).
+        m.rescan_failed(t1 + s(3000), s(1800), reason.into());
+        m.force(t1 + s(3010), REASON_ADMIN.into());
+        assert!(!m.outgrown_while_blocked(urgent));
+        assert_eq!(
+            m.due(t1 + s(3010), calm),
+            Some(Due::Rescan(REASON_ADMIN.into()))
+        );
+    }
+
+    #[test]
+    fn abandoned_walks_leave_no_reader_to_wait_for() {
+        let (mut live, _base, _job) = after_move_in(&moved_in());
+        assert!(live.walks_outstanding());
+        let now = Instant::now() + Duration::from_secs(1);
+        assert_eq!(live.abandon_walks(now), 1);
+        assert!(!live.walks_outstanding());
+        assert_eq!(live.next_walk_deadline(), None, "nothing to watch");
+        assert_eq!(live.abandon_walks(now), 0);
+        // The folder itself stays (as far as it was read).
+        assert!(live.has_changes());
     }
 
     #[test]

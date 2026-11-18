@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **A failed rescan no longer freezes live updates.** When a rescan could not run (no room beside the index, or a build that could not be written) the service waited 15 minutes, then 30, up to 12 hours without applying any live change, so the index it kept serving fell behind by every change made meanwhile. The service now keeps applying live changes to the current index while the rescan waits for its retry; the retry and the reason for it are unchanged, Service health shows the rescan as pending, and **Rescan now** still ends the wait at once. To keep the scan's memory low the live changes are kept through a rescan only while they are small (up to 32 MiB, about 110,000 changes); with more, or when they grow past their hard limit during the wait (the size is checked again at every retry, so a long wait on a busy PC can end it), live updates stop until a scan works, as before. The first start with no index is unchanged (nothing is served until a scan works). Not tried on a real PC: it needs raw volume access; the session hand-over is tested with made-up volumes and records.
+
 ## 0.1.0-beta.21
 
 - **A full disk no longer pushes the index into memory.** When the index file could not be written (usually a full disk), a rescan or merge used to build the whole index in memory instead (gigabytes on a large PC). Now a merge first checks that the disk has room for the new file (about 2.5 times the current one) and otherwise keeps the index as it is and tries again later, and a large index that could not be written is not built in memory. A rescan also checks for room first, and both wait longer after each failure (15 minutes, then 30, up to 12 hours); Service health says so while merging changes keeps failing. Small indexes (up to a million entries) still fall back to memory. On Linux the file's disk space is reserved before it is written, so a full disk is an error, not a crash.
