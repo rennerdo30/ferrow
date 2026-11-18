@@ -61,7 +61,6 @@ pub fn save_and_map(
 ) -> Option<io::Result<ferrow_index::Index>> {
     let path = config.index_path.as_ref()?;
     let _one = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    MAINTAINER_SAVED.store(true, Ordering::Release);
     let _saving = crate::health::STATE.saving();
     let started = Instant::now();
     let saved = (|| -> io::Result<ferrow_index::Index> {
@@ -77,6 +76,10 @@ pub fn save_and_map(
     let took = started.elapsed();
     crate::health::STATE.save_done(took, saved.as_ref().err().map(|e| e.to_string()));
     if saved.is_ok() {
+        // Only a save that worked makes the maintainer the file's writer: a
+        // failed one leaves its heap index to the background saver (whose
+        // check against the published index still applies).
+        MAINTAINER_SAVED.store(true, Ordering::Release);
         crate::eventlog::info(format!("index saved in {:.1} s", took.as_secs_f64()));
     }
     Some(saved)

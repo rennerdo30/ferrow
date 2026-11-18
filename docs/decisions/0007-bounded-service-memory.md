@@ -64,7 +64,8 @@ slower. The owner chose to do both: map the index and compress it.
    - The heap index the builder made is dropped, so the steady state holds no
      heap copy.
    - The save after a scan already exists (about 3.5 s at 27 M). It now happens
-     right away, not on the 30-minute schedule, at background priority.
+     right away, not on the 30-minute schedule, in the thread's background
+     mode (lower CPU, disk and memory priority).
    - The file just written is mapped without being checked again (its header,
      length and checksum field are compared with what was written); a full
      check would read gigabytes once more after every save.
