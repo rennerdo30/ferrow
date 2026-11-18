@@ -835,8 +835,8 @@ fn reread_journal(
 pub(crate) use platform::low_io_priority;
 #[cfg(windows)]
 pub use platform::{
-    can_read_volume, fetch_record, fetch_state, open_volume, query_journal, read_journal,
-    read_volume, record_is_free, volume_device, volume_serial, wait_journal,
+    can_read_volume, fetch_record, fetch_state, journal_capacity, open_volume, query_journal,
+    read_journal, read_volume, record_is_free, volume_device, volume_serial, wait_journal,
 };
 
 #[cfg(windows)]
@@ -1175,6 +1175,30 @@ mod platform {
             )
         };
         (ok != 0).then_some((data.UsnJournalID, data.FirstUsn, data.NextUsn))
+    }
+
+    /// The most a volume's change journal keeps (bytes of records) before
+    /// Windows drops its oldest records: its configured maximum size.
+    pub fn journal_capacity(volume: &std::fs::File) -> Option<u64> {
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, USN_JOURNAL_DATA_V0};
+        // SAFETY: zeroed POD output buffer.
+        let mut data: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
+        let mut returned = 0u32;
+        // SAFETY: live volume handle; output pointer and size describe `data`.
+        let ok = unsafe {
+            DeviceIoControl(
+                volume.as_raw_handle(),
+                FSCTL_QUERY_USN_JOURNAL,
+                std::ptr::null(),
+                0,
+                (&raw mut data).cast(),
+                size_of::<USN_JOURNAL_DATA_V0>() as u32,
+                &raw mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(data.MaximumSize)
     }
 
     /// Whether this process may read the NTFS volume holding `path`

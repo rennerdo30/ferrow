@@ -498,8 +498,19 @@ const MERGE_LAG_BYTES: i64 = MAX_REPLAY_BYTES / 4 * 3;
 /// …or how long the saved state may lag at all.
 const TABLES_REFRESH: Duration = Duration::from_secs(12 * 60 * 60);
 /// After an attempt to bring the saved state up to date (it may have
-/// failed: a full disk), the next waits at least this long.
+/// failed: a full disk), the next waits at least this long, doubled after
+/// each attempt that did not save the tables, up to TABLES_REFRESH.
 const REFRESH_RETRY: Duration = Duration::from_secs(15 * 60);
+
+/// How long to wait before the next attempt after `failures` attempts in a
+/// row that did not save the tables (0: the last one did).
+fn refresh_retry(failures: u32) -> Duration {
+    (REFRESH_RETRY * 2u32.pow(failures.saturating_sub(1).min(6))).min(TABLES_REFRESH)
+}
+
+/// The smallest journal size the lag limits scale down to: a journal that
+/// reports less (just created) is treated as this large.
+const MIN_JOURNAL_SPAN: i64 = 4 << 20;
 /// Why such a merge runs.
 const REASON_REFRESH: &str = "bring the saved index up to date";
 
@@ -819,6 +830,7 @@ fn maintain(
         if let Some(fatal) = &report.fatal_error {
             eventlog::error(format!("scan failed: {fatal}"));
             STATE.scan_failed();
+            STATE.set_tables_mapped(0);
             return;
         }
         // Saved and mapped before it is published: the heap copy goes now,
@@ -1033,13 +1045,23 @@ fn run_session(
         vec![(u64::MAX, 0); applied.len()]
     };
     let mut tables_saved = Instant::now();
-    let mut next_refresh = Instant::now();
+    // Attempts in a row that did not save the tables, and when the next may
+    // run: tables that could not be saved at the start wait one retry gap.
+    let mut refresh_failures: u32 = u32::from(!tables_current);
+    let mut next_refresh = Instant::now() + refresh_retry(refresh_failures);
     let refresh_possible = can_save_tables && tables.is_some() && persist.is_some();
     // Each journal's size, which bounds how far the saved position may lag.
+    // Each journal's configured maximum size (what it keeps before dropping
+    // its oldest records), not what it holds now: a journal created a moment
+    // ago is small but will grow.
     let spans: Vec<i64> = volumes
         .handles
         .iter()
-        .map(|(file, _)| ntfs::query_journal(file).map_or(0, |(_, first, next)| next - first))
+        .map(|(file, _)| {
+            ntfs::journal_capacity(file).map_or(0, |max| {
+                i64::try_from(max).unwrap_or(i64::MAX).max(MIN_JOURNAL_SPAN)
+            })
+        })
         .collect();
     let devices: Vec<String> = facts.iter().map(|f| f.device.clone()).collect();
     let (tx, rx) = (tx.clone(), rx);
@@ -1080,8 +1102,9 @@ fn run_session(
                 && Instant::now() >= next_refresh
                 && refresh_due(&lags, &spans, tables_saved.elapsed(), changed)
             {
-                // One attempt per REFRESH_RETRY, whatever its outcome.
-                next_refresh = Instant::now() + REFRESH_RETRY;
+                // One attempt per retry gap, whatever its outcome (a merge
+                // reports its own below).
+                next_refresh = Instant::now() + refresh_retry(refresh_failures + 1);
                 if changed {
                     rescan.request(Reason::compact(REASON_REFRESH));
                 } else if let Some(path) = tables {
@@ -1097,6 +1120,10 @@ fn run_session(
                         live.replace_tables(saved);
                         saved_at = applied.clone();
                         tables_saved = Instant::now();
+                        refresh_failures = 0;
+                    } else {
+                        refresh_failures += 1;
+                        next_refresh = Instant::now() + refresh_retry(refresh_failures);
                     }
                 }
             }
@@ -1114,6 +1141,7 @@ fn run_session(
                     // The fullest the live layer gets: what it holds before
                     // the rescan replaces it.
                     log_memory("before rescan", Some(&live), &base, store);
+                    STATE.set_tables_mapped(0);
                     break why;
                 }
                 Some(Due::Compact(why)) => {
@@ -1181,8 +1209,14 @@ fn run_session(
                         if tables_written {
                             saved_at = applied.clone();
                             tables_saved = Instant::now();
+                            refresh_failures = 0;
                         } else {
+                            // Not saved: retried after a gap that grows
+                            // with each miss (each retry may be a merge
+                            // that rewrites the index file).
                             saved_at = vec![(u64::MAX, 0); applied.len()];
+                            refresh_failures += 1;
+                            next_refresh = Instant::now() + refresh_retry(refresh_failures);
                         }
                         STATE.set_tables_mapped(live.mapped_bytes());
                         base = live.base().clone();
@@ -1211,7 +1245,14 @@ fn run_session(
                 // Only a deadline ahead: once due, the refresh was asked for
                 // (a merge then wakes the maintainer itself).
                 (refresh_possible && lagging)
-                    .then(|| (tables_saved + TABLES_REFRESH).max(next_refresh))
+                    .then(|| {
+                        // A limit already met waits only for the retry gap.
+                        if refresh_due(&lags, &spans, Duration::ZERO, changed) {
+                            next_refresh
+                        } else {
+                            (tables_saved + TABLES_REFRESH).max(next_refresh)
+                        }
+                    })
                     .filter(|&at| at > Instant::now()),
             ]
             .into_iter()
@@ -1552,6 +1593,18 @@ mod tests {
             Ok(()),
             "up to the limit"
         );
+    }
+
+    #[test]
+    fn failed_refreshes_wait_longer_each_time_up_to_twelve_hours() {
+        let min = Duration::from_secs(60);
+        assert_eq!(refresh_retry(0), 15 * min);
+        assert_eq!(refresh_retry(1), 15 * min);
+        assert_eq!(refresh_retry(2), 30 * min);
+        assert_eq!(refresh_retry(4), 120 * min);
+        assert_eq!(refresh_retry(6), 480 * min);
+        assert_eq!(refresh_retry(7), TABLES_REFRESH);
+        assert_eq!(refresh_retry(u32::MAX), TABLES_REFRESH);
     }
 
     #[test]
