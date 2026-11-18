@@ -35,6 +35,12 @@ static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// maintainer saved and is about to publish.
 static MAINTAINER_SAVED: AtomicBool = AtomicBool::new(false);
 
+/// Set while the live maintainer builds an index into the file: the
+/// background saver writes nothing meanwhile (the build renames its file
+/// into place before the new index is published). Cleared when the build
+/// ends, whatever its outcome.
+static BUILDING: AtomicBool = AtomicBool::new(false);
+
 fn save(config: &DaemonConfig, snapshot: Arc<Snapshot>) -> io::Result<()> {
     save_index(config, &snapshot.index)
 }
@@ -98,7 +104,49 @@ pub struct IndexFile {
 /// Temporary files a save or build of another process left beside the index
 /// (a crash or a power loss mid-way; a file build's is the size of the index)
 /// are removed once they are this old.
-const STALE_TEMPORARY: Duration = Duration::from_secs(10 * 60);
+const STALE_TEMPORARY: Duration = Duration::from_secs(60 * 60);
+
+/// Whether the process that named a temporary file (`.ferrow[-kind]-<pid>-…`)
+/// still runs. Unknown counts as running.
+fn writer_alive(name: &str) -> bool {
+    let Some(pid) = name
+        .strip_prefix(".ferrow-")
+        .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == '-'))
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+    else {
+        return true;
+    };
+    process_alive(pid)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: plain query of another process; the handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // Gone, or not ours to ask: only a missing process is certain.
+        return std::io::Error::last_os_error().raw_os_error() != Some(87);
+    }
+    let mut code = 0u32;
+    // SAFETY: a live handle and a writable code.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+    // SAFETY: the handle opened above.
+    unsafe { CloseHandle(handle) };
+    !ok || code == STILL_ACTIVE
+}
+
+#[cfg(not(windows))]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
 
 /// Remove `.ferrow-<pid>-….tmp` files in `dir` of another process (this
 /// one's may be in use) that nobody wrote for [`STALE_TEMPORARY`].
@@ -114,12 +162,15 @@ fn remove_stale_temporaries(dir: &std::path::Path) {
             .strip_prefix(".ferrow-")
             .is_some_and(|rest| rest.ends_with(".tmp"));
         let this_process = name.starts_with(&format!(".ferrow{own}"))
-            || name.starts_with(&format!(".ferrow-live{own}"));
+            || name.starts_with(&format!(".ferrow-live{own}"))
+            || name.starts_with(&format!(".ferrow-spill{own}"));
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
             .is_ok_and(|at| at.elapsed().is_ok_and(|age| age >= STALE_TEMPORARY));
-        if ours && !this_process && old {
+        // A file whose writer still runs may be in use (a mapped build
+        // writes without touching the file's time).
+        if ours && !this_process && old && !writer_alive(name) {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => crate::eventlog::info(format!(
                     "removed a temporary file left by an interrupted save: {name}"
@@ -152,8 +203,11 @@ impl IndexFile {
         // From the first build on, the maintainer is the file's only writer:
         // the background saver must not write a published heap index over
         // the file this build renames into place before it is published.
-        MAINTAINER_SAVED.store(true, Ordering::Release);
-        prepare_state(&self.config)?;
+        BUILDING.store(true, Ordering::Release);
+        if let Err(error) = prepare_state(&self.config) {
+            BUILDING.store(false, Ordering::Release);
+            return Err(error);
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
             remove_stale_temporaries(parent);
@@ -173,6 +227,13 @@ impl IndexFile {
     /// and the protection of the new file. `report` is what the build
     /// returned; a failed file build or spill is logged, not hidden.
     pub fn built(&self, report: &ferrow_walk::IndexFileReport) {
+        // A build that replaced the file makes the maintainer its writer; one
+        // that fell back to memory leaves its index to `save_and_map`, and to
+        // the background saver if that fails too.
+        if report.timings.is_some() {
+            MAINTAINER_SAVED.store(true, Ordering::Release);
+        }
+        BUILDING.store(false, Ordering::Release);
         if let Some(t) = &report.timings {
             // What a save would have taken: the checksum, the write and the
             // replacement. The parts before are the build itself.
@@ -244,6 +305,7 @@ impl Persistence {
                 // leave the older one on disk.
                 if snapshot.index.is_mapped()
                     || MAINTAINER_SAVED.load(Ordering::Acquire)
+                    || BUILDING.load(Ordering::Acquire)
                     || !Arc::ptr_eq(&published.get().index, &snapshot.index)
                 {
                     return Ok(());
@@ -397,11 +459,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_writer_that_still_runs_keeps_its_temporary_file() {
+        assert!(writer_alive(&format!(
+            ".ferrow-{}-1-2.tmp",
+            std::process::id()
+        )));
+        assert!(!writer_alive(".ferrow-4294967-1-2.tmp"));
+        assert!(!writer_alive(".ferrow-spill-4294967-3.tmp"));
+        assert!(writer_alive(".ferrow-odd.tmp"), "unknown counts as running");
+    }
+
+    #[test]
     fn stale_temporary_files_of_other_processes_are_removed() {
         let dir = std::env::temp_dir().join(format!("ferrowd-stale-tmp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let old = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
         let make = |name: &str, aged: bool| {
             let file = std::fs::File::create(dir.join(name)).unwrap();
             if aged {
@@ -409,9 +482,11 @@ mod tests {
             }
         };
         let own = std::process::id();
-        make(".ferrow-1-2-3.tmp", true); // another process, old: removed
-        make(".ferrow-live-1-abc.tmp", true); // the same for live tables
-        make(".ferrow-1-2-4.tmp", false); // recent: may be in use
+        make(".ferrow-4294967-2-3.tmp", true); // a process gone, old: removed
+        make(".ferrow-live-4294967-abc.tmp", true); // the same for live tables
+        make(".ferrow-spill-4294967-9.tmp", true); // and spilled shards
+        make(".ferrow-4294967-2-4.tmp", false); // recent: may be in use
+        make(&format!(".ferrow-{own}-3-1.tmp"), true); // this process, old
         make(&format!(".ferrow-{own}-2-5.tmp"), true); // this process
         make("index.bin", true); // not a temporary file
         remove_stale_temporaries(&dir);
@@ -421,7 +496,8 @@ mod tests {
             .collect();
         left.sort();
         let mut want = vec![
-            ".ferrow-1-2-4.tmp".to_string(),
+            ".ferrow-4294967-2-4.tmp".to_string(),
+            format!(".ferrow-{own}-3-1.tmp"),
             format!(".ferrow-{own}-2-5.tmp"),
             "index.bin".to_string(),
         ];

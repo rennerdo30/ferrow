@@ -878,7 +878,17 @@ fn maintain(
                     BUILD_RETRY.as_secs() / 60
                 ));
                 STATE.scan_failed();
-                std::thread::sleep(BUILD_RETRY);
+                // Wait, dropping the journals' records (the next scan reads
+                // everything again); an administrator's rescan ends the wait.
+                let until = Instant::now() + BUILD_RETRY;
+                while let Some(left) = until.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(left) {
+                        Ok(Message::RescanNow) => break,
+                        Ok(_) => {}
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
                 continue;
             }
             eventlog::error(format!("scan failed: {fatal}"));
@@ -1216,11 +1226,15 @@ fn run_session(
                             // columns in the heap.
                             let build = |live: &mut Live| match ready(persist) {
                                 Some(file) => {
-                                    live.compact_into(Some(&file.target()))
-                                        .map(|(new, report)| {
-                                            file.built(&report);
-                                            new
-                                        })
+                                    let built = live.compact_into(Some(&file.target()));
+                                    // Declined (folder reads): the build ends
+                                    // without a file.
+                                    let report = built
+                                        .as_ref()
+                                        .map(|(_, report)| report.clone())
+                                        .unwrap_or_default();
+                                    file.built(&report);
+                                    built.map(|(new, _)| new)
                                 }
                                 None => live.compact(),
                             };
