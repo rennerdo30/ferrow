@@ -633,7 +633,7 @@ mod tests {
             children_first: &first,
             children_ids: &ids,
             volumes: vec![SavedVolumeRef {
-                device: r"\?\Volume{1}",
+                device: r"\\?\Volume{1}",
                 serial: 3,
                 journal: (11, 12345),
                 record_size: 1024,
