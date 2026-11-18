@@ -760,6 +760,14 @@ fn save_tables(
     facts: &[saved::VolumeFacts],
 ) -> Option<saved::Saved> {
     let checksum = live.base().file_checksum()?;
+    // The children table is part of the file; a large one that has no room
+    // in a file is not built in the heap for it (ADR 0007).
+    if let Err(error) = live.ensure_children() {
+        eventlog::warn(format!(
+            "could not save the live tables ({error}); the next start scans"
+        ));
+        return None;
+    }
     let started = Instant::now();
     // Background mode, like the index save.
     let written = background_io(|| {
@@ -808,6 +816,8 @@ fn maintain(
     let mut first = true;
     // Scans in a row whose index could not be built (or had no room).
     let mut build_failures: u32 = 0;
+    // Scans in a row whose live tables had no room (see `build_failures`).
+    let mut table_failures: u32 = 0;
     // The session a due rescan interrupted: if the scan fails it goes on
     // over its index (live updates keep being applied) until the retry.
     let mut paused: Option<Session> = None;
@@ -916,12 +926,9 @@ fn maintain(
             }
             // The session it interrupted goes on (nothing was torn down but
             // the wait for the retry), or this waits without live updates.
-            if let Some(session) = paused.take() {
-                next = Some(Session {
-                    retry: Some((gap, reason.clone())),
-                    ..session
-                });
-            } else if !wait_to_retry(&rx, gap, &mut reason) {
+            if after_failed_rescan(&mut paused, &mut next, gap, &reason)
+                && !wait_to_retry(&rx, gap, &mut reason)
+            {
                 return;
             }
             continue;
@@ -959,12 +966,9 @@ fn maintain(
                     live_meanwhile(paused.is_some())
                 ));
                 STATE.scan_failed();
-                if let Some(session) = paused.take() {
-                    next = Some(Session {
-                        retry: Some((gap, reason.clone())),
-                        ..session
-                    });
-                } else if !wait_to_retry(&rx, gap, &mut reason) {
+                if after_failed_rescan(&mut paused, &mut next, gap, &reason)
+                    && !wait_to_retry(&rx, gap, &mut reason)
+                {
                     return;
                 }
                 continue;
@@ -976,7 +980,7 @@ fn maintain(
         }
         // The new index replaces the old one: its layer (and its map of the
         // old saved tables) goes before the new tables are saved.
-        paused = None;
+        drop_paused(&mut paused);
         // Saved and mapped before it is published: the heap copy goes now,
         // and the file is the one the next start loads.
         let base = Arc::new(map_saved(&index, persist.as_ref()).unwrap_or(index));
@@ -1055,7 +1059,7 @@ fn maintain(
         // there is one (a saved copy replaces them just below), and the
         // scan's record maps are in files too: this step holds no table of
         // 4 to 16 bytes per entry in memory.
-        let mut live = Live::new_in(
+        let built = Live::try_new_in(
             base.clone(),
             &maps,
             persist.as_ref().and_then(Persist::directory),
@@ -1063,6 +1067,38 @@ fn maintain(
         // The record maps (16 bytes per entry) are only needed to build
         // the overlay; do not keep them for the whole live session.
         drop(maps);
+        let mut live = match built {
+            Ok(live) => {
+                table_failures = 0;
+                live
+            }
+            Err(error) => {
+                // A table of hundreds of megabytes has no file to be built
+                // in (a full disk): not built in the heap. The new index is
+                // served as it is, without live updates; the scan is tried
+                // again after the back-off (which a full disk makes wait for
+                // room first), or when an administrator asks for one.
+                table_failures += 1;
+                let gap = refresh_retry(table_failures);
+                let why = format!("no live updates: {error}");
+                eventlog::warn(format!(
+                    "{why}; the index is served as scanned and the scan is tried again in {} min",
+                    gap.as_secs() / 60
+                ));
+                STATE.set_tables_mapped(0);
+                STATE.set_pending(Some((&why, Instant::now() + gap)));
+                store.swap(Snapshot {
+                    index: base,
+                    live: None,
+                    mode: "scan".into(),
+                    report: format!("{summary}; {why}"),
+                });
+                if !wait_to_retry(&rx, gap, &mut reason) {
+                    return;
+                }
+                continue;
+            }
+        };
         let mut tables_current = false;
         if can_save_tables
             && let Some(path) = tables.as_deref()
@@ -1092,6 +1128,44 @@ fn live_meanwhile(kept: bool) -> &'static str {
     } else {
         "; live updates stop until a scan works"
     }
+}
+
+/// A rescan produced no index (there was no room for it, or its build
+/// failed): the session it interrupted, if it was kept, goes on over the index
+/// served with the retry as its own timer (`gap`, then `reason` is asked
+/// again), and `false` is returned; with no session `true` says the
+/// maintainer must wait for the retry itself, without live updates.
+fn after_failed_rescan(
+    paused: &mut Option<Session>,
+    next: &mut Option<Session>,
+    gap: Duration,
+    reason: &str,
+) -> bool {
+    match paused.take() {
+        Some(session) => {
+            *next = Some(Session {
+                retry: Some((gap, reason.to_string())),
+                ..session
+            });
+            false
+        }
+        None => true,
+    }
+}
+
+/// A rescan produced an index: it replaces the one the interrupted session
+/// followed, so that session (its layer and its map of the old saved tables)
+/// goes. `true` when there was one.
+fn drop_paused(paused: &mut Option<Session>) -> bool {
+    paused.take().is_some()
+}
+
+/// Whether a session's layer is kept through the rescan that ends it: only
+/// when the rescan is due now (`wait` is zero, not the rest of a back-off the
+/// layer already outgrew) and the layer's heap (`held` bytes) is small enough
+/// to sit beside the scan's bounded memory ([`KEPT_LIVE_HEAP`]).
+fn keep_through_rescan(wait: Duration, held: u64) -> bool {
+    wait.is_zero() && held <= KEPT_LIVE_HEAP
 }
 
 /// A frozen index and the live layer over it, from a scan or from the saved
@@ -1721,7 +1795,7 @@ fn run_session(
         // Kept for a scan that fails, unless the layer is too large to hold
         // beside the scan (or it was given up already).
         let held = live.heap_bytes();
-        let keep = wait.is_zero() && held <= KEPT_LIVE_HEAP;
+        let keep = keep_through_rescan(wait, held);
         if wait.is_zero() && !keep {
             eventlog::info(format!(
                 "the live layer holds {} MiB (more than {} MiB): it is dropped for the rescan, and live updates stop meanwhile if the scan fails",
@@ -2442,6 +2516,53 @@ mod tests {
         drop(tx);
         assert!(!settle(Some(ended), &rx, &mut reason, &mut paused));
         assert!(paused.is_none());
+    }
+
+    /// The failed-rescan glue of `maintain`: both failures (no room for the
+    /// index, a scan whose build failed) hand the interrupted session back
+    /// through `after_failed_rescan`, so reverting that hand-back (a rescan
+    /// that fails ending live updates again) fails here.
+    #[test]
+    fn a_failed_rescan_hands_the_paused_session_back_with_its_retry() {
+        let gap = Duration::from_secs(900);
+        let (mut paused, mut next) = (Some(session_of(layer_with(3))), None);
+        let waits = after_failed_rescan(&mut paused, &mut next, gap, "journal reset");
+        assert!(!waits, "a session goes on, so the maintainer does not wait");
+        assert!(paused.is_none(), "handed over, not kept twice");
+        let session = next.expect("live updates go on");
+        assert_eq!(session.live.delta_len(), 3, "the same layer");
+        assert_eq!(session.retry, Some((gap, "journal reset".to_string())));
+        // Nothing was paused (a layer too large to keep was dropped): the
+        // maintainer waits for the retry itself, with no session.
+        let (mut paused, mut next) = (None, None);
+        assert!(after_failed_rescan(
+            &mut paused,
+            &mut next,
+            gap,
+            "journal reset"
+        ));
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn a_rescan_that_built_an_index_drops_the_paused_session() {
+        let mut paused = Some(session_of(layer_with(1)));
+        assert!(drop_paused(&mut paused));
+        assert!(paused.is_none(), "it followed the index that was replaced");
+        assert!(!drop_paused(&mut paused));
+    }
+
+    #[test]
+    fn the_keep_decision_is_the_heap_limit_and_a_rescan_due_now() {
+        let now = Duration::ZERO;
+        assert!(keep_through_rescan(now, 0));
+        assert!(
+            keep_through_rescan(now, KEPT_LIVE_HEAP),
+            "the limit is kept"
+        );
+        assert!(!keep_through_rescan(now, KEPT_LIVE_HEAP + 1));
+        // The rest of a back-off the layer outgrew: given up, whatever its size.
+        assert!(!keep_through_rescan(Duration::from_secs(1), 0));
     }
 
     #[test]

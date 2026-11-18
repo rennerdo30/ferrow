@@ -126,7 +126,8 @@ slower. The owner chose to do both: map the index and compress it.
       panicked scan leaves nothing), written through a writable map or
       appended in chunks as the read arrives and mapped read-only afterwards.
       The live layer's frozen tables (entry to record, record to entry,
-      children) are built the same way and replaced by the saved copy.
+      children) are built the same way and replaced by the saved copy when the
+      tables can be saved (they stay as files for the session otherwise).
     - One temporary-file layer serves every table of the build: a
       `store::Scratch` (a zero-filled file written through a map, then frozen
       read-only) for tables of known size, `store::Appender` (chunked appends)
@@ -134,6 +135,16 @@ slower. The owner chose to do both: map the index and compress it.
       (`store::create_temp_file`) and one disk-space step (`store::reserve`,
       before the first mapped write). The same code reads a table from the heap
       or from a file, so the result is the same bytes.
+    - **The live layer's tables are refused too** (FR-47 follow-up). The
+      service builds them with `Live::try_new_in`: the entry to record table,
+      each volume's record to entry table and the children table use
+      `Scratch::try_zeroed` above `HEAP_FALLBACK_ENTRIES` elements, so a missing
+      file is an error, not about 0.5 GB of heap at 27 M entries. The service
+      then serves the new index without live updates (the event log, the
+      snapshot and health say why) and scans again after its own back-off; a
+      small table still falls back, counted. With no room for the children
+      table the tables are not saved, and a move of a frozen folder is not
+      applied but asks for a rescan.
     - **No large silent heap fallback** (the lesson of FR-47). Before a
       volume's MFT is read the scan estimates what it will write (160 B per MFT
       record for the read's files, 130 for the shards and the new index;
