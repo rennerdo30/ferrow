@@ -2674,7 +2674,11 @@ mod tests {
         assert_eq!(ids_a[..], ids_b[..]);
         assert!(first_b.is_mapped() && ids_b.is_mapped() && !first_a.is_mapped());
         assert!(files.mapped_bytes() > 0 && heap.mapped_bytes() == 0);
-        assert!(leftovers() >= 3, "files while the tables live");
+        // Named while they live on Windows (deleted on close); unlinked
+        // once created on Unix.
+        if cfg!(windows) {
+            assert!(leftovers() >= 3, "files while the tables live");
+        }
         drop(files);
         assert_eq!(leftovers(), 0, "gone with the tables");
         // A directory that is not there: the same tables, in the heap.
