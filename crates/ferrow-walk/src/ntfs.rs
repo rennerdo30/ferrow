@@ -11,6 +11,9 @@
 //! The record parser is plain byte parsing and is unit-tested on every
 //! platform with synthetic records; only the volume access is Windows.
 
+use std::path::{Path, PathBuf};
+
+use ferrow_index::store::{Appender, Col, Plain, Scratch, count_heap_fallback};
 use ferrow_index::{ColumnSet, EntryMetadata};
 
 /// Records below this number are NTFS metadata files (`$MFT`,
@@ -122,15 +125,80 @@ fn filetime_to_metadata(ticks: i64) -> Option<i64> {
 }
 
 /// One name of a file (hard links give a file several).
+///
+/// Laid out without padding (24 bytes) so a table of names can live in a
+/// memory-mapped temporary file (see [`VolumeBuilder::with_spill`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct NameRecord {
     /// The file's base record number.
     pub record: u64,
     pub parent_record: u64,
-    pub parent_sequence: u16,
     /// Stored name bytes (WTF-8) in the owning arena.
     pub name_offset: u32,
+    pub parent_sequence: u16,
     pub name_len: u16,
+}
+
+// SAFETY: `repr(C)`, integers only, and no padding (8 + 8 + 4 + 2 + 2 bytes,
+// checked below): every bit pattern is a valid value.
+unsafe impl Plain for NameRecord {}
+const _: () = assert!(size_of::<NameRecord>() == 24);
+
+/// A record's [`RecordInfo`] as a table row: integers only, no padding, so
+/// the per-record table can live in a memory-mapped temporary file. All zero
+/// is a record that is not in use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+struct RecordSlot {
+    created: i64,
+    modified: i64,
+    accessed: i64,
+    size: u64,
+    attributes: u32,
+    reparse_tag: u32,
+    sequence: u16,
+    flags: u16,
+    reserved: u32,
+}
+
+// SAFETY: `repr(C)`, integers only, and no padding (4 * 8 + 4 + 4 + 2 + 2 + 4
+// bytes, checked below): every bit pattern is a valid value.
+unsafe impl Plain for RecordSlot {}
+const _: () = assert!(size_of::<RecordSlot>() == 48);
+
+const SLOT_IN_USE: u16 = 1;
+const SLOT_IS_DIR: u16 = 2;
+
+impl RecordSlot {
+    fn new(info: &RecordInfo) -> RecordSlot {
+        RecordSlot {
+            created: info.created,
+            modified: info.modified,
+            accessed: info.accessed,
+            size: info.size,
+            attributes: info.attributes,
+            reparse_tag: info.reparse_tag,
+            sequence: info.sequence,
+            flags: if info.in_use { SLOT_IN_USE } else { 0 }
+                | if info.is_dir { SLOT_IS_DIR } else { 0 },
+            reserved: 0,
+        }
+    }
+
+    fn info(&self) -> RecordInfo {
+        RecordInfo {
+            in_use: self.flags & SLOT_IN_USE != 0,
+            is_dir: self.flags & SLOT_IS_DIR != 0,
+            sequence: self.sequence,
+            attributes: self.attributes,
+            created: self.created,
+            modified: self.modified,
+            accessed: self.accessed,
+            size: self.size,
+            reparse_tag: self.reparse_tag,
+        }
+    }
 }
 
 /// A value that belongs to a base record but was found in one of its
@@ -462,17 +530,198 @@ pub fn parse_usn_records(mut bytes: &[u8]) -> Vec<UsnRecord> {
     out
 }
 
+/// Bytes of temporary files a read of one volume keeps per MFT record at its
+/// highest: the record table (48), the names (24) and their text, the
+/// grouping (8) and the record map the scan appends (16). **An estimate**: a
+/// synthetic stream with about 20 B of name text measured 118 to 121 B per
+/// record at 1 M entries; real names average about 42 B (ADR 0007, the
+/// owner's PC), so 160 leaves some room. Many hard links need more.
+pub const FILE_BYTES_PER_RECORD: u64 = 160;
+
+/// Bytes per record the scan writes after the read on the same disk: the
+/// builder's spilled shards (about 60) and the new index file (about 70).
+pub const BUILD_BYTES_PER_RECORD: u64 = 130;
+
+/// Bytes of disk a scan of a volume of `records` MFT records is expected to
+/// need beside the index: its temporary tables and what the build writes
+/// (see [`FILE_BYTES_PER_RECORD`], [`BUILD_BYTES_PER_RECORD`]). Checked
+/// before the MFT is read, so a disk that cannot take the result fails in
+/// seconds rather than after minutes of reading.
+pub fn files_estimate(records: u64) -> u64 {
+    records.saturating_mul(FILE_BYTES_PER_RECORD + BUILD_BYTES_PER_RECORD)
+}
+
+/// What a read with temporary files may do when it cannot have them. The
+/// numbers are the caller's to set so that a test can say "a volume this
+/// large with this much room" without a volume or a full disk.
+#[derive(Clone, Copy, Debug)]
+pub struct SpillPolicy {
+    /// A volume with more MFT records than this is never read into the heap
+    /// instead of files (the heap would take gigabytes: the reason files
+    /// exist): its read fails with [`crate::BUILD_FAILED`] and the service
+    /// tries again later. A smaller one falls back to the heap, counted
+    /// ([`ferrow_index::store::scratch_in_heap`]) and noted.
+    pub heap_fallback_records: u64,
+    /// Bytes free where the files go, when known; unknown means no check
+    /// (the first table that cannot be made then decides).
+    pub free_bytes: Option<u64>,
+}
+
+impl SpillPolicy {
+    /// The policy of a real read: the shared fallback limit and the disk's
+    /// free space beside `dir`.
+    pub fn for_dir(dir: &Path) -> SpillPolicy {
+        SpillPolicy {
+            heap_fallback_records: crate::HEAP_FALLBACK_ENTRIES as u64,
+            free_bytes: crate::free_bytes(dir),
+        }
+    }
+}
+
+/// The failure of a read that must not fall back to the heap.
+fn build_failed(why: impl std::fmt::Display) -> String {
+    format!("{}: {why}", crate::BUILD_FAILED)
+}
+
+/// Where a builder's tables go: the directory and whether the volume is too
+/// large for the heap to stand in for a file.
+struct Spill {
+    dir: PathBuf,
+    records: u64,
+    large: bool,
+}
+
+impl Spill {
+    /// A zeroed table of `len` values in a file. If the file cannot be made:
+    /// a large volume fails the read, a small one gets the heap (counted,
+    /// `note` says why).
+    fn table<T: Plain>(&self, len: usize, note: &mut Option<String>) -> Result<Scratch<T>, String> {
+        match Scratch::try_zeroed(len, &self.dir) {
+            Ok(table) => Ok(table),
+            Err(error) if self.large => Err(self.refused("a table", &error)),
+            Err(error) => {
+                count_heap_fallback();
+                note.get_or_insert_with(|| {
+                    format!(
+                        "a scan table could not be put in a file ({error}); it is kept in memory"
+                    )
+                });
+                Ok(Scratch::zeroed(len, None))
+            }
+        }
+    }
+
+    /// A names or arena appender: a failed file may continue in the heap only
+    /// for a small volume.
+    fn appender<T: Plain>(&self) -> Result<Appender<T>, String> {
+        if self.large {
+            Appender::new(&self.dir).map_err(|e| self.refused("the names", &e))
+        } else {
+            Ok(Appender::or_heap(&self.dir))
+        }
+    }
+
+    fn refused(&self, what: &str, error: &dyn std::fmt::Display) -> String {
+        build_failed(format!(
+            "{what} for a volume of {} MFT records could not be put in a file beside the index ({error}); not read into memory instead",
+            self.records
+        ))
+    }
+}
+
+/// Names forgotten by [`VolumeBuilder::forget`] in a builder whose names are
+/// in files: a name is dead when its index is below the cut-off made at that
+/// call and its record was forgotten then. (A builder that holds its names in
+/// the heap removes them instead.)
+///
+/// The grouping asks this for every name of the volume, twice, so the answer
+/// for the usual name must cost a few instructions, not a hash. Kept as a
+/// bitmap over the record numbers (one bit per record: 3 MB for 24 million
+/// records, built only when something was forgotten; the names arrive about in
+/// record order, so the bits are read nearly sequentially) in front of the
+/// forgotten records sorted with the highest cut-off each was forgotten at,
+/// which is searched only for a record whose bit is set. Records beyond the
+/// bitmap's cap (far above any real MFT) skip it and are searched directly.
+struct Forgotten {
+    /// Bit `r` is set when record `r` was forgotten (records below
+    /// `bits.len() * 64`).
+    bits: Vec<u64>,
+    /// `(record, cut-off)`, sorted by record, one per record.
+    dead: Vec<(u64, usize)>,
+}
+
+/// The most record numbers the bitmap covers: 2^27 records, a 16 MB bitmap.
+const FORGOTTEN_BITMAP_RECORDS: u64 = 1 << 27;
+
+impl Forgotten {
+    fn new() -> Forgotten {
+        Forgotten {
+            bits: Vec::new(),
+            dead: Vec::new(),
+        }
+    }
+
+    /// Forget `records`' names below index `cut`.
+    fn add(&mut self, cut: usize, records: impl IntoIterator<Item = u64>) {
+        self.dead.extend(records.into_iter().map(|r| (r, cut)));
+        self.dead.sort_unstable();
+        // One entry per record, with the highest cut-off (sorted ascending).
+        self.dead.dedup_by(|later, kept| {
+            let same = later.0 == kept.0;
+            if same {
+                kept.1 = kept.1.max(later.1);
+            }
+            same
+        });
+        let covered = self
+            .dead
+            .iter()
+            .map(|d| d.0)
+            .filter(|&r| r < FORGOTTEN_BITMAP_RECORDS)
+            .max()
+            .map_or(0, |max| max as usize / 64 + 1);
+        self.bits = vec![0; covered];
+        for &(record, _) in self.dead.iter().filter(|d| d.0 < FORGOTTEN_BITMAP_RECORDS) {
+            self.bits[record as usize / 64] |= 1 << (record % 64);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.dead.is_empty()
+    }
+
+    /// Whether name number `index`, of file `record`, was forgotten.
+    #[inline]
+    fn kills(&self, record: u64, index: usize) -> bool {
+        let candidate = if record < FORGOTTEN_BITMAP_RECORDS {
+            self.bits
+                .get(record as usize / 64)
+                .is_some_and(|word| word >> (record % 64) & 1 == 1)
+        } else {
+            !self.dead.is_empty()
+        };
+        candidate
+            && self
+                .dead
+                .binary_search_by_key(&record, |d| d.0)
+                .is_ok_and(|at| index < self.dead[at].1)
+    }
+}
+
 /// The whole volume's MFT contents, indexed for subtree emission.
+///
+/// Its tables are columns that are either in the heap or read from temporary
+/// files ([`VolumeBuilder::with_spill`]); everything reads them as slices.
 #[derive(Debug, Default)]
 pub struct Volume {
     /// Indexed by record number.
-    pub infos: Vec<RecordInfo>,
-    pub names: Vec<NameRecord>,
-    pub arena: Vec<u8>,
+    infos: Col<RecordSlot>,
+    names: Col<NameRecord>,
+    arena: Col<u8>,
     /// `names` indices grouped by parent record: the children of record
     /// `r` are `order[first[r]..first[r + 1]]`.
-    order: Vec<u32>,
-    first: Vec<u32>,
+    order: Col<u32>,
+    first: Col<u32>,
     pub serial: u64,
     /// Change journal id and the position after the read, when the
     /// volume has a journal (the starting point for live updates).
@@ -483,48 +732,198 @@ pub struct Volume {
     pub warning: Option<String>,
     /// Bytes per MFT record.
     pub record_size: usize,
+    /// Why the volume was read in memory although temporary files were wanted
+    /// (a file could not be made or failed), when it was.
+    pub spill_note: Option<String>,
+}
+
+/// Where a [`VolumeBuilder`] keeps the names it was given.
+enum NameSink {
+    /// One exactly sized pair of vectors per chunk, joined by `finish` (growing
+    /// one vector chunk by chunk would hold up to twice the names at every
+    /// doubling).
+    Chunks(Vec<(Vec<NameRecord>, Vec<u8>)>),
+    /// Appended to temporary files as each chunk arrives, with their arena
+    /// offsets already shifted to the whole volume's arena.
+    Files {
+        names: Appender<NameRecord>,
+        arena: Appender<u8>,
+        /// The chunk's names being shifted (a reused buffer).
+        shifted: Vec<NameRecord>,
+        /// A chunk's names did not fit the 32-bit arena offsets.
+        overflow: bool,
+    },
 }
 
 /// Takes the parse chunks of a volume one by one into the layout [`Volume`]
 /// needs, so the whole parse never sits beside the finished volume. The
 /// per-record table is allocated once for all `records` and filled as each
-/// chunk arrives; a chunk's names stay in their own exactly sized vectors
-/// until [`VolumeBuilder::finish`] joins them (growing one vector chunk by
-/// chunk would hold up to twice the names at every doubling).
+/// chunk arrives.
+///
+/// [`VolumeBuilder::new`] keeps everything in the heap (a chunk's names stay
+/// in their own exactly sized vectors until [`VolumeBuilder::finish`] joins
+/// them). [`VolumeBuilder::with_spill`] keeps the per-record table, the names
+/// and the grouping tables in anonymous temporary files instead (ADR 0007):
+/// a full scan's private memory is then a fixed working set, whatever the
+/// number of records, and the tables are the same bytes either way.
 pub struct VolumeBuilder {
-    infos: Vec<RecordInfo>,
-    chunks: Vec<(Vec<NameRecord>, Vec<u8>)>,
+    infos: Scratch<RecordSlot>,
+    names: NameSink,
     patches: Vec<Patch>,
+    forgotten: Forgotten,
+    /// Where the tables go (also those `finish` makes: the grouping by
+    /// parent); `None`: the heap.
+    spill: Option<Spill>,
+    note: Option<String>,
 }
 
 impl VolumeBuilder {
-    /// A builder for a volume of `records` MFT records (used or free).
+    /// A builder for a volume of `records` MFT records (used or free), all in
+    /// the heap.
     pub fn new(records: u64) -> VolumeBuilder {
         VolumeBuilder {
-            infos: vec![RecordInfo::default(); records as usize],
-            chunks: Vec::new(),
+            infos: Scratch::zeroed(records as usize, None),
+            names: NameSink::Chunks(Vec::new()),
             patches: Vec::new(),
+            forgotten: Forgotten::new(),
+            spill: None,
+            note: None,
+        }
+    }
+
+    /// A builder whose tables live in anonymous temporary files in `dir`,
+    /// given the room `policy` says is there.
+    ///
+    /// Never silently large in the heap: when the disk has less room than
+    /// [`files_estimate`] says the read needs, or a file cannot be made, a
+    /// volume above `policy.heap_fallback_records` gets an error that starts
+    /// with [`crate::BUILD_FAILED`] (the service backs off and retries), and a
+    /// smaller one is built in the heap, counted
+    /// ([`ferrow_index::store::scratch_in_heap`]) and described by
+    /// [`Self::note`]: the volume is the same, only larger.
+    pub fn with_spill(
+        records: u64,
+        dir: &Path,
+        policy: &SpillPolicy,
+    ) -> Result<VolumeBuilder, String> {
+        let large = records > policy.heap_fallback_records;
+        let need = files_estimate(records);
+        if let Some(free) = policy.free_bytes.filter(|&free| free < need) {
+            let why = format!(
+                "{} MB free beside the index, a scan of {records} MFT records needs about {} MB for its temporary files and the index",
+                free >> 20,
+                need >> 20
+            );
+            if large {
+                return Err(build_failed(format!(
+                    "{why}; a volume this large is not read into memory instead"
+                )));
+            }
+            count_heap_fallback();
+            let mut builder = VolumeBuilder::new(records);
+            builder.note = Some(format!("{why}; the volume is read in memory"));
+            return Ok(builder);
+        }
+        let spill = Spill {
+            dir: dir.to_path_buf(),
+            records,
+            large,
+        };
+        let mut note = None;
+        let infos = spill.table(records as usize, &mut note)?;
+        let names = NameSink::Files {
+            names: spill.appender()?,
+            arena: spill.appender()?,
+            shifted: Vec::new(),
+            overflow: false,
+        };
+        Ok(VolumeBuilder {
+            infos,
+            names,
+            patches: Vec::new(),
+            forgotten: Forgotten::new(),
+            spill: Some(spill),
+            note,
+        })
+    }
+
+    /// Why a table is in the heap although files were wanted, if one is.
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref().or(match &self.names {
+            NameSink::Files { names, arena, .. } => names.fallback().or(arena.fallback()),
+            NameSink::Chunks(_) => None,
+        })
+    }
+
+    /// Why the volume cannot be finished, once that is certain: a names file
+    /// failed on a volume too large for the heap, or the names outgrew the
+    /// 32-bit arena offsets. A read stops at the first `Some` instead of
+    /// reading the rest of the volume to fail at the end.
+    pub fn failure(&self) -> Option<String> {
+        match &self.names {
+            NameSink::Files {
+                names,
+                arena,
+                overflow,
+                ..
+            } => {
+                if *overflow {
+                    return Some("the names of the volume are larger than 4 GiB".into());
+                }
+                names
+                    .failure()
+                    .or(arena.failure())
+                    .map(|why| format!("a names file failed ({why})"))
+            }
+            NameSink::Chunks(_) => None,
         }
     }
 
     /// Take one parsed chunk; later values for a record replace earlier ones.
     pub fn push(&mut self, chunk: Parsed) {
-        for (n, info) in chunk.infos {
-            if let Some(slot) = self.infos.get_mut(n as usize) {
-                *slot = info;
+        for (n, info) in &chunk.infos {
+            if let Some(slot) = self.infos.get_mut(*n as usize) {
+                *slot = RecordSlot::new(info);
             }
         }
         self.patches.extend(chunk.patches);
-        let (mut names, mut arena) = (chunk.names, chunk.arena);
-        names.shrink_to_fit();
-        arena.shrink_to_fit();
-        self.chunks.push((names, arena));
+        match &mut self.names {
+            NameSink::Chunks(chunks) => {
+                let (mut names, mut arena) = (chunk.names, chunk.arena);
+                names.shrink_to_fit();
+                arena.shrink_to_fit();
+                chunks.push((names, arena));
+            }
+            NameSink::Files {
+                names,
+                arena,
+                shifted,
+                overflow,
+            } => {
+                let base = arena.len();
+                if *overflow || base + chunk.arena.len() > u32::MAX as usize {
+                    *overflow = true;
+                    return;
+                }
+                shifted.clear();
+                shifted.extend(chunk.names.iter().map(|n| NameRecord {
+                    name_offset: n.name_offset + base as u32,
+                    ..*n
+                }));
+                names.extend_from_slice(shifted);
+                arena.extend_from_slice(&chunk.arena);
+            }
+        }
     }
 
     /// Forget what was parsed for the records in `changed`, so a fresh parse
     /// of them can be pushed (the journal refresh after a long read). A
     /// changed record's name or patch stays only where the matching `keep_*`
     /// says so.
+    ///
+    /// `keep_*` must say `true` for every record not in `changed`: a builder
+    /// in the heap asks them about every name and patch, one with files only
+    /// about the names of changed records.
     pub fn forget(
         &mut self,
         changed: &std::collections::BTreeSet<u64>,
@@ -533,36 +932,58 @@ impl VolumeBuilder {
     ) {
         for &n in changed {
             if let Some(slot) = self.infos.get_mut(n as usize) {
-                *slot = RecordInfo::default();
+                *slot = RecordSlot::default();
             }
         }
         self.patches.retain(|p| match p {
             Patch::Size { record, .. } | Patch::Reparse { record, .. } => keep_patches(*record),
         });
-        for (names, _) in &mut self.chunks {
-            names.retain(|n| keep_names(n.record));
+        match &mut self.names {
+            NameSink::Chunks(chunks) => {
+                for (names, _) in chunks {
+                    names.retain(|n| keep_names(n.record));
+                }
+            }
+            NameSink::Files { names, .. } => {
+                // Only a changed record's names can go; the names pushed
+                // after this call are not affected.
+                let cut = names.len();
+                self.forgotten.add(
+                    cut,
+                    changed
+                        .iter()
+                        .copied()
+                        .filter(|&record| !keep_names(record)),
+                );
+            }
         }
     }
 
     /// Heap held while the chunks are collected, by capacity (memory
     /// accounting).
     pub fn heap_parts(&self) -> [(&'static str, usize); 4] {
-        [
-            (
-                "parsed.infos",
-                self.infos.capacity() * size_of::<RecordInfo>(),
-            ),
-            (
-                "parsed.names",
-                self.chunks
+        let (names, arena) = match &self.names {
+            NameSink::Chunks(chunks) => (
+                chunks
                     .iter()
                     .map(|c| c.0.capacity() * size_of::<NameRecord>())
                     .sum(),
+                chunks.iter().map(|c| c.1.capacity()).sum(),
             ),
-            (
-                "parsed.arena",
-                self.chunks.iter().map(|c| c.1.capacity()).sum(),
+            NameSink::Files {
+                names,
+                arena,
+                shifted,
+                ..
+            } => (
+                names.heap_bytes() + shifted.capacity() * size_of::<NameRecord>(),
+                arena.heap_bytes(),
             ),
+        };
+        [
+            ("parsed.infos", self.infos.heap_bytes()),
+            ("parsed.names", names),
+            ("parsed.arena", arena),
             (
                 "parsed.patches",
                 self.patches.capacity() * size_of::<Patch>(),
@@ -570,46 +991,110 @@ impl VolumeBuilder {
         ]
     }
 
+    /// Bytes of temporary files the builder holds (its tables, written or
+    /// waiting to be).
+    pub fn file_bytes(&self) -> usize {
+        self.infos.file_bytes()
+            + match &self.names {
+                NameSink::Chunks(_) => 0,
+                NameSink::Files { names, arena, .. } => names.file_bytes() + arena.file_bytes(),
+            }
+    }
+
     /// Join the chunks into the volume. Names and arena are made one after the
     /// other and every chunk's part is freed as soon as it is copied, so the
     /// copy never holds more than one extra copy of the larger of the two.
-    pub fn finish(mut self, serial: u64) -> Volume {
-        let records = self.infos.len();
+    ///
+    /// # Panics
+    /// When the volume cannot be made (see [`VolumeBuilder::finish_checked`]):
+    /// only possible for a builder with files or names beyond the 32-bit
+    /// arena offsets.
+    pub fn finish(self, serial: u64) -> Volume {
+        self.finish_checked(serial)
+            .unwrap_or_else(|error| panic!("cannot finish the volume: {error}"))
+    }
+
+    /// [`VolumeBuilder::finish`], reporting a failure: names that do not fit
+    /// the 32-bit arena offsets, or a table file that failed and could not be
+    /// read back.
+    pub fn finish_checked(mut self, serial: u64) -> Result<Volume, String> {
         for patch in &self.patches {
             match *patch {
                 Patch::Size { record, size } => {
-                    if let Some(info) = self.infos.get_mut(record as usize) {
-                        info.size = size;
+                    if let Some(slot) = self.infos.get_mut(record as usize) {
+                        slot.size = size;
                     }
                 }
                 Patch::Reparse { record, tag } => {
-                    if let Some(info) = self.infos.get_mut(record as usize) {
-                        info.reparse_tag = tag;
+                    if let Some(slot) = self.infos.get_mut(record as usize) {
+                        slot.reparse_tag = tag;
                     }
                 }
             }
         }
-        let mut bases = Vec::with_capacity(self.chunks.len());
-        let mut arena_len = 0usize;
-        for (_, arena) in &self.chunks {
-            bases.push(arena_len as u32);
-            arena_len += arena.len();
-        }
-        let mut names = Vec::with_capacity(self.chunks.iter().map(|c| c.0.len()).sum());
-        for ((chunk, _), base) in self.chunks.iter_mut().zip(&bases) {
-            names.extend(chunk.drain(..).map(|mut n| {
-                n.name_offset += base;
-                n
-            }));
-            *chunk = Vec::new();
-        }
-        let mut arena = Vec::with_capacity(arena_len);
-        for (_, part) in &mut self.chunks {
-            arena.extend_from_slice(part);
-            *part = Vec::new();
-        }
-        let infos = std::mem::take(&mut self.infos);
-        Volume::group(infos, names, arena, records, serial)
+        let (names, arena): (Col<NameRecord>, Col<u8>) =
+            match std::mem::replace(&mut self.names, NameSink::Chunks(Vec::new())) {
+                NameSink::Chunks(mut chunks) => {
+                    let mut bases = Vec::with_capacity(chunks.len());
+                    let mut arena_len = 0usize;
+                    for (_, arena) in &chunks {
+                        bases.push(arena_len as u32);
+                        arena_len += arena.len();
+                    }
+                    if arena_len > u32::MAX as usize {
+                        return Err("the names of the volume are larger than 4 GiB".into());
+                    }
+                    let mut names = Vec::with_capacity(chunks.iter().map(|c| c.0.len()).sum());
+                    for ((chunk, _), base) in chunks.iter_mut().zip(&bases) {
+                        names.extend(chunk.drain(..).map(|mut n| {
+                            n.name_offset += base;
+                            n
+                        }));
+                        *chunk = Vec::new();
+                    }
+                    let mut arena = Vec::with_capacity(arena_len);
+                    for (_, part) in &mut chunks {
+                        arena.extend_from_slice(part);
+                        *part = Vec::new();
+                    }
+                    (names.into(), arena.into())
+                }
+                NameSink::Files {
+                    names,
+                    arena,
+                    overflow,
+                    ..
+                } => {
+                    if overflow {
+                        return Err("the names of the volume are larger than 4 GiB".into());
+                    }
+                    let fell_back = names.fallback().or(arena.fallback()).map(str::to_string);
+                    let names = names
+                        .finish()
+                        .map_err(|e| format!("the names table: {e}"))?;
+                    let arena = arena
+                        .finish()
+                        .map_err(|e| format!("the names arena: {e}"))?;
+                    if let Some(why) = fell_back {
+                        self.note.get_or_insert(format!(
+                            "a names file failed ({why}); its names are kept in memory"
+                        ));
+                    }
+                    (names, arena)
+                }
+            };
+        let infos = std::mem::take(&mut self.infos).freeze();
+        let mut volume = Volume::group(
+            infos,
+            names,
+            arena,
+            serial,
+            &self.forgotten,
+            self.spill.as_ref(),
+            &mut self.note,
+        )?;
+        volume.spill_note = self.note;
+        Ok(volume)
     }
 }
 
@@ -620,72 +1105,126 @@ impl Volume {
         builder.finish(serial)
     }
 
-    /// The volume from its tables: groups the names by parent record.
+    /// The volume from its tables: groups the names by parent record (in
+    /// `spill`'s temporary files when there is one). Names of a record that
+    /// `forgotten` lists, and names of a parent beyond the table, are left out
+    /// of the grouping.
     fn group(
-        infos: Vec<RecordInfo>,
-        names: Vec<NameRecord>,
-        arena: Vec<u8>,
-        records: usize,
+        infos: Col<RecordSlot>,
+        names: Col<NameRecord>,
+        arena: Col<u8>,
         serial: u64,
-    ) -> Volume {
-        let mut first = vec![0u32; records + 1];
-        for n in &names {
-            if (n.parent_record as usize) < records {
+        forgotten: &Forgotten,
+        spill: Option<&Spill>,
+        note: &mut Option<String>,
+    ) -> Result<Volume, String> {
+        let records = infos.len();
+        let any_forgotten = !forgotten.is_empty();
+        let counted = |i: usize, n: &NameRecord| {
+            (n.parent_record as usize) < records && !(any_forgotten && forgotten.kills(n.record, i))
+        };
+        let table = |len: usize, note: &mut Option<String>| match spill {
+            Some(spill) => spill.table::<u32>(len, note),
+            None => Ok(Scratch::zeroed(len, None)),
+        };
+        let mut first = table(records + 1, note)?;
+        for (i, n) in names.iter().enumerate() {
+            if counted(i, n) {
                 first[n.parent_record as usize + 1] += 1;
             }
         }
         for i in 1..first.len() {
             first[i] += first[i - 1];
         }
-        let mut fill = first.clone();
-        let mut order = vec![0u32; first[records] as usize];
+        let total = first[records] as usize;
+        let mut order = table(total, note)?;
+        // Fill by advancing each parent's start, then shift the starts back
+        // (no second table of `records` entries).
         for (i, n) in names.iter().enumerate() {
-            let p = n.parent_record as usize;
-            if p < records {
-                order[fill[p] as usize] = i as u32;
-                fill[p] += 1;
+            if counted(i, n) {
+                let p = n.parent_record as usize;
+                order[first[p] as usize] = i as u32;
+                first[p] += 1;
             }
         }
-        Volume {
+        for i in (1..=records).rev() {
+            first[i] = first[i - 1];
+        }
+        first[0] = 0;
+        Ok(Volume {
             infos,
             names,
             arena,
-            order,
-            first,
+            order: order.freeze(),
+            first: first.freeze(),
             serial,
             journal: None,
             warning: None,
             record_size: 1024,
-        }
+            spill_note: None,
+        })
+    }
+
+    /// MFT records the volume has a slot for (used or free).
+    pub fn records(&self) -> usize {
+        self.infos.len()
+    }
+
+    /// Names held (a file with several names has several; names a journal
+    /// refresh forgot may still be counted).
+    pub fn name_count(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Bytes of name text held.
+    pub fn arena_len(&self) -> usize {
+        self.arena.len()
     }
 
     /// Heap held while the volume is in memory, by capacity (memory
     /// accounting): the per-record table, the names, their arena and the
-    /// parent grouping.
+    /// parent grouping. A table read from a temporary file holds none.
     pub fn heap_parts(&self) -> [(&'static str, usize); 5] {
         [
-            (
-                "volume.infos",
-                self.infos.capacity() * size_of::<RecordInfo>(),
-            ),
-            (
-                "volume.names",
-                self.names.capacity() * size_of::<NameRecord>(),
-            ),
-            ("volume.arena", self.arena.capacity()),
-            ("volume.order", self.order.capacity() * 4),
-            ("volume.first", self.first.capacity() * 4),
+            ("volume.infos", self.infos.heap_bytes()),
+            ("volume.names", self.names.heap_bytes()),
+            ("volume.arena", self.arena.heap_bytes()),
+            ("volume.order", self.order.heap_bytes()),
+            ("volume.first", self.first.heap_bytes()),
         ]
     }
 
-    pub fn info(&self, record: u64) -> Option<&RecordInfo> {
-        self.infos.get(record as usize).filter(|i| i.in_use)
+    /// Bytes of the volume's tables that are read from temporary files (file
+    /// cache, not private memory).
+    pub fn mapped_bytes(&self) -> usize {
+        self.infos.mapped_bytes()
+            + self.names.mapped_bytes()
+            + self.arena.mapped_bytes()
+            + self.order.mapped_bytes()
+            + self.first.mapped_bytes()
+    }
+
+    pub fn info(&self, record: u64) -> Option<RecordInfo> {
+        self.infos
+            .get(record as usize)
+            .filter(|slot| slot.flags & SLOT_IN_USE != 0)
+            .map(RecordSlot::info)
     }
 
     /// The current names directly inside directory `record`: entries
     /// whose stored parent reference still matches the directory's
     /// sequence (a stale reference belongs to a deleted directory).
     pub fn children(&self, record: u64) -> impl Iterator<Item = (&NameRecord, &[u8])> + '_ {
+        self.children_with_info(record)
+            .map(|(name, bytes, _)| (name, bytes))
+    }
+
+    /// [`Volume::children`] with each child's record (read once, as the scan
+    /// needs it right away).
+    pub fn children_with_info(
+        &self,
+        record: u64,
+    ) -> impl Iterator<Item = (&NameRecord, &[u8], RecordInfo)> + '_ {
         let (start, end, sequence) = match self.info(record) {
             Some(info) if (record as usize) + 1 < self.first.len() => (
                 self.first[record as usize] as usize,
@@ -696,15 +1235,12 @@ impl Volume {
         };
         self.order[start..end].iter().filter_map(move |&i| {
             let n = &self.names[i as usize];
-            if n.parent_sequence != sequence
-                || n.record == record
-                || n.record < FIRST_USER_RECORD
-                || self.info(n.record).is_none()
-            {
+            if n.parent_sequence != sequence || n.record == record || n.record < FIRST_USER_RECORD {
                 return None;
             }
+            let info = self.info(n.record)?;
             let off = n.name_offset as usize;
-            Some((n, &self.arena[off..off + n.name_len as usize]))
+            Some((n, &self.arena[off..off + n.name_len as usize], info))
         })
     }
 }
@@ -836,7 +1372,8 @@ pub(crate) use platform::low_io_priority;
 #[cfg(windows)]
 pub use platform::{
     can_read_volume, fetch_record, fetch_state, journal_capacity, open_volume, query_journal,
-    read_journal, read_volume, record_is_free, volume_device, volume_serial, wait_journal,
+    read_journal, read_volume, read_volume_in, record_is_free, volume_device, volume_serial,
+    wait_journal,
 };
 
 #[cfg(windows)]
@@ -1012,8 +1549,94 @@ mod platform {
     }
 
     /// Read and parse the whole MFT of the NTFS volume holding `path`.
-    /// Returns the device path (the per-volume cache key) and the data.
+    /// Returns the device path (the per-volume cache key) and the data. The
+    /// parsed volume is held in the heap (see [`read_volume_in`]).
     pub fn read_volume(path: &Path) -> Result<(String, Volume), String> {
+        read_volume_in(path, None)
+    }
+
+    /// Why a read failed, and whether the temporary files it used were the
+    /// cause (then the read may be tried again in the heap).
+    struct ReadFailure {
+        message: String,
+        spill: bool,
+    }
+
+    impl ReadFailure {
+        /// A failure of the read's temporary files (or of finishing what they
+        /// hold). A volume too large for the heap fails for good, as a build
+        /// failure the service retries later (see [`super::build_failed`]); a
+        /// small one may be read again in the heap. With no files in use it is
+        /// an ordinary failure.
+        fn files(message: String, files_used: bool, large: bool) -> ReadFailure {
+            match (files_used, large) {
+                (false, _) => message.into(),
+                (true, true) => ReadFailure {
+                    message: if message.starts_with(crate::BUILD_FAILED) {
+                        message
+                    } else {
+                        super::build_failed(message)
+                    },
+                    spill: false,
+                },
+                (true, false) => ReadFailure {
+                    message,
+                    spill: true,
+                },
+            }
+        }
+    }
+
+    impl From<String> for ReadFailure {
+        fn from(message: String) -> ReadFailure {
+            ReadFailure {
+                message,
+                spill: false,
+            }
+        }
+    }
+
+    impl From<&str> for ReadFailure {
+        fn from(message: &str) -> ReadFailure {
+            message.to_string().into()
+        }
+    }
+
+    /// [`read_volume`], keeping the parsed volume's tables in anonymous
+    /// temporary files in `spill` when there is a directory (ADR 0007, step
+    /// 9): the record table, the names and the grouping by parent are
+    /// written through memory maps, so the read's private memory is a fixed
+    /// working set (the read buffers and one parsed chunk), not 100 bytes or
+    /// more per entry.
+    ///
+    /// The disk is checked first: a volume whose temporary files would not fit
+    /// beside the index, or whose file cannot be made or fails during the
+    /// read, is **not** read into the heap when it has more than
+    /// [`crate::HEAP_FALLBACK_ENTRIES`] records; the read stops at once with an
+    /// error that starts with [`crate::BUILD_FAILED`], which the scan turns
+    /// into a fatal error the service retries after a back-off. A smaller
+    /// volume is read in the heap instead (counted in
+    /// [`ferrow_index::store::scratch_in_heap`], `spill_note` says why). Either
+    /// way a returned volume is complete.
+    pub fn read_volume_in(path: &Path, spill: Option<&Path>) -> Result<(String, Volume), String> {
+        match read_volume_once(path, spill) {
+            Err(failed) if failed.spill && spill.is_some() => {
+                ferrow_index::store::count_heap_fallback();
+                let (device, mut volume) = read_volume_once(path, None).map_err(|f| f.message)?;
+                volume.spill_note = Some(format!(
+                    "the read with temporary files failed ({}); the volume was read again in memory",
+                    failed.message
+                ));
+                Ok((device, volume))
+            }
+            other => other.map_err(|f| f.message),
+        }
+    }
+
+    fn read_volume_once(
+        path: &Path,
+        spill: Option<&Path>,
+    ) -> Result<(String, Volume), ReadFailure> {
         use windows_sys::Win32::System::IO::DeviceIoControl;
         use windows_sys::Win32::System::Ioctl::{
             FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER,
@@ -1042,7 +1665,7 @@ mod platform {
             )
         };
         if ok == 0 {
-            return Err(format!("volume data: {}", std::io::Error::last_os_error()));
+            return Err(format!("volume data: {}", std::io::Error::last_os_error()).into());
         }
         let cluster = data.BytesPerCluster as u64;
         let record_size = data.BytesPerFileRecordSegment as usize;
@@ -1075,8 +1698,18 @@ mod platform {
         let records = valid / record_size as u64;
         let serial = data.VolumeSerialNumber as u64;
 
+        let large = records > crate::HEAP_FALLBACK_ENTRIES as u64;
+        // Made before any of the MFT is read: the room check and the files'
+        // creation fail a large volume here, not after minutes of reading.
+        let all = match spill {
+            Some(dir) => {
+                VolumeBuilder::with_spill(records, dir, &super::SpillPolicy::for_dir(dir))?
+            }
+            None => VolumeBuilder::new(records),
+        };
+
         // Reader thread: sequential reads; this thread parses in parallel.
-        let mut builder = std::thread::scope(|scope| -> Result<VolumeBuilder, String> {
+        let mut builder = std::thread::scope(|scope| -> Result<VolumeBuilder, ReadFailure> {
             let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Aligned)>(2);
             let volume = &volume;
             let reader = scope.spawn(move || -> Result<(), String> {
@@ -1113,7 +1746,7 @@ mod platform {
                 }
                 Ok(())
             });
-            let mut all = VolumeBuilder::new(records);
+            let mut all = all;
             for (first_record, mut buf) in rx {
                 let part = buf
                     .as_mut_slice()
@@ -1131,6 +1764,11 @@ mod platform {
                         a
                     });
                 all.push(part);
+                // A names file that failed on a volume too large for the heap:
+                // stop reading (dropping the channel ends the reader).
+                if let Some(why) = all.failure() {
+                    return Err(ReadFailure::files(why, spill.is_some(), large));
+                }
             }
             reader
                 .join()
@@ -1147,7 +1785,9 @@ mod platform {
             }
             None => None,
         };
-        let mut out = builder.finish(serial);
+        let mut out = builder
+            .finish_checked(serial)
+            .map_err(|message| ReadFailure::files(message, spill.is_some(), large))?;
         out.journal = journal;
         out.warning = warning;
         out.record_size = record_size;
@@ -1906,15 +2546,19 @@ pub(crate) mod tests {
         assert!(chunks(usize::MAX).len() == 1 && chunks(3).len() > 10);
         for per in [1, 3, 7, 50] {
             let v = built(per);
-            assert_eq!(v.infos, whole.infos, "records, chunks of {per}");
+            assert_eq!(v.infos[..], whole.infos[..], "records, chunks of {per}");
             assert_eq!(listing(&v), listing(&whole), "children, chunks of {per}");
             assert_eq!(v.names.len(), whole.names.len());
             assert_eq!(v.arena.len(), whole.arena.len());
         }
         // What the chunks said: sizes, a patched size and reparse tag, links.
-        assert_eq!(whole.infos[21].size, 21);
-        assert_eq!(whole.infos[22].size, 9999, "patch from an extension record");
-        assert_eq!(whole.infos[23].reparse_tag, 0xA000_000C);
+        assert_eq!(whole.info(21).unwrap().size, 21);
+        assert_eq!(
+            whole.info(22).unwrap().size,
+            9999,
+            "patch from an extension record"
+        );
+        assert_eq!(whole.info(23).unwrap().reparse_tag, 0xA000_000C);
         assert_eq!(whole.children(20).count(), 40);
         assert_eq!(whole.children(5).count(), 1 + 8, "Docs and eight links");
         assert!(whole.children(5).any(|(_, n)| n == b"link25"));
@@ -2198,5 +2842,559 @@ pub(crate) mod tests {
         });
         assert!(result.is_err());
         assert_eq!(queries, 4);
+    }
+
+    /// A pseudo-random volume as parse chunks of `per` records each: folders
+    /// and files under random folders (with record-number gaps), some files
+    /// with a second name in another folder (a hard link), some names that
+    /// arrive in a later chunk than their record (an extension record's), and
+    /// size and reparse patches. Returns the volume's record count and the
+    /// chunks. Deterministic.
+    pub(crate) fn synthetic(n: usize, per: usize) -> (u64, Vec<Parsed>) {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let info = |is_dir: bool, size: u64, modified: i64| RecordInfo {
+            in_use: true,
+            is_dir,
+            sequence: 1 + (size % 3) as u16,
+            attributes: if is_dir { 0x10 } else { 0x20 },
+            modified,
+            size,
+            ..RecordInfo::default()
+        };
+        // (record, sequence) of every folder created so far.
+        let mut dirs: Vec<(u64, u16)> = vec![(ROOT_RECORD, 1)];
+        let mut files: Vec<u64> = Vec::new();
+        let mut out = vec![Parsed::default()];
+        let mut record = FIRST_USER_RECORD;
+        let add_name = |part: &mut Parsed, record: u64, parent: (u64, u16), name: &str| {
+            let name_offset = part.arena.len() as u32;
+            part.arena.extend_from_slice(name.as_bytes());
+            part.names.push(NameRecord {
+                record,
+                parent_record: parent.0,
+                parent_sequence: parent.1,
+                name_offset,
+                name_len: name.len() as u16,
+            });
+        };
+        let mut root = info(true, 0, 0);
+        root.sequence = 1;
+        out[0].infos.push((ROOT_RECORD, root));
+        for i in 0..n {
+            record += 1 + next() % 3;
+            if out.last().unwrap().infos.len() >= per {
+                out.push(Parsed::default());
+            }
+            let part = out.last_mut().unwrap();
+            let parent = dirs[(next() % dirs.len() as u64) as usize];
+            let is_dir = next() % 7 == 0;
+            let size = if is_dir { 0 } else { next() % 5_000_000 };
+            let sequence_of = info(is_dir, size, 0).sequence;
+            part.infos
+                .push((record, info(is_dir, size, 1_000_000 + i as i64)));
+            add_name(part, record, parent, &format!("n{i}-é{}", next() % 100));
+            if is_dir {
+                dirs.push((record, sequence_of));
+            } else {
+                files.push(record);
+                if next() % 11 == 0 {
+                    let other = dirs[(next() % dirs.len() as u64) as usize];
+                    add_name(part, record, other, &format!("link{i}"));
+                }
+                if next() % 13 == 0 {
+                    part.patches.push(Patch::Size {
+                        record,
+                        size: size + 1,
+                    });
+                }
+            }
+            if next() % 17 == 0 && !files.is_empty() {
+                let owner = files[(next() % files.len() as u64) as usize];
+                let other = dirs[(next() % dirs.len() as u64) as usize];
+                add_name(part, owner, other, &format!("ext{i}"));
+            }
+            if next() % 29 == 0 && !files.is_empty() {
+                let target = files[(next() % files.len() as u64) as usize];
+                part.patches.push(Patch::Reparse {
+                    record: target,
+                    tag: 0xA000_000C,
+                });
+            }
+        }
+        (record + 40, out)
+    }
+
+    /// A scratch directory that is removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!(
+                "ferrow-walk-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        /// Temporary files of a build still in the directory.
+        fn leftovers(&self) -> Vec<String> {
+            std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".ferrow-"))
+                .collect()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The policy of a read with room to spare and the usual heap limit.
+    fn roomy() -> SpillPolicy {
+        SpillPolicy {
+            heap_fallback_records: crate::HEAP_FALLBACK_ENTRIES as u64,
+            free_bytes: None,
+        }
+    }
+
+    /// A builder with files in `dir`, for a volume small enough for the heap
+    /// to stand in.
+    fn spilled(records: u64, dir: &Path) -> VolumeBuilder {
+        VolumeBuilder::with_spill(records, dir, &roomy()).unwrap()
+    }
+
+    fn assert_same_tables(a: &Volume, b: &Volume, what: &str) {
+        assert_eq!(a.infos[..], b.infos[..], "records, {what}");
+        assert_eq!(a.names[..], b.names[..], "names, {what}");
+        assert_eq!(a.arena[..], b.arena[..], "arena, {what}");
+        assert_eq!(a.order[..], b.order[..], "grouping, {what}");
+        assert_eq!(a.first[..], b.first[..], "starts, {what}");
+    }
+
+    #[test]
+    fn a_volume_built_in_temporary_files_is_the_volume_built_in_the_heap() {
+        let scratch = Scratch::new("volume");
+        let (records, chunks) = synthetic(4_000, 97);
+        assert!(chunks.len() > 30);
+        for per in [97usize, 1_000, usize::MAX] {
+            let (_, chunks) = synthetic(4_000, per);
+            let mut heap = VolumeBuilder::new(records);
+            let mut files = spilled(records, &scratch.0);
+            for chunk in chunks {
+                let copy = Parsed {
+                    infos: chunk.infos.clone(),
+                    names: chunk.names.clone(),
+                    arena: chunk.arena.clone(),
+                    patches: chunk.patches.clone(),
+                };
+                heap.push(copy);
+                files.push(chunk);
+            }
+            assert!(files.file_bytes() > 0, "the tables went to files");
+            let heap = heap.finish(5);
+            let files = files.finish(5);
+            assert_same_tables(&heap, &files, &format!("chunks of {per}"));
+            assert_eq!(listing_all(&heap, records), listing_all(&files, records));
+            assert_eq!(files.spill_note, None);
+            // Nothing of the volume is in the heap; all of it is in files.
+            assert!(files.heap_parts().iter().all(|(_, bytes)| *bytes == 0));
+            assert!(files.mapped_bytes() > 0);
+            assert_eq!(heap.mapped_bytes(), 0);
+            // A wide volume really has folders with several children and links.
+            assert!(heap.children(ROOT_RECORD).count() > 10);
+        }
+        drop(scratch);
+    }
+
+    fn listing_all(v: &Volume, records: u64) -> Vec<(u64, Kids)> {
+        (0..records)
+            .map(|r| {
+                // Order matters here: the scan emits in this order.
+                let kids: Vec<_> = v.children(r).map(|(n, b)| (n.record, b.to_vec())).collect();
+                (r, kids)
+            })
+            .filter(|(_, kids)| !kids.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn forgetting_records_in_a_volume_built_in_files_matches_the_heap() {
+        let scratch = Scratch::new("forget");
+        let (records, chunks) = synthetic(1_500, 40);
+        // The journal refresh forgets records after all chunks were read: a
+        // deleted one, a renamed one (its extension names go with it) and a
+        // rewritten one that keeps its extension-record names.
+        let changed: std::collections::BTreeSet<u64> = chunks
+            .iter()
+            .flat_map(|c| c.infos.iter().map(|(r, _)| *r))
+            .step_by(37)
+            .collect();
+        let renamed: std::collections::HashSet<u64> = changed.iter().copied().step_by(2).collect();
+        let used: std::collections::HashSet<u64> = changed.iter().copied().skip(1).collect();
+        let fresh = |record: u64| {
+            let mut p = Parsed::default();
+            p.infos.push((
+                record,
+                RecordInfo {
+                    in_use: true,
+                    sequence: 1,
+                    attributes: 0x20,
+                    size: 7,
+                    ..RecordInfo::default()
+                },
+            ));
+            p.names.push(NameRecord {
+                record,
+                parent_record: ROOT_RECORD,
+                parent_sequence: 1,
+                name_offset: 0,
+                name_len: 5,
+            });
+            p.arena.extend_from_slice(b"fresh");
+            p
+        };
+        let run = |mut b: VolumeBuilder| {
+            for chunk in synthetic(1_500, 40).1 {
+                b.push(chunk);
+            }
+            let refreshed: Vec<u64> = renamed
+                .iter()
+                .copied()
+                .filter(|r| used.contains(r))
+                .collect();
+            b.forget(
+                &changed,
+                |r| !changed.contains(&r) || (used.contains(&r) && !renamed.contains(&r)),
+                |r| used.contains(&r) || !changed.contains(&r),
+            );
+            for r in refreshed {
+                b.push(fresh(r));
+            }
+            b.finish(9)
+        };
+        let heap = run(VolumeBuilder::new(records));
+        let files = run(spilled(records, &scratch.0));
+        assert_eq!(heap.infos[..], files.infos[..]);
+        assert_eq!(
+            listing_all(&heap, records),
+            listing_all(&files, records),
+            "the children of every folder, in order"
+        );
+        // The refresh did something: the same volume without it lists other
+        // children.
+        let mut untouched = VolumeBuilder::new(records);
+        for chunk in synthetic(1_500, 40).1 {
+            untouched.push(chunk);
+        }
+        let untouched = untouched.finish(9);
+        assert_ne!(
+            listing_all(&heap, records),
+            listing_all(&untouched, records),
+            "forgetting changed the volume"
+        );
+        drop(scratch);
+    }
+
+    #[test]
+    fn a_builder_that_cannot_make_its_files_holds_the_same_volume_in_the_heap() {
+        let scratch = Scratch::new("nofiles");
+        let (records, chunks) = synthetic(800, 50);
+        let missing = scratch.0.join("no").join("such").join("dir");
+        let mut heap = VolumeBuilder::new(records);
+        let mut files = spilled(records, &missing);
+        let why = files.note().expect("a note says why").to_string();
+        assert!(why.contains("kept in memory"), "{why}");
+        for chunk in chunks {
+            heap.push(Parsed {
+                infos: chunk.infos.clone(),
+                names: chunk.names.clone(),
+                arena: chunk.arena.clone(),
+                patches: chunk.patches.clone(),
+            });
+            files.push(chunk);
+        }
+        assert_eq!(files.file_bytes(), 0);
+        let heap = heap.finish(1);
+        let files = files.finish(1);
+        assert_same_tables(&heap, &files, "no files");
+        assert_eq!(files.mapped_bytes(), 0);
+        assert!(files.spill_note.is_some());
+        drop(scratch);
+    }
+
+    #[test]
+    fn temporary_files_are_gone_after_success_failure_and_a_panic() {
+        let scratch = Scratch::new("cleanup");
+        let (records, chunks) = synthetic(1_000, 64);
+        let feed = |b: &mut VolumeBuilder| {
+            for c in synthetic(1_000, 64).1 {
+                b.push(c);
+            }
+        };
+        // Success: the volume holds the files; dropping it removes them.
+        {
+            let mut b = spilled(records, &scratch.0);
+            feed(&mut b);
+            let v = b.finish(1);
+            assert!(v.mapped_bytes() > 0);
+            drop(v);
+        }
+        assert_eq!(scratch.leftovers(), Vec::<String>::new(), "after success");
+        // Failure: a builder dropped before it was finished.
+        {
+            let mut b = spilled(records, &scratch.0);
+            feed(&mut b);
+            assert!(b.file_bytes() > 0);
+        }
+        assert_eq!(scratch.leftovers(), Vec::<String>::new(), "after a drop");
+        // Failure: names that cannot be finished (past the 32-bit offsets).
+        {
+            let mut b = spilled(records, &scratch.0);
+            feed(&mut b);
+            if let NameSink::Files { overflow, .. } = &mut b.names {
+                *overflow = true;
+            }
+            let error = b.finish_checked(1).expect_err("an error");
+            assert!(error.contains("4 GiB"), "{error}");
+        }
+        assert_eq!(scratch.leftovers(), Vec::<String>::new(), "after an error");
+        // A panic while the builder is alive.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = spilled(records, &scratch.0);
+            feed(&mut b);
+            assert!(b.file_bytes() > 0);
+            panic!("the parse failed");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(scratch.leftovers(), Vec::<String>::new(), "after a panic");
+        let _ = chunks;
+        drop(scratch);
+    }
+
+    /// Feed the synthetic volume's chunks to a builder.
+    fn feed_all(b: &mut VolumeBuilder, count: usize, per: usize) {
+        for chunk in synthetic(count, per).1 {
+            b.push(chunk);
+        }
+    }
+
+    #[test]
+    fn a_large_volume_with_no_room_for_its_files_fails_with_build_failed_before_reading() {
+        let scratch = Scratch::new("noroom");
+        let records = 5_000;
+        // Large: above the (injected) heap limit. 120 B/record would need
+        // 600 kB; 1 kB is free.
+        let large = SpillPolicy {
+            heap_fallback_records: 1_000,
+            free_bytes: Some(1_000),
+        };
+        let Err(error) = VolumeBuilder::with_spill(records, &scratch.0, &large) else {
+            panic!("a large volume without room must not get a builder");
+        };
+        assert!(error.starts_with(crate::BUILD_FAILED), "{error}");
+        assert!(error.contains("not read into memory instead"), "{error}");
+        assert!(error.contains("MB free"), "{error}");
+        assert_eq!(scratch.leftovers(), Vec::<String>::new(), "no file made");
+        // The same volume with room gets its files.
+        let roomy = SpillPolicy {
+            free_bytes: Some(files_estimate(records) + 1),
+            ..large
+        };
+        assert!(VolumeBuilder::with_spill(records, &scratch.0, &roomy).is_ok());
+        // Unknown free space is not a refusal (the first file decides).
+        let unknown = SpillPolicy {
+            free_bytes: None,
+            ..large
+        };
+        assert!(VolumeBuilder::with_spill(records, &scratch.0, &unknown).is_ok());
+        // A small volume with no room is built in the heap, with a note.
+        let small = SpillPolicy {
+            heap_fallback_records: 10_000,
+            free_bytes: Some(1_000),
+        };
+        let builder = VolumeBuilder::with_spill(records, &scratch.0, &small).unwrap();
+        let note = builder.note().expect("a note says why");
+        assert!(note.contains("read in memory"), "{note}");
+        assert_eq!(builder.file_bytes(), 0);
+        drop(scratch);
+    }
+
+    #[test]
+    fn a_large_volume_whose_files_cannot_be_made_fails_and_a_small_one_uses_the_heap() {
+        let scratch = Scratch::new("nodir");
+        let missing = scratch.0.join("no").join("such").join("dir");
+        let records = 5_000;
+        let large = SpillPolicy {
+            heap_fallback_records: 1_000,
+            free_bytes: None,
+        };
+        let Err(error) = VolumeBuilder::with_spill(records, &missing, &large) else {
+            panic!("no file, no builder for a large volume");
+        };
+        assert!(error.starts_with(crate::BUILD_FAILED), "{error}");
+        let small = SpillPolicy {
+            heap_fallback_records: 10_000,
+            ..large
+        };
+        let builder = VolumeBuilder::with_spill(records, &missing, &small).unwrap();
+        assert!(builder.note().is_some());
+        drop(scratch);
+    }
+
+    #[test]
+    fn a_names_file_that_fails_stops_a_large_volume_and_a_small_one_goes_on_in_the_heap() {
+        let scratch = Scratch::new("failing");
+        let (records, _) = synthetic(1_500, 40);
+        let fail = |b: &mut VolumeBuilder| {
+            let NameSink::Files { names, .. } = &mut b.names else {
+                panic!("names in files");
+            };
+            names.fail(std::io::Error::other("disk full"));
+        };
+        // Large: the failure is known at once, nothing is read back into the
+        // heap, and the volume cannot be finished.
+        let large = SpillPolicy {
+            heap_fallback_records: 100,
+            free_bytes: None,
+        };
+        let mut b = VolumeBuilder::with_spill(records, &scratch.0, &large).unwrap();
+        assert_eq!(b.failure(), None);
+        for chunk in synthetic(1_500, 40).1.into_iter().take(10) {
+            b.push(chunk);
+        }
+        fail(&mut b);
+        let why = b.failure().expect("the failure is reported at once");
+        assert!(why.contains("disk full"), "{why}");
+        let NameSink::Files { names, .. } = &b.names else {
+            unreachable!()
+        };
+        assert_eq!(names.heap_bytes(), 0, "not read back into memory");
+        assert!(b.finish_checked(1).is_err());
+        // Small: the names continue in the heap and the volume is complete.
+        let mut heap = VolumeBuilder::new(records);
+        feed_all(&mut heap, 1_500, 40);
+        let mut b = spilled(records, &scratch.0);
+        let mut chunks = synthetic(1_500, 40).1.into_iter();
+        for chunk in chunks.by_ref().take(10) {
+            b.push(chunk);
+        }
+        fail(&mut b);
+        assert_eq!(b.failure(), None, "a small volume can go on");
+        for chunk in chunks {
+            b.push(chunk);
+        }
+        let files = b.finish(1);
+        assert_same_tables(&heap.finish(1), &files, "names failed midway");
+        assert!(files.spill_note.is_some());
+        drop(scratch);
+    }
+
+    #[test]
+    fn forgotten_names_are_found_by_record_and_cut_off() {
+        let mut forgotten = Forgotten::new();
+        assert!(forgotten.is_empty() && !forgotten.kills(0, 0) && !forgotten.kills(u64::MAX, 0));
+        forgotten.add(10, [50, 20, 30]);
+        // A later call: record 20 again with a higher cut-off, and a new one.
+        forgotten.add(25, [20, 90]);
+        assert!(!forgotten.is_empty());
+        // Before the cut-off of its call: dead. At or after it: alive (a
+        // fresh name pushed after the forget).
+        assert!(forgotten.kills(30, 9) && !forgotten.kills(30, 10));
+        assert!(
+            forgotten.kills(20, 24) && !forgotten.kills(20, 25),
+            "highest cut"
+        );
+        assert!(forgotten.kills(90, 0) && !forgotten.kills(90, 25));
+        // Records between and outside the listed ones are never dead.
+        for record in [0, 19, 21, 29, 31, 49, 51, 89, 91, u64::MAX] {
+            assert!(!forgotten.kills(record, 0), "{record}");
+        }
+        // A record number beyond the bitmap is still found (and its neighbours not).
+        let far = FORGOTTEN_BITMAP_RECORDS + 7;
+        forgotten.add(5, [far]);
+        assert!(
+            forgotten.kills(far, 4) && !forgotten.kills(far, 5) && !forgotten.kills(far + 1, 0)
+        );
+        assert!(forgotten.kills(30, 9), "the others are kept");
+    }
+
+    #[test]
+    fn the_forgotten_lookup_agrees_with_the_set_per_call_rule_it_replaced() {
+        // The rule before: a name is dead when some forget call with a cut-off
+        // above its index listed its record.
+        let mut calls: Vec<(usize, std::collections::HashSet<u64>)> = Vec::new();
+        let mut forgotten = Forgotten::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut cut = 0usize;
+        for _ in 0..6 {
+            cut += (next() % 200) as usize;
+            let records: Vec<u64> = (0..(next() % 40)).map(|_| 16 + next() % 300).collect();
+            calls.push((cut, records.iter().copied().collect()));
+            forgotten.add(cut, records);
+        }
+        for index in 0..cut + 50 {
+            for record in 0..340u64 {
+                let old = calls
+                    .iter()
+                    .any(|(cut, dead)| index < *cut && dead.contains(&record));
+                assert_eq!(forgotten.kills(record, index), old, "{record} at {index}");
+            }
+        }
+    }
+
+    /// Prints what the forgotten check costs per name, against the hash-set
+    /// rule it replaced: `cargo test --release -p ferrow-walk
+    /// forgotten_lookup_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement"]
+    fn forgotten_lookup_cost() {
+        let names: u64 = 4_000_000;
+        let spread = |i: u64| (i.wrapping_mul(2_654_435_761) % 30_000_000) + 16;
+        for forgotten_records in [0u64, 20_000, 400_000] {
+            let records: Vec<u64> = (0..forgotten_records).map(|i| spread(i * 7)).collect();
+            let mut new = Forgotten::new();
+            let mut old: Vec<(usize, std::collections::HashSet<u64>)> = Vec::new();
+            if forgotten_records > 0 {
+                new.add(names as usize, records.iter().copied());
+                old.push((names as usize, records.iter().copied().collect()));
+            }
+            let time = |what: &str, check: &dyn Fn(u64, usize) -> bool| {
+                let started = std::time::Instant::now();
+                let mut dead = 0u64;
+                for i in 0..names {
+                    dead += u64::from(check(spread(i), i as usize));
+                }
+                let ns = started.elapsed().as_secs_f64() * 1e9 / names as f64;
+                println!(
+                    "forgotten={forgotten_records:>7} {what}: {ns:6.2} ns per name ({dead} dead)"
+                );
+                dead
+            };
+            let a = time("bitmap + search", &|r, i| {
+                !new.is_empty() && new.kills(r, i)
+            });
+            let b = time("hash set      ", &|r, i| {
+                old.iter().any(|(cut, dead)| i < *cut && dead.contains(&r))
+            });
+            assert_eq!(a, b);
+        }
     }
 }

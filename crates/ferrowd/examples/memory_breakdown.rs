@@ -26,12 +26,21 @@
 //!    state the service keeps,
 //! 8. a second scan while the old index and its published view are still held
 //!    (a rescan; the old `Live` is dropped first, as `maintain` does),
-//! 9. the same build as the service makes it since ADR 0007 step 8 (`bounded`):
-//!    the builder's shards spill to temporary files past a 32 MiB budget and
-//!    the freeze writes the index file in place (`freeze_to_file`), with its
-//!    own `bounded.emit` and `bounded.freeze` peaks beside the heap build's
-//!    `scan2.emit` and `scan2.freeze`. It is checked against the heap build's
-//!    index entry for entry,
+//! 9. the same scan as the service makes it since ADR 0007 steps 8 and 9
+//!    (`bounded`): the volume builder keeps its tables in temporary files
+//!    (`VolumeBuilder::with_spill`), the builder's shards spill to temporary
+//!    files past a 32 MiB budget, the record map is appended to a file, the
+//!    freeze writes the index file in place (`freeze_to_file`) and the live
+//!    layer's tables are built in files (`Live::new_in`, then the children
+//!    table `saved_ref` needs). Its `bounded.parse`, `bounded.from_parsed`,
+//!    `bounded.emit`, `bounded.freeze`, `bounded.live_new` and
+//!    `bounded.children` peaks sit beside the heap build's `scan2.*`; what the
+//!    files hold is printed as `FERROW-MEMORY-FILES` (file cache, not private
+//!    bytes). It is checked against the heap build's index entry for entry
+//!    and must leave no temporary file behind. A `forgotten` round then times
+//!    the join of the same volume with nothing, `FERROW_MEMORY_FORGET`
+//!    (default 20000) and a tenth of the records forgotten, as after a
+//!    journal refresh (`FERROW-MEMORY-TIMING round=forgotten`),
 //! 10. the merge of the live changes into a new index (`compact`), in the heap
 //!     (`Live::compact`) and into the index file (`Live::compact_into`), each
 //!     with its peak.
@@ -235,7 +244,7 @@ const KINDS: [&str; 7] = [
 /// Twenty thousand (by default) changes in the proportions of a busy desktop,
 /// plus a few folder renames and deletes (the first one builds the frozen
 /// children index). Needs the entry-to-record pairs of the scan.
-fn plan_changes(base: &Index, entries: &[(u64, u32)], records: u64, count: usize) -> Plan {
+fn plan_changes(base: &Index, entries: &ferrow_walk::Pairs, records: u64, count: usize) -> Plan {
     let mut rng = Rng::new(SEED ^ 0xC4A4);
     let n = base.len() as u32;
     let is_dir = |id: u32| base.flags(id) & flags::DIR != 0;
@@ -310,7 +319,7 @@ fn plan_changes(base: &Index, entries: &[(u64, u32)], records: u64, count: usize
             need.insert(parent, 0);
         }
     }
-    for &(record, id) in entries {
+    for (record, id) in entries.iter() {
         if let Some(slot) = need.get_mut(&id) {
             *slot = record;
         }
@@ -467,7 +476,12 @@ fn session(
     let _ = memory::release_free_heap();
     let before = memory::process().bytes();
     memory::reset_peak();
+    let parse_started = Instant::now();
     let (synth, parsed) = synth_stream(n, VolumeBuilder::new, |b, chunk| b.push(chunk));
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=parse ms={:.1}",
+        parse_started.elapsed().as_secs_f64() * 1000.0
+    );
     report.peak(
         &format!("{round}.parse"),
         before,
@@ -756,27 +770,122 @@ fn markdown_phases(report: &Report) -> String {
     out
 }
 
-/// The build the service makes since ADR 0007 step 8: the same record stream as
-/// a `session`, but the builder spills its shards to temporary files and the
-/// freeze writes the index file in place. Its peaks are the ones to compare with
-/// the heap build's `emit` and `freeze`; `reference` is the heap build of the
-/// same stream, which the result must equal entry for entry.
+/// The policy of a bench run: room for the files is assumed (the machine
+/// running it has it), and the usual limit for the heap.
+fn bench_policy() -> ntfs::SpillPolicy {
+    ntfs::SpillPolicy {
+        heap_fallback_records: ferrow_walk::HEAP_FALLBACK_ENTRIES as u64,
+        free_bytes: None,
+    }
+}
+
+/// The cost of the grouping when a journal refresh forgot records after the
+/// read (`VolumeBuilder::forget`): the same stream is finished in temporary
+/// files three times, with nothing forgotten, with `FERROW_MEMORY_FORGET`
+/// records forgotten (default 20 000, spread over the volume), and with a
+/// tenth of the volume forgotten. Every name of the volume is checked against
+/// the forgotten list twice (once to count, once to place), so this is the
+/// per-name cost of that check. Prints `FERROW-MEMORY-TIMING round=forgotten`
+/// lines.
+fn forgotten_round(n: usize) {
+    let dir = std::env::temp_dir().join(format!("ferrow-memory-forgotten-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("forgotten build directory");
+    let wanted = env_usize("FERROW_MEMORY_FORGET", 20_000);
+    for forgotten in [0, wanted, n / 10] {
+        let (synth, mut parsed) = synth_stream(
+            n,
+            |records| VolumeBuilder::with_spill(records, &dir, &bench_policy()).expect("room"),
+            |b, chunk| b.push(chunk),
+        );
+        if let Some(step) = synth.entries.checked_div(forgotten) {
+            // Records spread over the volume, none of the metadata files.
+            let step = step.max(1) as u64;
+            let changed: std::collections::BTreeSet<u64> =
+                (0..forgotten as u64).map(|i| 16 + i * step).collect();
+            let unchanged = |r: u64| !changed.contains(&r);
+            parsed.forget(&changed, unchanged, unchanged);
+        }
+        let started = Instant::now();
+        let volume = parsed.finish(0xF026);
+        println!(
+            "FERROW-MEMORY-TIMING round=forgotten step=from_parsed ms={:.1} forgotten={forgotten} entries={} names={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            synth.entries,
+            volume.name_count()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The scan the service makes since ADR 0007 steps 8 and 9: the same record
+/// stream as a `session`, but every table is bounded. The parsed volume's
+/// per-record table, names and grouping are written to temporary files
+/// (`VolumeBuilder::with_spill`), the builder spills its shards past a budget,
+/// the record map is appended to a file, the freeze writes the index file in
+/// place, and the live layer's tables are built in temporary files too
+/// (`Live::new_in`). Its peaks are the ones to compare with the heap build's
+/// `parse`, `from_parsed`, `emit` and `freeze`; `reference` is the heap build
+/// of the same stream, which the result must equal entry for entry.
+///
+/// What the files hold is reported as `FERROW-MEMORY-FILES` lines: it is file
+/// cache, not private memory, so it is not in the peaks.
 fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
     let round = "bounded";
     let dir = std::env::temp_dir().join(format!("ferrow-memory-bounded-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("bounded build directory");
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     let _ = memory::release_free_heap();
     let before = memory::process().bytes();
     memory::reset_peak();
-    let (synth, parsed) = synth_stream(n, VolumeBuilder::new, |b, chunk| b.push(chunk));
+    let started = Instant::now();
+    let (synth, parsed) = synth_stream(
+        n,
+        |records| {
+            VolumeBuilder::with_spill(records, &dir, &bench_policy())
+                .expect("room beside the bench")
+        },
+        |b, chunk| b.push(chunk),
+    );
     report.peak(
         &format!("{round}.parse"),
         before,
         memory::process().peak,
-        "parse chunks pushed into the volume builder; peak since this phase began",
+        "parse chunks pushed into a volume builder whose tables are in temporary files; peak since this phase began",
     );
-    let volume: Volume = parsed.finish(0xFE77);
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=parse ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    println!(
+        "FERROW-MEMORY-FILES round={round} part=volume_builder bytes={} note=temporary files (file cache, not private bytes)",
+        parsed.file_bytes()
+    );
+    assert_eq!(parsed.note(), None, "every table went to a file");
     report.entries = synth.entries as u64;
+    let mut parts = transient(&parsed.heap_parts());
+    report.show(&format!("{round}.parsed"), parts);
+
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let volume: Volume = parsed.finish(0xFE77);
+    report.peak(
+        &format!("{round}.from_parsed"),
+        before,
+        memory::process().peak,
+        "names, records and the grouping by parent finished in temporary files; peak since this phase began",
+    );
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=from_parsed ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    println!(
+        "FERROW-MEMORY-FILES round={round} part=volume bytes={} note=temporary files (file cache, not private bytes)",
+        volume.mapped_bytes()
+    );
+    assert!(volume.mapped_bytes() > 0 && volume.spill_note.is_none());
+    parts = transient(&volume.heap_parts());
+    report.show(&format!("{round}.volume"), parts);
 
     let budget = env_usize("FERROW_MEMORY_SPILL_BUDGET", DEFAULT_SPILL_BUDGET);
     println!("FERROW-MEMORY-CONFIG round={round} spill_budget_bytes={budget}");
@@ -784,24 +893,34 @@ fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
     let before = memory::process().bytes();
     memory::reset_peak();
     let started = Instant::now();
-    let map = ferrow_walk::emit_parsed_volume(
+    let map = ferrow_walk::emit_parsed_volume_in(
         &volume,
         ntfs::ROOT_RECORD,
         b"C:",
         &builder,
         ColumnSet::DEFAULT,
+        Some(&dir),
     );
     report.peak(
         &format!("{round}.emit"),
         before,
         memory::process().peak,
-        "volume, spilling builder (default budget) and record map while the subtree is emitted; peak since this phase began",
+        "volume in files, spilling builder (default budget) and record map in a file while the subtree is emitted; peak since this phase began",
     );
     println!(
         "FERROW-MEMORY-TIMING round={round} step=emit ms={:.1} spilled_bytes={} spill_write_ms={:.1}",
         started.elapsed().as_secs_f64() * 1000.0,
         builder.spilled_bytes(),
         builder.spill_time().as_secs_f64() * 1000.0
+    );
+    println!(
+        "FERROW-MEMORY-FILES round={round} part=record_map bytes={} note=temporary file (file cache, not private bytes)",
+        map.file_bytes()
+    );
+    assert_eq!(
+        map.entries.len(),
+        synth.entries,
+        "every entry is in the map"
     );
     let mut parts = transient(&volume.heap_parts());
     parts.extend(
@@ -834,7 +953,6 @@ fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
         memory::process().peak,
         "spilled shards placed in the index file, names folded, order sorted and file checksummed inside its memory map; peak since this phase began",
     );
-    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
     println!(
         "FERROW-MEMORY-TIMING round={round} step=freeze ms={:.1} scatter_ms={:.1} fold_ms={:.1} sort_ms={:.1} checksum_ms={:.1} flush_ms={:.1} replace_ms={:.1} file_bytes={} spilled_bytes={}",
         started.elapsed().as_secs_f64() * 1000.0,
@@ -867,7 +985,63 @@ fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
         Kind::Transient,
     ));
     report.show(&format!("{round}.built"), parts);
-    drop((index, map));
+
+    // The live layer over the new index, as `maintain` builds it: its tables
+    // in temporary files beside the index, the record map consumed and dropped.
+    let base = Arc::new(index);
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let live = Live::new_in(base.clone(), std::slice::from_ref(&map), Some(&dir));
+    drop(map);
+    report.peak(
+        &format!("{round}.live_new"),
+        before,
+        memory::process().peak,
+        "the live layer's frozen tables built in temporary files from the record map; peak since this phase began",
+    );
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=live_new ms={:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    println!(
+        "FERROW-MEMORY-FILES round={round} part=live_tables bytes={} note=temporary files (file cache, not private bytes)",
+        live.mapped_bytes()
+    );
+    assert!(live.mapped_bytes() > 0);
+    // What saving the tables first needs: the frozen children table.
+    let facts = [ferrowd::saved::VolumeFacts {
+        device: "synthetic".into(),
+        serial: 0xFE77,
+        journal: Some((1, 1)),
+        record_size: 1024,
+    }];
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let checksum = base.file_checksum().expect("a mapped file has a checksum");
+    let children = live.saved_ref(checksum, 0, &facts).children_first.len();
+    report.peak(
+        &format!("{round}.children"),
+        before,
+        memory::process().peak,
+        "the frozen children table, built in temporary files for the saved tables; peak since this phase began",
+    );
+    println!(
+        "FERROW-MEMORY-TIMING round={round} step=children ms={:.1} entries={}",
+        started.elapsed().as_secs_f64() * 1000.0,
+        children - 1
+    );
+    let live_parts = live.breakdown(None, 0).parts;
+    report.show(&format!("{round}.live"), live_parts);
+    drop((live, base));
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .expect("bounded build directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".ferrow-"))
+        .collect();
+    assert!(left.is_empty(), "temporary files left behind: {left:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1069,6 +1243,7 @@ fn main() {
 
     // The bounded build, against the heap build of the same stream.
     bounded_round(n, &mut report, two.live.base());
+    forgotten_round(n);
     compaction_round(&mut two.live, &mut report);
 
     // The result: the table to read.
@@ -1081,6 +1256,7 @@ fn main() {
         "scan1.mapped",
         "scan2.after_swap",
         "bounded.built",
+        "bounded.live",
     ] {
         summary.push_str(&markdown(&report, phase));
         summary.push('\n');

@@ -24,11 +24,12 @@
 //! fetching live in `live_windows`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
-use ferrow_index::store::Col;
+use ferrow_index::store::{Col, Plain, Scratch};
 use ferrow_index::{
     ColumnSet, DEFAULT_SPILL_BUDGET, EntryMetadata, FileTarget, Index, IndexBuilder, ROOT_PARENT,
     SortKey, flags,
@@ -705,6 +706,20 @@ pub trait RecordSource {
     }
 }
 
+/// One of the live layer's frozen tables while a scan builds it: a
+/// [`Scratch`] buffer, an anonymous temporary file beside the index written
+/// through a memory map (ADR 0007, step 9), so building the table of a 27 M
+/// entry PC does not take 8 (or 4) bytes per entry of private memory on top of
+/// the saved copy that replaces it a moment later. When the file cannot be made
+/// the table is in the heap, as before, and `Scratch` counts it
+/// (`ferrow_index::store::scratch_in_heap`), which the service reports.
+/// `len` elements of `value`.
+fn filled<T: Plain>(len: usize, value: T, dir: Option<&Path>) -> Scratch<T> {
+    let mut table = Scratch::zeroed(len, dir);
+    table.fill(value);
+    table
+}
+
 /// What a volume's tables are built from.
 struct VolumeSeed {
     /// Table size: the highest record number plus one.
@@ -925,14 +940,29 @@ pub struct Live {
     /// When the reader last showed it is alive (ready, began or finished a
     /// folder): a queued folder only waits for it from then on.
     progress: Instant,
+    /// Where tables built later (the children table) go while they are built:
+    /// anonymous temporary files beside the index. `None`: the heap.
+    scratch: Option<PathBuf>,
 }
 
 impl Live {
     pub fn new(base: Arc<Index>, maps: &[VolumeMap]) -> Live {
+        Live::new_in(base, maps, None)
+    }
+
+    /// [`Live::new`] with the frozen tables built in anonymous temporary
+    /// files in `scratch` (ADR 0007, step 9) when there is a directory: the
+    /// entry-to-record table, each volume's record-to-entry table and the
+    /// children table built later are written through memory maps, so the
+    /// build holds no table of 4 to 8 bytes per entry in the heap. The tables
+    /// read the same either way and the files go when the tables do (a saved
+    /// copy replaces them, see [`Live::replace_tables`]). A table whose file
+    /// cannot be made is built in the heap.
+    pub fn new_in(base: Arc<Index>, maps: &[VolumeMap], scratch: Option<&Path>) -> Live {
         let n = base.len();
-        let mut base_record = vec![u64::MAX; n];
+        let mut base_record = filled(n, u64::MAX, scratch);
         for (v, map) in maps.iter().enumerate() {
-            for &(record, id) in &map.entries {
+            for (record, id) in map.entries.iter() {
                 if (id as usize) < n {
                     base_record[id as usize] = ((v as u64) << 48) | record;
                 }
@@ -941,7 +971,7 @@ impl Live {
         let seeds = maps
             .iter()
             .map(|map| VolumeSeed {
-                records: map.entries.iter().map(|&(r, _)| r + 1).max().unwrap_or(0),
+                records: map.entries.iter().map(|(r, _)| r + 1).max().unwrap_or(0),
                 excluded: Arc::new(map.excluded.iter().copied().collect()),
                 roots: map.roots.iter().map(|&(r, _)| r).collect(),
             })
@@ -949,21 +979,25 @@ impl Live {
         let entries = maps
             .iter()
             .enumerate()
-            .flat_map(|(v, map)| map.entries.iter().map(move |&(record, id)| (v, record, id)));
-        let volumes = Live::volumes(seeds, entries);
-        Live::assemble(base, base_record.into(), volumes, 0)
+            .flat_map(|(v, map)| map.entries.iter().map(move |(record, id)| (v, record, id)));
+        let volumes = Live::volumes(seeds, entries, scratch);
+        let mut live = Live::assemble(base, base_record.freeze(), volumes, 0);
+        live.scratch = scratch.map(Path::to_path_buf);
+        live
     }
 
-    /// The per-volume record tables from `(volume, record, frozen id)`.
+    /// The per-volume record tables from `(volume, record, frozen id)`, built
+    /// in temporary files in `scratch` when there is a directory.
     fn volumes(
         seeds: Vec<VolumeSeed>,
         entries: impl Iterator<Item = (usize, u64, u32)>,
+        scratch: Option<&Path>,
     ) -> Vec<Volume> {
         // Per volume: the record → entry table and the link pairs.
-        type Tables = (Vec<u32>, Vec<(u64, u32)>);
+        type Tables = (Scratch<u32>, Vec<(u64, u32)>);
         let mut tables: Vec<Tables> = seeds
             .iter()
-            .map(|seed| (vec![u32::MAX; seed.records as usize], Vec::new()))
+            .map(|seed| (filled(seed.records as usize, u32::MAX, scratch), Vec::new()))
             .collect();
         for (v, record, id) in entries {
             let (record_base, links) = &mut tables[v];
@@ -988,7 +1022,7 @@ impl Live {
                 links.sort_by_key(|&(record, _)| record);
                 let (link_records, link_ids): (Vec<u64>, Vec<u32>) = links.into_iter().unzip();
                 Volume {
-                    record_base: record_base.into(),
+                    record_base: record_base.freeze(),
                     link_records: link_records.into(),
                     link_ids: link_ids.into(),
                     overlay: HashMap::new(),
@@ -1030,6 +1064,7 @@ impl Live {
             log: HashMap::new(),
             log_seq: 0,
             progress: Instant::now(),
+            scratch: None,
             base,
         }
     }
@@ -1453,7 +1488,8 @@ impl Live {
     fn base_children(&self) -> &(Col<u32>, Col<u32>) {
         self.base_children.get_or_init(|| {
             let n = self.base.len();
-            let mut first = vec![0u32; n + 1];
+            let dir = self.scratch.as_deref();
+            let mut first = Scratch::<u32>::zeroed(n + 1, dir);
             for c in 0..n as u32 {
                 let p = self.base.parent(c);
                 if p != ROOT_PARENT {
@@ -1465,7 +1501,7 @@ impl Live {
             }
             // Fill by advancing each parent's start, then shift the starts
             // back (no second table of n entries).
-            let mut ids = vec![0u32; first[n] as usize];
+            let mut ids = Scratch::<u32>::zeroed(first[n] as usize, dir);
             for c in 0..n as u32 {
                 let p = self.base.parent(c);
                 if p != ROOT_PARENT {
@@ -1477,7 +1513,7 @@ impl Live {
                 first[i] = first[i - 1];
             }
             first[0] = 0;
-            (first.into(), ids.into())
+            (first.freeze(), ids.freeze())
         })
     }
 
@@ -2455,7 +2491,7 @@ impl Live {
             .enumerate()
             .filter(|(_, p)| **p != u64::MAX)
             .map(|(id, &p)| ((p >> 48) as usize, p & RECORD_MASK, id as u32));
-        let volumes = Live::volumes(seeds, entries);
+        let volumes = Live::volumes(seeds, entries, None);
         Some((
             Live::assemble(index, records.into(), volumes, self.next_walk),
             file_report,
@@ -2585,12 +2621,79 @@ mod tests {
         let a = b.add_with_metadata(docs, b"a.txt", 0, file_info(1).metadata(ColumnSet::DEFAULT));
         let bb = b.add_with_metadata(root, b"b.txt", 0, file_info(2).metadata(ColumnSet::DEFAULT));
         let map = VolumeMap {
-            entries: vec![(5, root), (20, docs), (21, a), (22, bb)],
+            entries: vec![(5, root), (20, docs), (21, a), (22, bb)].into(),
             excluded: vec![30],
             roots: vec![(5, root)],
             ..VolumeMap::default()
         };
         (Arc::new(b.freeze()), map)
+    }
+
+    /// The tables a scan builds after the MFT read (ADR 0007, step 9): in
+    /// temporary files they are the tables built in the heap, a record's
+    /// several names included, and the files go with the tables.
+    #[test]
+    fn tables_built_in_temporary_files_are_the_tables_built_in_the_heap() {
+        let dir = std::env::temp_dir().join(format!("ferrowd-tables-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let leftovers = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".ferrow-")
+                })
+                .count()
+        };
+        let (base, mut map) = fixture();
+        // Record 21 (a.txt) is also entry 3's second name: a hard link.
+        map.entries = vec![(5, 0), (20, 1), (21, 2), (22, 3), (21, 3)].into();
+        let heap = Live::new(base.clone(), std::slice::from_ref(&map));
+        let files = Live::new_in(base.clone(), std::slice::from_ref(&map), Some(&dir));
+        assert_eq!(heap.base_record[..], files.base_record[..]);
+        assert!(!heap.base_record.is_mapped() && files.base_record.is_mapped());
+        for (a, b) in heap.volumes.iter().zip(&files.volumes) {
+            assert_eq!(a.record_base[..], b.record_base[..]);
+            assert_eq!(a.link_records[..], b.link_records[..]);
+            assert_eq!(a.link_ids[..], b.link_ids[..]);
+            assert!(b.record_base.is_mapped() && !a.record_base.is_mapped());
+            assert_eq!(
+                a.record_base[21], MULTI,
+                "the linked record is in the links"
+            );
+            assert_eq!(b.link_records.len(), 2);
+        }
+        // The children table is built on first use, in files as well.
+        let (first_a, ids_a) = heap.base_children();
+        let (first_b, ids_b) = files.base_children();
+        assert_eq!(first_a[..], first_b[..]);
+        assert_eq!(ids_a[..], ids_b[..]);
+        assert!(first_b.is_mapped() && ids_b.is_mapped() && !first_a.is_mapped());
+        assert!(files.mapped_bytes() > 0 && heap.mapped_bytes() == 0);
+        // Named while they live on Windows (deleted on close); unlinked
+        // once created on Unix.
+        if cfg!(windows) {
+            assert!(leftovers() >= 3, "files while the tables live");
+        }
+        drop(files);
+        assert_eq!(leftovers(), 0, "gone with the tables");
+        // A directory that is not there: the same tables, in the heap.
+        let nowhere = dir.join("missing");
+        let counted = ferrow_index::store::scratch_in_heap();
+        let heap_again = Live::new_in(base, &[map], Some(&nowhere));
+        assert_eq!(heap_again.base_record[..], heap.base_record[..]);
+        assert!(!heap_again.base_record.is_mapped());
+        // Not silent: every table that should have been a file is counted
+        // (the service warns when the count grows).
+        assert!(
+            ferrow_index::store::scratch_in_heap() >= counted + 2,
+            "base_record and a record_base fell back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[derive(Default)]
@@ -4094,7 +4197,7 @@ mod tests {
             );
         }
         let map = VolumeMap {
-            entries,
+            entries: entries.into(),
             excluded: vec![30],
             roots: vec![(5, root)],
             ..VolumeMap::default()
@@ -4498,13 +4601,13 @@ mod tests {
         let on_d = b.add_with_metadata(d, b"same.txt", 0, md);
         let maps = [
             VolumeMap {
-                entries: vec![(5, c), (21, on_c)],
+                entries: vec![(5, c), (21, on_c)].into(),
                 excluded: vec![30],
                 roots: vec![(5, c)],
                 ..VolumeMap::default()
             },
             VolumeMap {
-                entries: vec![(5, d), (21, on_d)],
+                entries: vec![(5, d), (21, on_d)].into(),
                 excluded: vec![31],
                 roots: vec![(5, d)],
                 ..VolumeMap::default()
@@ -5161,7 +5264,7 @@ mod tests {
         let keep = b.add_with_metadata(root, b"keep.txt", 0, meta); // 4
         assert_eq!((leaf, mid, top, keep), (1, 2, 3, 4));
         let map = VolumeMap {
-            entries: vec![(5, root), (21, leaf), (22, mid), (20, top), (23, keep)],
+            entries: vec![(5, root), (21, leaf), (22, mid), (20, top), (23, keep)].into(),
             excluded: vec![],
             roots: vec![(5, root)],
             ..VolumeMap::default()
@@ -5251,7 +5354,7 @@ mod tests {
         let sub = b.add_with_metadata(docs, b"Sub", flags::DIR, dir);
         let c = b.add_with_metadata(sub, b"c.txt", 0, file_info(3).metadata(ColumnSet::DEFAULT));
         let map = VolumeMap {
-            entries: vec![(5, root), (20, docs), (21, a), (22, bb), (23, sub), (24, c)],
+            entries: vec![(5, root), (20, docs), (21, a), (22, bb), (23, sub), (24, c)].into(),
             excluded: vec![30],
             roots: vec![(5, root)],
             ..VolumeMap::default()
@@ -5615,7 +5718,7 @@ mod tests {
             let _ = base;
             Arc::new(b.freeze())
         };
-        map.entries = vec![(5, root), (20, docs), (21, a), (22, bb), (21, link)];
+        map.entries = vec![(5, root), (20, docs), (21, a), (22, bb), (21, link)].into();
         let original = Live::new(base.clone(), &[map]);
         let saved = save_and_read(&original, "restore");
         let mut restored = Live::restore(base.clone(), saved);

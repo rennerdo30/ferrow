@@ -201,7 +201,7 @@ fn base_index(n: usize) -> (Arc<Index>, VolumeMap) {
     });
     let map = VolumeMap {
         device: "bench".into(),
-        entries,
+        entries: entries.into(),
         roots: vec![(FIRST_RECORD, 0)],
         ..VolumeMap::default()
     };

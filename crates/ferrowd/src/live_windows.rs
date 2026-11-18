@@ -1017,7 +1017,15 @@ fn maintain(
                 record_size: m.record_size as u32,
             })
             .collect();
-        let mut live = Live::new(base.clone(), &maps);
+        // The tables are built in temporary files beside the index when
+        // there is one (a saved copy replaces them just below), and the
+        // scan's record maps are in files too: this step holds no table of
+        // 4 to 16 bytes per entry in memory.
+        let mut live = Live::new_in(
+            base.clone(),
+            &maps,
+            persist.as_ref().and_then(Persist::directory),
+        );
         // The record maps (16 bytes per entry) are only needed to build
         // the overlay; do not keep them for the whole live session.
         drop(maps);
@@ -1208,7 +1216,7 @@ fn run_session(
             if in_heap > scratch_in_heap_seen {
                 scratch_in_heap_seen = in_heap;
                 eventlog::warn(
-                    "a sort order could not be kept in a file beside the index (disk full or read-only?); it is in memory",
+                    "a temporary table (a sort order, or a table of the scan or of the live layer) could not be kept in a file beside the index (disk full or read-only?); it is in memory",
                 );
             }
             // Keep the saved index and its journal positions from falling
@@ -1932,7 +1940,7 @@ mod tests {
         let b = IndexBuilder::with_columns(ColumnSet::DEFAULT);
         let root = b.add_root(b"C:", flags::DIR);
         let map = VolumeMap {
-            entries: vec![(5, root)],
+            entries: vec![(5, root)].into(),
             roots: vec![(5, root)],
             ..VolumeMap::default()
         };

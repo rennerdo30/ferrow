@@ -118,33 +118,6 @@ impl Drop for Building {
     }
 }
 
-/// Bytes free for this process on the volume holding `dir`.
-fn free_bytes(dir: &std::path::Path) -> Option<u64> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-        let mut free = 0u64;
-        // SAFETY: a NUL-terminated path and a writable count; the other
-        // outputs are optional.
-        let ok = unsafe {
-            GetDiskFreeSpaceExW(
-                wide.as_ptr(),
-                &mut free,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        (ok != 0).then_some(free)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = dir;
-        None
-    }
-}
-
 /// Temporary files a save or build of another process left beside the index
 /// (a crash or a power loss mid-way; a file build's is the size of the index)
 /// are removed once they are this old.
@@ -240,11 +213,18 @@ impl IndexFile {
     /// the size of the current file: the new file, the builder's spilled
     /// shards (about as large again) and the live tables. `Err` with the
     /// numbers when it has not; `Ok` when either figure is unknown.
+    ///
+    /// Stale temporary files of a dead process are removed first: after a
+    /// crash mid-scan they may be what fills the disk, and a refused rebuild
+    /// would never reach [`Self::prepare`], which also removes them.
     pub fn has_room(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            remove_stale_temporaries(parent);
+        }
         let Ok(size) = std::fs::metadata(&self.path).map(|m| m.len()) else {
             return Ok(());
         };
-        let Some(free) = self.path.parent().and_then(free_bytes) else {
+        let Some(free) = self.path.parent().and_then(ferrow_walk::free_bytes) else {
             return Ok(());
         };
         let needed = size.saturating_mul(5) / 2;
@@ -327,6 +307,25 @@ impl IndexFile {
                 "could not spill the build to disk ({error}); it stayed in memory"
             ));
         }
+        // The read of the drives' file tables: the proof that its tables were
+        // in temporary files (or why they were not).
+        if report.read_file_bytes > 0 {
+            crate::eventlog::info(format!(
+                "the scan's file-table read kept up to {} MiB of tables in temporary files, not in memory",
+                report.read_file_bytes >> 20
+            ));
+        }
+        if let Some(error) = &report.read_spill_failure {
+            crate::eventlog::warn(format!(
+                "the scan could not keep all of its file-table read in temporary files ({error}); that part was kept in memory"
+            ));
+        }
+    }
+
+    /// The directory of the index file: where a build's temporary files go
+    /// (they are removed when the build ends, whatever ends it).
+    pub fn directory(&self) -> Option<&std::path::Path> {
+        self.path.parent().filter(|dir| !dir.as_os_str().is_empty())
     }
 
     /// Save a heap index and map it back from the file (the fallback when a
@@ -539,7 +538,7 @@ mod tests {
         std::fs::write(dir.join("index.bin"), vec![0u8; 4096]).unwrap();
         assert!(file.has_room().is_ok(), "4 KiB fits");
         if cfg!(windows) {
-            assert!(free_bytes(&dir).is_some_and(|free| free > 0));
+            assert!(ferrow_walk::free_bytes(&dir).is_some_and(|free| free > 0));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
