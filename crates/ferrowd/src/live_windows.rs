@@ -404,15 +404,32 @@ pub type Persist =
 /// The same index read from its saved file instead of the heap, when
 /// `persist` can save and map it; `None` otherwise (a failure is logged and
 /// the caller keeps its heap index: correct, only larger).
+/// Run `work` with this thread in background mode (lower CPU, disk and
+/// memory priority); a thread already in it stays so.
+fn background_io<T>(work: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        THREAD_MODE_BACKGROUND_END,
+    };
+    // SAFETY: the pseudo handle of the current thread; the call fails
+    // harmlessly when the thread is in background mode already.
+    let began = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0;
+    let out = work();
+    if began {
+        // SAFETY: as above; only ends the mode this call began.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
+    }
+    out
+}
+
 fn map_saved(
     index: &ferrow_index::Index,
     persist: Option<&Persist>,
 ) -> Option<ferrow_index::Index> {
-    // Background work: lowest CPU and disk priority, like the scan, so a
-    // save of gigabytes does not compete with searches.
-    ferrow_walk::priority::enter_background();
-    let saved = persist.and_then(|persist| persist(index));
-    ferrow_walk::priority::leave_background();
+    // Background work: the thread's background mode lowers its CPU, disk
+    // and memory priority, so writing gigabytes does not compete with
+    // searches (which may read the mapped file meanwhile).
+    let saved = background_io(|| persist.and_then(|persist| persist(index)));
     match saved? {
         Ok(mapped) => Some(mapped),
         Err(error) => {
@@ -589,8 +606,12 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                             }?;
                             // The merged index replaces the file and is read
                             // from it, so its heap copy goes at once.
-                            if let Some(mapped) = map_saved(new.base(), persist.as_ref()) {
-                                let _ = new.replace_base(Arc::new(mapped));
+                            if let Some(mapped) = map_saved(new.base(), persist.as_ref())
+                                && !new.replace_base(Arc::new(mapped))
+                            {
+                                eventlog::warn(
+                                    "the saved index does not match the merged one; it stays in memory",
+                                );
                             }
                             Some(new)
                         },
