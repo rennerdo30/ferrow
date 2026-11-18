@@ -833,6 +833,10 @@ mod tests {
         dir
     }
 
+    /// Named temporary files a live buffer shows in its directory: one on
+    /// Windows (deleted on close); none on Unix (unlinked once created).
+    const LIVE: usize = if cfg!(windows) { 1 } else { 0 };
+
     fn leftovers(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
@@ -857,7 +861,7 @@ mod tests {
         for (i, v) in buf.iter_mut().enumerate() {
             *v = (i as u32).wrapping_mul(2_654_435_761);
         }
-        assert_eq!(leftovers(&dir), 1, "one temporary file while it lives");
+        assert_eq!(leftovers(&dir), LIVE, "one temporary file while it lives");
         let col = buf.freeze();
         assert!(col.is_mapped() && col.heap_bytes() == 0);
         assert_eq!((col.len(), col.mapped_bytes()), (100_000, 400_000));
@@ -962,7 +966,7 @@ mod tests {
         // gone, later appends are ignored and `finish` is an error.
         let mut app = Appender::<u32>::new(&dir).unwrap();
         app.extend_from_slice(&vec![7u32; APPEND_BUFFER / 4 + 1]);
-        assert_eq!(leftovers(&dir), 1);
+        assert_eq!(leftovers(&dir), LIVE);
         app.degrade(&io::Error::other("disk full"));
         assert_eq!(app.failure(), Some("disk full"));
         assert_eq!(leftovers(&dir), 0, "its disk space returns");
