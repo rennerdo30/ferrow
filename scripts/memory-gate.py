@@ -1,35 +1,54 @@
 #!/usr/bin/env python3
 """Memory gate for the service's memory per entry (ADR 0007, step 7).
 
-Reads the output of `examples/memory_breakdown` run with 5 000 000 entries on
-the Windows runner (the `FERROW-MEMORY*` lines), prints one table and fails,
-naming the phase and the number, when a phase needs more memory than its
-limit below. A later change then cannot quietly bring the service back above
-the owner's budget: never more than 1 GB, target 512 MB, on a 27.2 M entry PC.
+Reads the output of `examples/memory_breakdown` run twice on the Windows
+runner, with 5 000 000 and with 1 000 000 entries (the `FERROW-MEMORY*`
+lines), prints the tables and fails, naming the phase and the number, when a
+phase needs more memory than its limit below. A later change then cannot
+quietly bring the service back above the owner's budget: never more than 1 GB,
+target 512 MB, on a 27.2 M entry PC.
 
-Usage: memory-gate.py <memory_breakdown output> [--summary FILE]
+Usage: memory-gate.py <5M output> <1M output> [--summary FILE]
 
-`--summary` (CI passes `$GITHUB_STEP_SUMMARY`) also appends the table as
+`--summary` (CI passes `$GITHUB_STEP_SUMMARY`) also appends the tables as
 Markdown. Exit codes: 0 pass, 1 a limit is exceeded or a measurement is
-missing, 2 the input is not a 5 M entry run.
+missing or not credible, 2 the input is not the two runs the limits are
+calibrated for.
 
 What is measured (all private bytes, Windows: `PrivateUsage`; the mapped index
 and the temporary files are file cache and not counted):
 
 (a) scan: the growth above the point where a full scan starts, per phase and
     in total (the highest point of parse, join, emit, freeze and the live
-    layer's tables). It is a fixed working set, not a cost per entry: the
-    tables live in temporary files and the builder spills past 32 MiB, so a
-    limit in MiB at 5 M entries also catches a per-entry table coming back.
+    layer's tables). Its working set is fixed, not a cost per entry: the
+    tables live in temporary files and the builder spills past its budget.
 (b) steady: what the process holds after a scan, once the heap builds are
-    dropped, and the live layer's own heap in bytes per entry.
-(c) compaction: the growth of `Live::compact_into`, in bytes per entry (its
-    own live tables are still in the heap, ADR 0007 decision 6).
-(d) restart: the growth of mapping the saved index and tables and restoring
-    the live layer, and the private bytes afterwards.
+    dropped and without giving the allocator's free memory back (the service
+    never calls `HeapCompact`), and the live layer's own heap in bytes per
+    entry. The same figure after a `HeapCompact` is shown as a diagnostic.
+(c) compaction: the growth of `Live::compact_into`.
+(d) restart: the growth of saving the live tables, of mapping the saved index
+    and tables and restoring the live layer, and the private bytes afterwards;
+    then the first sort orders built on the mapped index.
 
-Every limit sits in `CHECKS` and `PC` below, with where its number comes from.
-Change a limit only with the measured numbers that justify it, in the commit.
+Two lines of defence, both here:
+
+1. Absolute limits at 5 M entries. A fixed working set (the emit's shards
+   alone are about the spill budget x 1.6) and the runner's noise leave a few
+   bytes per entry of room under them, so a small per-entry table could hide.
+2. The SLOPE: (value at 5 M - value at 1 M) / (entries at 5 M - entries at
+   1 M), in bytes per entry. The fixed part and most of the noise cancel in
+   the difference, so a table of 2 bytes per entry brought back into the
+   scan's emit, parse or total or the compaction moves the slope by 2 and
+   trips it. The run uses an 8 MiB spill budget (`SPILL_BUDGET`) so that the
+   emit's fixed part is small and the same at both sizes: a 1 M entry run
+   writes about 32 MiB of shards, which would not fill the production budget.
+
+The extrapolation to the owner's PC is a fit from the same two sizes, fixed
+part + slope x 27.2 M, not the 5 M figure scaled by the entry count.
+
+Every limit sits below, with where its number comes from. Change a limit only
+with the measured numbers that justify it, in the commit.
 """
 
 import argparse
@@ -37,7 +56,9 @@ import re
 import sys
 
 MIB = 1 << 20
-ENTRIES = 5_000_000  # the run the limits are calibrated for (FERROW_BENCH_ENTRIES default)
+ENTRIES_LARGE = 5_000_000  # FERROW_BENCH_ENTRIES of the two runs the limits are calibrated for
+ENTRIES_SMALL = 1_000_000
+SPILL_BUDGET = 8 * MIB  # FERROW_MEMORY_SPILL_BUDGET of both runs
 
 # The owner's PC (ADR 0007): 27.2 M entries, never more than 1 GB, target 512 MB.
 PC = {
@@ -46,99 +67,169 @@ PC = {
     "target_bytes": 512 * MIB,
 }
 
-# Each limit is a number from the hosted `memory breakdown (windows 5M)` job
-# (windows-latest, release build, 5 M entries) plus a margin. Run to run, the
-# scan phases (1 ms sampled peaks) differ by up to about 12 %: parse 13.9 to
-# 16.9 MiB, emit 58.3 to 65.1 MiB over eight runs (six on main, 2026-11-18
-# 08:54 to 09:40 UTC, two on this gate's branch); the compaction, steady state
-# and restart by about 1 to 5 %. So every limit is at least 20 % above the
-# highest value seen, and still well inside what one per-entry table brings back
-# (4 B/entry is 19 MiB at 5 M entries).
-#
-# unit "MiB": growth_bytes of a `FERROW-MEMORY-PEAK` line; "B/entry": the same
+# PROVISIONAL (calibration run): every limit below is replaced with the CI numbers.
+# unit "MiB": the growth of a `FERROW-MEMORY-PEAK` line; "B/entry": the same
 # divided by the entries of the run.
 #
-# (id, phase line, what it is, unit, limit, where the limit comes from)
+# (id, phase line, what it is, unit, limit, floor, where the limit comes from)
+# A floor is the least a phase must grow: below it the sampler or the phase did
+# not run (a dead sampler reads as no growth and would pass every limit).
 CHECKS = [
     # (a) the full scan path, from the bounded build (the path the service takes)
     ("scan.parse", "bounded.parse", "parse chunks into the file-backed volume builder",
-     "MiB", 22,
-     "measured 13.9-16.9 MiB over eight runs (16 MiB chunk buffers, fixed), +30 %"),
+     "MiB", 22, 0, "provisional"),
     ("scan.join", "bounded.from_parsed", "join of names, records and the grouping by parent",
-     "MiB", 2,
-     "measured 0-0.2 MiB, everything is written to temporary files; +1.8 MiB"),
+     "MiB", 2, None, "provisional"),
     ("scan.emit", "bounded.emit", "emission through the spilling builder and the record map file",
-     "MiB", 80,
-     "measured 58.3-65.1 MiB = the 32 MiB spill budget x 1.6 (shard heap while entries "
-     "are added) plus the working set, +23 %; raising the budget raises this"),
+     "MiB", 80, 0, "provisional"),
     ("scan.freeze", "bounded.freeze", "freeze into the index file (place, fold, sort, checksum in the map)",
-     "MiB", 8,
-     "measured 4.0-5.0 MiB (4.9 MB at 2 M entries in ADR 0007 decision 8: fixed, not per entry), +60 %"),
+     "MiB", 8, None, "provisional"),
     ("scan.live_new", "bounded.live_new", "the live layer's tables built in temporary files",
-     "MiB", 8,
-     "measured 4.5 MiB, +76 %"),
+     "MiB", 8, None, "provisional"),
     ("scan.children", "bounded.children", "the frozen children table for the saved tables",
-     "MiB", 1,
-     "measured 0.08 MiB"),
+     "MiB", 1, None, "provisional"),
 ]
 
-# The same peaks, taken together: the highest point of the whole scan above
-# where it started. (ADR 0007 budget: about 60 MB working set plus the 16 MiB
-# read buffers the example does not have.)
 SCAN_PHASES = [c[1] for c in CHECKS if c[0].startswith("scan.")]
-SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 84,
-              "measured 63.2-67.8 MiB (the emit's shards are still alive in the freeze, so the "
-              "highest point is the freeze's: emit + freeze), +24 %")
-STEADY = ("steady.private", "steady", "private bytes after the scan, heap builds dropped",
-          "MiB", 16,
-          "measured 6.95 and 7.32 MiB in two hosted runs (the allocator's free memory, 28 MB held, "
-          "and the runtime; 1.4 B/entry), +120 %: 2 B/entry more heap would trip it")
+SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 84, None, "provisional")
+STEADY = ("steady.private", "steady", "private bytes after the scan, heap builds dropped, nothing given back",
+          "MiB", 16, None, "provisional")
 STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record tables are mapped)",
-               "B/entry", 1.0,
-               "measured 0.36 B/entry (removed bits 0.125, record_base remainder 0.23); "
-               "a heap table of 1 B/entry or more is a regression")
+               "B/entry", 1.0, None, "provisional")
 COMPACT = ("compact.file", "compact.file", "compaction into the index file (Live::compact_into)",
-           "B/entry", 26,
-           "measured 18.7-21.2 B/entry over six runs (about 60 MB fixed + the new live tables in "
-           "the heap, decision 6, still to do), +23 %")
+           "B/entry", 26, None, "provisional")
+SAVE_TABLES = ("restart.save_tables", "restart.save_tables", "restart: stream the live tables to live.bin",
+               "MiB", 4, None, "provisional")
 RESTART = ("restart.load", "restart.load", "restart: map index and tables, restore the live layer",
-           "MiB", 6,
-           "measured 1.36 MiB in both hosted runs (the tables are mapped, only the maps' "
-           "bookkeeping and the live layer's bit sets are in the heap), +340 %")
+           "MiB", 6, None, "provisional")
 RESTARTED = ("restart.private", "restarted", "private bytes after a restart from the saved files",
-             "MiB", 14,
-             "measured 5.83 and 6.95 MiB in two hosted runs, +100 %")
+             "MiB", 14, None, "provisional")
+SORT = ("restart.sort", "restart.sort_orders", "first sort orders (size, date) on the mapped index",
+        "MiB", 16, None, "provisional")
+
+# The slope checks: (id, measure, what, limit in B/entry, where the limit comes from)
+SLOPES = [
+    ("slope.parse", "parse", "scan parse, growth per entry between 1 M and 5 M", 100.0, "provisional"),
+    ("slope.emit", "emit", "scan emit, growth per entry between 1 M and 5 M", 100.0, "provisional"),
+    ("slope.total", "total", "scan total, growth per entry between 1 M and 5 M", 100.0, "provisional"),
+    ("slope.compact", "compact", "compaction, growth per entry between 1 M and 5 M", 100.0, "provisional"),
+]
+
+
+class BadLine(Exception):
+    """A measurement line the gate cannot read; the message names it."""
 
 
 def fields(line):
-    return dict(re.findall(r"(\w+)=(\S+)", line))
+    """The key=value pairs of a measurement line, up to its free text (` note=`)."""
+    return dict(re.findall(r"(\w+)=(\S+)", line.split(" note=", 1)[0]))
 
 
 def parse(text):
     """The measured lines by kind and phase."""
-    out = {"PEAK": {}, "STEADY": {}, "TOTAL": {}, "ACTIVE": None, "DONE": False}
-    for raw in text.splitlines():
+    out = {"PEAK": {}, "STEADY": {}, "TOTAL": {}, "BUDGET": None, "ACTIVE": None, "SAMPLER": None, "DONE": False}
+    for n, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         for kind in ("PEAK", "STEADY", "TOTAL"):
             if line.startswith(f"FERROW-MEMORY-{kind} "):
                 f = fields(line)
+                f["_line"] = (n, line)
+                if "phase" not in f:
+                    raise BadLine(f"line {n}: a {kind} line without phase=: {line[:240]}")
                 out[kind][f["phase"]] = f
         if line.startswith("FERROW-MEMORY-ACTIVE "):
             out["ACTIVE"] = fields(line)
+        if line.startswith("FERROW-MEMORY-SAMPLER "):
+            out["SAMPLER"] = fields(line)
+        if line.startswith("FERROW-MEMORY-CONFIG ") and "spill_budget_bytes=" in line:
+            out["BUDGET"] = fields(line).get("spill_budget_bytes")
         if line.startswith("FERROW-MEMORY-DONE"):
             out["DONE"] = True
     return out
 
 
 def number(f, key):
-    return float(f[key])
+    try:
+        return float(f[key])
+    except (KeyError, ValueError):
+        n, line = f.get("_line", (0, "?"))
+        raise BadLine(f"line {n}: no number {key}= in: {line[:240]}") from None
+
+
+class Run:
+    """One run of the example: its lines and the figures the gate reads from them."""
+
+    def __init__(self, label, data):
+        self.label, self.data = label, data
+        self.peaks, self.steady_lines = data["PEAK"], data["STEADY"]
+
+    @property
+    def entries(self):
+        """The index's entry count (a run asks for n names and gets a few more, hard links)."""
+        return number(self.steady_lines["mapped"], "entries") if "mapped" in self.steady_lines else None
+
+    def growth(self, phase):
+        """Growth of a phase's peak above where it started, in bytes (None: no such line)."""
+        f = self.peaks.get(phase)
+        return None if f is None else number(f, "growth_bytes")
+
+    def scan_total(self):
+        """The highest point of the scan's phases above where the scan began, in bytes."""
+        start = self.peaks.get("bounded.parse")
+        seen = [self.peaks[p] for p in SCAN_PHASES if p in self.peaks]
+        if start is None or len(seen) != len(SCAN_PHASES):
+            return None
+        return max(number(f, "peak_bytes") for f in seen) - number(start, "before_bytes")
+
+    def steady(self, phase, key="growth_bytes"):
+        f = self.steady_lines.get(phase)
+        return None if f is None else number(f, key)
+
+    def restart_peak(self):
+        """The restart's highest private bytes above the process's baseline, in bytes."""
+        f, s = self.peaks.get("restart.load"), self.steady_lines.get("restarted")
+        if f is None or s is None:
+            return None
+        return number(f, "peak_bytes") - number(s, "baseline_bytes")
+
+    def measure(self, name):
+        return {
+            "parse": lambda: self.growth("bounded.parse"),
+            "emit": lambda: self.growth("bounded.emit"),
+            "total": self.scan_total,
+            "compact": lambda: self.growth("compact.file"),
+            "steady": lambda: self.steady("mapped"),
+            "restart": self.restart_peak,
+        }[name]()
+
+    def credibility(self):
+        """Why the run's peaks cannot be believed (a dead sampler reads as no growth), or []."""
+        out = []
+        s = self.data["SAMPLER"]
+        if s is None:
+            out.append("no FERROW-MEMORY-SAMPLER line: the peak sampler was never proven")
+        elif s.get("ok") != "true":
+            out.append(f"the peak sampler self-check failed (a 48 MiB block held for 30 ms showed as "
+                       f"{s.get('seen_bytes', '?')} bytes): the sampler is dead, so every peak reads as no growth")
+        for phase in sorted(set(SCAN_PHASES + [c[1] for c in (COMPACT, SAVE_TABLES, RESTART, SORT)])):
+            f = self.peaks.get(phase)
+            if f is None:
+                continue
+            if f.get("sampler") != "ok":
+                out.append(f"{phase}: the platform gave no peak (sampler={f.get('sampler', 'absent')})")
+            elif number(f, "peak_bytes") == 0:
+                out.append(f"{phase}: peak_bytes=0 (no sampled value)")
+            elif number(f, "peak_bytes") < number(f, "before_bytes"):
+                out.append(f"{phase}: peak {number(f, 'peak_bytes'):.0f} is below the start "
+                           f"{number(f, 'before_bytes'):.0f} (the sampler lost its window)")
+        return out
 
 
 class Row:
-    def __init__(self, ident, phase, what, unit, measured, limit, source, status="ok", extra=""):
+    def __init__(self, ident, phase, what, unit, measured, limit, status="ok", extra="", small=None, floor=None):
         self.ident, self.phase, self.what, self.unit = ident, phase, what, unit
-        self.measured, self.limit, self.source = measured, limit, source
-        self.status, self.extra = status, extra
+        self.measured, self.limit, self.status, self.extra = measured, limit, status, extra
+        self.small, self.floor = small, floor
 
     def fmt(self, value):
         if value is None:
@@ -146,78 +237,89 @@ class Row:
         return f"{value:.2f} {self.unit}"
 
 
-def check(ident, phase, what, unit, measured, limit, source):
+def check(ident, phase, what, unit, measured, limit, floor=None, small=None):
     if measured is None:
-        return Row(ident, phase, what, unit, None, limit, source, "FAIL", "no measurement in the output")
-    status = "ok" if measured <= limit else "FAIL"
-    return Row(ident, phase, what, unit, measured, limit, source, status)
+        return Row(ident, phase, what, unit, None, limit, "FAIL", "no measurement in the output", small, floor)
+    if measured > limit:
+        return Row(ident, phase, what, unit, measured, limit, "FAIL", "", small, floor)
+    if floor is not None and (measured < floor or (small is not None and small < floor)):
+        low = measured if measured < floor else small
+        return Row(ident, phase, what, unit, measured, limit, "FAIL",
+                   f"{low:.2f} {unit} is below the floor of {floor} {unit}: the phase or the "
+                   f"peak sampler did not run", small, floor)
+    return Row(ident, phase, what, unit, measured, limit, "ok", "", small, floor)
 
 
-def evaluate(data):
-    entries = data["ACTIVE"] and int(data["ACTIVE"]["entries"])
-    rows = []
-    peaks = data["PEAK"]
+def per_unit(value, unit, entries):
+    if value is None:
+        return None
+    return value / MIB if unit == "MiB" else value / entries
 
-    def growth(phase, unit):
-        f = peaks.get(phase)
-        if f is None:
-            return None
-        g = number(f, "growth_bytes")
-        return g / MIB if unit == "MiB" else number(f, "growth_per_entry")
 
-    for ident, phase, what, unit, limit, source in CHECKS:
-        rows.append(check(ident, phase, what, unit, growth(phase, unit), limit, source))
+def slope(big, small, e_big, e_small):
+    """Bytes per entry between the two runs."""
+    if big is None or small is None:
+        return None
+    return (big - small) / (e_big - e_small)
 
-    # The whole scan: highest point of its phases above where the scan began.
-    ident, what, unit, limit, source = SCAN_TOTAL
-    start = peaks.get("bounded.parse")
-    seen = [peaks[p] for p in SCAN_PHASES if p in peaks]
-    total = None
-    if start is not None and len(seen) == len(SCAN_PHASES):
-        total = (max(number(f, "peak_bytes") for f in seen) - number(start, "before_bytes")) / MIB
-    scan_total = check(ident, "bounded.*", what, unit, total, limit, source)
-    rows.append(scan_total)
 
-    # (b) steady state
-    steady = data["STEADY"].get("mapped")
-    ident, phase, what, unit, limit, source = STEADY
-    steady_mib = steady and number(steady, "growth_bytes") / MIB
-    rows.append(check(ident, "steady.mapped", what, unit, steady_mib, limit, source))
-    ident, phase, what, unit, limit, source = STEADY_HEAP
-    total_line = data["TOTAL"].get("bounded.live")
-    heap = total_line and number(total_line, "accounted_per_entry")
-    rows.append(check(ident, phase, what, unit, heap, limit, source))
+def evaluate(large, small):
+    """The rows of the three tables: absolute limits, slopes, extrapolation."""
+    el, es = large.entries, small.entries
+    rows, slopes = [], []
 
-    # (c) compaction
-    ident, phase, what, unit, limit, source = COMPACT
-    rows.append(check(ident, phase, what, unit, growth(phase, unit), limit, source))
+    def absolute(spec, measured_of):
+        ident, phase, what, unit, limit, floor, _source = spec
+        m_large, m_small = measured_of(large), measured_of(small)
+        rows.append(check(ident, phase, what, unit, per_unit(m_large, unit, el), limit, floor,
+                          per_unit(m_small, unit, es)))
 
-    # (d) restart
-    ident, phase, what, unit, limit, source = RESTART
-    rows.append(check(ident, phase, what, unit, growth(phase, unit), limit, source))
-    restarted = data["STEADY"].get("restarted")
-    ident, phase, what, unit, limit, source = RESTARTED
-    restarted_mib = restarted and number(restarted, "growth_bytes") / MIB
-    rows.append(check(ident, "restarted", what, unit, restarted_mib, limit, source))
+    for ident, phase, what, unit, limit, floor, source in CHECKS:
+        absolute((ident, phase, what, unit, limit, floor, source), lambda r, p=phase: r.growth(p))
+    ident, what, unit, limit, floor, source = SCAN_TOTAL
+    absolute((ident, "bounded.*", what, unit, limit, floor, source), lambda r: r.scan_total())
+    ident, phase, what, unit, limit, floor, source = STEADY
+    absolute((ident, "steady.mapped", what, unit, limit, floor, source), lambda r: r.steady("mapped"))
+    ident, phase, what, unit, limit, floor, source = STEADY_HEAP
+    heap = lambda r: (number(r.data["TOTAL"][phase], "accounted_per_entry") if phase in r.data["TOTAL"] else None)  # noqa: E731
+    rows.append(check(ident, phase, what, unit, heap(large), limit, floor, heap(small)))
+    for spec in (COMPACT, SAVE_TABLES, RESTART, SORT):
+        ident, phase, what, unit, limit, floor, source = spec
+        absolute(spec, lambda r, p=phase: r.growth(p))
+    ident, phase, what, unit, limit, floor, source = RESTARTED
+    absolute((ident, "restarted", what, unit, limit, floor, source), lambda r: r.steady("restarted"))
 
-    # Extrapolation to the owner's PC. Every byte of growth measured at 5 M
-    # entries is scaled by the entry count, although the scan's working set is
-    # fixed: an upper bound, never an estimate to quote as the PC's figure.
-    scale = PC["entries"] / entries if entries else None
+    # The compacted steady state is a diagnostic only (the service never compacts the heap).
+    comp_large, comp_small = large.steady("mapped", "compacted_growth_bytes"), small.steady("mapped", "compacted_growth_bytes")
+    rows.append(Row("steady.compacted", "steady.mapped", "the same after HeapCompact (diagnostic, no limit)", "MiB",
+                    per_unit(comp_large, "MiB", el), None, "info" if comp_large is not None else "FAIL",
+                    "" if comp_large is not None else "no measurement in the output", per_unit(comp_small, "MiB", es)))
+
+    # The slope: growth per entry between the two sizes.
+    for ident, name, what, limit, _source in SLOPES:
+        s = slope(large.measure(name), small.measure(name), el, es)
+        row = Row(ident, name, what, "B/entry", s, limit, small=None)
+        if s is None:
+            row.status, row.extra = "FAIL", "no measurement in the output"
+        elif s > limit:
+            row.status = "FAIL"
+        slopes.append(row)
+
+    # Extrapolation: a fit, fixed part + slope x entries, from the same two sizes.
     ext = []
 
-    def per_pc(mib):
-        return None if mib is None or scale is None else mib * scale
+    def fit(name):
+        v_large, v_small = large.measure(name), small.measure(name)
+        if v_large is None or v_small is None:
+            return None
+        s = max(slope(v_large, v_small, el, es), 0.0)  # a negative slope is noise
+        return (v_large + s * (PC["entries"] - el)) / MIB
 
-    s = per_pc(steady_mib)
-    scan = per_pc(scan_total.measured)
-    comp = per_pc(growth("compact.file", "MiB"))
-    rst = per_pc(restarted_mib)
-    rl = per_pc(growth("restart.load", "MiB"))
+    def plus(a, b):
+        return None if a is None or b is None else a + b
 
     def add(ident, what, mib, must_meet_target):
-        row = Row(ident, "27.2M entries", what, "MiB", mib, PC["target_bytes"] / MIB,
-                  "ADR 0007: 1 GB hard, 512 MB target (owner, 2026-11-18); growth at 5 M x 5.44")
+        row = Row(ident, "27.2M entries", what, "MiB", mib, PC["target_bytes"] / MIB)
         if mib is None:
             row.status, row.extra = "FAIL", "no measurement in the output"
         elif mib > PC["hard_bytes"] / MIB:
@@ -226,75 +328,102 @@ def evaluate(data):
             row.status = "FAIL" if must_meet_target else "over target"
         ext.append(row)
 
-    def plus(a, b):
-        return None if a is None or b is None else a + b
-
-    add("pc.steady", "steady state", s, True)
-    add("pc.scan", "steady + a full scan (rescan)", plus(s, scan), True)
-    add("pc.compact", "steady + a compaction", plus(s, comp), False)
-    add("pc.restart", "a restart", plus(rst, rl), True)
-    return rows, ext
+    steady = fit("steady")
+    add("pc.steady", "steady state", steady, True)
+    add("pc.scan", "steady + a full scan (rescan)", plus(steady, fit("total")), True)
+    add("pc.compact", "steady + a compaction", plus(steady, fit("compact")), False)
+    add("pc.restart", "a restart (peak)", fit("restart"), True)
+    return rows, slopes, ext
 
 
-def render(rows, ext, entries):
-    lines = [f"Memory gate: {entries:,} entries (windows-latest, private bytes)", ""]
-    head = f"{'check':<16}{'phase':<22}{'measured':>16}{'limit':>16}  status"
-    for title, group in (("limits at 5M entries", rows), ("extrapolated to the owner's PC (upper bound)", ext)):
+def render(groups, entries):
+    lines = [f"Memory gate: {entries[0]:,} and {entries[1]:,} entries (windows-latest, private bytes)", ""]
+    head = f"{'check':<20}{'phase':<22}{'1M':>14}{'5M':>16}{'limit':>16}  status"
+    for title, group in groups:
         lines += [title, head, "-" * len(head)]
         for r in group:
-            lines.append(f"{r.ident:<16}{r.phase:<22}{r.fmt(r.measured):>16}{r.fmt(r.limit):>16}  {r.status}"
+            small = r.fmt(r.small) if r.small is not None else ""
+            lines.append(f"{r.ident:<20}{r.phase:<22}{small:>14}{r.fmt(r.measured):>16}"
+                         f"{(r.fmt(r.limit) if r.limit is not None else ''):>16}  {r.status}"
                          + (f" ({r.extra})" if r.extra else ""))
-            lines.append(f"{'':<16}{r.what}")
+            lines.append(f"{'':<20}{r.what}")
         lines.append("")
     return "\n".join(lines)
 
 
-def markdown(rows, ext, entries):
-    out = [f"## Memory gate ({entries:,} entries)", ""]
-    for title, group in (("Limits at 5M entries", rows),
-                         ("Extrapolated to the owner's PC: 27.2M entries, 1 GB hard, 512 MB target (upper bound)", ext)):
-        out += [f"### {title}", "", "| check | phase | what | measured | limit | status |", "|---|---|---|---:|---:|---|"]
+def markdown(groups, entries):
+    out = [f"## Memory gate ({entries[0]:,} and {entries[1]:,} entries)", ""]
+    for title, group in groups:
+        out += [f"### {title}", "", "| check | phase | what | 1M | 5M | limit | status |", "|---|---|---|---:|---:|---:|---|"]
         for r in group:
-            status = r.status if r.status == "ok" else f"**{r.status}**"
-            out.append(f"| {r.ident} | {r.phase} | {r.what} | {r.fmt(r.measured)} | {r.fmt(r.limit)} | {status} |")
+            status = r.status if r.status in ("ok", "info") else f"**{r.status}**"
+            small = r.fmt(r.small) if r.small is not None else ""
+            limit = r.fmt(r.limit) if r.limit is not None else ""
+            out.append(f"| {r.ident} | {r.phase} | {r.what} | {small} | {r.fmt(r.measured)} | {limit} | {status} |")
         out.append("")
     return "\n".join(out)
 
 
+def load(path, label, expected_entries):
+    """The run in `path`, or an exit code and the reason."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        data = parse(f.read())
+    if data["ACTIVE"] is None or not data["DONE"]:
+        return None, 1, (f"the {label} output has no FERROW-MEMORY-ACTIVE and FERROW-MEMORY-DONE "
+                         f"lines: the measurement did not run to its end")
+    asked = int(data["ACTIVE"]["entries"])
+    if asked != expected_entries:
+        return None, 2, f"the limits are calibrated for {expected_entries} entries in the {label} run, it has {asked}"
+    if data["BUDGET"] is None or int(data["BUDGET"]) != SPILL_BUDGET:
+        return None, 2, (f"the limits are calibrated for a spill budget of {SPILL_BUDGET} bytes, the {label} run has "
+                         f"{data['BUDGET']} (set FERROW_MEMORY_SPILL_BUDGET)")
+    return Run(label, data), 0, ""
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
-    ap.add_argument("output")
+    ap.add_argument("large", help="output of the 5 M entry run")
+    ap.add_argument("small", help="output of the 1 M entry run")
     ap.add_argument("--summary")
     args = ap.parse_args(argv)
-    with open(args.output, encoding="utf-8", errors="replace") as f:
-        data = parse(f.read())
-    active = data["ACTIVE"]
-    if active is None or not data["DONE"]:
-        print("MEMORY GATE FAILED: the output has no FERROW-MEMORY-ACTIVE and FERROW-MEMORY-DONE "
-              "lines: the measurement did not run to its end", file=sys.stderr)
+    try:
+        runs = []
+        for path, label, n in ((args.large, "5M", ENTRIES_LARGE), (args.small, "1M", ENTRIES_SMALL)):
+            run, code, why = load(path, label, n)
+            if run is None:
+                print(f"{'MEMORY GATE FAILED' if code == 1 else 'MEMORY GATE'}: {why}", file=sys.stderr)
+                return code
+            runs.append(run)
+        large, small = runs
+        bad_runs = [f"{r.label}: {why}" for r in runs for why in r.credibility()]
+        rows, slopes, ext = evaluate(large, small)
+    except BadLine as e:
+        print(f"::error title=Memory gate::{e}", file=sys.stderr)
+        print(f"MEMORY GATE FAILED: {e}", file=sys.stderr)
         return 1
-    if int(active["entries"]) != ENTRIES:
-        print(f"MEMORY GATE: the limits are calibrated for {ENTRIES} entries, this run has "
-              f"{active['entries']}", file=sys.stderr)
-        return 2
-    rows, ext = evaluate(data)
-    entries = int(active["entries"])
-    print(render(rows, ext, entries))
+    entries = (int(large.entries), int(small.entries))
+    groups = [("Limits at 5M entries (and the 1M run)", rows),
+              ("Growth per entry between the 1M and the 5M run (the slope)", slopes),
+              ("Fitted to the owner's PC: 27.2M entries, 1 GB hard, 512 MB target (fixed part + slope x entries)", ext)]
+    print(render(groups, entries))
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
-            f.write(markdown(rows, ext, entries) + "\n")
-    bad = [r for r in rows + ext if r.status == "FAIL"]
-    for r in rows + ext:
+            f.write(markdown(groups, entries) + "\n")
+    for r in ext:
         if r.status == "over target":
-            print(f"::warning title=Memory gate::{r.phase} {r.what}: {r.fmt(r.measured)} extrapolated "
-                  f"is over the 512 MB target (known: compaction keeps its live tables in the heap)")
+            print(f"::warning title=Memory gate::{r.phase} {r.what}: {r.fmt(r.measured)} fitted is over the "
+                  f"512 MB target (known: compaction keeps its live tables in the heap)")
+    bad = [r for r in rows + slopes + ext if r.status == "FAIL"]
+    for why in bad_runs:
+        print(f"::error title=Memory gate::peak measurement not credible, {why}", file=sys.stderr)
     for r in bad:
         reason = r.extra or f"{r.fmt(r.measured)} is over the limit of {r.fmt(r.limit)}"
         print(f"::error title=Memory gate::{r.ident} ({r.phase}): {r.what}: {reason}", file=sys.stderr)
-    if bad:
+    if bad or bad_runs:
         print("MEMORY GATE FAILED: " + "; ".join(
-            f"{r.ident} [{r.phase}] {r.fmt(r.measured)} > {r.fmt(r.limit)}" if r.measured is not None
-            else f"{r.ident} [{r.phase}] no measurement" for r in bad), file=sys.stderr)
+            [f"{r.ident} [{r.phase}] {r.fmt(r.measured)} > {r.fmt(r.limit)}" if r.measured is not None
+             and not r.extra else f"{r.ident} [{r.phase}] {r.extra or 'no measurement'}" for r in bad]
+            + [f"peaks not credible in the {why}" for why in bad_runs]), file=sys.stderr)
         return 1
     print("MEMORY GATE PASSED")
     return 0
