@@ -67,6 +67,8 @@ enum Inner {
 pub struct Pairs {
     inner: Inner,
     note: Option<String>,
+    /// Made by [`Pairs::spilling_strict`]: a failed file loses the map.
+    strict: bool,
 }
 
 impl Default for Pairs {
@@ -87,6 +89,7 @@ impl From<Vec<(u64, u32)>> for Pairs {
         Pairs {
             inner: Inner::Heap(pairs),
             note: None,
+            strict: false,
         }
     }
 }
@@ -97,6 +100,7 @@ impl Pairs {
         Pairs {
             inner: Inner::Heap(Vec::new()),
             note: None,
+            strict: false,
         }
     }
 
@@ -115,6 +119,7 @@ impl Pairs {
                 stage: Vec::with_capacity(STAGE),
             }),
             note,
+            strict: false,
         }
     }
 
@@ -128,12 +133,25 @@ impl Pairs {
                 stage: Vec::with_capacity(STAGE),
             }),
             note: None,
+            strict: true,
         })
     }
 
     /// Why the map is in the heap although a file was wanted, if it is.
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
+    }
+
+    /// Whether a strict map's file has failed: the map is lost and
+    /// [`Pairs::seal`] will fail, so the scan of its volume can stop now
+    /// instead of emitting the rest for nothing. Always `false` for a map
+    /// that may fall back to the heap (its volume goes on). Only the staged
+    /// pairs reach the file in pieces, so a failure shows within
+    /// [`STAGE`] pushes of it.
+    #[inline]
+    pub fn lost(&self) -> bool {
+        self.strict
+            && matches!(&self.inner, Inner::Writing(writer) if writer.file.failure().is_some())
     }
 
     /// Add a pair (only before [`Pairs::seal`]).
@@ -278,6 +296,7 @@ impl Clone for Pairs {
         Pairs {
             inner: Inner::Heap(self.iter().collect()),
             note: self.note.clone(),
+            strict: false,
         }
     }
 }

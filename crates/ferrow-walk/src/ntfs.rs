@@ -531,16 +531,24 @@ pub fn parse_usn_records(mut bytes: &[u8]) -> Vec<UsnRecord> {
 }
 
 /// Bytes of temporary files a read of one volume keeps per MFT record at its
-/// highest: the record table (48), the names (24) and their text (about 20),
-/// the grouping (8) and the record map the scan appends (16). **An estimate**
-/// from a synthetic stream (118 to 121 B per record at 1 M entries), rounded
-/// up; a volume whose names are far longer or with many hard links needs more.
-pub const FILE_BYTES_PER_RECORD: u64 = 120;
+/// highest: the record table (48), the names (24) and their text, the
+/// grouping (8) and the record map the scan appends (16). **An estimate**: a
+/// synthetic stream with about 20 B of name text measured 118 to 121 B per
+/// record at 1 M entries; real names average about 42 B (ADR 0007, the
+/// owner's PC), so 160 leaves some room. Many hard links need more.
+pub const FILE_BYTES_PER_RECORD: u64 = 160;
 
-/// Bytes of temporary files a read of a volume of `records` MFT records is
-/// expected to need (see [`FILE_BYTES_PER_RECORD`]).
+/// Bytes per record the scan writes after the read on the same disk: the
+/// builder's spilled shards (about 60) and the new index file (about 70).
+pub const BUILD_BYTES_PER_RECORD: u64 = 130;
+
+/// Bytes of disk a scan of a volume of `records` MFT records is expected to
+/// need beside the index: its temporary tables and what the build writes
+/// (see [`FILE_BYTES_PER_RECORD`], [`BUILD_BYTES_PER_RECORD`]). Checked
+/// before the MFT is read, so a disk that cannot take the result fails in
+/// seconds rather than after minutes of reading.
 pub fn files_estimate(records: u64) -> u64 {
-    records.saturating_mul(FILE_BYTES_PER_RECORD)
+    records.saturating_mul(FILE_BYTES_PER_RECORD + BUILD_BYTES_PER_RECORD)
 }
 
 /// What a read with temporary files may do when it cannot have them. The
@@ -802,7 +810,7 @@ impl VolumeBuilder {
         let need = files_estimate(records);
         if let Some(free) = policy.free_bytes.filter(|&free| free < need) {
             let why = format!(
-                "{} MB free beside the index, a read of {records} MFT records needs about {} MB of temporary files",
+                "{} MB free beside the index, a scan of {records} MFT records needs about {} MB for its temporary files and the index",
                 free >> 20,
                 need >> 20
             );
@@ -912,6 +920,10 @@ impl VolumeBuilder {
     /// of them can be pushed (the journal refresh after a long read). A
     /// changed record's name or patch stays only where the matching `keep_*`
     /// says so.
+    ///
+    /// `keep_*` must say `true` for every record not in `changed`: a builder
+    /// in the heap asks them about every name and patch, one with files only
+    /// about the names of changed records.
     pub fn forget(
         &mut self,
         changed: &std::collections::BTreeSet<u64>,

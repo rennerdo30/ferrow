@@ -802,7 +802,8 @@ fn forgotten_round(n: usize) {
             let step = step.max(1) as u64;
             let changed: std::collections::BTreeSet<u64> =
                 (0..forgotten as u64).map(|i| 16 + i * step).collect();
-            parsed.forget(&changed, |_| false, |_| false);
+            let unchanged = |r: u64| !changed.contains(&r);
+            parsed.forget(&changed, unchanged, unchanged);
         }
         let started = Instant::now();
         let volume = parsed.finish(0xF026);

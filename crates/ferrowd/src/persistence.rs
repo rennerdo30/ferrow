@@ -213,7 +213,14 @@ impl IndexFile {
     /// the size of the current file: the new file, the builder's spilled
     /// shards (about as large again) and the live tables. `Err` with the
     /// numbers when it has not; `Ok` when either figure is unknown.
+    ///
+    /// Stale temporary files of a dead process are removed first: after a
+    /// crash mid-scan they may be what fills the disk, and a refused rebuild
+    /// would never reach [`Self::prepare`], which also removes them.
     pub fn has_room(&self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            remove_stale_temporaries(parent);
+        }
         let Ok(size) = std::fs::metadata(&self.path).map(|m| m.len()) else {
             return Ok(());
         };

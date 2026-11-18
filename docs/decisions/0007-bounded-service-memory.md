@@ -135,9 +135,10 @@ slower. The owner chose to do both: map the index and compress it.
       before the first mapped write). The same code reads a table from the heap
       or from a file, so the result is the same bytes.
     - **No large silent heap fallback** (the lesson of FR-47). Before a
-      volume's MFT is read the scan estimates its files (120 B per MFT record,
-      estimated from the synthetic stream) and checks the free space beside the
-      index. A volume above `HEAP_FALLBACK_ENTRIES` (1 M records) that does not
+      volume's MFT is read the scan estimates what it will write (160 B per MFT
+      record for the read's files, 130 for the shards and the new index;
+      estimates) and checks the free space beside the index, after removing
+      the temporary files a dead service left. A volume above `HEAP_FALLBACK_ENTRIES` (1 M records) that does not
       fit, whose file cannot be made or whose file fails during the read is
       not read into the heap instead: the read stops at once and the scan fails
       with `BUILD_FAILED`, so the service keeps its index and retries with its
@@ -151,8 +152,8 @@ slower. The owner chose to do both: map the index and compress it.
       follow the directory order the emission walks; changing it would change
       results). Not chosen: a smaller `RecordInfo`; it would save under a
       third and keep the heap growing with the volume.
-    - Costs: temporary disk space (about 120 B per MFT record per volume plus
-      the shards: about 4 GB at 27 M, estimated) beside the old and new index
+    - Costs: temporary disk space (about 120 to 160 B per MFT record per
+      volume plus the shards: about 5 GB at 27 M, estimated) beside the old and new index
       file, and about 10 % more CPU time in the parse and emission steps (50
       to 60 ms per million entries, measured at 1 M). The grouping's check for
       names a journal refresh forgot is a bitmap over record numbers (3 MB at

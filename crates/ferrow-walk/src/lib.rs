@@ -1427,6 +1427,11 @@ fn emit_mft_subtree(
         usize::MAX,
     )];
     while let Some((dir, dir_id, dir_path, top)) = stack.pop() {
+        // A large volume's record map file failed (a full disk): the scan
+        // fails at its seal; the rest would be emitted for nothing.
+        if pairs.lost() {
+            break;
+        }
         if let Some(p) = walker.progress
             && top != last_top
             && let Some(name) = top_names.get(top)
