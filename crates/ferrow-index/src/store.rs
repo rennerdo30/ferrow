@@ -690,7 +690,10 @@ impl<T: Plain> Appender<T> {
             AppendSink::File { flushed, buf, .. } => *flushed as usize + buf.len(),
             _ => return,
         };
-        if total > self.heap_limit {
+        // An appender that may not use the heap is lost, whatever it held
+        // (a failed flush always holds something; only a forced failure of
+        // an empty one gets here with nothing).
+        if self.heap_limit == 0 || total > self.heap_limit {
             let why = if self.heap_limit == 0 {
                 error.to_string()
             } else {

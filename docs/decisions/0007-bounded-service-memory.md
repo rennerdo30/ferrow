@@ -126,7 +126,8 @@ slower. The owner chose to do both: map the index and compress it.
       panicked scan leaves nothing), written through a writable map or
       appended in chunks as the read arrives and mapped read-only afterwards.
       The live layer's frozen tables (entry to record, record to entry,
-      children) are built the same way and replaced by the saved copy.
+      children) are built the same way and replaced by the saved copy when the
+      tables can be saved (they stay as files for the session otherwise).
     - One temporary-file layer serves every table of the build: a
       `store::Scratch` (a zero-filled file written through a map, then frozen
       read-only) for tables of known size, `store::Appender` (chunked appends)
@@ -134,6 +135,21 @@ slower. The owner chose to do both: map the index and compress it.
       (`store::create_temp_file`) and one disk-space step (`store::reserve`,
       before the first mapped write). The same code reads a table from the heap
       or from a file, so the result is the same bytes.
+    - **The live layer's tables are refused too** (FR-47 follow-up). The
+      service builds them with `Live::try_new_in`: the entry to record table,
+      each volume's record to entry table and the children table use
+      `Scratch::try_zeroed` above `HEAP_FALLBACK_ENTRIES` elements, so a missing
+      file is an error, not about 0.5 GB of heap at 27 M entries. The service
+      then serves the new index without live updates (the event log, the
+      snapshot and health say why: each volume is listed as unavailable with the
+      reason) and scans again after its own back-off; the saved tables of the
+      old index are deleted; a small table still falls back, counted. With no
+      room for the children table the tables are not saved, and a move of a
+      frozen folder is not applied but asks for a rescan; that refusal is
+      remembered for a minute (no repeated pass over the index) and a large
+      table checks for room (about 8 B/entry) first. The layer a merge makes
+      carries the same placement, so its children table is refused too; its
+      own record tables stay in the heap (decision 6).
     - **No large silent heap fallback** (the lesson of FR-47). Before a
       volume's MFT is read the scan estimates what it will write (160 B per MFT
       record for the read's files, 130 for the shards and the new index;
@@ -234,7 +250,7 @@ reader of the diagnostics sees both.
    gated; see `docs/service.md`.
 8. Bounded scan: the MFT read and the live tables a scan builds in
    temporary files (done: FR-46 phase 7; not yet measured on a 27 M entry
-   PC; a compaction's own tables are still in the heap).
+   PC; a compaction's own record tables are still in the heap).
 
 Each step is its own PR, with the `docs/SPEC.md` §3 numbers from the CI
 bench, and is reviewed for search speed.

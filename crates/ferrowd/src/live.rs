@@ -24,8 +24,9 @@
 //! fetching live in `live_windows`.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
@@ -52,6 +53,11 @@ const MAX_REMOVED_DIVISOR: usize = 10;
 /// re-attaches it. Delta entries below the folder are always copied (the
 /// delta limits bound them). See [`Live::move_children`].
 const MAX_MOVE: usize = 100_000;
+/// After the children table was refused (no room beside the index) another
+/// try waits this long: the refused change asks for a rescan, which waits at
+/// least [`MIN_RESCAN_GAP`] itself, and a retry earlier than that would only
+/// repeat the failure.
+const CHILDREN_RETRY: Duration = MIN_RESCAN_GAP;
 
 /// The size limits of the live layer. They follow the index: a fixed limit
 /// asked a PC with 27 million entries for a full rescan (over a minute of
@@ -138,6 +144,7 @@ pub const REASON_MOVED_IN: &str = "a folder moved into an indexed location";
 pub const REASON_LARGE_MOVE: &str = "a large folder moved";
 pub const REASON_ADMIN: &str = "requested by an administrator";
 pub const REASON_NESTING: &str = "a folder moved below a folder that was inside it";
+pub const REASON_NO_CHILDREN: &str = "a folder moved and its children table has no room";
 /// The end of the reason text for a delta full of dead entries (`"N …"`).
 const REASON_SUPERSEDED_SUFFIX: &str = "superseded entries";
 
@@ -150,6 +157,8 @@ pub fn reason_kind(reason: &str) -> &'static str {
         "large folder move"
     } else if reason.starts_with(REASON_NESTING) {
         "folders swapped nesting"
+    } else if reason.starts_with(REASON_NO_CHILDREN) {
+        "no room for a table"
     } else if reason.ends_with(" live changes") {
         "too many live changes"
     } else if reason.ends_with(" replaced entries") {
@@ -738,18 +747,65 @@ pub trait RecordSource {
     }
 }
 
-/// One of the live layer's frozen tables while a scan builds it: a
-/// [`Scratch`] buffer, an anonymous temporary file beside the index written
-/// through a memory map (ADR 0007, step 9), so building the table of a 27 M
-/// entry PC does not take 8 (or 4) bytes per entry of private memory on top of
-/// the saved copy that replaces it a moment later. When the file cannot be made
-/// the table is in the heap, as before, and `Scratch` counts it
-/// (`ferrow_index::store::scratch_in_heap`), which the service reports.
-/// `len` elements of `value`.
-fn filled<T: Plain>(len: usize, value: T, dir: Option<&Path>) -> Scratch<T> {
-    let mut table = Scratch::zeroed(len, dir);
-    table.fill(value);
-    table
+/// Where the live layer's frozen tables are built while a scan makes them:
+/// anonymous temporary files beside the index written through a memory map
+/// ([`Scratch`], ADR 0007, step 9), so building the tables of a 27 M entry PC
+/// does not take 8 (or 4) bytes per entry of private memory on top of the
+/// saved copy that replaces them a moment later.
+///
+/// A table of at most `refuse_above` elements whose file cannot be made is in
+/// the heap, as before, and `Scratch` counts it
+/// (`ferrow_index::store::scratch_in_heap`), which the service reports. A
+/// larger one is refused instead (an error): its heap copy would be hundreds
+/// of megabytes (ADR 0007: no large silent heap fallback). Without a
+/// directory (no index file at all) every table is in the heap by design.
+#[derive(Clone, Copy)]
+struct Placement<'a> {
+    dir: Option<&'a Path>,
+    refuse_above: usize,
+}
+
+impl<'a> Placement<'a> {
+    /// The heap, by design (a compaction's tables, tests).
+    const HEAP: Placement<'static> = Placement {
+        dir: None,
+        refuse_above: usize::MAX,
+    };
+
+    /// `len` zeroed elements, named `what` in an error.
+    fn zeroed<T: Plain>(self, what: &str, len: usize) -> io::Result<Scratch<T>> {
+        match self.dir {
+            Some(dir) if len > self.refuse_above => Scratch::try_zeroed(len, dir).map_err(|e| {
+                io::Error::other(format!(
+                    "the {what} ({} MiB) cannot be built in a file beside the index: {e}",
+                    (len * size_of::<T>()) >> 20
+                ))
+            }),
+            _ => Ok(Scratch::zeroed(len, self.dir)),
+        }
+    }
+
+    /// `len` elements of `value`.
+    fn filled<T: Plain>(self, what: &str, len: usize, value: T) -> io::Result<Scratch<T>> {
+        let mut table = self.zeroed(what, len)?;
+        table.fill(value);
+        Ok(table)
+    }
+}
+
+/// Whether `free` bytes (`None`: unknown) leave room for the children table
+/// of `n` entries: its two columns hold about 4 bytes per entry each. Checked
+/// before the build, so a disk that has no room is not read for it.
+fn children_room(n: usize, free: Option<u64>) -> Result<(), String> {
+    let need = 8 * n as u64;
+    match free {
+        Some(free) if free < need => Err(format!(
+            "the children table needs about {} MiB beside the index and {} MiB are free",
+            need >> 20,
+            free >> 20
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What a volume's tables are built from.
@@ -975,6 +1031,19 @@ pub struct Live {
     /// Where tables built later (the children table) go while they are built:
     /// anonymous temporary files beside the index. `None`: the heap.
     scratch: Option<PathBuf>,
+    /// A table of more than this many elements is refused rather than built
+    /// in the heap when its file cannot be made (see [`Placement`]).
+    refuse_above: usize,
+    /// When and why the children table was last refused. The build is a
+    /// pass over the whole `parent` column (hundreds of milliseconds to
+    /// seconds at 27 M entries) and makes a file of about 108 MB it then
+    /// throws away, so a refusal is remembered and answered again without a
+    /// build until `children_retry` has passed ([`Live::ensure_children`]).
+    children_refused: Mutex<Option<(Instant, String)>>,
+    children_retry: Duration,
+    /// Builds of the children table started (tests count them).
+    #[cfg(test)]
+    children_builds: std::sync::atomic::AtomicUsize,
 }
 
 impl Live {
@@ -989,10 +1058,39 @@ impl Live {
     /// build holds no table of 4 to 8 bytes per entry in the heap. The tables
     /// read the same either way and the files go when the tables do (a saved
     /// copy replaces them, see [`Live::replace_tables`]). A table whose file
-    /// cannot be made is built in the heap.
+    /// cannot be made is built in the heap, counted. Tests and examples use
+    /// this; the service uses [`Live::try_new_in`], which refuses that for a
+    /// large table.
     pub fn new_in(base: Arc<Index>, maps: &[VolumeMap], scratch: Option<&Path>) -> Live {
+        let place = Placement {
+            dir: scratch,
+            refuse_above: usize::MAX,
+        };
+        Live::build(base, maps, place).expect("a heap fallback cannot fail")
+    }
+
+    /// [`Live::new_in`] for the service: a table of more than
+    /// [`ferrow_walk::HEAP_FALLBACK_ENTRIES`] elements (the entry-to-record
+    /// table, a volume's record-to-entry table, and the children table built
+    /// later) whose file cannot be made is an error, not a heap table of
+    /// hundreds of megabytes at 27 M entries (ADR 0007: no large silent heap
+    /// fallback). The caller serves the index without live updates then.
+    /// Smaller tables fall back to the heap, counted.
+    pub fn try_new_in(
+        base: Arc<Index>,
+        maps: &[VolumeMap],
+        scratch: Option<&Path>,
+    ) -> io::Result<Live> {
+        let place = Placement {
+            dir: scratch,
+            refuse_above: ferrow_walk::HEAP_FALLBACK_ENTRIES,
+        };
+        Live::build(base, maps, place)
+    }
+
+    fn build(base: Arc<Index>, maps: &[VolumeMap], place: Placement<'_>) -> io::Result<Live> {
         let n = base.len();
-        let mut base_record = filled(n, u64::MAX, scratch);
+        let mut base_record = place.filled("entry-to-record table", n, u64::MAX)?;
         for (v, map) in maps.iter().enumerate() {
             for (record, id) in map.entries.iter() {
                 if (id as usize) < n {
@@ -1012,25 +1110,27 @@ impl Live {
             .iter()
             .enumerate()
             .flat_map(|(v, map)| map.entries.iter().map(move |(record, id)| (v, record, id)));
-        let volumes = Live::volumes(seeds, entries, scratch);
+        let volumes = Live::volumes(seeds, entries, place)?;
         let mut live = Live::assemble(base, base_record.freeze(), volumes, 0);
-        live.scratch = scratch.map(Path::to_path_buf);
-        live
+        live.scratch = place.dir.map(Path::to_path_buf);
+        live.refuse_above = place.refuse_above;
+        Ok(live)
     }
 
     /// The per-volume record tables from `(volume, record, frozen id)`, built
-    /// in temporary files in `scratch` when there is a directory.
+    /// in temporary files when `place` has a directory.
     fn volumes(
         seeds: Vec<VolumeSeed>,
         entries: impl Iterator<Item = (usize, u64, u32)>,
-        scratch: Option<&Path>,
-    ) -> Vec<Volume> {
+        place: Placement<'_>,
+    ) -> io::Result<Vec<Volume>> {
         // Per volume: the record → entry table and the link pairs.
         type Tables = (Scratch<u32>, Vec<(u64, u32)>);
-        let mut tables: Vec<Tables> = seeds
-            .iter()
-            .map(|seed| (filled(seed.records as usize, u32::MAX, scratch), Vec::new()))
-            .collect();
+        let mut tables: Vec<Tables> = Vec::with_capacity(seeds.len());
+        for seed in &seeds {
+            let table = place.filled("record-to-entry table", seed.records as usize, u32::MAX)?;
+            tables.push((table, Vec::new()));
+        }
         for (v, record, id) in entries {
             let (record_base, links) = &mut tables[v];
             let slot = &mut record_base[record as usize];
@@ -1046,7 +1146,7 @@ impl Live {
                 }
             }
         }
-        seeds
+        Ok(seeds
             .into_iter()
             .zip(tables)
             .map(|(seed, (record_base, mut links))| {
@@ -1062,7 +1162,7 @@ impl Live {
                     roots: seed.roots,
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// A live layer over `base` with nothing changed yet. `next_walk`: the id
@@ -1097,6 +1197,11 @@ impl Live {
             log_seq: 0,
             progress: Instant::now(),
             scratch: None,
+            refuse_above: usize::MAX,
+            children_refused: Mutex::new(None),
+            children_retry: CHILDREN_RETRY,
+            #[cfg(test)]
+            children_builds: std::sync::atomic::AtomicUsize::new(0),
             base,
         }
     }
@@ -1533,34 +1638,106 @@ impl Live {
 
     fn base_children(&self) -> &(Col<u32>, Col<u32>) {
         self.base_children.get_or_init(|| {
-            let n = self.base.len();
-            let dir = self.scratch.as_deref();
-            let mut first = Scratch::<u32>::zeroed(n + 1, dir);
-            for c in 0..n as u32 {
-                let p = self.base.parent(c);
-                if p != ROOT_PARENT {
-                    first[p as usize + 1] += 1;
-                }
-            }
-            for i in 1..first.len() {
-                first[i] += first[i - 1];
-            }
-            // Fill by advancing each parent's start, then shift the starts
-            // back (no second table of n entries).
-            let mut ids = Scratch::<u32>::zeroed(first[n] as usize, dir);
-            for c in 0..n as u32 {
-                let p = self.base.parent(c);
-                if p != ROOT_PARENT {
-                    ids[first[p as usize] as usize] = c;
-                    first[p as usize] += 1;
-                }
-            }
-            for i in (1..=n).rev() {
-                first[i] = first[i - 1];
-            }
-            first[0] = 0;
-            (first.freeze(), ids.freeze())
+            debug_assert!(
+                self.scratch.is_none() || self.base.len() <= self.refuse_above,
+                "a large children table is made by ensure_children, which can refuse it"
+            );
+            self.build_children(usize::MAX)
+                .expect("a heap fallback cannot fail")
         })
+    }
+
+    /// Build the frozen children table now if it is not there, refusing to
+    /// put a large one (the service's layer: more than
+    /// [`ferrow_walk::HEAP_FALLBACK_ENTRIES`] entries) in the heap when its
+    /// file cannot be made. Called before anything that needs the table (the
+    /// first save of the tables, a move of a frozen folder); an error means
+    /// the caller must not go on without it.
+    ///
+    /// A refusal is remembered: until `children_retry` has passed the same
+    /// error is returned at once, without a build, so a batch of changes
+    /// that each need the table (a delete of many frozen folders) does not
+    /// repeat the pass over the whole index and a file of about 108 MB per
+    /// change on the maintainer thread. A large table also needs free room
+    /// for about 8 bytes per entry first
+    /// ([`children_room`]), which is checked before the build starts.
+    pub fn ensure_children(&self) -> io::Result<()> {
+        if self.base_children.get().is_some() {
+            return Ok(());
+        }
+        if let Some((at, why)) = self
+            .children_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            && at.elapsed() < self.children_retry
+        {
+            return Err(io::Error::other(why.clone()));
+        }
+        let built = self.build_children_checked();
+        let mut refused = self
+            .children_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match built {
+            Ok(table) => {
+                *refused = None;
+                let _ = self.base_children.set(table);
+                Ok(())
+            }
+            Err(error) => {
+                *refused = Some((Instant::now(), error.to_string()));
+                Err(error)
+            }
+        }
+    }
+
+    /// The service's build of the children table: with the room check in
+    /// front of a large one.
+    fn build_children_checked(&self) -> io::Result<(Col<u32>, Col<u32>)> {
+        let n = self.base.len();
+        if let Some(dir) = self.scratch.as_deref()
+            && n > self.refuse_above
+        {
+            children_room(n, ferrow_walk::free_bytes(dir)).map_err(io::Error::other)?;
+        }
+        #[cfg(test)]
+        self.children_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.build_children(self.refuse_above)
+    }
+
+    fn build_children(&self, refuse_above: usize) -> io::Result<(Col<u32>, Col<u32>)> {
+        let n = self.base.len();
+        let place = Placement {
+            dir: self.scratch.as_deref(),
+            refuse_above,
+        };
+        let mut first = place.zeroed("children table", n + 1)?;
+        for c in 0..n as u32 {
+            let p = self.base.parent(c);
+            if p != ROOT_PARENT {
+                first[p as usize + 1] += 1;
+            }
+        }
+        for i in 1..first.len() {
+            first[i] += first[i - 1];
+        }
+        // Fill by advancing each parent's start, then shift the starts
+        // back (no second table of n entries).
+        let mut ids = place.zeroed("children table", first[n] as usize)?;
+        for c in 0..n as u32 {
+            let p = self.base.parent(c);
+            if p != ROOT_PARENT {
+                ids[first[p as usize] as usize] = c;
+                first[p as usize] += 1;
+            }
+        }
+        for i in (1..=n).rev() {
+            first[i] = first[i - 1];
+        }
+        first[0] = 0;
+        Ok((first.freeze(), ids.freeze()))
     }
 
     /// The live children of a folder: its frozen children, those of the
@@ -2258,6 +2435,17 @@ impl Live {
         {
             return Err(REASON_NESTING.into());
         }
+        // Moving or removing a frozen folder walks the frozen children table,
+        // which a large layer builds in a file and refuses to build in the
+        // heap: with no room for it nothing is applied (the change is not
+        // lost, a scan reads it) and the disks are read again when there is.
+        if old
+            .iter()
+            .any(|&l| matches!(l, Loc::Base(_)) && self.flags_of(l) & flags::DIR != 0)
+            && let Err(error) = self.ensure_children()
+        {
+            return Err(format!("{REASON_NO_CHILDREN} ({error})"));
+        }
         applied.changed += 1;
         for &loc in &old {
             self.remove(loc);
@@ -2546,11 +2734,16 @@ impl Live {
             .enumerate()
             .filter(|(_, p)| **p != u64::MAX)
             .map(|(id, &p)| ((p >> 48) as usize, p & RECORD_MASK, id as u32));
-        let volumes = Live::volumes(seeds, entries, None);
-        Some((
-            Live::assemble(index, records.into(), volumes, self.next_walk),
-            file_report,
-        ))
+        let volumes =
+            Live::volumes(seeds, entries, Placement::HEAP).expect("a heap fallback cannot fail");
+        let mut live = Live::assemble(index, records.into(), volumes, self.next_walk);
+        // The merged layer builds its children table (later, on the first
+        // save of the tables or a move of a frozen folder) the way this one
+        // does: in a file beside the index, refused when there is none. Its
+        // record tables above stay in the heap ([`Placement::HEAP`]).
+        live.scratch = self.scratch.clone();
+        live.refuse_above = self.refuse_above;
+        Some((live, file_report))
     }
 
     /// Which delta entries a compaction places, given the frozen entries it
@@ -3798,6 +3991,208 @@ mod tests {
         let r = live.apply(&[change(20, false)], &f);
         assert!(r.walks.is_empty() && r.rescan.is_none());
         assert_eq!(shown(&live, &base), oracle(&f));
+    }
+
+    fn no_directory(tag: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("ferrowd-{tag}-{}", std::process::id()))
+            .join("missing")
+    }
+
+    /// FR-47 (ADR 0007, no large silent heap fallback): a frozen table above
+    /// the limit whose file cannot be made is refused, not built in the heap;
+    /// a small one still falls back, counted.
+    #[test]
+    fn a_large_table_with_no_file_is_refused_and_a_small_one_falls_back() {
+        let (base, map) = fixture();
+        let maps = std::slice::from_ref(&map);
+        let nowhere = no_directory("refuse");
+        let at = |refuse_above| Placement {
+            dir: Some(&nowhere),
+            refuse_above,
+        };
+        // Above the limit: the entry-to-record table (4 entries), then, with
+        // the limit between the two, the record-to-entry table (23 records).
+        let error = Live::build(base.clone(), maps, at(0)).err().unwrap();
+        assert!(
+            error.to_string().contains("entry-to-record table"),
+            "{error}"
+        );
+        let error = Live::build(base.clone(), maps, at(10)).err().unwrap();
+        assert!(
+            error.to_string().contains("record-to-entry table"),
+            "{error}"
+        );
+        // The service's own limit is far above these tables: the heap. (The
+        // fallback also bumps `scratch_in_heap()`, a counter of the whole
+        // process that tests running in parallel bump as well, so it is not
+        // read here: the tables themselves say where they are.)
+        let live =
+            Live::try_new_in(base.clone(), maps, Some(&nowhere)).expect("small tables fall back");
+        assert!(!live.base_record.is_mapped() && !live.volumes[0].record_base.is_mapped());
+        // Where the files can be made the same limit gives files.
+        let dir = std::env::temp_dir().join(format!("ferrowd-refuse-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = Live::build(
+            base,
+            maps,
+            Placement {
+                dir: Some(&dir),
+                refuse_above: 0,
+            },
+        )
+        .unwrap();
+        assert!(live.base_record.is_mapped() && live.volumes[0].record_base.is_mapped());
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-47: with no room for the children table a move of a frozen folder
+    /// applies nothing and asks for a scan; changes that do not need the
+    /// table go on, and the table is built when there is room.
+    #[test]
+    fn a_folder_move_with_no_room_for_the_children_table_changes_nothing_and_asks_for_a_scan() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base.clone(), &[map]);
+        live.scratch = Some(no_directory("children"));
+        live.refuse_above = 0;
+        let error = live.ensure_children().unwrap_err();
+        assert!(error.to_string().contains("children table"), "{error}");
+        assert!(
+            live.base_children.get().is_none(),
+            "nothing was built in the heap"
+        );
+        // A frozen folder moves: refused as a whole (nothing half applied).
+        let mut f = initial();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        let r = live.apply(&[change(20, false)], &f);
+        assert_eq!(r.changed, 0);
+        let why = r.rescan.expect("a scan is asked for");
+        assert!(why.starts_with(REASON_NO_CHILDREN), "{why}");
+        assert_eq!(why.kind(), ReasonKind::Disk);
+        assert!(!live.has_changes());
+        assert!(live.base_children.get().is_none());
+        // A file moving needs no table: applied.
+        let mut g = initial();
+        g.set(22, file_info(2), &[(20, "b.txt")]);
+        let r = live.apply(&[change(22, false)], &g);
+        assert!(r.rescan.is_none() && r.changed == 1, "{r:?}");
+        // With room the same folder move goes through.
+        let dir = std::env::temp_dir().join(format!("ferrowd-children-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        live.scratch = Some(dir.clone());
+        // The refusal is remembered for the retry gap (see the test of that
+        // name); the gap has passed.
+        live.children_retry = Duration::ZERO;
+        let r = live.apply(&[change(20, false)], &f);
+        assert!(r.rescan.is_none() && r.changed == 1, "{r:?}");
+        assert!(
+            live.base_children
+                .get()
+                .is_some_and(|(first, _)| first.is_mapped())
+        );
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused children table is remembered: the next change that needs it
+    /// within the retry gap is answered at once, with no pass over the index
+    /// and no file; after the gap it tries again, and a try that works ends
+    /// the refusals.
+    #[test]
+    fn a_refused_children_table_is_not_built_again_within_the_retry_gap() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        live.scratch = Some(no_directory("refused-twice"));
+        live.refuse_above = 0;
+        live.children_retry = Duration::from_millis(400);
+        let builds = |live: &Live| {
+            live.children_builds
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let first = live.ensure_children().unwrap_err().to_string();
+        assert_eq!(builds(&live), 1);
+        // Further refusals, by a direct call or by changes that move a frozen
+        // folder: the same answer, no build.
+        assert_eq!(live.ensure_children().unwrap_err().to_string(), first);
+        let mut f = initial();
+        f.set(20, DIR_INFO, &[(5, "Papers")]);
+        for _ in 0..3 {
+            let r = live.apply(&[change(20, false)], &f);
+            assert_eq!(r.changed, 0);
+            let why = r.rescan.expect("a scan is asked for");
+            assert!(why.starts_with(REASON_NO_CHILDREN), "{why}");
+            assert!(why.contains(&first), "{why}");
+        }
+        assert_eq!(builds(&live), 1, "a refused change builds nothing");
+
+        // After the gap it tries again (and is refused again here) ...
+        std::thread::sleep(Duration::from_millis(450));
+        live.ensure_children().unwrap_err();
+        assert_eq!(builds(&live), 2);
+        // ... and once there is room the table is built and nothing is refused.
+        let dir = std::env::temp_dir().join(format!("ferrowd-retry-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        live.scratch = Some(dir.clone());
+        std::thread::sleep(Duration::from_millis(450));
+        live.ensure_children().unwrap();
+        assert_eq!(builds(&live), 3);
+        assert!(live.base_children.get().is_some());
+        live.ensure_children().unwrap();
+        assert_eq!(builds(&live), 3, "built: nothing more to do");
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A large children table checks the free room (about 8 bytes per entry)
+    /// before the build, so a disk with no room is not read for it.
+    #[test]
+    fn the_children_table_needs_room_for_about_eight_bytes_per_entry() {
+        let n = 27_000_000usize;
+        let need = 8 * n as u64;
+        assert!(children_room(n, Some(need)).is_ok());
+        let error = children_room(n, Some(need - 1)).unwrap_err();
+        assert!(
+            error.contains("205 MiB") && error.contains("children table"),
+            "{error}"
+        );
+        assert!(children_room(n, Some(0)).is_err());
+        // Unknown free space (off Windows): the build goes on and its own file
+        // errors decide.
+        assert!(children_room(n, None).is_ok());
+    }
+
+    /// FR-47 review: the layer a merge makes is built like the one a scan
+    /// makes, so its children table is refused too when there is no file for
+    /// it (it was built in the heap, about 216 MB at 27 M entries).
+    #[test]
+    fn a_merged_layer_refuses_a_large_children_table_when_there_is_no_file() {
+        let (base, map) = fixture();
+        let mut live = Live::new(base, &[map]);
+        live.scratch = Some(no_directory("merged"));
+        live.refuse_above = 0;
+        let mut merged = live.compact().expect("no folder is being read");
+        assert_eq!(merged.scratch, live.scratch);
+        assert_eq!(merged.refuse_above, 0);
+        let error = merged.ensure_children().unwrap_err();
+        assert!(error.to_string().contains("children table"), "{error}");
+        assert!(
+            merged.base_children.get().is_none(),
+            "not built in the heap"
+        );
+        // A merge of the merged layer keeps it as well.
+        let third = merged.compact().expect("no folder is being read");
+        assert!(third.ensure_children().is_err());
+        // With a directory it is built in a file.
+        let dir = std::env::temp_dir().join(format!("ferrowd-merged-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        merged.scratch = Some(dir.clone());
+        merged.children_retry = Duration::ZERO;
+        merged.ensure_children().unwrap();
+        assert!(merged.base_children.get().unwrap().0.is_mapped());
+        drop((merged, third));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Prices `Live::view` (run by hand: `cargo test --release -p ferrowd

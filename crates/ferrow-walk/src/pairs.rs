@@ -154,6 +154,15 @@ impl Pairs {
             && matches!(&self.inner, Inner::Writing(writer) if writer.file.failure().is_some())
     }
 
+    /// Make the file of a map being written fail, as a full disk does (a test
+    /// cannot fill one): a strict map is then [`Pairs::lost`].
+    #[doc(hidden)]
+    pub fn fail_file(&mut self, error: std::io::Error) {
+        if let Inner::Writing(writer) = &mut self.inner {
+            writer.file.fail(error);
+        }
+    }
+
     /// Add a pair (only before [`Pairs::seal`]).
     ///
     /// # Panics
