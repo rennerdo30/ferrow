@@ -274,6 +274,12 @@ pub fn render(h: &Health, json: bool) -> String {
             mb(h.index_mapped_bytes)
         ));
     }
+    if let Some(why) = &h.merge_blocked {
+        out.push_str(&format!(
+            "live changes: not merged into the index: {}\n",
+            p(why)
+        ));
+    }
     out.push_str(&format!(
         "live changes applied: {}; connection errors: {}\n",
         h.live_changes, h.connection_errors

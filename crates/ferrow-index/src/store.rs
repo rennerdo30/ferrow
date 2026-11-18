@@ -297,14 +297,36 @@ pub fn scratch_in_heap() -> u64 {
 
 /// Give `file` `bytes` of real disk space. On NTFS extending a file
 /// allocates it (a full disk fails here); elsewhere a file extended with
-/// `set_len` is sparse, and a write through a map into a block the disk
-/// cannot give stops the process (SIGBUS), so the zeros are written.
-fn reserve(file: &std::fs::File, bytes: u64) -> std::io::Result<()> {
+/// `set_len` is sparse (Linux allocates with `posix_fallocate`; elsewhere
+/// the zeros are written), and a write through a map into a block the disk
+/// cannot give stops the process (SIGBUS): the space is taken first.
+pub(crate) fn reserve(file: &std::fs::File, bytes: u64) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         file.set_len(bytes)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let len = libc::off_t::try_from(bytes).map_err(std::io::Error::other)?;
+        // SAFETY: an open file descriptor; posix_fallocate allocates blocks
+        // and extends the file, or returns an error number.
+        match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
+            0 => Ok(()),
+            // A file system without it: write the zeros instead.
+            libc::EOPNOTSUPP => write_zeros(file, bytes),
+            errno => Err(std::io::Error::from_raw_os_error(errno)),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        write_zeros(file, bytes)
+    }
+}
+
+/// Write `bytes` zeros at the start of `file` (its real disk space).
+#[cfg(not(windows))]
+fn write_zeros(file: &std::fs::File, bytes: u64) -> std::io::Result<()> {
     {
         use std::io::Write;
         let zeros = vec![0u8; 1 << 20];

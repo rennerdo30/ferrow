@@ -118,6 +118,33 @@ impl Drop for Building {
     }
 }
 
+/// Bytes free for this process on the volume holding `dir`.
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0u64;
+        // SAFETY: a NUL-terminated path and a writable count; the other
+        // outputs are optional.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 /// Temporary files a save or build of another process left beside the index
 /// (a crash or a power loss mid-way; a file build's is the size of the index)
 /// are removed once they are this old.
@@ -207,6 +234,28 @@ impl IndexFile {
             path: config.index_path.clone()?,
             config: Arc::new(config.clone()),
         })
+    }
+
+    /// Whether the index file's volume has room for a rebuild of an index
+    /// the size of the current file: the new file, the builder's spilled
+    /// shards (about as large again) and the live tables. `Err` with the
+    /// numbers when it has not; `Ok` when either figure is unknown.
+    pub fn has_room(&self) -> Result<(), String> {
+        let Ok(size) = std::fs::metadata(&self.path).map(|m| m.len()) else {
+            return Ok(());
+        };
+        let Some(free) = self.path.parent().and_then(free_bytes) else {
+            return Ok(());
+        };
+        let needed = size.saturating_mul(5) / 2;
+        if free < needed {
+            return Err(format!(
+                "{} MB free beside the index, a rebuild needs about {} MB",
+                free >> 20,
+                needed >> 20
+            ));
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -473,7 +522,30 @@ impl Drop for Persistence {
 mod tests {
     use super::*;
 
-    /// Tests that start a build hold this: the state they check is global.
+    #[test]
+    fn a_rebuild_fits_when_the_disk_has_room_for_its_files() {
+        let dir = std::env::temp_dir().join(format!("ferrowd-room-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-room-unused"),
+            index_path: Some(dir.join("index.bin")),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let file = IndexFile::new(&config).unwrap();
+        assert!(file.has_room().is_ok(), "no index yet: nothing to judge");
+        std::fs::write(dir.join("index.bin"), vec![0u8; 4096]).unwrap();
+        assert!(file.has_room().is_ok(), "4 KiB fits");
+        if cfg!(windows) {
+            assert!(free_bytes(&dir).is_some_and(|free| free > 0));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tests that start a build or take the save lock hold this: the state
+    /// they check is global.
     static BUILDING_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -555,6 +627,7 @@ mod tests {
 
     #[test]
     fn a_new_index_is_saved_and_read_back_from_its_file() {
+        let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ferrowd-save-map-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("index.bin");
@@ -591,6 +664,7 @@ mod tests {
 
     #[test]
     fn a_build_into_the_index_file_replaces_it_and_leaves_the_save_lock_free() {
+        let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ferrowd-build-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("state").join("index.bin");
@@ -610,11 +684,7 @@ mod tests {
             .is_none()
         );
         // The state directory does not exist yet: preparing it creates it.
-        let _building = {
-            let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
-            file.prepare().unwrap()
-        };
-        drop(_building);
+        drop(file.prepare().unwrap());
 
         let build = |entries: usize| {
             let b = ferrow_index::IndexBuilder::with_spill(

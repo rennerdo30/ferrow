@@ -418,6 +418,9 @@ pub struct Maintenance {
     duty_earliest: Instant,
     /// Since when the delta has been past its hard limit (without a break).
     urgent_since: Option<Instant>,
+    /// After a merge failed (its file could not be written: a full disk), no
+    /// merge starts before this, urgent or prompt alike.
+    blocked_until: Option<Instant>,
     /// Since when entries have been hidden by a large folder move: they
     /// wait for folder reads and saves no longer than an overgrown delta.
     prompt_since: Option<Instant>,
@@ -433,6 +436,7 @@ impl Maintenance {
             duty_earliest: now,
             urgent_since: None,
             prompt_since: None,
+            blocked_until: None,
         }
     }
 
@@ -514,6 +518,9 @@ impl Maintenance {
         if let Some(why) = self.rescan.due(now, load.urgent) {
             return Some(Due::Rescan(why));
         }
+        if self.blocked_until.is_some_and(|until| now < until) {
+            return None;
+        }
         if (self.rescan.pending().is_some() && !load.prompt)
             || self.compact.is_none()
             || !(load.urgent
@@ -543,9 +550,21 @@ impl Maintenance {
         self.compact.take().map(Due::Compact)
     }
 
+    /// A compaction failed at `now` (its file could not be written): none
+    /// starts again for `gap`, whatever the delta's size or hidden entries
+    /// (retrying at once would only fail again, at full cost). The request
+    /// stays: it runs when the gap ends.
+    pub fn failed(&mut self, now: Instant, gap: Duration, reason: String) {
+        self.blocked_until = Some(now + gap.max(MIN_COMPACT_GAP));
+        self.compact.get_or_insert(reason);
+        self.urgent_since = None;
+        self.prompt_since = None;
+    }
+
     /// A compaction that took `took` ended at `now`: the next waits for its
     /// share of the time.
     pub fn compacted(&mut self, now: Instant, took: Duration) {
+        self.blocked_until = None;
         let gap = (took * COMPACT_DUTY).clamp(MIN_COMPACT_GAP, MAX_COMPACT_GAP);
         self.compact_earliest = now + gap;
         self.duty_earliest = now + (took * COMPACT_DUTY).min(MAX_COMPACT_GAP);
@@ -579,6 +598,12 @@ impl Maintenance {
                 }
             })
             .flatten();
+        // While blocked after a failure, the end of the block is the
+        // earliest a merge can start.
+        let compact = match (compact, self.blocked_until) {
+            (Some(at), Some(until)) if until > at => Some(until),
+            (other, _) => other,
+        };
         [self.rescan.wake_at(), compact].into_iter().flatten().min()
     }
 }
@@ -4804,6 +4829,39 @@ mod tests {
         drop(now);
         drop(base);
         assert!(weak_old.upgrade().is_none(), "the old index is freed");
+    }
+
+    #[test]
+    fn a_failed_merge_blocks_every_merge_for_its_gap() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut m = Maintenance::after_scan(t0, s(60));
+        let prompt = Load {
+            prompt: true,
+            ..Load::default()
+        };
+        let urgent = Load::of(1000, 10, false, false);
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert!(matches!(m.due(t0, prompt), Some(Due::Compact(_))));
+        // It failed after 1 ms: neither hidden entries nor an overgrown
+        // delta start another before the gap ends.
+        let t1 = t0 + Duration::from_millis(1);
+        m.failed(t1, s(900), REASON_LARGE_MOVE.into());
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        for load in [prompt, urgent] {
+            assert_eq!(m.due(t1 + Duration::from_millis(10), load), None);
+            assert_eq!(m.due(t1 + s(899), load), None);
+            assert_eq!(
+                m.wake_at(t1 + s(1), load),
+                Some(t1 + s(900)),
+                "no busy wake"
+            );
+        }
+        assert!(matches!(m.due(t1 + s(900), prompt), Some(Due::Compact(_))));
+        // A success lifts the block.
+        m.compacted(t1 + s(901), s(1));
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert!(matches!(m.due(t1 + s(902), urgent), Some(Due::Compact(_))));
     }
 
     #[test]

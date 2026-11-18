@@ -76,6 +76,9 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
         ));
     }
     rows.push(("Items", service::items_text(h.entries), None));
+    if let Some(why) = &h.merge_blocked {
+        rows.push(("Merging changes", why.clone(), Some(Level::Caution)));
+    }
     if h.connection_errors > 0 {
         rows.push((
             "Connection errors",
