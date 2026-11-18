@@ -43,7 +43,16 @@
 //!    journal refresh (`FERROW-MEMORY-TIMING round=forgotten`),
 //! 10. the merge of the live changes into a new index (`compact`), in the heap
 //!     (`Live::compact`) and into the index file (`Live::compact_into`), each
-//!     with its peak.
+//!     with its peak,
+//! 11. the steady state and the restart (`steady_and_restart`): the heap
+//!     builds are dropped and the private bytes left are printed as
+//!     `FERROW-MEMORY-STEADY phase=mapped`; the live tables are saved, all is
+//!     dropped, and the index and tables are mapped and the live layer
+//!     restored as at the service's start (`restart.load` peak,
+//!     `FERROW-MEMORY-STEADY phase=restarted`).
+//!
+//! `scripts/memory-gate.py` reads this output in CI (the Windows job, 5 M
+//! entries) and fails when a phase is over its limit: ADR 0007, step 7.
 //!
 //! Assumptions are printed as `FERROW-MEMORY-CONFIG`: free-record share,
 //! hard-link share, change mix and count. Change them with the environment
@@ -829,7 +838,7 @@ fn forgotten_round(n: usize) {
 ///
 /// What the files hold is reported as `FERROW-MEMORY-FILES` lines: it is file
 /// cache, not private memory, so it is not in the peaks.
-fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
+fn bounded_round(n: usize, report: &mut Report, reference: &Index) -> Bounded {
     let round = "bounded";
     let dir = std::env::temp_dir().join(format!("ferrow-memory-bounded-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("bounded build directory");
@@ -1034,7 +1043,117 @@ fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
     );
     let live_parts = live.breakdown(None, 0).parts;
     report.show(&format!("{round}.live"), live_parts);
+    Bounded {
+        live,
+        base,
+        dir,
+        facts,
+    }
+}
+
+/// What the bounded build leaves in the service's hands: the live layer over
+/// the index file, held until the end so the steady state and the restart
+/// can be measured after the heap builds are gone.
+struct Bounded {
+    live: Live,
+    base: Arc<Index>,
+    dir: std::path::PathBuf,
+    facts: [ferrowd::saved::VolumeFacts; 1],
+}
+
+/// The steady state and the restart, which the CI memory gate reads
+/// (`scripts/memory-gate.py`).
+///
+/// `bounded_round` ends with the live layer over its index file, but the heap
+/// builds before it are still held, so the process counters there say nothing
+/// about the service's own steady state. Here the heap builds are dropped
+/// first and the private bytes that remain are measured: the bounded build's
+/// result, as the service holds it after a scan (`FERROW-MEMORY-STEADY
+/// phase=mapped`).
+///
+/// Then the restart (ADR 0007 decision 5): the live tables are saved beside
+/// the index, everything is dropped, and the index and the tables are mapped
+/// again and a live layer is restored from them, as `try_restore` does at
+/// start. Its peak (`FERROW-MEMORY-PEAK phase=restart.load`) and the private
+/// bytes afterwards (`FERROW-MEMORY-STEADY phase=restarted`) are what a
+/// restart costs; the saved tables are read through maps, so both are small.
+fn steady_and_restart(held: Bounded, report: &mut Report) {
+    let Bounded {
+        live,
+        base,
+        dir,
+        facts,
+    } = held;
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let steady = |report: &Report, phase: &str, live: &Live| {
+        let _ = memory::release_free_heap();
+        let now = memory::process_with_heap();
+        let private = now.bytes();
+        let grown = private.saturating_sub(report.baseline);
+        println!(
+            "FERROW-MEMORY-STEADY phase={phase} entries={} private_bytes={private} baseline_bytes={} growth_bytes={grown} growth_per_entry={:.3} mapped_bytes={} note=private bytes after the heap builds are dropped; the mapped files are file cache, not private bytes",
+            report.entries,
+            report.baseline,
+            grown as f64 / report.entries as f64,
+            live.mapped_bytes() + live.base().mapped_bytes(),
+        );
+    };
+    report.show("steady.mapped", live.breakdown(None, 0).parts);
+    steady(report, "mapped", &live);
+
+    // Save the live tables beside the index.
+    let index_path = dir.join("index.bin");
+    let tables_path = ferrowd::saved::path_beside(&index_path);
+    let checksum = base.file_checksum().expect("a mapped file has a checksum");
+    let fingerprint = ferrowd::saved::fingerprint(&[b"memory_breakdown"]);
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    ferrowd::saved::write(&tables_path, &live.saved_ref(checksum, fingerprint, &facts))
+        .expect("save the live tables");
+    println!(
+        "FERROW-MEMORY-TIMING round=restart step=save_tables ms={:.1} file_bytes={}",
+        ms(started.elapsed()),
+        std::fs::metadata(&tables_path).map_or(0, |m| m.len())
+    );
+    report.peak(
+        "restart.save_tables",
+        before,
+        memory::process().peak,
+        "the live tables streamed to live.bin; peak since this phase began",
+    );
     drop((live, base));
+
+    // The restart: map both files, restore the live layer.
+    let _ = memory::release_free_heap();
+    let before = memory::process().bytes();
+    memory::reset_peak();
+    let started = Instant::now();
+    let base = Arc::new(Index::load(&index_path).expect("map the saved index"));
+    assert!(base.is_mapped(), "a current file is mapped");
+    let saved = ferrowd::saved::read(
+        &tables_path,
+        base.file_checksum().expect("checksum"),
+        base.len(),
+        fingerprint,
+    )
+    .expect("the saved tables belong to the index");
+    let live = Live::restore(base, saved);
+    println!(
+        "FERROW-MEMORY-TIMING round=restart step=load ms={:.1} entries={}",
+        ms(started.elapsed()),
+        live.base().len()
+    );
+    report.peak(
+        "restart.load",
+        before,
+        memory::process().peak,
+        "index and live tables mapped, checksums read through the maps, live layer restored; peak since this phase began",
+    );
+    report.show("restarted.live", live.breakdown(None, 0).parts);
+    steady(report, "restarted", &live);
+    drop(live);
+
     let left: Vec<_> = std::fs::read_dir(&dir)
         .expect("bounded build directory")
         .filter_map(|e| e.ok())
@@ -1242,9 +1361,13 @@ fn main() {
     }
 
     // The bounded build, against the heap build of the same stream.
-    bounded_round(n, &mut report, two.live.base());
+    let bounded = bounded_round(n, &mut report, two.live.base());
     forgotten_round(n);
     compaction_round(&mut two.live, &mut report);
+    // The heap builds are gone: what is left is the service's steady state,
+    // then its restart from the saved files (the CI memory gate reads both).
+    drop(two);
+    steady_and_restart(bounded, &mut report);
 
     // The result: the table to read.
     println!("FERROW-MEMORY-DONE");
@@ -1273,6 +1396,5 @@ fn main() {
         file.write_all(summary.as_bytes()).expect("summary write");
     }
     println!("{summary}");
-    drop(two);
     let _ = std::fs::remove_file(&path);
 }
