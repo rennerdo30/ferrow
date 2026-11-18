@@ -173,7 +173,7 @@ impl Write for At<'_> {
 /// An anonymous temporary file in `dir`: it is gone when its handle closes,
 /// whatever ends the process (deleted on close on Windows, unlinked at once
 /// on Unix), so a failed or killed build leaves nothing behind.
-fn create_spill_file(dir: &Path) -> io::Result<File> {
+pub(crate) fn create_spill_file(dir: &Path) -> io::Result<File> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     for _ in 0..100 {
@@ -876,6 +876,7 @@ impl IndexBuilder {
         }
         let index = crate::persist::index_from_own_map(&mapped)
             .map_err(|e| SaveError::Io(io::Error::other(e.to_string())))?;
+        index.use_scratch_beside(target.path);
         timings.replace = t.elapsed();
         timings.total = started.elapsed();
         timings.entries = n;

@@ -270,6 +270,14 @@ impl Index {
 
     /// Whether the columns are read from the saved file (it is on disk
     /// already: saving it again would write the same bytes).
+    /// Prepare sort orders in temporary files beside `path` (the file this
+    /// index is read from) instead of the heap.
+    pub(crate) fn use_scratch_beside(&self, path: &std::path::Path) {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            self.metadata.set_scratch_dir(dir);
+        }
+    }
+
     pub fn is_mapped(&self) -> bool {
         self.parent.is_mapped()
     }

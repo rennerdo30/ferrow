@@ -206,6 +206,81 @@ impl<T: Plain + fmt::Debug> fmt::Debug for Col<T> {
     }
 }
 
+/// A writable buffer of plain values: an anonymous temporary file in a
+/// directory, mapped (file cache, not private memory; ADR 0007), or the
+/// heap when there is no directory or the file cannot be made. Frozen into
+/// a read-only [`Col`] when filled.
+pub(crate) enum Scratch<T: Plain> {
+    Heap(Vec<T>),
+    Mapped {
+        map: memmap2::MmapMut,
+        len: usize,
+        // Kept open while mapped: on Windows the file is deleted on close.
+        _file: std::fs::File,
+    },
+}
+
+impl<T: Plain> Scratch<T> {
+    /// `len` zeroed values, in a temporary file in `dir` when given.
+    pub(crate) fn zeroed(len: usize, dir: Option<&std::path::Path>) -> Scratch<T> {
+        let mapped = dir.filter(|_| len > 0).and_then(|dir| {
+            let bytes = len.checked_mul(size_of::<T>())?;
+            let file = crate::build::create_spill_file(dir).ok()?;
+            file.set_len(bytes as u64).ok()?;
+            // SAFETY: an anonymous file of this process, sized above; no
+            // one else opens it (it has no name on Unix, and is opened
+            // without sharing and deleted on close on Windows).
+            let map = unsafe { memmap2::MmapMut::map_mut(&file) }.ok()?;
+            Some(Scratch::Mapped {
+                map,
+                len,
+                _file: file,
+            })
+        });
+        mapped.unwrap_or_else(|| Scratch::Heap(vec![zero(); len]))
+    }
+
+    /// Whether the values are in a temporary file.
+    #[cfg(test)]
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self, Scratch::Mapped { .. })
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        match self {
+            Scratch::Heap(v) => v,
+            // SAFETY: the map is page-aligned and `len` values long (sized
+            // in `zeroed`); `T: Plain` accepts any bytes; the borrow is
+            // exclusive through `&mut self`.
+            Scratch::Mapped { map, len, .. } => unsafe {
+                std::slice::from_raw_parts_mut(map.as_mut_ptr().cast::<T>(), *len)
+            },
+        }
+    }
+
+    /// The filled values, read-only.
+    pub(crate) fn freeze(self) -> Col<T> {
+        match self {
+            Scratch::Heap(v) => v.into(),
+            Scratch::Mapped { map, len, _file } => match map.make_read_only() {
+                Ok(map) => {
+                    // The section keeps the file's data while mapped, also
+                    // once its handle is closed.
+                    drop(_file);
+                    let map = Arc::new(map);
+                    Col::mapped(&map, 0, len).expect("a page-aligned map of len values")
+                }
+                Err(_) => unreachable!("make_read_only of an owned map"),
+            },
+        }
+    }
+}
+
+fn zero<T: Plain>() -> T {
+    // SAFETY: `T: Plain` accepts any bytes, zero included.
+    unsafe { std::mem::zeroed() }
+}
+
 /// Open `path` and map it read-only. On Windows the handle allows delete
 /// sharing (and nothing else beyond reading): a save may then rename a new
 /// file over this one while the map keeps serving the old contents, and no
@@ -231,6 +306,29 @@ pub fn map_file(path: &std::path::Path) -> std::io::Result<Arc<Mmap>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scratch_buffer_lives_in_a_temporary_file_and_leaves_nothing() {
+        let dir = std::env::temp_dir().join(format!("ferrow-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut buf = Scratch::<u32>::zeroed(100_000, Some(&dir));
+        assert!(buf.is_mapped());
+        for (i, v) in buf.as_mut_slice().iter_mut().enumerate() {
+            *v = i as u32 * 3;
+        }
+        let col = buf.freeze();
+        assert!(col.is_mapped());
+        assert_eq!((col.len(), col[99_999]), (100_000, 299_997));
+        assert_eq!(col.heap_bytes(), 0);
+        drop(col);
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left, 0, "the temporary file is gone");
+        // Without a directory: the heap.
+        let heap = Scratch::<u8>::zeroed(10, None);
+        assert!(!heap.is_mapped());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_owned_column_reads_its_vector_after_it_grows() {
