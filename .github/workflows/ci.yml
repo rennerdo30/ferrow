@@ -594,8 +594,12 @@ jobs:
         run: |
           git rev-parse HEAD
           FERROW_BENCH_ENTRIES=20000 FERROW_MEMORY_CHANGES=500 timeout -k 5s 120s target/release/examples/memory_breakdown > /dev/null
-          FERROW_BENCH_ENTRIES=1000000 timeout -k 10s 600s target/release/examples/memory_breakdown 2>&1 | tee memory-breakdown-windows-1m-output.txt > /dev/null
-          FERROW_MEMORY_SUMMARY="$GITHUB_STEP_SUMMARY" timeout -k 10s 1200s target/release/examples/memory_breakdown 2>&1 | tee memory-breakdown-windows-output.txt
+          for i in 1 2 3 4 5; do
+            FERROW_BENCH_ENTRIES=1000000 timeout -k 10s 600s target/release/examples/memory_breakdown > memory-breakdown-windows-1m-$i.txt 2>&1
+            timeout -k 10s 1200s target/release/examples/memory_breakdown > memory-breakdown-windows-5m-$i.txt 2>&1
+          done
+          cp memory-breakdown-windows-1m-1.txt memory-breakdown-windows-1m-output.txt
+          cp memory-breakdown-windows-5m-1.txt memory-breakdown-windows-output.txt
       # The gate: the limits per phase (scan, steady state, compaction,
       # restart) and their extrapolation to the owner's 27.2 M entry PC are
       # in scripts/memory-gate.py. It runs after the measurement, so the
@@ -610,6 +614,8 @@ jobs:
           path: |
             memory-breakdown-windows-output.txt
             memory-breakdown-windows-1m-output.txt
+            memory-breakdown-windows-1m-?.txt
+            memory-breakdown-windows-5m-?.txt
             memory-gate-windows-output.txt
             delta-limit-windows-output.txt
           if-no-files-found: warn
