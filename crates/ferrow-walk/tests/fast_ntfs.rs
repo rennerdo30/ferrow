@@ -10,9 +10,10 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use ferrow_index::{ColumnSet, Index};
-use ferrow_walk::{NtfsMode, WalkOptions, scan, scan_with_maps};
+use ferrow_index::{ColumnSet, FileTarget, Index};
+use ferrow_walk::{NtfsMode, WalkOptions, scan, scan_with_maps, scan_with_maps_to_file};
 use support::Fixture;
 
 fn entries(index: &Index) -> BTreeMap<String, (u16, Option<u64>, Option<i64>)> {
@@ -27,9 +28,9 @@ fn entries(index: &Index) -> BTreeMap<String, (u16, Option<u64>, Option<i64>)> {
         .collect()
 }
 
-#[test]
-fn fast_ntfs_matches_the_walk() {
-    let mut fx = Fixture::new("fast-ntfs");
+/// A tree with nested folders, a big file, a hard link, a hidden file, a
+/// junction, a Unicode name and two excludes (a folder and a file).
+fn populate(fx: &mut Fixture) {
     let root = fx.path.clone();
     std::fs::create_dir_all(root.join("Docs/Deep/Deeper")).unwrap();
     std::fs::create_dir_all(root.join("excluded/inner")).unwrap();
@@ -49,16 +50,26 @@ fn fast_ntfs_matches_the_walk() {
         .unwrap();
     assert!(status.success());
     fx.junction(&root.join("Docs"), &root.join("docs-junction"));
+}
 
-    let options = |ntfs| WalkOptions {
-        roots: vec![root.clone()],
+fn options(root: &Path, ntfs: NtfsMode) -> WalkOptions {
+    WalkOptions {
+        roots: vec![root.to_path_buf()],
         excludes: vec![root.join("excluded"), root.join("skip-me.txt")],
         columns: ColumnSet::DEFAULT,
         follow_symlinks: false,
         ntfs,
-    };
-    let (walked, walk_report) = scan(&options(NtfsMode::Off));
-    let (fast, fast_report, maps) = scan_with_maps(&options(NtfsMode::AllRoots));
+    }
+}
+
+#[test]
+fn fast_ntfs_matches_the_walk() {
+    let mut fx = Fixture::new("fast-ntfs");
+    let root = fx.path.clone();
+    populate(&mut fx);
+
+    let (walked, walk_report) = scan(&options(&root, NtfsMode::Off));
+    let (fast, fast_report, maps) = scan_with_maps(&options(&root, NtfsMode::AllRoots));
     assert_eq!(walk_report.errors, 0, "{walk_report:?}");
     assert_eq!(fast_report.errors, 0, "{fast_report:?}");
     eprintln!("fast path: {}", fast_report.mode);
@@ -81,12 +92,15 @@ fn fast_ntfs_matches_the_walk() {
             map.entries
                 .iter()
                 .find(|(_, id)| fast.path(*id).ends_with(name))
-                .map(|(r, _)| *r)
+                .map(|(r, _)| r)
                 .unwrap()
         };
         assert_eq!(record_of("report.txt"), record_of("report-link.txt"));
         assert_ne!(record_of("report.txt"), record_of("tiny.bin"));
         assert_eq!(map.excluded.len(), 2);
+        // The heap read keeps nothing in temporary files.
+        assert_eq!(fast_report.index_file.read_file_bytes, 0);
+        assert_eq!(map.file_bytes(), 0);
     } else {
         assert!(maps.is_empty());
     }
@@ -99,4 +113,63 @@ fn fast_ntfs_matches_the_walk() {
             .any(|p| p.contains("secret") || p.ends_with("skip-me.txt"))
     );
     assert_eq!(fast, walked);
+}
+
+/// The scan the service makes (ADR 0007 steps 8 and 9): the MFT read keeps its
+/// tables and the record map in temporary files beside the index, and the
+/// result is the heap scan's entries and record map.
+#[test]
+fn fast_ntfs_into_a_file_matches_the_heap_scan() {
+    let mut fx = Fixture::new("fast-ntfs-file");
+    let root = fx.path.clone();
+    populate(&mut fx);
+    let state = std::env::temp_dir().join(format!("ferrow-fast-ntfs-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state).unwrap();
+    let path = state.join("index.bin");
+
+    let (heap, heap_report, heap_maps) = scan_with_maps(&options(&root, NtfsMode::AllRoots));
+    let (index, report, maps) = scan_with_maps_to_file(
+        &options(&root, NtfsMode::AllRoots),
+        &FileTarget {
+            path: &path,
+            lock: None,
+        },
+    );
+    assert_eq!(report.errors, 0, "{report:?}");
+    assert!(report.fatal_error.is_none());
+    assert!(report.index_file.error.is_none(), "{:?}", report.index_file);
+    eprintln!("file scan: {}", report.mode);
+    assert_eq!(entries(&index), entries(&heap));
+    assert_eq!(report.entries, heap_report.entries);
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        assert!(report.mode.starts_with("mft "), "{}", report.mode);
+        assert!(
+            report.mode.contains("tables in temporary files"),
+            "the read used files: {}",
+            report.mode
+        );
+        assert!(report.index_file.read_file_bytes > 0);
+        assert_eq!(report.index_file.read_spill_failure, None);
+        assert_eq!((maps.len(), heap_maps.len()), (1, 1));
+        let (map, heap_map) = (&maps[0], &heap_maps[0]);
+        assert!(map.file_bytes() > 0, "the record map is in a file");
+        // Same pairs in the same order as the heap scan's (the ids follow the
+        // emission order, which the file-backed tables do not change).
+        assert_eq!(map.entries, heap_map.entries);
+        assert_eq!(map.roots, heap_map.roots);
+        assert_eq!(map.excluded, heap_map.excluded);
+        assert_eq!(map.serial, heap_map.serial);
+        assert!(map.journal.is_some());
+    } else {
+        assert!(maps.is_empty());
+    }
+    drop((index, maps));
+    let left: Vec<_> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".ferrow-"))
+        .collect();
+    assert!(left.is_empty(), "temporary files left behind: {left:?}");
+    let _ = std::fs::remove_dir_all(&state);
 }

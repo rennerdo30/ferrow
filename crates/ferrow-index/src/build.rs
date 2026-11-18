@@ -33,7 +33,9 @@ use rayon::prelude::*;
 
 use crate::metadata::{ColumnSet, FileMeta, ShardMeta, payload_len};
 use crate::persist::{CHECKSUM_START, HEADER_LEN, MAGIC, VERSION, expected_len, sorted_pad};
-use crate::store::{self, Plain, as_bytes, as_bytes_mut, cast_mut};
+use crate::store::{
+    self, Plain, as_bytes, as_bytes_mut, cast_mut, create_temp_file, read_at, write_at,
+};
 use crate::{Index, IndexBuilder, SHARDS, SaveError, Shard};
 
 /// The default private-memory budget of the shards of a spilling builder
@@ -103,50 +105,6 @@ fn other(what: &str) -> SaveError {
     SaveError::Io(io::Error::other(what.to_string()))
 }
 
-/// Positional file I/O: no shared cursor, so a read never disturbs a write.
-#[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-#[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.write_all_at(buf, offset)
-}
-#[cfg(windows)]
-fn read_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        match file.seek_read(buf, offset) {
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => {
-                buf = &mut buf[n..];
-                offset += n as u64;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-#[cfg(windows)]
-fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        match file.seek_write(buf, offset) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) => {
-                buf = &buf[n..];
-                offset += n as u64;
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
 /// A cursor over a file by position, as `Read` and `Write`.
 struct At<'a> {
     file: &'a File,
@@ -168,50 +126,6 @@ impl Write for At<'_> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-}
-
-/// An anonymous temporary file in `dir`: it is gone when its handle closes,
-/// whatever ends the process (deleted on close on Windows, unlinked at once
-/// on Unix), so a failed or killed build leaves nothing behind.
-fn create_spill_file(dir: &Path) -> io::Result<File> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    for _ in 0..100 {
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(".ferrow-spill-{pid}-{seq}.tmp"));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const GENERIC_READ: u32 = 0x8000_0000;
-            const GENERIC_WRITE: u32 = 0x4000_0000;
-            const DELETE: u32 = 0x0001_0000;
-            const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
-            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-            opts.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-                .attributes(FILE_ATTRIBUTE_TEMPORARY)
-                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
-        }
-        match opts.open(&path) {
-            Ok(file) => {
-                #[cfg(unix)]
-                std::fs::remove_file(&path)?;
-                return Ok(file);
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not create a unique temporary spill file",
-    ))
 }
 
 /// Bytes a builder keeps for one entry, besides its name, in its shard:
@@ -394,7 +308,7 @@ impl Spill {
     fn try_write(&self, idx: usize, shard: &Shard) -> io::Result<()> {
         let mut spill = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
         if spill.file.is_none() {
-            spill.file = Some(create_spill_file(&self.dir)?);
+            spill.file = Some(create_temp_file(&self.dir)?);
         }
         let at = spill.end;
         let end = {

@@ -21,10 +21,12 @@ use ferrow_index::{
 
 mod identity;
 pub mod ntfs;
+mod pairs;
 pub mod priority;
 pub mod subtree;
 
 use identity::{FileId, file_id};
+pub use pairs::{Pairs, PairsIter};
 
 /// What to scan.
 #[derive(Debug, Clone, Default)]
@@ -92,6 +94,13 @@ pub struct IndexFileReport {
     pub spill_failure: Option<String>,
     /// The file build failed and the index was built in the heap instead.
     pub error: Option<String>,
+    /// Bytes of temporary files the MFT read held at its largest (the parsed
+    /// volume's tables and the record map, ADR 0007 step 9); 0 when the read
+    /// kept them in the heap.
+    pub read_file_bytes: u64,
+    /// The first reason an MFT read kept a table in the heap or read again in
+    /// the heap although temporary files were wanted (correct, larger).
+    pub read_spill_failure: Option<String>,
 }
 
 impl ScanReport {
@@ -698,8 +707,9 @@ pub struct VolumeMap {
     pub record_size: usize,
     /// `(record number, entry id)` for every entry from this volume,
     /// including root entries. A record with several names (hard links)
-    /// appears once per name.
-    pub entries: Vec<(u64, u32)>,
+    /// appears once per name. A scan that builds into the index file keeps
+    /// them in a temporary file (see [`Pairs`]).
+    pub entries: Pairs,
     /// Record numbers of excluded files and directories on this volume.
     pub excluded: Vec<u64>,
     /// Root entries filled from this volume: `(root record, entry id)`.
@@ -710,9 +720,15 @@ impl VolumeMap {
     /// Heap held by the map, by capacity (memory accounting).
     pub fn heap_bytes(&self) -> usize {
         self.device.capacity()
-            + self.entries.capacity() * size_of::<(u64, u32)>()
+            + self.entries.heap_bytes()
             + self.excluded.capacity() * size_of::<u64>()
             + self.roots.capacity() * size_of::<(u64, u32)>()
+    }
+
+    /// Bytes of the record map that live in a temporary file (file cache, not
+    /// private memory).
+    pub fn file_bytes(&self) -> usize {
+        self.entries.file_bytes()
     }
 }
 
@@ -757,12 +773,14 @@ fn scan_inner(
     target: Option<&FileTarget<'_>>,
 ) -> (Index, ScanReport, Vec<VolumeMap>) {
     let started = Instant::now();
-    let builder = match target {
-        Some(target) => {
-            let dir = match target.path.parent() {
-                Some(dir) if !dir.as_os_str().is_empty() => dir,
-                _ => Path::new("."),
-            };
+    // Beside the index file: the shards of the builder and (on Windows) the
+    // tables of the MFT read spill to temporary files there.
+    let spill_dir: Option<&Path> = target.map(|target| match target.path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    });
+    let builder = match spill_dir {
+        Some(dir) => {
             IndexBuilder::with_spill(options.columns, dir, ferrow_index::DEFAULT_SPILL_BUDGET)
         }
         None => IndexBuilder::with_columns(options.columns),
@@ -893,6 +911,8 @@ fn scan_inner(
     let mut maps: Vec<VolumeMap> = Vec::new();
     #[allow(unused_mut, reason = "only filled on Windows")]
     let mut fast_read_errors: Vec<(PathBuf, String)> = Vec::new();
+    #[allow(unused_mut, reason = "only filled on Windows")]
+    let mut read_spill = ReadSpill::default();
     #[cfg(windows)]
     let root_dirs = if options.follow_symlinks || options.ntfs == NtfsMode::Off {
         root_dirs
@@ -900,7 +920,17 @@ fn scan_inner(
         let (mft, walk): (Vec<_>, Vec<_>) = root_dirs
             .into_iter()
             .partition(|(dir, _, _)| options.ntfs == NtfsMode::AllRoots || is_volume_root(dir));
-        let mut rest = scan_from_mft(mft, &walker, &mut modes, &mut maps, &mut fast_read_errors);
+        let mut rest = scan_from_mft(
+            mft,
+            &walker,
+            spill_dir,
+            &mut ScanOutput {
+                modes: &mut modes,
+                maps: &mut maps,
+                read_errors: &mut fast_read_errors,
+                spill: &mut read_spill,
+            },
+        );
         rest.extend(walk);
         rest
     };
@@ -925,7 +955,7 @@ fn scan_inner(
     });
 
     let entries = builder.len();
-    let (index, index_file, fatal_error) = match freeze_builder(builder, target) {
+    let (index, mut index_file, fatal_error) = match freeze_builder(builder, target) {
         Ok((index, report)) => (index, report, None),
         Err(fatal) => (
             IndexBuilder::with_columns(options.columns).freeze(),
@@ -933,6 +963,8 @@ fn scan_inner(
             Some(fatal),
         ),
     };
+    index_file.read_file_bytes = read_spill.file_bytes;
+    index_file.read_spill_failure = read_spill.failure;
     if modes.is_empty() {
         modes.push("parallel read_dir".to_string());
     }
@@ -973,6 +1005,7 @@ pub fn freeze_builder(
                 timings: Some(timings),
                 spill_failure,
                 error: None,
+                ..IndexFileReport::default()
             },
         )),
         Err(failed) => {
@@ -980,6 +1013,7 @@ pub fn freeze_builder(
                 timings: None,
                 spill_failure: spill_failure.or_else(|| failed.builder.spill_failure()),
                 error: Some(failed.error.to_string()),
+                ..IndexFileReport::default()
             };
             failed
                 .builder
@@ -990,30 +1024,67 @@ pub fn freeze_builder(
     }
 }
 
+/// What the MFT reads of a scan kept in temporary files (see
+/// [`IndexFileReport::read_file_bytes`]).
+#[derive(Default)]
+struct ReadSpill {
+    file_bytes: u64,
+    failure: Option<String>,
+}
+
+impl ReadSpill {
+    /// Remember the first reason a table stayed in the heap.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn failed(&mut self, why: &str) {
+        self.failure.get_or_insert_with(|| why.to_string());
+    }
+}
+
+/// Where [`scan_from_mft`] reports to.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct ScanOutput<'a> {
+    modes: &'a mut Vec<String>,
+    maps: &'a mut Vec<VolumeMap>,
+    read_errors: &'a mut Vec<(PathBuf, String)>,
+    spill: &'a mut ReadSpill,
+}
+
 /// Fill every root on a readable NTFS volume from its MFT (one read per
-/// volume) and return the roots that still need the directory walk.
+/// volume) and return the roots that still need the directory walk. With
+/// `spill_dir` the parsed volume's tables and the record map live in
+/// temporary files there (ADR 0007 step 9), so the read's private memory does
+/// not grow with the number of entries.
 #[cfg(windows)]
 fn scan_from_mft(
     root_dirs: Vec<(PathBuf, u32, Option<FileId>)>,
     walker: &Walker<'_>,
-    modes: &mut Vec<String>,
-    maps: &mut Vec<VolumeMap>,
-    read_errors: &mut Vec<(PathBuf, String)>,
+    spill_dir: Option<&Path>,
+    out: &mut ScanOutput<'_>,
 ) -> Vec<(PathBuf, u32, Option<FileId>)> {
     let mut pending: Vec<(PathBuf, u32, Option<FileId>)> = root_dirs;
     let mut walk = Vec::new();
     while let Some((dir, id, identity)) = pending.pop() {
         let started = Instant::now();
-        let (device, volume) = match ntfs::read_volume(&dir) {
+        let (device, volume) = match ntfs::read_volume_in(&dir, spill_dir) {
             Ok(v) => v,
             Err(reason) => {
-                modes.push(format!("walk {} ({reason})", dir.display()));
-                read_errors.push((dir.clone(), reason));
+                out.modes.push(format!("walk {} ({reason})", dir.display()));
+                out.read_errors.push((dir.clone(), reason));
                 walk.push((dir, id, identity));
                 continue;
             }
         };
         let read = started.elapsed();
+        if let Some(note) = &volume.spill_note {
+            out.spill.failed(note);
+        }
+        // What earlier volumes' record maps keep in files stays while this
+        // volume's tables are in them.
+        let held_files = out.maps.iter().map(VolumeMap::file_bytes).sum::<usize>();
+        out.spill.file_bytes = out
+            .spill
+            .file_bytes
+            .max((held_files + volume.mapped_bytes()) as u64);
         // Every other pending root on the same volume reuses this read.
         let mut here = vec![(dir, id, identity)];
         let mut rest = Vec::new();
@@ -1040,8 +1111,15 @@ fn scan_from_mft(
                 .filter(|id| id.kind == 1 && id.volume == volume.serial)
                 .map(|id| (id.id as u64) & 0x0000_FFFF_FFFF_FFFF)
                 .collect(),
+            entries: match spill_dir {
+                Some(dir) => Pairs::spilling(dir),
+                None => Pairs::new(),
+            },
             ..VolumeMap::default()
         };
+        if let Some(note) = map.entries.note() {
+            out.spill.failed(note);
+        }
         for (dir, id, identity) in here {
             let identity = match identity.map(Ok).unwrap_or_else(|| file_id(&dir)) {
                 Ok(identity) => identity,
@@ -1061,24 +1139,48 @@ fn scan_from_mft(
                 continue;
             }
             map.roots.push((record, id));
-            map.entries.push((record, id));
+            map.entries.push(record, id);
             if record == ntfs::ROOT_RECORD {
                 reserve_for_volume(walker.builder, &volume, &mut map.entries);
             }
             entries += emit_mft_subtree(&volume, record, id, &dir, walker, &mut map.entries);
         }
-        if !map.roots.is_empty() {
-            maps.push(map);
-        }
         // The scan's own proof that the columnar builder ran, and what it holds
         // when the volume's subtree is in (the highest point of the build).
         let held: usize = walker.builder.memory_parts().iter().map(|p| p.1).sum();
-        modes.push(format!(
-            "mft {device} ({} records read in {:.2} s, {entries} entries, builder {:.1} B/entry)",
-            volume.infos.len(),
+        let files = if volume.mapped_bytes() > 0 {
+            format!(
+                ", tables in temporary files {} MiB",
+                volume.mapped_bytes() >> 20
+            )
+        } else {
+            String::new()
+        };
+        out.modes.push(format!(
+            "mft {device} ({} records read in {:.2} s, {entries} entries, builder {:.1} B/entry{files})",
+            volume.records(),
             read.as_secs_f64(),
             held as f64 / walker.builder.len().max(1) as f64
         ));
+        if map.roots.is_empty() {
+            continue;
+        }
+        match map.entries.seal() {
+            Ok(()) => {
+                if let Some(note) = map.entries.note() {
+                    out.spill.failed(note);
+                }
+                out.maps.push(map);
+            }
+            Err(error) => {
+                // The index has every entry, but this volume's record map is
+                // lost: it stays without live updates until the next scan.
+                out.spill.failed(&error);
+                out.modes.push(format!(
+                    "mft {device}: {error}; no live updates for this volume"
+                ));
+            }
+        }
     }
     walk
 }
@@ -1186,9 +1288,9 @@ fn ntfs_device_of(path: &Path) -> Option<String> {
 /// get their room at once instead of growing by doubling (a doubling holds up
 /// to twice what it needs while it copies). Only for the volume root; a folder
 /// root emits a part of the names and would reserve far too much.
-fn reserve_for_volume(builder: &IndexBuilder, volume: &ntfs::Volume, pairs: &mut Vec<(u64, u32)>) {
-    builder.reserve(volume.names.len(), volume.arena.len());
-    pairs.reserve_exact(volume.names.len());
+fn reserve_for_volume(builder: &IndexBuilder, volume: &ntfs::Volume, pairs: &mut Pairs) {
+    builder.reserve(volume.name_count(), volume.arena_len());
+    pairs.reserve_exact(volume.name_count());
 }
 
 /// Add everything below directory `record` (already added as `root_id`)
@@ -1200,7 +1302,7 @@ fn emit_mft_subtree(
     root_id: u32,
     root_path: &Path,
     walker: &Walker<'_>,
-    pairs: &mut Vec<(u64, u32)>,
+    pairs: &mut Pairs,
 ) -> usize {
     let excluding = !walker.excludes.is_empty();
     let mut added = 0usize;
@@ -1228,10 +1330,7 @@ fn emit_mft_subtree(
             last_top = top;
             p.set_location(&root_path.join(ferrow_index::osname::bytes_to_os(name)));
         }
-        for (name, bytes) in volume.children(dir) {
-            let Some(info) = volume.info(name.record) else {
-                continue;
-            };
+        for (name, bytes, info) in volume.children_with_info(dir) {
             let surrogate = info.is_name_surrogate();
             let is_dir = info.is_descended_dir();
             let ent_flags = info.entry_flags();
@@ -1263,7 +1362,7 @@ fn emit_mft_subtree(
                 info.metadata(walker.columns),
             );
             added += 1;
-            pairs.push((name.record, id));
+            pairs.push(name.record, id);
             batch.add();
             if is_dir {
                 let child_top = if walker.progress.is_none() {
@@ -1313,6 +1412,21 @@ pub fn emit_parsed_volume(
     builder: &IndexBuilder,
     columns: ColumnSet,
 ) -> VolumeMap {
+    emit_parsed_volume_in(volume, root_record, root_name, builder, columns, None)
+}
+
+/// [`emit_parsed_volume`] with the record map kept in a temporary file in
+/// `spill` (sealed before it returns), as the scan keeps it when it builds
+/// into the index file.
+#[doc(hidden)]
+pub fn emit_parsed_volume_in(
+    volume: &ntfs::Volume,
+    root_record: u64,
+    root_name: &[u8],
+    builder: &IndexBuilder,
+    columns: ColumnSet,
+    spill: Option<&Path>,
+) -> VolumeMap {
     let errors = Errors::new();
     let excludes = ExcludeSet::default();
     let walker = Walker {
@@ -1329,10 +1443,14 @@ pub fn emit_parsed_volume(
         serial: volume.serial,
         journal: volume.journal,
         record_size: volume.record_size,
+        entries: match spill {
+            Some(dir) => Pairs::spilling(dir),
+            None => Pairs::new(),
+        },
         ..VolumeMap::default()
     };
     map.roots.push((root_record, root_id));
-    map.entries.push((root_record, root_id));
+    map.entries.push(root_record, root_id);
     if root_record == ntfs::ROOT_RECORD {
         reserve_for_volume(builder, volume, &mut map.entries);
     }
@@ -1344,6 +1462,9 @@ pub fn emit_parsed_volume(
         &walker,
         &mut map.entries,
     );
+    map.entries
+        .seal()
+        .expect("a record map written to a temporary file can be read back");
     map
 }
 
@@ -1482,6 +1603,92 @@ mod tests {
             .unwrap();
         assert_eq!(index.metadata(id).size, Some(14));
         assert_eq!(index.metadata(id).modified, expected.modified);
+    }
+
+    /// Everything of a scan's MFT path that is bounded in files (the parsed
+    /// volume, the builder's shards, the record map, the index file) makes the
+    /// same bytes and the same record map as the heap path.
+    #[test]
+    fn a_scan_through_temporary_files_makes_the_same_index_file_and_record_map() {
+        let dir = TestDir::new("bounded-scan");
+        let (records, chunks) = ntfs::tests::synthetic(6_000, 211);
+        let mut heap_volume = ntfs::VolumeBuilder::new(records);
+        for chunk in chunks {
+            heap_volume.push(chunk);
+        }
+        let heap_volume = heap_volume.finish(7);
+        let builder = IndexBuilder::with_columns(ColumnSet::DEFAULT);
+        let heap_map = emit_parsed_volume(
+            &heap_volume,
+            ntfs::ROOT_RECORD,
+            b"C:",
+            &builder,
+            ColumnSet::DEFAULT,
+        );
+        let heap_index = builder.freeze();
+        let heap_file = dir.0.join("heap.bin");
+        heap_index.save(&heap_file).unwrap();
+        assert!(heap_index.len() > 6_000, "links add entries");
+        assert!(heap_map.file_bytes() == 0 && heap_volume.mapped_bytes() == 0);
+
+        // The bounded path with the smallest budget the builder allows, so
+        // its shards spill many times, and every volume table in a file.
+        let state = dir.0.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let (records2, chunks2) = ntfs::tests::synthetic(6_000, 211);
+        assert_eq!(records, records2);
+        let mut volume = ntfs::VolumeBuilder::with_spill(records, &state);
+        for chunk in chunks2 {
+            volume.push(chunk);
+        }
+        let volume = volume.finish(7);
+        assert!(volume.mapped_bytes() > 0 && volume.spill_note.is_none());
+        let builder = IndexBuilder::with_spill(ColumnSet::DEFAULT, &state, 1);
+        let map = emit_parsed_volume_in(
+            &volume,
+            ntfs::ROOT_RECORD,
+            b"C:",
+            &builder,
+            ColumnSet::DEFAULT,
+            Some(&state),
+        );
+        assert!(builder.spilled_bytes() > 0, "the shards spilled");
+        assert!(map.file_bytes() > 0, "the record map is in a file");
+        assert!(
+            map.heap_bytes() < 1 << 20,
+            "its heap is a write buffer, not {} B",
+            map.heap_bytes()
+        );
+        drop(volume);
+        let file = state.join("index.bin");
+        let index = builder.freeze_to_file(&file).unwrap();
+        assert!(index.is_mapped());
+
+        assert_eq!(
+            std::fs::read(&heap_file).unwrap(),
+            std::fs::read(&file).unwrap(),
+            "byte-identical index files"
+        );
+        assert_eq!(map.entries, heap_map.entries, "entries");
+        assert_eq!(map.entries.len(), heap_map.entries.len());
+        assert_eq!(map.roots, heap_map.roots, "roots");
+        assert_eq!(map.excluded, heap_map.excluded, "excluded");
+        assert_eq!(
+            (map.serial, map.journal, map.record_size),
+            (heap_map.serial, heap_map.journal, heap_map.record_size)
+        );
+        // Every entry is in the map once per name, ids ascending as made.
+        let ids: Vec<u32> = map.entries.iter().map(|(_, id)| id).collect();
+        assert!(ids.windows(2).all(|w| w[0] <= w[1]));
+        // A clone and a vector read the same pairs.
+        assert_eq!(map.entries.clone(), Pairs::from(map.entries.to_vec()));
+        drop((map, index));
+        let left: Vec<_> = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".ferrow-"))
+            .collect();
+        assert!(left.is_empty(), "temporary files left: {left:?}");
     }
 
     struct TestDir(PathBuf);

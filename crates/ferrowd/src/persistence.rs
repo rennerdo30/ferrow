@@ -278,6 +278,25 @@ impl IndexFile {
                 "could not spill the build to disk ({error}); it stayed in memory"
             ));
         }
+        // The read of the drives' file tables: the proof that its tables were
+        // in temporary files (or why they were not).
+        if report.read_file_bytes > 0 {
+            crate::eventlog::info(format!(
+                "the scan's file-table read kept up to {} MiB of tables in temporary files, not in memory",
+                report.read_file_bytes >> 20
+            ));
+        }
+        if let Some(error) = &report.read_spill_failure {
+            crate::eventlog::warn(format!(
+                "the scan could not keep all of its file-table read in temporary files ({error}); that part was kept in memory"
+            ));
+        }
+    }
+
+    /// The directory of the index file: where a build's temporary files go
+    /// (they are removed when the build ends, whatever ends it).
+    pub fn directory(&self) -> Option<&std::path::Path> {
+        self.path.parent().filter(|dir| !dir.as_os_str().is_empty())
     }
 
     /// Save a heap index and map it back from the file (the fallback when a

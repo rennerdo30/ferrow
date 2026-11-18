@@ -1,6 +1,6 @@
 # 0007: Bounded service memory (mapped and compressed index)
 
-Status: accepted (owner, 2026-11-18). Tracked as FR-46. Decision 8 (bounded rebuilds): built in FR-46 phase 5, on top of the mapped index (decisions 1 to 4).
+Status: accepted (owner, 2026-11-18). Tracked as FR-46. Decision 8 (bounded rebuilds): built in FR-46 phase 5, on top of the mapped index (decisions 1 to 4). Decision 10 (bounded scan): built in FR-46 phase 7.
 
 ## Context
 
@@ -109,11 +109,37 @@ slower. The owner chose to do both: map the index and compress it.
    - The name-order permutation is sorted in the file's map, so it is not in
      the heap either: the heap growth of the freeze is a fixed working set
      (4.9 MB at 2 M entries, measured), not 4 B/entry.
-   - Not covered here: the scan's record map and parsed volume, and the new
-     live tables of a compaction (decision 6).
+   - Not covered here: the scan's record map and parsed volume (decision 10),
+     and the new live tables of a compaction (decision 6).
 9. **Metadata sort orders go to the file.**
    - A sort order prepared on request (size, dates) is written beside the
      index and mapped, not kept in the heap (4 B/entry each).
+10. **The scan's MFT read is bounded** (built, FR-46 phase 7).
+    - A full scan (first start, journal reset, **Rescan now**) held what it
+      parsed in the heap until the index was built: the per-record table (48
+      B per MFT record), the names (24 B each plus the text), the grouping by
+      parent and the record map (16 B/entry): 102 to 106 B/entry for the parse
+      and about 180 B/entry for the scan at its peak (measured, synthetic 1 M
+      entries), about 4 to 5 GB at 27 M.
+    - Every one of those tables is now an anonymous temporary file beside the
+      index (the kind decision 8 uses: deleted on close, so a failed, killed or
+      panicked scan leaves nothing), written through a writable map or
+      appended in chunks as the read arrives and mapped read-only afterwards.
+      The live layer's frozen tables (entry to record, record to entry,
+      children) are built the same way and replaced by the saved copy.
+    - The same code reads a table from the heap or from a file, so the result
+      is the same bytes. A table whose file cannot be made stays in the heap; a
+      file that fails mid-read continues in the heap; a read that cannot
+      recover runs again in the heap, with a warning.
+    - Chosen over shrinking the tables only (the per-record table is 1.1 GB
+      at 27 M even at 48 B per record, and the names are 0.9 GB) and over a
+      streaming emission (entry ids and their order, hence the saved bytes,
+      follow the directory order the emission walks; changing it would change
+      results). Not chosen: a smaller `RecordInfo`; it would save under a
+      third and keep the heap growing with the volume.
+    - Costs: temporary disk space (about 4 GB at 27 M, estimated) beside the
+      old and new index file, and about 10 % more CPU time in the parse and
+      emission steps (50 ms per million entries, measured).
 
 ## Budget (27.2 M entries, private bytes)
 
@@ -121,7 +147,8 @@ slower. The owner chose to do both: map the index and compress it.
 |---|---|---|
 | Steady | 3.7 GB | 150–400 MB |
 | Start | 6.2 GB | the steady figure plus replay (no scan) |
-| Rescan or compaction | +2.3–4.4 GB | about 60 MB (shards, working set) + the scan's record map and the new live tables until decision 6 |
+| Full scan | +4–5 GB (extrapolated from 182 B/entry) | about 60 MB (builder shards, working set) plus the read buffers (about 64 MB), measured at 1 M entries and extrapolated; the tables are in temporary files (decision 10) |
+| Compaction | +2.3–4.4 GB | about 60 MB (shards, working set) + the new live tables until decision 6 |
 
 The file cache holding the mapped index is not counted against the budget,
 but it is reported. Service health shows "mapped" next to "private" so that a
@@ -138,6 +165,9 @@ reader of the diagnostics sees both.
 6. Sort orders in the file.
 7. CI gate: the Windows memory-breakdown job asserts private bytes per
    entry, so a later change cannot quietly grow it again.
+8. Bounded scan: the MFT read and the live tables a scan builds in
+   temporary files (done: FR-46 phase 7; not yet measured on a 27 M entry
+   PC; a compaction's own tables are still in the heap).
 
 Each step is its own PR, with the `docs/SPEC.md` §3 numbers from the CI
 bench, and is reviewed for search speed.
