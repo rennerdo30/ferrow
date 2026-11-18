@@ -173,7 +173,7 @@ impl Write for At<'_> {
 /// An anonymous temporary file in `dir`: it is gone when its handle closes,
 /// whatever ends the process (deleted on close on Windows, unlinked at once
 /// on Unix), so a failed or killed build leaves nothing behind.
-fn create_spill_file(dir: &Path) -> io::Result<File> {
+pub(crate) fn create_spill_file(dir: &Path) -> io::Result<File> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     for _ in 0..100 {
@@ -194,7 +194,10 @@ fn create_spill_file(dir: &Path) -> io::Result<File> {
             const DELETE: u32 = 0x0001_0000;
             const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
             const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_DELETE: u32 = 0x4;
             opts.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
                 .attributes(FILE_ATTRIBUTE_TEMPORARY)
                 .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
         }
@@ -876,6 +879,7 @@ impl IndexBuilder {
         }
         let index = crate::persist::index_from_own_map(&mapped)
             .map_err(|e| SaveError::Io(io::Error::other(e.to_string())))?;
+        index.use_scratch_beside(target.path);
         timings.replace = t.elapsed();
         timings.total = started.elapsed();
         timings.entries = n;

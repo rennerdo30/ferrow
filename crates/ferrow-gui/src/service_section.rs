@@ -69,7 +69,7 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
         rows.push((
             "Index file",
             format!(
-                "{} read from the saved file through the file cache ({counted})",
+                "{} read from the saved index files through the file cache ({counted})",
                 service::memory_text(h.index_mapped_bytes)
             ),
             None,

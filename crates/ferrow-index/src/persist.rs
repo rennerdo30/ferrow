@@ -241,6 +241,7 @@ pub(crate) fn save_and_map(index: &Index, path: &Path) -> Result<Index, SaveErro
     )
     .map_err(|_| not_ours())?;
     mapped.file_checksum = Some(sum);
+    mapped.use_scratch_beside(path);
     Ok(mapped)
 }
 
@@ -1141,6 +1142,7 @@ fn load_mapped(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
     index.file_checksum = Some(u32::from_le_bytes(
         map[20..24].try_into().expect("header checked"),
     ));
+    index.use_scratch_beside(path);
     timings.metadata_load = if index.columns_present().bits() == 0 {
         MetadataLoad::Absent
     } else {
@@ -2867,5 +2869,45 @@ mod tests {
         let again = names_index(10, false).save_and_map(&path).unwrap();
         assert_eq!(again.len(), 11);
         assert_eq!(mapped.len(), 3002);
+    }
+
+    #[test]
+    fn a_mapped_index_prepares_its_sort_orders_beside_its_file() {
+        let dir = test_dir("sort-beside");
+        let path = dir.join("index.bin");
+        let built = names_index(20_000, true);
+        built.save(&path).unwrap();
+        let mapped = Index::load(&path).unwrap();
+        let before = mapped.mapped_bytes();
+        for index in [&built, &mapped] {
+            index.request_sort(crate::SortKey::Size);
+            assert_eq!(
+                index
+                    .sort_ticket(crate::SortKey::Size)
+                    .unwrap()
+                    .wait_timeout(Duration::from_secs(30)),
+                crate::SortStatus::Ready
+            );
+        }
+        let order = |index: &Index| -> Vec<u32> {
+            let o = index.metadata_order(crate::SortKey::Size, false).unwrap();
+            o.range(0, o.len()).collect()
+        };
+        assert_eq!(order(&mapped), order(&built), "the same order");
+        // The order is in a temporary file, not the heap.
+        assert!(mapped.mapped_bytes() >= before + 20_000 * 3);
+        assert!(mapped.heap_bytes() < 64 * 1024, "{}", mapped.heap_bytes());
+        drop(mapped);
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "temporary files are gone with the index");
     }
 }

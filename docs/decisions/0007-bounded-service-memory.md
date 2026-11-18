@@ -111,7 +111,7 @@ slower. The owner chose to do both: map the index and compress it.
      (4.9 MB at 2 M entries, measured), not 4 B/entry.
    - Not covered here: the scan's record map and parsed volume, and the new
      live tables of a compaction (decision 6).
-9. **Metadata sort orders go to the file.**
+9. **Metadata sort orders go to the file.** (Done: the ids, the merge scratch and the finished order of a mapped index are anonymous temporary files beside `index.bin`, deleted on close.)
    - A sort order prepared on request (size, dates) is written beside the
      index and mapped, not kept in the heap (4 B/entry each).
 
@@ -135,7 +135,7 @@ reader of the diagnostics sees both.
 3. Record maps and overlay in the file.
 4. Names stored once.
 5. Bounded rebuilds (done: FR-46 phase 5).
-6. Sort orders in the file.
+6. Sort orders in the file (done: temporary files beside the index).
 7. CI gate: the Windows memory-breakdown job asserts private bytes per
    entry, so a later change cannot quietly grow it again.
 
