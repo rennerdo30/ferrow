@@ -902,6 +902,11 @@ fn maintain(
         {
             build_failures += 1;
             let gap = refresh_retry(build_failures);
+            // No scan started, so nothing cleared an administrator's claim:
+            // give it back, or every later "Rescan now" would be refused as
+            // "already requested" until a scan really starts.
+            STATE.release_rescan();
+            STATE.set_pending(Some((reason.as_str(), Instant::now() + gap)));
             if build_failures == 1 {
                 eventlog::warn(format!(
                     "no rescan now: {why}; tried again in {} min{}",
@@ -1305,6 +1310,12 @@ fn run_session(
         let mut hard_delta = live.limits().hard_delta;
         let mut base = base;
         let mut gate = PublishGate::new();
+        // The ended session may have applied a batch whose view the gate
+        // still held back: the resumed one owes it, or it would stay unseen
+        // until the next change (on a quiet disk, the whole back-off).
+        if resumed_total.is_some() {
+            gate.changed();
+        }
         let (reason, wait) = loop {
             // A batch keeps one reason; a disk reason in the same batch as a
             // large move must not leave its hidden entries without the
@@ -2259,8 +2270,9 @@ mod tests {
         assert!(started.elapsed() >= gap, "the retry waits for its back-off");
         assert_eq!(ended.reason, "journal reset", "the reason stands");
         assert!(ended.wait.is_zero());
+        // The resumed session publishes once (it may owe a held-back view),
+        // from the same layer: never the frozen index alone.
         let published = rig.store.get();
-        assert_eq!(published.report, "published before");
         assert_eq!(
             published.live.as_ref().map(|view| view.entries),
             Some(1 + 3),
@@ -2272,6 +2284,33 @@ mod tests {
         assert_eq!(applied.changed, 1);
         assert_eq!(kept.live.view().entries, 1 + 4);
         assert_eq!(kept.live.delta_len(), 4);
+    }
+
+    #[test]
+    fn a_resumed_session_publishes_the_view_the_ended_one_held_back() {
+        let live = layer_with(3);
+        let mut rig = Rig::over(&live);
+        let kept = rig.rescan_due(session_of(live)).session.unwrap();
+        // The ended session applied its changes, but the publish gate held
+        // their view back: the store still shows the frozen index alone.
+        rig.store.swap(Snapshot {
+            index: kept.base.clone(),
+            live: None,
+            mode: "live".into(),
+            report: "held back".into(),
+        });
+        // No journal change comes during the wait (a quiet disk).
+        rig.run(Session {
+            retry: Some((Duration::from_millis(300), "no room".into())),
+            ..kept
+        })
+        .expect("the retry is due");
+        let published = rig.store.get();
+        assert_eq!(
+            published.live.as_ref().map(|view| view.entries),
+            Some(1 + 3),
+            "the owed view is published without waiting for another change"
+        );
     }
 
     #[test]
