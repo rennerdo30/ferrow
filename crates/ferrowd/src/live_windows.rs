@@ -414,10 +414,10 @@ pub type Persist = crate::persistence::IndexFile;
 /// The index file a build may write into: `file`, once its directory is
 /// ready (a failure is logged and the build is made in memory: correct, only
 /// larger).
-fn ready(file: Option<&Persist>) -> Option<&Persist> {
+fn ready(file: Option<&Persist>) -> Option<(&Persist, crate::persistence::Building)> {
     let file = file?;
     match file.prepare() {
-        Ok(()) => Some(file),
+        Ok(building) => Some((file, building)),
         Err(error) => {
             eventlog::warn(format!(
                 "the index directory is not ready ({error}); the new index is built in memory"
@@ -435,7 +435,7 @@ fn scan_into(
     file: Option<&Persist>,
 ) -> (ferrow_index::Index, ferrow_walk::ScanReport, Vec<VolumeMap>) {
     match ready(file) {
-        Some(file) => {
+        Some((file, _building)) => {
             let out = ferrow_walk::scan_with_maps_to_file(options, &file.target());
             file.built(&out.1.index_file);
             out
@@ -883,7 +883,20 @@ fn maintain(
                 let until = Instant::now() + BUILD_RETRY;
                 while let Some(left) = until.checked_duration_since(Instant::now()) {
                     match rx.recv_timeout(left) {
-                        Ok(Message::RescanNow) => break,
+                        Ok(Message::RescanNow) => {
+                            reason = REASON_ADMIN.into();
+                            break;
+                        }
+                        // A reader that stopped for good is reported now:
+                        // the next session does not start it again.
+                        Ok(Message::Reset {
+                            device,
+                            reason: why,
+                            fatal: true,
+                        }) => {
+                            eventlog::warn(format!("journal of {device}: {why}"));
+                            STATE.journal_problem(&device, true, &why);
+                        }
                         Ok(_) => {}
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => return,
@@ -1225,7 +1238,7 @@ fn run_session(
                             // read from it: no builder, no second copy of the
                             // columns in the heap.
                             let build = |live: &mut Live| match ready(persist) {
-                                Some(file) => {
+                                Some((file, _building)) => {
                                     let built = live.compact_into(Some(&file.target()));
                                     // Declined (folder reads): the build ends
                                     // without a file.

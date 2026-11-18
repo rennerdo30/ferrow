@@ -101,6 +101,23 @@ pub struct IndexFile {
     path: std::path::PathBuf,
 }
 
+/// A build into the index file is running (see [`IndexFile::prepare`]).
+#[must_use = "the saver waits only while this lives"]
+pub struct Building(());
+
+impl Building {
+    fn start() -> Building {
+        BUILDING.store(true, Ordering::Release);
+        Building(())
+    }
+}
+
+impl Drop for Building {
+    fn drop(&mut self) {
+        BUILDING.store(false, Ordering::Release);
+    }
+}
+
 /// Temporary files a save or build of another process left beside the index
 /// (a crash or a power loss mid-way; a file build's is the size of the index)
 /// are removed once they are this old.
@@ -199,20 +216,19 @@ impl IndexFile {
     /// Make the state directory ready for a build that writes beside the index
     /// (its temporary file and the spilled shards): created, and protected as
     /// a save protects it.
-    pub fn prepare(&self) -> io::Result<()> {
-        // From the first build on, the maintainer is the file's only writer:
-        // the background saver must not write a published heap index over
-        // the file this build renames into place before it is published.
-        BUILDING.store(true, Ordering::Release);
-        if let Err(error) = prepare_state(&self.config) {
-            BUILDING.store(false, Ordering::Release);
-            return Err(error);
-        }
+    ///
+    /// The background saver writes nothing until the returned guard is
+    /// dropped (the build renames its file into place before the new index
+    /// is published): keep it for the whole build, `built()` included. An
+    /// error, or a panic in the build, drops it too.
+    pub fn prepare(&self) -> io::Result<Building> {
+        let building = Building::start();
+        prepare_state(&self.config)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
             remove_stale_temporaries(parent);
         }
-        Ok(())
+        Ok(building)
     }
 
     /// Where a build puts its index, replacing the file under [`SAVE_LOCK`].
@@ -233,7 +249,6 @@ impl IndexFile {
         if report.timings.is_some() {
             MAINTAINER_SAVED.store(true, Ordering::Release);
         }
-        BUILDING.store(false, Ordering::Release);
         if let Some(t) = &report.timings {
             // What a save would have taken: the checksum, the write and the
             // replacement. The parts before are the build itself.
@@ -458,6 +473,38 @@ impl Drop for Persistence {
 mod tests {
     use super::*;
 
+    /// Tests that start a build hold this: the state they check is global.
+    static BUILDING_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_saver_waits_exactly_while_a_build_runs() {
+        let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ferrowd-building-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = |path: std::path::PathBuf| DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-building-unused"),
+            index_path: Some(path),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let good = IndexFile::new(&config(dir.join("index.bin"))).unwrap();
+        {
+            let _building = good.prepare().unwrap();
+            assert!(BUILDING.load(Ordering::Acquire));
+        }
+        assert!(!BUILDING.load(Ordering::Acquire), "held only by the guard");
+        // A directory that cannot be made (its parent is a file): the error
+        // does not leave the saver held back.
+        std::fs::write(dir.join("a-file"), b"x").unwrap();
+        let bad =
+            IndexFile::new(&config(dir.join("a-file").join("sub").join("index.bin"))).unwrap();
+        assert!(bad.prepare().is_err());
+        assert!(!BUILDING.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_writer_that_still_runs_keeps_its_temporary_file() {
         assert!(writer_alive(&format!(
@@ -563,7 +610,11 @@ mod tests {
             .is_none()
         );
         // The state directory does not exist yet: preparing it creates it.
-        file.prepare().unwrap();
+        let _building = {
+            let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
+            file.prepare().unwrap()
+        };
+        drop(_building);
 
         let build = |entries: usize| {
             let b = ferrow_index::IndexBuilder::with_spill(
