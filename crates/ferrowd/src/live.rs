@@ -1114,10 +1114,14 @@ impl Live {
 
     /// Read the frozen index from `base` instead: the same entries with the
     /// same ids, typically the copy saved and mapped back from its file
-    /// (ADR 0007). Nothing else changes.
-    pub fn replace_base(&mut self, base: Arc<Index>) {
-        assert_eq!(base.len(), self.base.len(), "the same index");
+    /// (ADR 0007). Nothing else changes. `false` (and nothing replaced) for
+    /// an index of another length.
+    pub fn replace_base(&mut self, base: Arc<Index>) -> bool {
+        if base.len() != self.base.len() {
+            return false;
+        }
         self.base = base;
+        true
     }
 
     /// The size limits of this layer (they follow the frozen index).

@@ -270,7 +270,7 @@ pub fn render(h: &Health, json: bool) -> String {
     ));
     if h.index_mapped_bytes > 0 {
         out.push_str(&format!(
-            "index file: {} read through a memory map (file cache, not private memory)\n",
+            "index file: {} mapped from the saved file (file cache, not private memory)\n",
             mb(h.index_mapped_bytes)
         ));
     }

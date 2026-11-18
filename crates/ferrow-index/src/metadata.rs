@@ -721,7 +721,9 @@ impl<T: Value> Column<T> {
             let start = *at;
             let bytes = take(data, at, len)?;
             Ok(match map {
-                Some(map) => Col::mapped(map, start, len).ok_or(LoadError::Truncated)?,
+                Some(map) => {
+                    Col::mapped(map, start, len).ok_or(LoadError::Corrupt("misaligned section"))?
+                }
                 None => bytes.to_vec().into(),
             })
         };

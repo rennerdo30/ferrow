@@ -419,7 +419,12 @@ fn map_saved(
     index: &ferrow_index::Index,
     persist: Option<&Persist>,
 ) -> Option<ferrow_index::Index> {
-    match persist.and_then(|persist| persist(index))? {
+    // Background work: lowest CPU and disk priority, like the scan, so a
+    // save of gigabytes does not compete with searches.
+    ferrow_walk::priority::enter_background();
+    let saved = persist.and_then(|persist| persist(index));
+    ferrow_walk::priority::leave_background();
+    match saved? {
         Ok(mapped) => Some(mapped),
         Err(error) => {
             eventlog::warn(format!(
@@ -933,7 +938,7 @@ fn run_session(
                             // The merged index replaces the file and is read
                             // from it, so its heap copy goes at once.
                             if let Some(mapped) = map_saved(new.base(), persist) {
-                                new.replace_base(Arc::new(mapped));
+                                let _ = new.replace_base(Arc::new(mapped));
                                 // Its live tables too, with the journal
                                 // positions every merged change is up to,
                                 // unless the index is known to miss changes

@@ -203,6 +203,53 @@ pub(crate) fn serialized_len(index: &Index) -> Result<usize, SaveError> {
 }
 
 pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
+    save_with_checksum(index, path).map(|_| ())
+}
+
+/// Save `index` to `path` and map the file back without checking it again
+/// (ADR 0007): this process just wrote it, so the header, the length and the
+/// checksum field are compared with what was written, and the columns are
+/// read in place. A full load would read the whole file once more (seconds
+/// for gigabytes, on every core) after every scan and merge.
+pub(crate) fn save_and_map(index: &Index, path: &Path) -> Result<Index, SaveError> {
+    let sum = save_with_checksum(index, path)?;
+    let not_ours = || {
+        SaveError::Io(std::io::Error::other(
+            "the saved index changed before it was mapped",
+        ))
+    };
+    let map = crate::store::map_file(path).map_err(SaveError::Io)?;
+    let header = parse_header(&map).map_err(|_| not_ours())?;
+    let expected = serialized_len(index)? as u64;
+    if header.version != VERSION
+        || header.checksum != sum
+        || map.len() as u64 != expected
+        || header.entry_count as usize != index.len()
+    {
+        return Err(not_ours());
+    }
+    let mut mapped = from_bytes_with(
+        &map,
+        Some(&map),
+        Check::Trusted,
+        &mut LoadTimings::default(),
+    )
+    .map_err(|_| not_ours())?;
+    mapped.file_checksum = Some(sum);
+    Ok(mapped)
+}
+
+/// How much of a file [`from_bytes_with`] checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Everything: checksum, structure and derived data.
+    Full,
+    /// Lengths and alignment only: a file this process just wrote and
+    /// whose checksum field it compared.
+    Trusted,
+}
+
+fn save_with_checksum(index: &Index, path: &Path) -> Result<u32, SaveError> {
     let c = index.columns();
     let n = c.parent.len();
     let n32 = u32::try_from(n).map_err(|_| SaveError::TooLarge("entry count"))?;
@@ -213,6 +260,7 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
 
     // Streamed through a small buffer: a save holds no copy of the index
     // (it used to fill one buffer the size of the file first).
+    let mut checksum = 0;
     write_atomically(path, |file| {
         let mut out = CrcWriter::new(std::io::BufWriter::with_capacity(SAVE_BUFFER, file));
         out.write_raw(&MAGIC)?;
@@ -235,13 +283,15 @@ pub(crate) fn save(index: &Index, path: &Path) -> Result<(), SaveError> {
             return Err(std::io::Error::other("index size changed while saving"));
         }
         let sum = out.crc.finalize();
+        checksum = sum;
         let mut file = out.inner.into_inner().map_err(|e| e.into_error())?;
         use std::io::Seek;
         file.seek(std::io::SeekFrom::Start(20))?;
         file.write_all(&sum.to_le_bytes())?;
         Ok(file)
     })
-    .map_err(SaveError::Io)
+    .map_err(SaveError::Io)?;
+    Ok(checksum)
 }
 
 /// The save's write buffer.
@@ -512,10 +562,16 @@ pub(crate) fn load_with_timings(path: &Path) -> Result<(Index, LoadTimings), Loa
         file.seek(std::io::SeekFrom::Start(0))
             .map_err(LoadError::Io)?;
         if parse_header(&head)?.version >= 4 {
-            drop(file);
-            let (index, mut timings) = load_mapped(path)?;
-            timings.total = started.elapsed();
-            return Ok((index, timings));
+            match load_mapped(path) {
+                Ok((index, mut timings)) => {
+                    timings.total = started.elapsed();
+                    return Ok((index, timings));
+                }
+                // The file cannot be mapped (no address space, a file
+                // system that refuses): read it into the heap instead.
+                Err(LoadError::Io(_)) => {}
+                Err(other) => return Err(other),
+            }
         }
     }
     let (index, mut timings) = load_from(&mut file, file_len, &Overlap::new(Some(path)))?;
@@ -1056,7 +1112,7 @@ pub fn from_bytes(data: &[u8]) -> Result<Index, LoadError> {
 }
 
 fn from_bytes_inner(data: &[u8], timings: &mut LoadTimings) -> Result<Index, LoadError> {
-    from_bytes_with(data, None, timings)
+    from_bytes_with(data, None, Check::Full, timings)
 }
 
 /// Map a v4 file and check it as [`from_bytes`] checks bytes; the columns
@@ -1066,7 +1122,7 @@ fn load_mapped(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
     let t = Instant::now();
     let map = crate::store::map_file(path).map_err(LoadError::Io)?;
     timings.read += t.elapsed();
-    let mut index = from_bytes_with(&map, Some(&map), &mut timings)?;
+    let mut index = from_bytes_with(&map, Some(&map), Check::Full, &mut timings)?;
     index.file_checksum = Some(u32::from_le_bytes(
         map[20..24].try_into().expect("header checked"),
     ));
@@ -1083,6 +1139,7 @@ fn load_mapped(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
 fn from_bytes_with(
     data: &[u8],
     map: Option<&std::sync::Arc<memmap2::Mmap>>,
+    check: Check,
     timings: &mut LoadTimings,
 ) -> Result<Index, LoadError> {
     let header = parse_header(data)?;
@@ -1107,11 +1164,13 @@ fn from_bytes_with(
     } else {
         MetadataLoad::SerialReader
     };
-    let t = Instant::now();
-    let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
-    timings.checksum += t.elapsed();
-    if !sum_ok {
-        return Err(LoadError::ChecksumMismatch);
+    if check == Check::Full {
+        let t = Instant::now();
+        let sum_ok = crc32(&data[CHECKSUM_START..]) == header.checksum;
+        timings.checksum += t.elapsed();
+        if !sum_ok {
+            return Err(LoadError::ChecksumMismatch);
+        }
     }
 
     let t = Instant::now();
@@ -1154,19 +1213,20 @@ fn from_bytes_with(
         return Err(LoadError::Corrupt("unexpected metadata bytes"));
     }
     timings.decode += t.elapsed();
-    validate(
-        Parts {
-            parent,
-            name_off,
-            name_len,
-            flags: ent_flags,
-            arena,
-            folded_arena,
-            sorted,
-            metadata,
-        },
-        timings,
-    )
+    let parts = Parts {
+        parent,
+        name_off,
+        name_len,
+        flags: ent_flags,
+        arena,
+        folded_arena,
+        sorted,
+        metadata,
+    };
+    match check {
+        Check::Full => validate(parts, timings),
+        Check::Trusted => Ok(assemble(parts)),
+    }
 }
 
 /// Step over the zero bytes before `sorted` (v4); anything else there is
@@ -1424,7 +1484,7 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
     timings.derived += derived_started.elapsed();
     timings.derived_sort = timings.derived - timings.derived_fold;
 
-    let mut index = Index::from_columns(OwnedColumns {
+    Ok(assemble(Parts {
         parent,
         name_off,
         name_len,
@@ -1432,9 +1492,22 @@ fn validate(parts: Parts, timings: &mut LoadTimings) -> Result<Index, LoadError>
         arena,
         folded_arena,
         sorted,
+        metadata,
+    }))
+}
+
+fn assemble(parts: Parts) -> Index {
+    let mut index = Index::from_columns(OwnedColumns {
+        parent: parts.parent,
+        name_off: parts.name_off,
+        name_len: parts.name_len,
+        flags: parts.flags,
+        arena: parts.arena,
+        folded_arena: parts.folded_arena,
+        sorted: parts.sorted,
     });
-    index.metadata = metadata;
-    Ok(index)
+    index.metadata = parts.metadata;
+    index
 }
 
 /// What a streaming check of a saved index found.
@@ -2717,5 +2790,24 @@ mod tests {
         assert_eq!(loaded.sorted(), built.sorted());
         assert_eq!(loaded.metadata(17), built.metadata(17));
         assert!(verify_file(&path).is_ok());
+    }
+
+    #[test]
+    fn save_and_map_reads_the_file_it_just_wrote_without_a_second_check() {
+        let dir = test_dir("save-and-map");
+        let path = dir.join("index.bin");
+        let built = names_index(3000, true);
+        let mapped = built.save_and_map(&path).unwrap();
+        assert!(mapped.is_mapped());
+        assert_eq!(mapped.sorted(), built.sorted());
+        assert_eq!(mapped.name(1234), built.name(1234));
+        assert_eq!(mapped.metadata(17), built.metadata(17));
+        // The same bytes a full load accepts.
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.sorted(), mapped.sorted());
+        // Again over the mapped file: replaced, the old map still reads.
+        let again = names_index(10, false).save_and_map(&path).unwrap();
+        assert_eq!(again.len(), 11);
+        assert_eq!(mapped.len(), 3002);
     }
 }

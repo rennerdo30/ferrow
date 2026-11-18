@@ -28,6 +28,13 @@ pub struct Persistence {
 /// live maintainer (which saves and maps every new index, ADR 0007).
 static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Set once the live maintainer has saved an index: from then on it is the
+/// only writer of the file. The background saver only writes before that
+/// (an index loaded from an older file version, a walk without live
+/// updates): an index it holds may already be older than the one the
+/// maintainer saved and is about to publish.
+static MAINTAINER_SAVED: AtomicBool = AtomicBool::new(false);
+
 fn save(config: &DaemonConfig, snapshot: Arc<Snapshot>) -> io::Result<()> {
     save_index(config, &snapshot.index)
 }
@@ -54,25 +61,25 @@ pub fn save_and_map(
 ) -> Option<io::Result<ferrow_index::Index>> {
     let path = config.index_path.as_ref()?;
     let _one = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    MAINTAINER_SAVED.store(true, Ordering::Release);
+    let _saving = crate::health::STATE.saving();
     let started = Instant::now();
-    let saved = save_index(config, index);
+    let saved = (|| -> io::Result<ferrow_index::Index> {
+        prepare_state(config)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Mapped back without reading the file again: it was just written.
+        let mapped = index.save_and_map(path).map_err(io::Error::other)?;
+        prepare_state(config)?;
+        Ok(mapped)
+    })();
     let took = started.elapsed();
     crate::health::STATE.save_done(took, saved.as_ref().err().map(|e| e.to_string()));
-    if let Err(error) = saved {
-        return Some(Err(error));
+    if saved.is_ok() {
+        crate::eventlog::info(format!("index saved in {:.1} s", took.as_secs_f64()));
     }
-    crate::eventlog::info(format!("index saved in {:.1} s", took.as_secs_f64()));
-    Some(
-        ferrow_index::Index::load(path)
-            .map_err(io::Error::other)
-            .and_then(|mapped| {
-                if mapped.len() == index.len() && mapped.is_mapped() {
-                    Ok(mapped)
-                } else {
-                    Err(io::Error::other("the saved index did not map back"))
-                }
-            }),
-    )
+    Some(saved)
 }
 
 impl Persistence {
@@ -104,6 +111,7 @@ impl Persistence {
                 // writing it after the maintainer saved a newer one would
                 // leave the older one on disk.
                 if snapshot.index.is_mapped()
+                    || MAINTAINER_SAVED.load(Ordering::Acquire)
                     || !Arc::ptr_eq(&published.get().index, &snapshot.index)
                 {
                     return Ok(());
