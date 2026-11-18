@@ -1151,7 +1151,11 @@ fn run_session(
                 rescan.wake_at(Instant::now(), load),
                 gate.wake_at(),
                 live.next_walk_deadline(),
-                (refresh_possible && lag > 0).then(|| tables_saved + TABLES_REFRESH),
+                // Only a deadline ahead: once due, the refresh was asked for
+                // (a merge then wakes the maintainer itself).
+                (refresh_possible && lag > 0)
+                    .then(|| tables_saved + TABLES_REFRESH)
+                    .filter(|&at| at > Instant::now()),
             ]
             .into_iter()
             .flatten()
