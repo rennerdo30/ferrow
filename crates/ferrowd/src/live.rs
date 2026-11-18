@@ -1251,7 +1251,9 @@ impl Live {
     }
 
     /// Smaller limits, so a test needs no hundreds of thousands of changes.
+    /// Only the Windows maintainer tests use it.
     #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn set_limits(&mut self, limits: DeltaLimits) {
         self.limits = limits;
     }
