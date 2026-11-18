@@ -1236,6 +1236,11 @@ fn run_session(
                     log_memory("before compaction", Some(&live), &base, store);
                     let save_now = can_save_tables && !rescan.rescan_waiting();
                     let mut tables_written = false;
+                    // A merge declines only while folders are read; otherwise
+                    // a missing result is a failure (the index file could
+                    // not be built: a full disk), which waits its gap.
+                    let merge_started = Instant::now();
+                    let reading = live.walks_outstanding();
                     let report = format!("{summary}; {applied_total} live changes");
                     // Single writer: this thread, on the low-priority pool.
                     // Journal changes queue in the channel meanwhile, and
@@ -1248,6 +1253,15 @@ fn run_session(
                             // The merged index is built in the index file and
                             // read from it: no builder, no second copy of the
                             // columns in the heap.
+                            // Too little disk for the new file: keep the index as
+                            // it is (a merge in memory would take gigabytes)
+                            // and try again after the merge's gap.
+                            if let Some(file) = persist
+                                && let Err(why) = file.has_room()
+                            {
+                                eventlog::warn(format!("no merge in memory now: {why}"));
+                                return None;
+                            }
                             let build = |live: &mut Live| match ready(persist) {
                                 Some((file, _building)) => {
                                     let built = live.compact_into(Some(&file.target()));
@@ -1344,6 +1358,13 @@ fn run_session(
                             base.len()
                         ));
                         log_memory("after compaction", Some(&live), &base, store);
+                    } else if !reading {
+                        rescan.compacted(Instant::now(), merge_started.elapsed());
+                        refresh_failures += 1;
+                        next_refresh = Instant::now() + refresh_retry(refresh_failures);
+                        eventlog::warn(format!(
+                            "the merge in memory ({why}) failed; the index stays as it is and the merge is tried again later"
+                        ));
                     }
                     continue;
                 }

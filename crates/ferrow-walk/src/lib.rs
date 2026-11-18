@@ -958,6 +958,10 @@ fn scan_inner(
 /// (the spilled shards could not be read back): a later scan may succeed.
 pub const BUILD_FAILED: &str = "the index could not be built";
 
+/// The most entries an index that could not be built into its file is built
+/// in memory instead (about 200 MB at the peak); a larger one is not built.
+pub const HEAP_FALLBACK_ENTRIES: usize = 1_000_000;
+
 pub fn freeze_builder(
     builder: IndexBuilder,
     target: Option<&FileTarget<'_>>,
@@ -976,6 +980,16 @@ pub fn freeze_builder(
             },
         )),
         Err(failed) => {
+            // A large index is not built in memory instead: that would take
+            // gigabytes the file build exists to avoid (a full disk is the
+            // usual cause). The caller keeps what it has and tries later.
+            if failed.builder.len() > HEAP_FALLBACK_ENTRIES {
+                return Err(format!(
+                    "{BUILD_FAILED}: {} (not built in memory instead: {} entries)",
+                    failed.error,
+                    failed.builder.len()
+                ));
+            }
             let report = IndexFileReport {
                 timings: None,
                 spill_failure: spill_failure.or_else(|| failed.builder.spill_failure()),
