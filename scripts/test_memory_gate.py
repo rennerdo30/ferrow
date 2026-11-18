@@ -95,7 +95,7 @@ class MemoryGate(unittest.TestCase):
     def test_total_scan_peak_fails_when_every_phase_is_inside_its_own_limit(self):
         # emit and freeze each inside their limits, but the shards of the emit
         # are still alive in the freeze: the sum is over the total's limit.
-        code, _, err, _ = run(output(overrides={"bounded.emit": 75, "bounded.freeze": 7}))
+        code, _, err, _ = run(output(overrides={"bounded.emit": 78, "bounded.freeze": 7.5}))
         self.assertEqual(code, 1)
         self.assertIn("scan.total", err)
         self.assertNotIn("scan.emit", err.split("MEMORY GATE FAILED")[1])
@@ -103,7 +103,7 @@ class MemoryGate(unittest.TestCase):
     def test_extrapolation_over_hard_limit_fails_over_target_warns_for_compaction(self):
         # A steady state that is inside its own limit but, scaled to 27.2 M
         # entries and with a rescan on top, is over the 512 MB target.
-        code, _, err, _ = run(output(overrides={"steady": 16, "bounded.emit": 75, "bounded.freeze": 4}))
+        code, _, err, _ = run(output(overrides={"steady": 16, "bounded.emit": 78, "bounded.freeze": 4}))
         self.assertEqual(code, 1)
         self.assertIn("pc.scan", err)
         # A compaction over the target only warns (its tables are in the heap, decision 6).

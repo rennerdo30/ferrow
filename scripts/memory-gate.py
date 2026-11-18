@@ -48,11 +48,12 @@ PC = {
 
 # Each limit is a number from the hosted `memory breakdown (windows 5M)` job
 # (windows-latest, release build, 5 M entries) plus a margin. Run to run, the
-# Windows numbers differ by about 1 % (the 1 ms sampled peaks of the scan
-# phases: 14.4 to 15.3 MiB parse, 58.3 to 59.4 MiB emit, over six runs on
-# main between 2026-11-18 08:54 and 09:40 UTC), so a limit 30 to 50 % above
-# the highest value seen is far outside the noise and still well inside what
-# one per-entry table brings back (4 B/entry is 19 MiB at 5 M entries).
+# scan phases (1 ms sampled peaks) differ by up to about 12 %: parse 13.9 to
+# 16.9 MiB, emit 58.3 to 65.1 MiB over eight runs (six on main, 2026-11-18
+# 08:54 to 09:40 UTC, two on this gate's branch); the compaction, steady state
+# and restart by about 1 to 5 %. So every limit is at least 20 % above the
+# highest value seen, and still well inside what one per-entry table brings back
+# (4 B/entry is 19 MiB at 5 M entries).
 #
 # unit "MiB": growth_bytes of a `FERROW-MEMORY-PEAK` line; "B/entry": the same
 # divided by the entries of the run.
@@ -62,14 +63,14 @@ CHECKS = [
     # (a) the full scan path, from the bounded build (the path the service takes)
     ("scan.parse", "bounded.parse", "parse chunks into the file-backed volume builder",
      "MiB", 22,
-     "measured 14.4-15.3 MiB over six runs (16 MiB chunk buffers, fixed), +44 %"),
+     "measured 13.9-16.9 MiB over eight runs (16 MiB chunk buffers, fixed), +30 %"),
     ("scan.join", "bounded.from_parsed", "join of names, records and the grouping by parent",
      "MiB", 2,
      "measured 0-0.2 MiB, everything is written to temporary files; +1.8 MiB"),
     ("scan.emit", "bounded.emit", "emission through the spilling builder and the record map file",
-     "MiB", 76,
-     "measured 58.3-59.4 MiB = the 32 MiB spill budget x 1.6 (shard heap while entries "
-     "are added) plus the working set, +28 %; raising the budget raises this"),
+     "MiB", 80,
+     "measured 58.3-65.1 MiB = the 32 MiB spill budget x 1.6 (shard heap while entries "
+     "are added) plus the working set, +23 %; raising the budget raises this"),
     ("scan.freeze", "bounded.freeze", "freeze into the index file (place, fold, sort, checksum in the map)",
      "MiB", 8,
      "measured 4.0-5.0 MiB (4.9 MB at 2 M entries in ADR 0007 decision 8: fixed, not per entry), +60 %"),
@@ -85,13 +86,13 @@ CHECKS = [
 # where it started. (ADR 0007 budget: about 60 MB working set plus the 16 MiB
 # read buffers the example does not have.)
 SCAN_PHASES = [c[1] for c in CHECKS if c[0].startswith("scan.")]
-SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 80,
-              "measured 63.8 MiB (the emit's shards are still alive in the freeze, so the highest "
-              "point is the freeze's: emit + freeze), +25 %")
+SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 84,
+              "measured 63.2-67.8 MiB (the emit's shards are still alive in the freeze, so the "
+              "highest point is the freeze's: emit + freeze), +24 %")
 STEADY = ("steady.private", "steady", "private bytes after the scan, heap builds dropped",
           "MiB", 16,
-          "measured 6.95 MiB in the first hosted run (the allocator's free memory, 28 MB held, "
-          "and the runtime; 1.4 B/entry), +130 %: 2 B/entry more heap would trip it")
+          "measured 6.95 and 7.32 MiB in two hosted runs (the allocator's free memory, 28 MB held, "
+          "and the runtime; 1.4 B/entry), +120 %: 2 B/entry more heap would trip it")
 STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record tables are mapped)",
                "B/entry", 1.0,
                "measured 0.36 B/entry (removed bits 0.125, record_base remainder 0.23); "
@@ -102,11 +103,11 @@ COMPACT = ("compact.file", "compact.file", "compaction into the index file (Live
            "the heap, decision 6, still to do), +23 %")
 RESTART = ("restart.load", "restart.load", "restart: map index and tables, restore the live layer",
            "MiB", 6,
-           "measured 1.36 MiB in the first hosted run (the tables are mapped, only the maps' "
+           "measured 1.36 MiB in both hosted runs (the tables are mapped, only the maps' "
            "bookkeeping and the live layer's bit sets are in the heap), +340 %")
 RESTARTED = ("restart.private", "restarted", "private bytes after a restart from the saved files",
              "MiB", 14,
-             "measured 5.83 MiB in the first hosted run, +140 %")
+             "measured 5.83 and 6.95 MiB in two hosted runs, +100 %")
 
 
 def fields(line):
