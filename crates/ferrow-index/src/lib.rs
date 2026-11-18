@@ -261,7 +261,7 @@ impl Index {
     /// Whether the columns are read from the saved file (it is on disk
     /// already: saving it again would write the same bytes).
     pub fn is_mapped(&self) -> bool {
-        matches!(self.parent, Col::Mapped { .. })
+        self.parent.is_mapped()
     }
 
     /// [`Index::heap_bytes`] split into named parts (capacity, not length):
@@ -1126,27 +1126,22 @@ mod tests {
             .unwrap()
             .owned_mut()
             .reserve(61);
-        assert!(idx.parent.owned_mut().capacity() > idx.parent.len());
-        assert!(idx.name_off.owned_mut().capacity() > idx.name_off.len());
-        assert!(idx.name_len.owned_mut().capacity() > idx.name_len.len());
-        assert!(idx.flags.owned_mut().capacity() > idx.flags.len());
-        assert!(idx.arena.owned_mut().capacity() > idx.arena.len());
-        assert!(idx.folded_arena.owned_mut().capacity() > idx.folded_arena.len());
-        // Exact per-column capacity accounting: 4+4+2+2 bytes of fixed
-        // columns plus 4 bytes of sort order per entry, plus both
-        // arenas.
-        let sorted_cap = Arc::get_mut(&mut idx.sorted)
-            .unwrap()
-            .owned_mut()
-            .capacity();
-        assert!(sorted_cap > idx.sorted.len());
-        let expected = idx.parent.owned_mut().capacity() * 4
-            + idx.name_off.owned_mut().capacity() * 4
-            + idx.name_len.owned_mut().capacity() * 2
-            + idx.flags.owned_mut().capacity() * 2
-            + idx.arena.owned_mut().capacity()
-            + idx.folded_arena.owned_mut().capacity()
-            + sorted_cap * 4
+        assert!(idx.parent.heap_bytes() > idx.parent.len() * 4);
+        assert!(idx.name_off.heap_bytes() > idx.name_off.len() * 4);
+        assert!(idx.name_len.heap_bytes() > idx.name_len.len() * 2);
+        assert!(idx.flags.heap_bytes() > idx.flags.len() * 2);
+        assert!(idx.arena.heap_bytes() > idx.arena.len());
+        assert!(idx.folded_arena.heap_bytes() > idx.folded_arena.len());
+        assert!(idx.sorted.heap_bytes() > idx.sorted.len() * 4);
+        // Exact per-column capacity accounting: every column and both
+        // arenas, by capacity.
+        let expected = idx.parent.heap_bytes()
+            + idx.name_off.heap_bytes()
+            + idx.name_len.heap_bytes()
+            + idx.flags.heap_bytes()
+            + idx.arena.heap_bytes()
+            + idx.folded_arena.heap_bytes()
+            + idx.sorted.heap_bytes()
             + std::mem::size_of::<Vec<u32>>()
             + 2 * std::mem::size_of::<usize>();
         assert_eq!(idx.heap_bytes(), expected);

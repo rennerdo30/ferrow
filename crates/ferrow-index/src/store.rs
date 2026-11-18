@@ -4,7 +4,7 @@
 //! pages are the operating system's file cache, shared and reclaimable).
 
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -25,15 +25,27 @@ unsafe impl Plain for u16 {}
 // SAFETY: as above.
 unsafe impl Plain for u32 {}
 
-/// One column: owned, or `len` elements of a shared map from byte `off`.
-pub(crate) enum Col<T: Plain> {
+/// What keeps a column's elements alive.
+enum Backing<T> {
     Owned(Vec<T>),
-    Mapped {
-        map: Arc<Mmap>,
-        off: usize,
-        len: usize,
-    },
+    Mapped(#[allow(dead_code)] Arc<Mmap>),
 }
+
+/// One column: owned, or elements of a shared map. Reading it is a plain
+/// slice of `ptr` and `len` (no branch per access: searches read columns
+/// once per entry); `backing` keeps the memory alive.
+pub(crate) struct Col<T: Plain> {
+    ptr: *const T,
+    len: usize,
+    backing: Backing<T>,
+}
+
+// SAFETY: `ptr` points into `backing`, which is `Send + Sync` (a `Vec` of
+// `Send + Sync` plain values, or a read-only map behind an `Arc`); the
+// column hands out only shared slices, or a `&mut Vec` through `&mut self`.
+unsafe impl<T: Plain> Send for Col<T> {}
+// SAFETY: as above.
+unsafe impl<T: Plain> Sync for Col<T> {}
 
 impl<T: Plain> Col<T> {
     /// `len` elements of `map` from byte `off`; `None` when that range is
@@ -41,77 +53,120 @@ impl<T: Plain> Col<T> {
     pub(crate) fn mapped(map: &Arc<Mmap>, off: usize, len: usize) -> Option<Col<T>> {
         let bytes = len.checked_mul(size_of::<T>())?;
         let end = off.checked_add(bytes)?;
-        let aligned = (map.as_ptr() as usize + off).is_multiple_of(align_of::<T>());
-        (end <= map.len() && aligned).then(|| Col::Mapped {
-            map: map.clone(),
-            off,
+        if end > map.len() {
+            return None;
+        }
+        // SAFETY: `off <= map.len()`, so the pointer stays inside (or one
+        // past the end of) the map.
+        let ptr = unsafe { map.as_ptr().add(off) }.cast::<T>();
+        ptr.is_aligned().then(|| Col {
+            ptr,
             len,
+            backing: Backing::Mapped(map.clone()),
         })
     }
 
     /// Heap bytes this column holds (its capacity); 0 when mapped.
     pub(crate) fn heap_bytes(&self) -> usize {
-        match self {
-            Col::Owned(v) => v.capacity() * size_of::<T>(),
-            Col::Mapped { .. } => 0,
+        match &self.backing {
+            Backing::Owned(v) => v.capacity() * size_of::<T>(),
+            Backing::Mapped(_) => 0,
         }
     }
 
     /// Mapped bytes this column reads; 0 when owned.
     pub(crate) fn mapped_bytes(&self) -> usize {
-        match self {
-            Col::Owned(_) => 0,
-            Col::Mapped { len, .. } => len * size_of::<T>(),
+        match &self.backing {
+            Backing::Owned(_) => 0,
+            Backing::Mapped(_) => self.len * size_of::<T>(),
         }
     }
 
-    /// The vector of an owned column, for the builder that fills it.
+    /// Whether the elements are read from a map.
+    pub(crate) fn is_mapped(&self) -> bool {
+        matches!(self.backing, Backing::Mapped(_))
+    }
+
+    /// The vector of an owned column, for the builder that fills it; the
+    /// column reads the vector again when the guard is dropped.
     ///
     /// # Panics
     /// On a mapped column, which is never written.
-    pub(crate) fn owned_mut(&mut self) -> &mut Vec<T> {
-        match self {
-            Col::Owned(v) => v,
-            Col::Mapped { .. } => panic!("a mapped column is read-only"),
+    pub(crate) fn owned_mut(&mut self) -> OwnedMut<'_, T> {
+        assert!(!self.is_mapped(), "a mapped column is read-only");
+        OwnedMut { col: self }
+    }
+}
+
+/// Write access to an owned column's vector (see [`Col::owned_mut`]).
+pub(crate) struct OwnedMut<'a, T: Plain> {
+    col: &'a mut Col<T>,
+}
+
+impl<T: Plain> Deref for OwnedMut<'_, T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Vec<T> {
+        match &self.col.backing {
+            Backing::Owned(v) => v,
+            Backing::Mapped(_) => unreachable!("checked in owned_mut"),
+        }
+    }
+}
+
+impl<T: Plain> DerefMut for OwnedMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut Vec<T> {
+        match &mut self.col.backing {
+            Backing::Owned(v) => v,
+            Backing::Mapped(_) => unreachable!("checked in owned_mut"),
+        }
+    }
+}
+
+impl<T: Plain> Drop for OwnedMut<'_, T> {
+    fn drop(&mut self) {
+        // The vector may have grown into a new allocation.
+        if let Backing::Owned(v) = &self.col.backing {
+            self.col.ptr = v.as_ptr();
+            self.col.len = v.len();
         }
     }
 }
 
 impl<T: Plain> Deref for Col<T> {
     type Target = [T];
+    #[inline]
     fn deref(&self) -> &[T] {
-        match self {
-            Col::Owned(v) => v,
-            // SAFETY: `mapped` checked that the range is inside the map and
-            // aligned for `T`, and `T: Plain` accepts any bytes. The map is
-            // read-only and kept alive by the `Arc`; the file is opened
-            // without write sharing and never written in place (a save
-            // replaces it by renaming a new file over it).
-            Col::Mapped { map, off, len } => unsafe {
-                std::slice::from_raw_parts(map.as_ptr().add(*off).cast::<T>(), *len)
-            },
-        }
+        // SAFETY: `ptr` and `len` describe live, initialised, aligned
+        // elements of `backing`: an owned vector (refreshed after every
+        // write through `OwnedMut`), or a range `mapped` checked to be
+        // inside the map and aligned; `T: Plain` accepts any bytes. The map
+        // is read-only and kept alive by the `Arc`; its file is opened
+        // without write sharing and never written in place (a save replaces
+        // it by renaming a new file over it).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
 impl<T: Plain> From<Vec<T>> for Col<T> {
     fn from(v: Vec<T>) -> Col<T> {
-        Col::Owned(v)
+        Col {
+            ptr: v.as_ptr(),
+            len: v.len(),
+            backing: Backing::Owned(v),
+        }
     }
 }
 
 impl<T: Plain> Default for Col<T> {
     fn default() -> Col<T> {
-        Col::Owned(Vec::new())
+        Vec::new().into()
     }
 }
 
 impl<T: Plain + fmt::Debug> fmt::Debug for Col<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Col::Owned(v) => write!(f, "Owned(len {})", v.len()),
-            Col::Mapped { off, len, .. } => write!(f, "Mapped(off {off}, len {len})"),
-        }
+        let kind = if self.is_mapped() { "Mapped" } else { "Owned" };
+        write!(f, "{kind}(len {})", self.len)
     }
 }
 
@@ -135,4 +190,22 @@ pub(crate) fn map_file(path: &std::path::Path) -> std::io::Result<Arc<Mmap>> {
     // rejects it by its header length first.
     let map = unsafe { Mmap::map(&file)? };
     Ok(Arc::new(map))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_owned_column_reads_its_vector_after_it_grows() {
+        let mut col: Col<u32> = vec![1, 2, 3].into();
+        {
+            let mut v = col.owned_mut();
+            v.reserve(10_000);
+            v.extend(4..1000);
+        }
+        assert_eq!(col.len(), 999);
+        assert_eq!(col[998], 999);
+        assert!(col.heap_bytes() >= 999 * 4);
+    }
 }

@@ -464,8 +464,8 @@ impl<T: Value> Column<T> {
     /// Place a shard's values at their entry ids (`ids[k]` is the entry the
     /// shard's k-th value belongs to).
     fn scatter(&mut self, part: &ShardColumn<T>, ids: &[u32]) {
-        let packed = self.packed.owned_mut();
-        let valid = self.valid.owned_mut();
+        let mut packed = self.packed.owned_mut();
+        let mut valid = self.valid.owned_mut();
         for (k, &id) in ids.iter().enumerate() {
             let i = id as usize;
             packed[i * T::WIDTH..(i + 1) * T::WIDTH]
