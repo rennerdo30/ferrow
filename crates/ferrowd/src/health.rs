@@ -186,6 +186,7 @@ impl State {
         // The index was built from the disks again: an earlier merge of live
         // changes says nothing about it.
         inner.compaction = None;
+        inner.merge_blocked = None;
         inner.scan = Some(ScanInfo {
             at_ms: now_ms(),
             reason: reason.into(),
@@ -245,14 +246,14 @@ impl State {
             .or_default() += 1;
     }
 
-    /// A compaction finished: the live layer grown past `reason`'s limit was
-    /// folded into a new index in memory in `took`. Not a scan (no disk was
-    /// read, [`State::is_scanning`] never said so): it has its own counters.
     /// Merges keep failing (`Some(why)`), or work again (`None`).
     pub fn merge_blocked(&self, why: Option<String>) {
         self.lock().merge_blocked = why;
     }
 
+    /// A compaction finished: the live layer grown past `reason`'s limit was
+    /// folded into a new index in memory in `took`. Not a scan (no disk was
+    /// read, [`State::is_scanning`] never said so): it has its own counters.
     pub fn compaction_done(&self, reason: &str, took: Duration) {
         let mut inner = self.lock();
         inner.merge_blocked = None;
