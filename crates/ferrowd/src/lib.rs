@@ -35,6 +35,7 @@ mod live_windows;
 pub mod memory;
 pub mod persistence;
 pub mod protection;
+pub mod saved;
 
 /// One immutable index plus how it was produced.
 pub struct Snapshot {
@@ -325,7 +326,7 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
 /// the volumes cannot be read directly. `serve` calls this itself.
 pub fn start_live(store: &SnapshotStore, options: WalkOptions) {
     #[cfg(windows)]
-    live_windows::start(store.clone(), options, None);
+    live_windows::start(store.clone(), options, None, None);
     #[cfg(not(windows))]
     let _ = (store, options);
 }
@@ -905,6 +906,7 @@ pub fn serve(
             Some(Arc::new(move |index: &Index| {
                 persistence::save_and_map(&persist_config, index)
             })),
+            config.index_path.as_deref().map(saved::path_beside),
         );
     }
     eventlog::info(format!("listening on {}", config.endpoint));

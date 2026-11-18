@@ -23,6 +23,7 @@ use crate::live::{
     WalkJob, compact_and_publish, index_parts, walk_limits_text,
 };
 use crate::memory::Breakdown;
+use crate::saved;
 use crate::{Snapshot, SnapshotStore, eventlog};
 
 /// How long changes are collected after the first one of a batch.
@@ -34,6 +35,9 @@ enum Message {
     Records {
         device: String,
         records: Vec<(u64, u32)>,
+        /// The journal id and the position the reader continues from: once
+        /// these records are applied, the index holds every change before it.
+        position: (u64, i64),
     },
     /// The journal was deleted, recreated or overrun: rescan. `fatal`: the
     /// reader has stopped and is not restarted until the service restarts.
@@ -78,6 +82,8 @@ enum Batch {
     Changes {
         changes: Vec<Change>,
         events: Vec<WalkEvent>,
+        /// Per volume, the journal position the batch's changes reach.
+        positions: Vec<(usize, (u64, i64))>,
     },
     Reset {
         device: String,
@@ -275,7 +281,12 @@ pub fn will_run(options: &WalkOptions) -> bool {
     !options.follow_symlinks && options.roots.iter().any(|r| fast(r))
 }
 
-pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
+pub fn start(
+    store: SnapshotStore,
+    options: WalkOptions,
+    persist: Option<Persist>,
+    tables: Option<std::path::PathBuf>,
+) {
     // Without raw volume access (not elevated) there is nothing live to
     // keep; the initial walk stands.
     if !will_run(&options) {
@@ -283,7 +294,7 @@ pub fn start(store: SnapshotStore, options: WalkOptions, persist: Option<Persist
     }
     let spawned = std::thread::Builder::new()
         .name("index-live".into())
-        .spawn(move || maintain(store, options, persist));
+        .spawn(move || maintain(store, options, persist, tables));
     if let Err(error) = spawned {
         eventlog::error(format!("live updates unavailable: {error}"));
     }
@@ -419,7 +430,167 @@ fn map_saved(
     }
 }
 
-fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>) {
+/// What the saved live tables must have been made with (see
+/// [`crate::saved::fingerprint`]).
+fn options_fingerprint(options: &WalkOptions) -> u64 {
+    let roots: Vec<String> = options
+        .roots
+        .iter()
+        .map(|r| root_key(&r.display().to_string()))
+        .collect();
+    let excludes: Vec<String> = options
+        .excludes
+        .iter()
+        .map(|r| root_key(&r.display().to_string()))
+        .collect();
+    let mut parts: Vec<Vec<u8>> = vec![
+        b"roots".to_vec(),
+        roots.join("\n").into_bytes(),
+        b"excludes".to_vec(),
+        excludes.join("\n").into_bytes(),
+        options.columns.bits().to_le_bytes().to_vec(),
+        vec![u8::from(options.follow_symlinks)],
+        format!("{:?}", options.ntfs).into_bytes(),
+    ];
+    parts.push(env!("CARGO_PKG_VERSION").as_bytes().to_vec());
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    saved::fingerprint(&refs)
+}
+
+/// The saved index and its live tables, when they can replace the startup
+/// scan: the loaded index is the mapped `index.bin` the tables were saved
+/// for, with the same roots and options, and every volume's change journal
+/// still holds every change since (same journal, saved position inside it).
+/// Otherwise `None`, with the reason in the log.
+fn try_restore(
+    store: &SnapshotStore,
+    tables: &std::path::Path,
+    fingerprint: u64,
+) -> Option<(Arc<ferrow_index::Index>, saved::Saved)> {
+    let base = store.get().index.clone();
+    let checksum = base.file_checksum()?;
+    let refuse = |why: String| {
+        eventlog::info(format!("startup scan: {why}"));
+    };
+    let saved = match saved::read(tables, checksum, base.len(), fingerprint) {
+        Ok(saved) => saved,
+        Err(why) => {
+            refuse(why.to_string());
+            return None;
+        }
+    };
+    for v in &saved.volumes {
+        let Ok(file) = ntfs::open_volume(&v.device) else {
+            refuse(format!("{} cannot be opened", v.device));
+            return None;
+        };
+        let Some((id, first, next)) = ntfs::query_journal(&file) else {
+            refuse(format!("{} has no change journal now", v.device));
+            return None;
+        };
+        let (saved_id, at) = v.journal;
+        if id != saved_id {
+            refuse(format!("the change journal of {} was replaced", v.device));
+            return None;
+        }
+        if at < first || at > next {
+            refuse(format!(
+                "the change journal of {} no longer holds every change since the index was saved",
+                v.device
+            ));
+            return None;
+        }
+    }
+    Some((base, saved))
+}
+
+/// Health's volume rows for an index restored from its saved tables: each
+/// configured root, live on the volume that holds it.
+fn restored_volumes(
+    options: &WalkOptions,
+    base: &ferrow_index::Index,
+    saved: &saved::Saved,
+) -> Vec<VolumeState> {
+    let mut buf = Vec::new();
+    let found: Vec<(Vec<String>, &saved::SavedVolume)> = saved
+        .volumes
+        .iter()
+        .map(|v| {
+            let roots = v
+                .roots
+                .iter()
+                .filter_map(|&record| {
+                    let id = *v.record_base.get(record as usize)?;
+                    ((id as usize) < base.len()).then(|| {
+                        base.path_bytes(id, &mut buf);
+                        root_key(&String::from_utf8_lossy(&buf))
+                    })
+                })
+                .collect();
+            (roots, v)
+        })
+        .collect();
+    options
+        .roots
+        .iter()
+        .map(|root| {
+            let text = root.display().to_string();
+            let key = root_key(&text);
+            match found.iter().find(|(roots, _)| roots.contains(&key)) {
+                Some((_, v)) => VolumeState {
+                    root: text,
+                    device: Some(v.device.clone()),
+                    mode: MODE_LIVE,
+                    reason: String::new(),
+                    entries: Some(v.entries),
+                    journal: JOURNAL_OK,
+                    journal_detail: String::new(),
+                },
+                None => VolumeState::walked(text, ""),
+            }
+        })
+        .collect()
+}
+
+/// Save `live`'s frozen tables beside its index and read them back mapped:
+/// `None` (with a warning) when its index is not the mapped file or the
+/// write fails, and then the next start scans.
+fn save_tables(
+    path: &std::path::Path,
+    live: &Live,
+    fingerprint: u64,
+    facts: &[saved::VolumeFacts],
+) -> Option<saved::Saved> {
+    let checksum = live.base().file_checksum()?;
+    let started = Instant::now();
+    let written = saved::write(path, &live.saved_ref(checksum, fingerprint, facts))
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            saved::read(path, checksum, live.base().len(), fingerprint).map_err(|e| e.to_string())
+        });
+    match written {
+        Ok(saved) => {
+            eventlog::info(format!(
+                "live tables saved in {:.1} s (the next start replays the change journal instead of scanning)",
+                started.elapsed().as_secs_f64()
+            ));
+            Some(saved)
+        }
+        Err(error) => {
+            eventlog::warn(format!(
+                "could not save the live tables ({error}); the next start scans"
+            ));
+            None
+        }
+    }
+}
+
+fn maintain(
+    store: SnapshotStore,
+    options: WalkOptions,
+    persist: Option<Persist>,
+    tables: Option<std::path::PathBuf>,
+) {
     let (tx, rx) = channel::<Message>();
     *CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
     let mut readers: HashMap<String, ()> = HashMap::new();
@@ -429,10 +600,67 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
     // With a saved index loaded, even the startup scan is background work:
     // that index answers searches meanwhile.
     let mut background = !store.get().index.is_empty();
+    let fingerprint = options_fingerprint(&options);
+    // Only the first session may come from the saved files; a rescan reads
+    // the drives.
+    let mut first = true;
     loop {
+        let started = Instant::now();
+        let restored = if std::mem::take(&mut first) {
+            tables
+                .as_deref()
+                .and_then(|path| try_restore(&store, path, fingerprint))
+        } else {
+            None
+        };
+        if let Some((base, saved)) = restored {
+            let facts: Vec<saved::VolumeFacts> = saved
+                .volumes
+                .iter()
+                .map(|v| saved::VolumeFacts {
+                    device: v.device.clone(),
+                    serial: v.serial,
+                    journal: v.journal,
+                    record_size: v.record_size,
+                })
+                .collect();
+            let volumes = restored_volumes(&options, &base, &saved);
+            let live = Live::restore(base.clone(), saved);
+            let took = started.elapsed();
+            let summary = format!(
+                "loaded the saved index ({} entries) and replays the change journal since it was saved; no scan ({:.1} s)",
+                base.len(),
+                took.as_secs_f64()
+            );
+            eventlog::info(&summary);
+            STATE.scan_finished("restart: no scan", took, volumes);
+            reason = match run_session(
+                &store,
+                &options,
+                &tx,
+                &rx,
+                &mut readers,
+                &mut generation,
+                &pool,
+                persist.as_ref(),
+                tables.as_deref(),
+                fingerprint,
+                Session {
+                    base,
+                    live,
+                    facts,
+                    can_save_tables: true,
+                    summary,
+                    took,
+                },
+            ) {
+                Some(why) => why,
+                None => return,
+            };
+            continue;
+        }
         STATE.scan_started();
         STATE.count_scan(&reason);
-        let started = Instant::now();
         let scan = || ferrow_walk::scan_with_maps(&options);
         let (index, report, maps) = match (&pool, background) {
             (Some(pool), true) => {
@@ -475,6 +703,11 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 eventlog::warn(format!("{}: {}", v.root, v.journal_detail));
             }
         }
+        // Every root read through its MFT, with a journal that could be
+        // re-read right after: what saved tables need to stand for a scan.
+        let every_root_live = volumes
+            .iter()
+            .all(|v| v.mode == MODE_LIVE && v.journal_detail.is_empty());
         STATE.scan_finished(&reason, took, volumes);
         store.swap(Snapshot {
             index: base.clone(),
@@ -508,43 +741,157 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 Err(e) => eventlog::error(format!("journal reader for {}: {e}", map.device)),
             }
         }
-        let volumes = Volumes {
-            handles: maps
-                .iter()
-                .filter_map(|m| {
-                    ntfs::open_volume(&m.device)
-                        .ok()
-                        .map(|f| (f, m.record_size))
-                })
-                .collect(),
-        };
-        if volumes.handles.len() != maps.len() {
-            eventlog::error("cannot reopen every volume; live updates stopped");
-            return;
-        }
-        let device_index: HashMap<String, usize> = maps
+        // The saved tables can replace the next startup scan only when every
+        // root is a volume read through its MFT, with a change journal.
+        let can_save_tables = maps.len() == live_volumes.len() && every_root_live;
+        let facts: Vec<saved::VolumeFacts> = maps
             .iter()
-            .enumerate()
-            .map(|(i, m)| (m.device.clone(), i))
+            .map(|m| saved::VolumeFacts {
+                device: m.device.clone(),
+                serial: m.serial,
+                journal: m.journal.unwrap_or((0, 0)),
+                record_size: m.record_size as u32,
+            })
             .collect();
         let mut live = Live::new(base.clone(), &maps);
-        let devices: Vec<String> = maps.iter().map(|m| m.device.clone()).collect();
         // The record maps (16 bytes per entry) are only needed to build
         // the overlay; do not keep them for the whole live session.
         drop(maps);
-        generation += 1;
+        if can_save_tables
+            && let Some(path) = tables.as_deref()
+            && let Some(saved) = save_tables(path, &live, fingerprint, &facts)
+        {
+            live.replace_tables(saved);
+        }
+        reason = match run_session(
+            &store,
+            &options,
+            &tx,
+            &rx,
+            &mut readers,
+            &mut generation,
+            &pool,
+            persist.as_ref(),
+            tables.as_deref(),
+            fingerprint,
+            Session {
+                base,
+                live,
+                facts,
+                can_save_tables,
+                summary,
+                took,
+            },
+        ) {
+            Some(why) => why,
+            None => return,
+        };
+    }
+}
+
+/// A frozen index and the live layer over it, from a scan or from the saved
+/// files, ready to follow the change journals.
+struct Session {
+    base: Arc<ferrow_index::Index>,
+    live: Live,
+    /// Per volume, in the live layer's volume order.
+    facts: Vec<saved::VolumeFacts>,
+    /// Whether the live tables may be saved for the next start.
+    can_save_tables: bool,
+    summary: String,
+    took: Duration,
+}
+
+/// Follow the change journals over `session` until a rescan is due: its
+/// reason, or `None` when live updates stopped.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    store: &SnapshotStore,
+    options: &WalkOptions,
+    tx: &Sender<Message>,
+    rx: &Receiver<Message>,
+    readers: &mut HashMap<String, ()>,
+    generation: &mut u64,
+    pool: &Option<rayon::ThreadPool>,
+    persist: Option<&Persist>,
+    tables: Option<&std::path::Path>,
+    fingerprint: u64,
+    session: Session,
+) -> Option<String> {
+    let _ = options;
+    let Session {
+        base,
+        mut live,
+        facts,
+        can_save_tables,
+        summary,
+        took,
+    } = session;
+    store.swap(Snapshot {
+        index: base.clone(),
+        live: None,
+        mode: "live".into(),
+        report: summary.clone(),
+    });
+    for fact in &facts {
+        if readers.contains_key(&fact.device) {
+            continue;
+        }
+        let device = fact.device.clone();
+        let journal = fact.journal;
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("usn-reader".into())
+            .spawn(move || read_journal(device, journal, tx));
+        match spawned {
+            Ok(_) => {
+                readers.insert(fact.device.clone(), ());
+            }
+            Err(e) => eventlog::error(format!("journal reader for {}: {e}", fact.device)),
+        }
+    }
+    let volumes = Volumes {
+        handles: facts
+            .iter()
+            .filter_map(|f| {
+                ntfs::open_volume(&f.device)
+                    .ok()
+                    .map(|file| (file, f.record_size as usize))
+            })
+            .collect(),
+    };
+    if volumes.handles.len() != facts.len() {
+        eventlog::error("cannot reopen every volume; live updates stopped");
+        return None;
+    }
+    let device_index: HashMap<String, usize> = facts
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.device.clone(), i))
+        .collect();
+    // Where each journal's changes are applied up to: what saved tables
+    // may claim.
+    let mut applied: Vec<(u64, i64)> = facts.iter().map(|f| f.journal).collect();
+    let devices: Vec<String> = facts.iter().map(|f| f.device.clone()).collect();
+    let (tx, rx) = (tx.clone(), rx);
+    let pool = pool.as_ref();
+    let generation = {
+        *generation += 1;
+        *generation
+    };
+    {
         let mut walker = Walker::start(generation, devices.clone(), tx.clone());
         eventlog::info(format!(
             "folders moved into the index are read in the background ({}), not rescanned",
             walk_limits_text(base.len())
         ));
-        log_memory("after scan", Some(&live), &base, &store);
+        log_memory("after scan", Some(&live), &base, store);
         let mut applied_total = 0usize;
         let mut rescan = Maintenance::after_scan(Instant::now(), took);
         let mut hard_delta = live.limits().hard_delta;
         let mut base = base;
         let mut gate = PublishGate::new();
-        reason = loop {
+        let reason = loop {
             // A batch keeps one reason; a disk reason in the same batch as a
             // large move must not leave its hidden entries without the
             // compaction that shows them (a request is kept only once).
@@ -564,18 +911,19 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                 Some(Due::Rescan(why)) => {
                     // The fullest the live layer gets: what it holds before
                     // the rescan replaces it.
-                    log_memory("before rescan", Some(&live), &base, &store);
+                    log_memory("before rescan", Some(&live), &base, store);
                     break why;
                 }
                 Some(Due::Compact(why)) => {
-                    log_memory("before compaction", Some(&live), &base, &store);
+                    log_memory("before compaction", Some(&live), &base, store);
+                    let save_now = can_save_tables && !rescan.rescan_waiting();
                     let report = format!("{summary}; {applied_total} live changes");
                     // Single writer: this thread, on the low-priority pool.
                     // Journal changes queue in the channel meanwhile, and
                     // searches read the snapshot published before.
                     let took = compact_and_publish(
                         &mut live,
-                        &store,
+                        store,
                         report,
                         |live| {
                             let mut new = match &pool {
@@ -584,8 +932,27 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                             }?;
                             // The merged index replaces the file and is read
                             // from it, so its heap copy goes at once.
-                            if let Some(mapped) = map_saved(new.base(), persist.as_ref()) {
+                            if let Some(mapped) = map_saved(new.base(), persist) {
                                 new.replace_base(Arc::new(mapped));
+                                // Its live tables too, with the journal
+                                // positions every merged change is up to,
+                                // unless the index is known to miss changes
+                                // (a rescan waits): then the next start scans.
+                                if save_now && let Some(path) = tables {
+                                    let facts: Vec<saved::VolumeFacts> = facts
+                                        .iter()
+                                        .zip(&applied)
+                                        .map(|(f, &journal)| saved::VolumeFacts {
+                                            journal,
+                                            ..f.clone()
+                                        })
+                                        .collect();
+                                    if let Some(saved) =
+                                        save_tables(path, &new, fingerprint, &facts)
+                                    {
+                                        new.replace_tables(saved);
+                                    }
+                                }
                             }
                             Some(new)
                         },
@@ -611,7 +978,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
                             took.as_secs_f64(),
                             base.len()
                         ));
-                        log_memory("after compaction", Some(&live), &base, &store);
+                        log_memory("after compaction", Some(&live), &base, store);
                     }
                     continue;
                 }
@@ -628,11 +995,13 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             .into_iter()
             .flatten()
             .min();
-            let Some(batch) = next_batch(&rx, &device_index, wake) else {
-                return;
-            };
-            let (changes, events) = match batch {
-                Batch::Changes { changes, events } => (changes, events),
+            let batch = next_batch(rx, &device_index, wake)?;
+            let (changes, events, positions) = match batch {
+                Batch::Changes {
+                    changes,
+                    events,
+                    positions,
+                } => (changes, events, positions),
                 Batch::Reset {
                     device,
                     reason,
@@ -700,6 +1069,10 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             if !changes.is_empty() {
                 outcome.absorb(live.apply(&changes, &volumes));
             }
+            // Applied: the index now holds every change before these.
+            for (volume, position) in positions {
+                applied[volume] = position;
+            }
             for job in std::mem::take(&mut outcome.walks) {
                 let id = job.id;
                 if !walker.send(job) {
@@ -755,6 +1128,7 @@ fn maintain(store: SnapshotStore, options: WalkOptions, persist: Option<Persist>
             });
             gate.published(Instant::now(), build);
         };
+        Some(reason)
     }
 }
 
@@ -774,6 +1148,7 @@ fn next_batch(
                 return Some(Batch::Changes {
                     changes: Vec::new(),
                     events: Vec::new(),
+                    positions: Vec::new(),
                 });
             }
             Err(RecvTimeoutError::Disconnected) => return None,
@@ -782,6 +1157,7 @@ fn next_batch(
     let deadline = Instant::now() + BATCH;
     let mut changes: HashMap<(usize, u64), bool> = HashMap::new();
     let mut events: Vec<WalkEvent> = Vec::new();
+    let mut positions: HashMap<usize, (u64, i64)> = HashMap::new();
     let mut take = |message: Message| -> Result<(), Batch> {
         match message {
             // Kept with the batch: returning early would drop the changes
@@ -800,12 +1176,18 @@ fn next_batch(
                 fatal,
             }),
             Message::RescanNow => Err(Batch::RescanNow),
-            Message::Records { device, records } => {
+            Message::Records {
+                device,
+                records,
+                position,
+            } => {
                 if let Some(&volume) = device_index.get(&device) {
                     for (record, reason) in records {
                         *changes.entry((volume, record)).or_default() |=
                             reason & REASON_CREATE != 0;
                     }
+                    // Messages of one reader arrive in order: the last wins.
+                    positions.insert(volume, position);
                 }
                 Ok(())
             }
@@ -838,6 +1220,7 @@ fn next_batch(
     Some(Batch::Changes {
         changes: out,
         events,
+        positions: positions.into_iter().collect(),
     })
 }
 
@@ -868,6 +1251,7 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
                     .send(Message::Records {
                         device: device.clone(),
                         records,
+                        position: (id, next),
                     })
                     .is_err()
                 {

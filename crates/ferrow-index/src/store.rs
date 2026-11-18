@@ -16,14 +16,17 @@ compile_error!("ferrow-index maps little-endian files in place and needs a littl
 /// every bit pattern valid, little-endian on every supported target.
 ///
 /// # Safety
-/// Implemented only for the unsigned integers below.
-pub(crate) unsafe trait Plain: Copy + Send + Sync + 'static {}
+/// Implemented only for the unsigned integers below; implement it for
+/// nothing else.
+pub unsafe trait Plain: Copy + Send + Sync + 'static {}
 // SAFETY: plain integers, no padding, any bit pattern is a valid value.
 unsafe impl Plain for u8 {}
 // SAFETY: as above.
 unsafe impl Plain for u16 {}
 // SAFETY: as above.
 unsafe impl Plain for u32 {}
+// SAFETY: as above.
+unsafe impl Plain for u64 {}
 
 /// What keeps a column's elements alive.
 enum Backing<T> {
@@ -34,7 +37,7 @@ enum Backing<T> {
 /// One column: owned, or elements of a shared map. Reading it is a plain
 /// slice of `ptr` and `len` (no branch per access: searches read columns
 /// once per entry); `backing` keeps the memory alive.
-pub(crate) struct Col<T: Plain> {
+pub struct Col<T: Plain> {
     ptr: *const T,
     len: usize,
     backing: Backing<T>,
@@ -50,7 +53,7 @@ unsafe impl<T: Plain> Sync for Col<T> {}
 impl<T: Plain> Col<T> {
     /// `len` elements of `map` from byte `off`; `None` when that range is
     /// outside the map or not aligned for `T`.
-    pub(crate) fn mapped(map: &Arc<Mmap>, off: usize, len: usize) -> Option<Col<T>> {
+    pub fn mapped(map: &Arc<Mmap>, off: usize, len: usize) -> Option<Col<T>> {
         let bytes = len.checked_mul(size_of::<T>())?;
         let end = off.checked_add(bytes)?;
         if end > map.len() {
@@ -67,7 +70,7 @@ impl<T: Plain> Col<T> {
     }
 
     /// Heap bytes this column holds (its capacity); 0 when mapped.
-    pub(crate) fn heap_bytes(&self) -> usize {
+    pub fn heap_bytes(&self) -> usize {
         match &self.backing {
             Backing::Owned(v) => v.capacity() * size_of::<T>(),
             Backing::Mapped(_) => 0,
@@ -75,7 +78,7 @@ impl<T: Plain> Col<T> {
     }
 
     /// Mapped bytes this column reads; 0 when owned.
-    pub(crate) fn mapped_bytes(&self) -> usize {
+    pub fn mapped_bytes(&self) -> usize {
         match &self.backing {
             Backing::Owned(_) => 0,
             Backing::Mapped(_) => self.len * size_of::<T>(),
@@ -83,7 +86,7 @@ impl<T: Plain> Col<T> {
     }
 
     /// Whether the elements are read from a map.
-    pub(crate) fn is_mapped(&self) -> bool {
+    pub fn is_mapped(&self) -> bool {
         matches!(self.backing, Backing::Mapped(_))
     }
 
@@ -174,7 +177,7 @@ impl<T: Plain + fmt::Debug> fmt::Debug for Col<T> {
 /// sharing (and nothing else beyond reading): a save may then rename a new
 /// file over this one while the map keeps serving the old contents, and no
 /// one may open it for writing meanwhile.
-pub(crate) fn map_file(path: &std::path::Path) -> std::io::Result<Arc<Mmap>> {
+pub fn map_file(path: &std::path::Path) -> std::io::Result<Arc<Mmap>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(windows)]

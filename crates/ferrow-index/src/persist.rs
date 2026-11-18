@@ -1066,7 +1066,10 @@ fn load_mapped(path: &Path) -> Result<(Index, LoadTimings), LoadError> {
     let t = Instant::now();
     let map = crate::store::map_file(path).map_err(LoadError::Io)?;
     timings.read += t.elapsed();
-    let index = from_bytes_with(&map, Some(&map), &mut timings)?;
+    let mut index = from_bytes_with(&map, Some(&map), &mut timings)?;
+    index.file_checksum = Some(u32::from_le_bytes(
+        map[20..24].try_into().expect("header checked"),
+    ));
     timings.metadata_load = if index.columns_present().bits() == 0 {
         MetadataLoad::Absent
     } else {
