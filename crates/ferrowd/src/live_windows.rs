@@ -479,6 +479,18 @@ fn options_fingerprint(options: &WalkOptions) -> u64 {
     saved::fingerprint(&refs)
 }
 
+/// The most change journal (bytes of USN records) a start replays instead of
+/// scanning: about a million changed files.
+const MAX_REPLAY_BYTES: i64 = 256 << 20;
+
+/// How long the saved tables may lag behind the changes applied before a
+/// merge is asked for to bring the saved index and its journal positions
+/// up to date (otherwise a long quiet session with a few changes leaves the
+/// saved position behind until the journal wraps past it).
+const TABLES_REFRESH: Duration = Duration::from_secs(2 * 60 * 60);
+/// Why such a merge runs.
+const REASON_REFRESH: &str = "bring the saved index up to date";
+
 /// The saved index and its live tables, when they can replace the startup
 /// scan: the loaded index is the mapped `index.bin` the tables were saved
 /// for, with the same roots and options, and every volume's change journal
@@ -502,10 +514,20 @@ fn try_restore(
         }
     };
     for v in &saved.volumes {
+        // Only a volume device is opened (the name comes from a file).
+        if !(v.device.starts_with(r"\\?\Volume{") && v.device.trim_end_matches('\\').ends_with('}'))
+        {
+            refuse("the saved live tables name an unexpected device".into());
+            return None;
+        }
         let Ok(file) = ntfs::open_volume(&v.device) else {
             refuse(format!("{} cannot be opened", v.device));
             return None;
         };
+        if ntfs::volume_serial(&file) != Some(v.serial) {
+            refuse(format!("{} is another volume now", v.device));
+            return None;
+        }
         let Some((id, first, next)) = ntfs::query_journal(&file) else {
             refuse(format!("{} has no change journal now", v.device));
             return None;
@@ -513,6 +535,15 @@ fn try_restore(
         let (saved_id, at) = v.journal;
         if id != saved_id {
             refuse(format!("the change journal of {} was replaced", v.device));
+            return None;
+        }
+        // Replaying more than this would take longer than the scan it saves
+        // (one record read per changed file).
+        if next.saturating_sub(at) > MAX_REPLAY_BYTES {
+            refuse(format!(
+                "the change journal of {} has too many changes since the index was saved",
+                v.device
+            ));
             return None;
         }
         if at < first || at > next {
@@ -646,11 +677,28 @@ fn maintain(
                 .map(|v| saved::VolumeFacts {
                     device: v.device.clone(),
                     serial: v.serial,
-                    journal: v.journal,
+                    journal: Some(v.journal),
                     record_size: v.record_size,
                 })
                 .collect();
             let volumes = restored_volumes(&options, &base, &saved);
+            // Each root must still be on the volume its tables are for
+            // (a drive letter can move to another volume).
+            if let Some(moved) = volumes.iter().find(|v| {
+                v.device.as_deref().is_none_or(|device| {
+                    ntfs::volume_device(std::path::Path::new(&v.root))
+                        .ok()
+                        .as_deref()
+                        != Some(device)
+                })
+            }) {
+                eventlog::info(format!(
+                    "startup scan: {} is not on the volume its saved tables are for",
+                    moved.root
+                ));
+                drop((base, saved));
+                continue;
+            }
             let live = Live::restore(base.clone(), saved);
             let took = started.elapsed();
             let summary = format!(
@@ -775,7 +823,7 @@ fn maintain(
             .map(|m| saved::VolumeFacts {
                 device: m.device.clone(),
                 serial: m.serial,
-                journal: m.journal.unwrap_or((0, 0)),
+                journal: m.journal,
                 record_size: m.record_size as u32,
             })
             .collect();
@@ -864,7 +912,10 @@ fn run_session(
             continue;
         }
         let device = fact.device.clone();
-        let journal = fact.journal;
+        // A volume without a change journal is read once and not followed.
+        let Some(journal) = fact.journal else {
+            continue;
+        };
         let tx = tx.clone();
         let spawned = std::thread::Builder::new()
             .name("usn-reader".into())
@@ -897,7 +948,10 @@ fn run_session(
         .collect();
     // Where each journal's changes are applied up to: what saved tables
     // may claim.
-    let mut applied: Vec<(u64, i64)> = facts.iter().map(|f| f.journal).collect();
+    let mut applied: Vec<(u64, i64)> = facts.iter().map(|f| f.journal.unwrap_or((0, 0))).collect();
+    // When the saved tables were last brought up to date (see
+    // TABLES_REFRESH).
+    let mut tables_saved = Instant::now();
     let devices: Vec<String> = facts.iter().map(|f| f.device.clone()).collect();
     let (tx, rx) = (tx.clone(), rx);
     let pool = pool.as_ref();
@@ -911,7 +965,8 @@ fn run_session(
             "folders moved into the index are read in the background ({}), not rescanned",
             walk_limits_text(base.len())
         ));
-        log_memory("after scan", Some(&live), &base, store);
+        STATE.set_tables_mapped(live.mapped_bytes());
+        log_memory("live updates start", Some(&live), &base, store);
         let mut applied_total = 0usize;
         let mut rescan = Maintenance::after_scan(Instant::now(), took);
         let mut hard_delta = live.limits().hard_delta;
@@ -923,6 +978,15 @@ fn run_session(
             // compaction that shows them (a request is kept only once).
             if live.adoptions_pending() {
                 rescan.request(Reason::compact(REASON_LARGE_MOVE));
+            }
+            // Keep the saved index and its journal positions from falling
+            // far behind: a merge brings both up to date.
+            if can_save_tables
+                && live.delta_len() > 0
+                && tables_saved.elapsed() >= TABLES_REFRESH
+                && !rescan.rescan_waiting()
+            {
+                rescan.request(Reason::compact(REASON_REFRESH));
             }
             let load = Load {
                 prompt: live.adoptions_pending(),
@@ -973,7 +1037,7 @@ fn run_session(
                                         .iter()
                                         .zip(&applied)
                                         .map(|(f, &journal)| saved::VolumeFacts {
-                                            journal,
+                                            journal: Some(journal),
                                             ..f.clone()
                                         })
                                         .collect();
@@ -998,6 +1062,8 @@ fn run_session(
                         },
                     );
                     if let Some(took) = took {
+                        tables_saved = Instant::now();
+                        STATE.set_tables_mapped(live.mapped_bytes());
                         base = live.base().clone();
                         hard_delta = live.limits().hard_delta;
                         gate = PublishGate::new();
@@ -1328,6 +1394,55 @@ fn read_journal(device: String, journal: (u64, i64), tx: Sender<Message>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_reports_how_far_each_journal_was_read() {
+        let (tx, rx) = channel::<Message>();
+        let devices: HashMap<String, usize> = [("A".to_string(), 0), ("B".to_string(), 1)]
+            .into_iter()
+            .collect();
+        for (device, record, at) in [("A", 5, 100), ("B", 7, 50), ("A", 6, 180), ("X", 1, 9)] {
+            tx.send(Message::Records {
+                device: device.into(),
+                records: vec![(record, REASON_CREATE)],
+                position: (1, at),
+            })
+            .unwrap();
+        }
+        let Some(Batch::Changes {
+            changes,
+            mut positions,
+            ..
+        }) = next_batch(&rx, &devices, None)
+        else {
+            panic!("a batch of changes");
+        };
+        assert_eq!(changes.len(), 3, "the unknown device is ignored");
+        positions.sort();
+        assert_eq!(
+            positions,
+            [(0, (1, 180)), (1, (1, 50))],
+            "the last position per journal"
+        );
+        // A reset ends the batch without positions: what it collected is
+        // not claimed as applied.
+        tx.send(Message::Records {
+            device: "A".into(),
+            records: vec![(8, 0)],
+            position: (1, 300),
+        })
+        .unwrap();
+        tx.send(Message::Reset {
+            device: "A".into(),
+            reason: "journal reset".into(),
+            fatal: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            next_batch(&rx, &devices, None),
+            Some(Batch::Reset { .. })
+        ));
+    }
 
     #[test]
     fn a_walked_volume_shows_the_error_the_fast_read_gave() {

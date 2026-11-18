@@ -685,9 +685,7 @@ struct VolumeSeed {
     roots: HashSet<u64>,
 }
 
-/// A record with several frozen entries (hard links) in `record_base`: its
-/// entries are in the volume's link table.
-const MULTI: u32 = u32::MAX - 1;
+use crate::saved::MULTI;
 
 struct Volume {
     /// Frozen entry of each record (`u32::MAX`: none, [`MULTI`]: several,
@@ -1071,7 +1069,7 @@ impl Live {
                 .map(|((v, facts), entries)| crate::saved::SavedVolumeRef {
                     device: &facts.device,
                     serial: facts.serial,
-                    journal: facts.journal,
+                    journal: facts.journal.unwrap_or((0, 0)),
                     record_size: facts.record_size,
                     entries,
                     excluded: {
@@ -1090,6 +1088,25 @@ impl Live {
                 })
                 .collect(),
         }
+    }
+
+    /// Bytes of the saved live tables this layer reads through a map.
+    pub fn mapped_bytes(&self) -> usize {
+        let children = self
+            .base_children
+            .get()
+            .map_or(0, |(first, ids)| first.mapped_bytes() + ids.mapped_bytes());
+        self.base_record.mapped_bytes()
+            + children
+            + self
+                .volumes
+                .iter()
+                .map(|v| {
+                    v.record_base.mapped_bytes()
+                        + v.link_records.mapped_bytes()
+                        + v.link_ids.mapped_bytes()
+                })
+                .sum::<usize>()
     }
 
     /// Read the frozen record tables from `saved` instead: the same tables,
@@ -1409,15 +1426,20 @@ impl Live {
             for i in 1..first.len() {
                 first[i] += first[i - 1];
             }
-            let mut fill = first.clone();
+            // Fill by advancing each parent's start, then shift the starts
+            // back (no second table of n entries).
             let mut ids = vec![0u32; first[n] as usize];
             for c in 0..n as u32 {
                 let p = self.base.parent(c);
                 if p != ROOT_PARENT {
-                    ids[fill[p as usize] as usize] = c;
-                    fill[p as usize] += 1;
+                    ids[first[p as usize] as usize] = c;
+                    first[p as usize] += 1;
                 }
             }
+            for i in (1..=n).rev() {
+                first[i] = first[i - 1];
+            }
+            first[0] = 0;
             (first.into(), ids.into())
         })
     }
@@ -5370,7 +5392,7 @@ mod tests {
             .map(|v| crate::saved::VolumeFacts {
                 device: format!(r"\?\Volume{{{v}}}"),
                 serial: v as u64,
-                journal: (7, 1000 + v as i64),
+                journal: Some((7, 1000 + v as i64)),
                 record_size: 1024,
             })
             .collect()

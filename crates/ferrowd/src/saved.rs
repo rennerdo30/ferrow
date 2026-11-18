@@ -36,8 +36,11 @@ const MAGIC: [u8; 8] = *b"FERROWLV";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 40;
 const CHECKSUM_START: usize = 16;
-/// Ids at or above this in `record_base` are markers (none, several).
-const FIRST_MARKER: u32 = u32::MAX - 1;
+/// A record with several frozen entries (hard links) in `record_base`: its
+/// entries are in the volume's link table.
+pub const MULTI: u32 = u32::MAX - 1;
+/// Ids at or above this in `record_base` are markers (several, none).
+const FIRST_MARKER: u32 = MULTI;
 
 /// One volume's frozen tables and where its change journal was read up to.
 pub struct SavedVolume {
@@ -77,8 +80,10 @@ pub struct Saved {
 pub struct VolumeFacts {
     pub device: String,
     pub serial: u64,
-    /// Change journal id and the position every saved change is up to.
-    pub journal: (u64, i64),
+    /// Change journal id and the position every saved change is up to;
+    /// `None`: the volume has no change journal (it is not followed, and
+    /// tables are not saved).
+    pub journal: Option<(u64, i64)>,
     pub record_size: u32,
 }
 
@@ -479,9 +484,38 @@ fn validate(saved: &Saved, n: usize) -> Result<(), Refused> {
             || v.link_records.windows(2).any(|w| w[0] > w[1])
             || v.link_records
                 .iter()
-                .any(|&r| r as usize >= v.record_base.len())
+                .any(|&r| r as usize >= v.record_base.len() || v.record_base[r as usize] != MULTI)
         {
             return Err(Refused::Corrupt("record table"));
+        }
+    }
+    // The tables agree: every entry with a record is found from it (alone
+    // in its slot, or among its record's links), and every record marked
+    // as linked has links. A writer bug would otherwise lose entries.
+    for (id, &packed) in saved.base_record.iter().enumerate() {
+        if packed == u64::MAX {
+            continue;
+        }
+        let v = &saved.volumes[(packed >> 48) as usize];
+        let record = packed & 0x0000_FFFF_FFFF_FFFF;
+        let found = match v.record_base[record as usize] {
+            MULTI => {
+                let from = v.link_records.partition_point(|&r| r < record);
+                let to = v.link_records.partition_point(|&r| r <= record);
+                v.link_ids[from..to].contains(&(id as u32))
+            }
+            slot => slot as usize == id,
+        };
+        if !found {
+            return Err(Refused::Corrupt("record tables disagree"));
+        }
+    }
+    for v in &saved.volumes {
+        let linked = v.record_base.iter().filter(|&&slot| slot == MULTI).count();
+        let mut records = v.link_records.to_vec();
+        records.dedup();
+        if records.len() != linked {
+            return Err(Refused::Corrupt("record tables disagree"));
         }
     }
     Ok(())
@@ -493,7 +527,8 @@ mod tests {
 
     #[allow(clippy::type_complexity)]
     fn sample() -> (Vec<u64>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u64>, Vec<u32>) {
-        // root(0) / a(1), b(2); records 5, 20, 21 on volume 0; b has two names.
+        // root(0) / a(1), b(2) and b's second name (3); records 5, 20, 21
+        // on volume 0.
         let base_record = vec![5, 20, 21, 21];
         let first = vec![0, 3, 3, 3, 3];
         let ids = vec![1, 2, 3];
@@ -578,5 +613,43 @@ mod tests {
         assert_eq!(a, fingerprint(&[b"C:\\", b"x"]));
         assert_ne!(a, fingerprint(&[b"C:\\x", b""]), "parts are delimited");
         assert_ne!(a, fingerprint(&[b"D:\\", b"x"]));
+    }
+
+    #[test]
+    fn tables_that_disagree_are_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("ferrowd-live-disagree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_beside(&dir.join("index.bin"));
+        let (base_record, first, ids, mut record_base, link_records, link_ids) = sample();
+        // Record 20 claims entry 2, but entry 1 is on record 20: entry 1
+        // could not be found from its record.
+        record_base[20] = 2;
+        let tables = SavedRef {
+            index_checksum: 1,
+            fingerprint: 2,
+            base_record: &base_record,
+            children_first: &first,
+            children_ids: &ids,
+            volumes: vec![SavedVolumeRef {
+                device: r"\?\Volume{1}",
+                serial: 3,
+                journal: (11, 12345),
+                record_size: 1024,
+                entries: 4,
+                excluded: vec![],
+                roots: vec![5],
+                record_base: &record_base,
+                link_records: &link_records,
+                link_ids: &link_ids,
+            }],
+        };
+        write(&path, &tables).unwrap();
+        assert!(matches!(
+            read(&path, 1, 4, 2),
+            Err(Refused::Corrupt("record tables disagree"))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
