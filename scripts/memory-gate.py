@@ -68,7 +68,7 @@ CHECKS = [
      "MiB", 2,
      "measured 0-0.2 MiB, everything is written to temporary files; +1.8 MiB"),
     ("scan.emit", "bounded.emit", "emission through the spilling builder and the record map file",
-     "MiB", 40,
+     "MiB", 80,
      "measured 58.3-65.1 MiB = the 32 MiB spill budget x 1.6 (shard heap while entries "
      "are added) plus the working set, +23 %; raising the budget raises this"),
     ("scan.freeze", "bounded.freeze", "freeze into the index file (place, fold, sort, checksum in the map)",
@@ -98,7 +98,7 @@ STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record
                "measured 0.36 B/entry (removed bits 0.125, record_base remainder 0.23); "
                "a heap table of 1 B/entry or more is a regression")
 COMPACT = ("compact.file", "compact.file", "compaction into the index file (Live::compact_into)",
-           "B/entry", 15,
+           "B/entry", 26,
            "measured 18.7-21.2 B/entry over six runs (about 60 MB fixed + the new live tables in "
            "the heap, decision 6, still to do), +23 %")
 RESTART = ("restart.load", "restart.load", "restart: map index and tables, restore the live layer",
