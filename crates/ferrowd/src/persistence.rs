@@ -380,6 +380,65 @@ mod tests {
     }
 
     #[test]
+    fn a_build_into_the_index_file_replaces_it_and_leaves_the_save_lock_free() {
+        let dir = std::env::temp_dir().join(format!("ferrowd-build-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state").join("index.bin");
+        let config = DaemonConfig {
+            endpoint: ferrow_ipc::Endpoint::named("ferrow-build-file-unused"),
+            index_path: Some(path.clone()),
+            roots: vec![],
+            excludes: vec![],
+            follow_symlinks: false,
+        };
+        let file = IndexFile::new(&config).unwrap();
+        assert!(
+            IndexFile::new(&DaemonConfig {
+                index_path: None,
+                ..config.clone()
+            })
+            .is_none()
+        );
+        // The state directory does not exist yet: preparing it creates it.
+        file.prepare().unwrap();
+
+        let build = |entries: usize| {
+            let b = ferrow_index::IndexBuilder::with_spill(
+                ferrow_index::ColumnSet::DEFAULT,
+                path.parent().unwrap(),
+                16 * 1024,
+            );
+            let root = b.add_root(b"C:", ferrow_index::flags::DIR);
+            for i in 0..entries {
+                b.add(root, format!("file {i}.txt").as_bytes(), 0);
+            }
+            b.freeze_to_file_with(&file.target()).unwrap()
+        };
+        let (first, timings) = build(3_000);
+        assert!(first.is_mapped());
+        assert!(timings.spilled_bytes > 0, "the build spilled");
+        file.built(&ferrow_walk::IndexFileReport {
+            timings: Some(timings),
+            ..Default::default()
+        });
+        assert!(SAVE_LOCK.try_lock().is_ok(), "the lock is released");
+
+        // A second build replaces the file while the first is mapped.
+        let (second, _) = build(4_000);
+        assert_eq!(first.len(), 3_001);
+        assert_eq!(second.len(), 4_001);
+        assert_eq!(ferrow_index::Index::load(&path).unwrap().len(), 4_001);
+        drop((first, second));
+        let mut left: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["index.bin"], "no temporary or spill file is left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shutdown_during_save_persists_a_newer_publication() {
         let store = SnapshotStore::new(Snapshot::empty());
         let config = DaemonConfig {

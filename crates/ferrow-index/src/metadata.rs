@@ -529,7 +529,7 @@ impl<'a, T: Value> FileColumn<'a, T> {
         }
         self.count.copy_from_slice(&(k as u32).to_le_bytes());
         let (ids, values) = self.tail.split_at_mut(k * 4);
-        for (slot, &(id, _)) in ids.chunks_exact_mut(4).zip(&self.overflow) {
+        for (slot, &(id, _)) in ids.as_chunks_mut::<4>().0.iter_mut().zip(&self.overflow) {
             slot.copy_from_slice(&id.to_le_bytes());
         }
         let mut raw = Vec::with_capacity(T::RAW);

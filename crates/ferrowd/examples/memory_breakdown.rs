@@ -33,8 +33,8 @@
 //!    `scan2.emit` and `scan2.freeze`. It is checked against the heap build's
 //!    index entry for entry,
 //! 10. the merge of the live changes into a new index (`compact`), in the heap
-//!    (`Live::compact`) and into the index file (`Live::compact_into`), each
-//!    with its peak.
+//!     (`Live::compact`) and into the index file (`Live::compact_into`), each
+//!     with its peak.
 //!
 //! Assumptions are printed as `FERROW-MEMORY-CONFIG`: free-record share,
 //! hard-link share, change mix and count. Change them with the environment
@@ -798,9 +798,10 @@ fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
         "volume, spilling builder (default budget) and record map while the subtree is emitted; peak since this phase began",
     );
     println!(
-        "FERROW-MEMORY-TIMING round={round} step=emit ms={:.1} spilled_bytes={}",
+        "FERROW-MEMORY-TIMING round={round} step=emit ms={:.1} spilled_bytes={} spill_write_ms={:.1}",
         started.elapsed().as_secs_f64() * 1000.0,
-        builder.spilled_bytes()
+        builder.spilled_bytes(),
+        builder.spill_time().as_secs_f64() * 1000.0
     );
     let mut parts = transient(&volume.heap_parts());
     parts.extend(

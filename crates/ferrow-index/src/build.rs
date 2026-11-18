@@ -82,7 +82,7 @@ pub struct FileFreezeTimings {
 /// still [`IndexBuilder::freeze_checked`] it into the heap.
 pub struct FileFreezeError {
     pub error: SaveError,
-    pub builder: IndexBuilder,
+    pub builder: Box<IndexBuilder>,
 }
 
 impl fmt::Debug for FileFreezeError {
@@ -308,6 +308,8 @@ pub(crate) struct Spill {
     failure: Mutex<Option<io::Error>>,
     failed: AtomicBool,
     spilled: AtomicU64,
+    /// Nanoseconds the writers spent in [`Spill::write`] (all threads).
+    spill_nanos: AtomicU64,
 }
 
 /// Spare shards kept for reuse (a few: spills are rare and quick).
@@ -325,6 +327,7 @@ impl Spill {
             failure: Mutex::default(),
             failed: AtomicBool::new(false),
             spilled: AtomicU64::new(0),
+            spill_nanos: AtomicU64::new(0),
         }
     }
 
@@ -346,6 +349,10 @@ impl Spill {
         self.spilled.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn spill_time(&self) -> Duration {
+        Duration::from_nanos(self.spill_nanos.load(Ordering::Relaxed))
+    }
+
     /// An empty shard to put in place of one that is written out.
     pub(crate) fn fresh(&self, columns: ColumnSet) -> Shard {
         self.spare
@@ -358,7 +365,11 @@ impl Spill {
     /// Write `full` (shard `idx`'s entries) to its spill file and recycle its
     /// memory; on failure the shard is parked in the heap, intact.
     pub(crate) fn write(&self, idx: usize, mut full: Shard) {
-        match self.try_write(idx, &full) {
+        let started = Instant::now();
+        let written = self.try_write(idx, &full);
+        self.spill_nanos
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match written {
             Ok(()) => {
                 full.clear();
                 let mut spare = self.spare.lock().unwrap_or_else(|e| e.into_inner());
@@ -618,6 +629,14 @@ impl IndexBuilder {
         self.spill.as_ref().map_or(0, Spill::spilled_bytes)
     }
 
+    /// Time the writers have spent writing shards out so far, summed over
+    /// threads (zero for a builder that does not spill).
+    pub fn spill_time(&self) -> Duration {
+        self.spill
+            .as_ref()
+            .map_or(Duration::ZERO, Spill::spill_time)
+    }
+
     /// The first failure to write a spill file, if there was one: the shards
     /// then stayed in memory and the build is correct, only larger.
     pub fn spill_failure(&self) -> Option<String> {
@@ -644,7 +663,7 @@ impl IndexBuilder {
             Ok(done) => Ok(done),
             Err(error) => Err(FileFreezeError {
                 error,
-                builder: self,
+                builder: Box::new(self),
             }),
         }
     }
@@ -829,7 +848,6 @@ impl IndexBuilder {
             regions.folded,
         );
         timings.sort = t.elapsed();
-        drop(regions);
 
         let t = Instant::now();
         let sum = crc_parallel(&map[CHECKSUM_START..]);
