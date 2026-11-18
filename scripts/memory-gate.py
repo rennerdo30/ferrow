@@ -59,6 +59,10 @@ MIB = 1 << 20
 ENTRIES_LARGE = 5_000_000  # FERROW_BENCH_ENTRIES of the two runs the limits are calibrated for
 ENTRIES_SMALL = 1_000_000
 SPILL_BUDGET = 8 * MIB  # FERROW_MEMORY_SPILL_BUDGET of both runs
+# What the service's own 32 MiB budget adds to a scan's highest point over the 8 MiB
+# of the run: the same example at 32 MiB measured 62.8 to 67.8 MiB for the scan total
+# (eight runs before this change), 15.4 MiB at 8 MiB: about 47 to 52 MiB more, so 52.
+PRODUCTION_BUDGET_MIB = 52
 
 # The owner's PC (ADR 0007): 27.2 M entries, never more than 1 GB, target 512 MB.
 PC = {
@@ -330,7 +334,8 @@ def evaluate(large, small):
 
     steady = fit("steady")
     add("pc.steady", "steady state", steady, True)
-    add("pc.scan", "steady + a full scan (rescan)", plus(steady, fit("total")), True)
+    add("pc.scan", "steady + a full scan (rescan, with the production spill budget)",
+        plus(steady, plus(fit("total"), PRODUCTION_BUDGET_MIB)), True)
     add("pc.compact", "steady + a compaction", plus(steady, fit("compact")), False)
     add("pc.restart", "a restart (peak)", fit("restart"), True)
     return rows, slopes, ext

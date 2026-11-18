@@ -446,10 +446,22 @@ impl Report {
     /// A platform that gave no peak prints `sampler=missing` and `peak_bytes=0`
     /// (never a silent zero growth); `scripts/memory-gate.py` fails on both.
     fn peak(&mut self, phase: &str, before: u64, peak: Option<u64>, note: &str) {
+        self.peak_net(phase, before, 0, peak, note);
+    }
+
+    /// [`Self::peak`] for a phase that starts with free heap memory the
+    /// allocator still holds (`reusable` bytes: committed minus allocated).
+    /// The phase reuses it, so the start is taken net of it: the growth is
+    /// the peak above the data the process really holds, not above that
+    /// data plus however much garbage an earlier phase happened to leave
+    /// (which varied by 12 MiB between runs and moved the compaction's
+    /// growth by as much; its peak itself varied by under 1 MiB).
+    fn peak_net(&mut self, phase: &str, before: u64, reusable: u64, peak: Option<u64>, note: &str) {
         let sampler = if peak.is_some() { "ok" } else { "missing" };
         let peak = peak.unwrap_or(0);
+        let before = before.saturating_sub(reusable);
         println!(
-            "FERROW-MEMORY-PEAK phase={phase} before_bytes={before} peak_bytes={peak} growth_bytes={} growth_per_entry={:.3} sampler={sampler} note={note}",
+            "FERROW-MEMORY-PEAK phase={phase} before_bytes={before} peak_bytes={peak} growth_bytes={} growth_per_entry={:.3} reusable_bytes={reusable} sampler={sampler} note={note}",
             peak.saturating_sub(before),
             peak.saturating_sub(before) as f64 / self.entries as f64,
         );
@@ -1279,7 +1291,9 @@ fn compaction_round(live: &mut Live, report: &mut Report) {
 
     let path = dir.path().join("index.bin");
     let _ = memory::release_free_heap();
-    let before = memory::process().bytes();
+    let now = memory::process_with_heap();
+    let before = now.bytes();
+    let reusable = now.heap.map_or(0, |h| h.committed.saturating_sub(h.in_use));
     memory::reset_peak();
     let started = Instant::now();
     let (filed, built) = live
@@ -1289,9 +1303,10 @@ fn compaction_round(live: &mut Live, report: &mut Report) {
         }))
         .expect("no folder read is outstanding");
     let took = started.elapsed();
-    report.peak(
+    report.peak_net(
         "compact.file",
         before,
+        reusable,
         memory::process().peak,
         "Live::compact_into the index file: spilling builder, file freeze in a map, plus the new tables; peak since this phase began",
     );
