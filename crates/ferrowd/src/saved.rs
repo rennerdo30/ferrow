@@ -512,9 +512,9 @@ fn validate(saved: &Saved, n: usize) -> Result<(), Refused> {
     }
     for v in &saved.volumes {
         let linked = v.record_base.iter().filter(|&&slot| slot == MULTI).count();
-        let mut records = v.link_records.to_vec();
-        records.dedup();
-        if records.len() != linked {
+        let distinct = v.link_records.windows(2).filter(|w| w[0] != w[1]).count()
+            + usize::from(!v.link_records.is_empty());
+        if distinct != linked {
             return Err(Refused::Corrupt("record tables disagree"));
         }
     }

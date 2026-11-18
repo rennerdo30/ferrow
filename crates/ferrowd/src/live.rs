@@ -1090,6 +1090,15 @@ impl Live {
         }
     }
 
+    /// Whether anything changed since the frozen index: an entry added,
+    /// hidden or with new metadata, or a record moved.
+    pub fn has_changes(&self) -> bool {
+        !self.delta.is_empty()
+            || self.removed_count > 0
+            || !self.overrides.is_empty()
+            || self.volumes.iter().any(|v| !v.overlay.is_empty())
+    }
+
     /// Bytes of the saved live tables this layer reads through a map.
     pub fn mapped_bytes(&self) -> usize {
         let children = self
