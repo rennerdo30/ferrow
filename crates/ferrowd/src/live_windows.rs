@@ -553,7 +553,7 @@ fn saved_lags(applied: &[(u64, i64)], saved: &[(u64, i64)]) -> Vec<i64> {
 
 /// Whether the saved state should be brought up to date now, by a merge
 /// (`merge`: something changed) or by saving its tables. Per volume, `lags`
-/// and `spans` (the journal's size, `next - first`, 0 when unknown): due
+/// and `spans` (the journal's configured maximum size, 0 when unknown): due
 /// when a volume lags by its limit (see TABLES_LAG_BYTES and
 /// MERGE_LAG_BYTES; at most a quarter or half of a small journal, which
 /// would otherwise wrap past the saved position first), or by anything
@@ -1121,6 +1121,7 @@ fn run_session(
                         saved_at = applied.clone();
                         tables_saved = Instant::now();
                         refresh_failures = 0;
+                        next_refresh = Instant::now() + refresh_retry(0);
                     } else {
                         refresh_failures += 1;
                         next_refresh = Instant::now() + refresh_retry(refresh_failures);
@@ -1210,6 +1211,7 @@ fn run_session(
                             saved_at = applied.clone();
                             tables_saved = Instant::now();
                             refresh_failures = 0;
+                            next_refresh = Instant::now() + refresh_retry(0);
                         } else {
                             // Not saved: retried after a gap that grows
                             // with each miss (each retry may be a merge
