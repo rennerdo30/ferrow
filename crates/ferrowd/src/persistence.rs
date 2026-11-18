@@ -544,7 +544,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Tests that start a build hold this: the state they check is global.
+    /// Tests that start a build or take the save lock hold this: the state
+    /// they check is global.
     static BUILDING_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -626,6 +627,7 @@ mod tests {
 
     #[test]
     fn a_new_index_is_saved_and_read_back_from_its_file() {
+        let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ferrowd-save-map-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("index.bin");
@@ -662,6 +664,7 @@ mod tests {
 
     #[test]
     fn a_build_into_the_index_file_replaces_it_and_leaves_the_save_lock_free() {
+        let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ferrowd-build-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("state").join("index.bin");
@@ -681,11 +684,7 @@ mod tests {
             .is_none()
         );
         // The state directory does not exist yet: preparing it creates it.
-        let _building = {
-            let _one = BUILDING_TEST.lock().unwrap_or_else(|e| e.into_inner());
-            file.prepare().unwrap()
-        };
-        drop(_building);
+        drop(file.prepare().unwrap());
 
         let build = |entries: usize| {
             let b = ferrow_index::IndexBuilder::with_spill(
