@@ -135,7 +135,7 @@ reader of the diagnostics sees both.
 3. Record maps and overlay in the file.
 4. Names stored once.
 5. Bounded rebuilds (done: FR-46 phase 5).
-6. Sort orders in the file.
+6. Sort orders in the file (done: temporary files beside the index).
 7. CI gate: the Windows memory-breakdown job asserts private bytes per
    entry, so a later change cannot quietly grow it again.
 

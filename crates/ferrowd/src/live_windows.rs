@@ -1121,6 +1121,7 @@ fn run_session(
         vec![(u64::MAX, 0); applied.len()]
     };
     let mut tables_saved = Instant::now();
+    let mut scratch_in_heap_seen = ferrow_index::store::scratch_in_heap();
     // Attempts in a row that did not save the tables, and when the next may
     // run: tables that could not be saved at the start wait one retry gap.
     let mut refresh_failures: u32 = u32::from(!tables_current);
@@ -1165,6 +1166,16 @@ fn run_session(
             // compaction that shows them (a request is kept only once).
             if live.adoptions_pending() {
                 rescan.request(Reason::compact(REASON_LARGE_MOVE));
+            }
+            // Temporary buffers (sort orders) that should have been files
+            // beside the index but went to the heap: memory is then not
+            // what it should be. Said once per new occurrence.
+            let in_heap = ferrow_index::store::scratch_in_heap();
+            if in_heap > scratch_in_heap_seen {
+                scratch_in_heap_seen = in_heap;
+                eventlog::warn(
+                    "a sort order could not be kept in a file beside the index (disk full or read-only?); it is in memory",
+                );
             }
             // Keep the saved index and its journal positions from falling
             // far behind. With changes, a merge brings both up to date;

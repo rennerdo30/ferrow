@@ -268,8 +268,6 @@ impl Index {
         self.file_checksum
     }
 
-    /// Whether the columns are read from the saved file (it is on disk
-    /// already: saving it again would write the same bytes).
     /// Prepare sort orders in temporary files beside `path` (the file this
     /// index is read from) instead of the heap.
     pub(crate) fn use_scratch_beside(&self, path: &std::path::Path) {
@@ -278,6 +276,8 @@ impl Index {
         }
     }
 
+    /// Whether the columns are read from the saved file (it is on disk
+    /// already: saving it again would write the same bytes).
     pub fn is_mapped(&self) -> bool {
         self.parent.is_mapped()
     }

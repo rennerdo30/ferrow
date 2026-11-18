@@ -194,7 +194,10 @@ pub(crate) fn create_spill_file(dir: &Path) -> io::Result<File> {
             const DELETE: u32 = 0x0001_0000;
             const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
             const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_DELETE: u32 = 0x4;
             opts.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
                 .attributes(FILE_ATTRIBUTE_TEMPORARY)
                 .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
         }

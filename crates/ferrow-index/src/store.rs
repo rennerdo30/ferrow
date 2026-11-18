@@ -61,7 +61,9 @@ pub(crate) fn cast_mut<T: Plain>(bytes: &mut [u8]) -> &mut [T] {
 /// What keeps a column's elements alive.
 enum Backing<T> {
     Owned(Vec<T>),
-    Mapped(#[allow(dead_code)] Arc<Mmap>),
+    /// A read-only map of a saved file, or a filled temporary buffer: only
+    /// kept alive here, never written again.
+    Mapped(#[allow(dead_code)] Arc<dyn std::any::Any + Send + Sync>),
 }
 
 /// One column: owned, or elements of a shared map. Reading it is a plain
@@ -95,7 +97,7 @@ impl<T: Plain> Col<T> {
         ptr.is_aligned().then(|| Col {
             ptr,
             len,
-            backing: Backing::Mapped(map.clone()),
+            backing: Backing::Mapped(map.clone() as Arc<dyn std::any::Any + Send + Sync>),
         })
     }
 
@@ -226,10 +228,10 @@ impl<T: Plain> Scratch<T> {
         let mapped = dir.filter(|_| len > 0).and_then(|dir| {
             let bytes = len.checked_mul(size_of::<T>())?;
             let file = crate::build::create_spill_file(dir).ok()?;
-            file.set_len(bytes as u64).ok()?;
-            // SAFETY: an anonymous file of this process, sized above; no
-            // one else opens it (it has no name on Unix, and is opened
-            // without sharing and deleted on close on Windows).
+            reserve(&file, bytes as u64).ok()?;
+            // SAFETY: an anonymous file of this process, sized above: it has
+            // no name on Unix, and on Windows it is opened allowing others
+            // only to read or delete it (no writer) and deleted on close.
             let map = unsafe { memmap2::MmapMut::map_mut(&file) }.ok()?;
             Some(Scratch::Mapped {
                 map,
@@ -237,7 +239,12 @@ impl<T: Plain> Scratch<T> {
                 _file: file,
             })
         });
-        mapped.unwrap_or_else(|| Scratch::Heap(vec![zero(); len]))
+        mapped.unwrap_or_else(|| {
+            if dir.is_some() && len > 0 {
+                SCRATCH_IN_HEAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Scratch::Heap(vec![zero(); len])
+        })
     }
 
     /// Whether the values are in a temporary file.
@@ -258,21 +265,57 @@ impl<T: Plain> Scratch<T> {
         }
     }
 
-    /// The filled values, read-only.
+    /// The filled values, read-only: the column only hands out shared
+    /// slices of them from now on.
     pub(crate) fn freeze(self) -> Col<T> {
         match self {
             Scratch::Heap(v) => v.into(),
-            Scratch::Mapped { map, len, _file } => match map.make_read_only() {
-                Ok(map) => {
-                    // The section keeps the file's data while mapped, also
-                    // once its handle is closed.
-                    drop(_file);
-                    let map = Arc::new(map);
-                    Col::mapped(&map, 0, len).expect("a page-aligned map of len values")
+            Scratch::Mapped { map, len, _file } => {
+                // The map keeps its own handle to the file (and the file's
+                // data) while it lives; the file goes when it drops.
+                drop(_file);
+                let ptr = map.as_ptr().cast::<T>();
+                Col {
+                    ptr,
+                    len,
+                    backing: Backing::Mapped(Arc::new(map)),
                 }
-                Err(_) => unreachable!("make_read_only of an owned map"),
-            },
+            }
         }
+    }
+}
+
+/// How many temporary buffers that should have been files were made in the
+/// heap instead (the directory could not take them: full, read-only). A
+/// service reports a growing count: its memory is then not what it plans.
+static SCRATCH_IN_HEAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`SCRATCH_IN_HEAP`].
+pub fn scratch_in_heap() -> u64 {
+    SCRATCH_IN_HEAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Give `file` `bytes` of real disk space. On NTFS extending a file
+/// allocates it (a full disk fails here); elsewhere a file extended with
+/// `set_len` is sparse, and a write through a map into a block the disk
+/// cannot give stops the process (SIGBUS), so the zeros are written.
+fn reserve(file: &std::fs::File, bytes: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        file.set_len(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Write;
+        let zeros = vec![0u8; 1 << 20];
+        let mut left = bytes;
+        let mut out = file;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            out.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
+        out.flush()
     }
 }
 
