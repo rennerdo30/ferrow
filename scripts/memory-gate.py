@@ -157,7 +157,7 @@ SLOPES = [
      "measured -0.22 to 0.13 B/entry: with the 8 MiB budget the fixed part is the same at both sizes"),
     ("slope.total", "total", "scan total, growth per entry between 1 M and 5 M", 1.2,
      "measured -0.22 to 0.60 B/entry, +0.6"),
-    ("slope.compact", "compact", "compaction, growth per entry between 1 M and 5 M", 10.5,
+    ("slope.compact", "compact", "compaction, growth per entry between 1 M and 5 M", 5.0,
      "measured 6.1-9.7 B/entry (typically 9.0-9.4: the one low sample in ten is a 5 M run whose start "
      "was 12 MiB higher with the same peak, so it can only hide, never invent, growth), +0.8; a "
      "regression of 2 B/entry reads 11.0-11.4 on a typical run"),
