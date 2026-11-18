@@ -2,7 +2,7 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.21
 
 - **A full disk no longer pushes the index into memory.** When the index file could not be written (usually a full disk), a rescan or merge used to build the whole index in memory instead (gigabytes on a large PC). Now a merge first checks that the disk has room for the new file (about 2.5 times the current one) and otherwise keeps the index as it is and tries again later, and a large index that could not be written is not built in memory. A rescan also checks for room first, and both wait longer after each failure (15 minutes, then 30, up to 12 hours); Service health says so while merging changes keeps failing. Small indexes (up to a million entries) still fall back to memory. On Linux the file's disk space is reserved before it is written, so a full disk is an error, not a crash.
 - **Sorting by size or date no longer adds to the service's memory.** The sort order the service prepares the first time you sort by size or a date (about 100 MB per column with 27 million files, plus as much again while it is built) is now kept in a temporary file beside the index, in Windows' file cache like the index itself, and removed once the index it belongs to is no longer in use. Service health's "Index file" figure counts these files too.
