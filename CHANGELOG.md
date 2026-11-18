@@ -2,6 +2,10 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
+## Unreleased
+
+- **Fixed: renaming or moving a large folder still rescanned every drive.** When a folder with more than about 100,000 files and folders below it was renamed or moved (a tool that swaps or cleans up a large folder does this often), the service read every drive again: on the owner's PC about 55 s of heavy CPU and disk, six times in 90 minutes. It now merges the move into the index in memory instead, with no disk reads. The folder shows up under its new name at once. The files inside show up under the new path once the merge is done, and are never shown under the old path meanwhile. The merge usually starts at once and takes a few seconds on a PC with tens of millions of files (estimated, not yet measured there); right after another merge, or while the index is being saved or moved-in folders are being read, it can take longer.
+
 ## 0.1.0-beta.19
 
 - **Fixed: drives with a large change journal were read folder by folder and got no live updates.** On a drive whose Windows change journal is bigger than 64 MiB, the service read the whole file table, then asked the journal for the last few minutes of changes at a position Windows refuses (error 87, "The parameter is incorrect") and threw the finished read away. Service health said the drive was "not NTFS", the drive got no live updates, and a rescan took minutes instead of seconds. The service now asks at a position Windows accepts. If the journal still cannot be re-read, it keeps the finished read and goes live anyway, with a warning that files changed just before the scan may show their old state until the next scan.

@@ -19,8 +19,8 @@ use ferrow_walk::{VolumeMap, WalkOptions, ntfs};
 use crate::health::{STATE, VolumeState};
 use crate::live::{
     Applied, Change, Due, Live, Load, MAX_WALK_TIME, Maintenance, NOTABLE_WALK, PublishGate,
-    REASON_ADMIN, Reason, ReasonKind, RecordSource, RecordState, WALK_SLACK, WalkJob,
-    compact_and_publish, index_parts, walk_limits_text,
+    REASON_ADMIN, REASON_LARGE_MOVE, Reason, ReasonKind, RecordSource, RecordState, WALK_SLACK,
+    WalkJob, compact_and_publish, index_parts, walk_limits_text,
 };
 use crate::memory::Breakdown;
 use crate::{Snapshot, SnapshotStore, eventlog};
@@ -514,12 +514,21 @@ fn maintain(store: SnapshotStore, options: WalkOptions) {
         let mut base = base;
         let mut gate = PublishGate::new();
         reason = loop {
-            let load = Load::of(
-                live.delta_len(),
-                hard_delta,
-                live.walks_outstanding(),
-                STATE.is_saving(),
-            );
+            // A batch keeps one reason; a disk reason in the same batch as a
+            // large move must not leave its hidden entries without the
+            // compaction that shows them (a request is kept only once).
+            if live.adoptions_pending() {
+                rescan.request(Reason::compact(REASON_LARGE_MOVE));
+            }
+            let load = Load {
+                prompt: live.adoptions_pending(),
+                ..Load::of(
+                    live.delta_len(),
+                    hard_delta,
+                    live.walks_outstanding(),
+                    STATE.is_saving(),
+                )
+            };
             match rescan.due(Instant::now(), load) {
                 Some(Due::Rescan(why)) => {
                     // The fullest the live layer gets: what it holds before
