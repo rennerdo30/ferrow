@@ -100,24 +100,35 @@ impl Pairs {
         }
     }
 
-    /// An empty map appended to a temporary file in `dir`; in the heap, with
-    /// [`Pairs::note`] saying why, when the file cannot be made.
+    /// An empty map appended to a temporary file in `dir`, for a volume small
+    /// enough for the heap to stand in: if the file cannot be made, or fails
+    /// later, the map is kept in the heap, counted
+    /// ([`ferrow_index::store::scratch_in_heap`]) and [`Pairs::note`] says why.
     pub fn spilling(dir: &Path) -> Pairs {
-        match Appender::new(dir) {
-            Ok(file) => Pairs {
-                inner: Inner::Writing(Writer {
-                    file,
-                    stage: Vec::with_capacity(STAGE),
-                }),
-                note: None,
-            },
-            Err(error) => Pairs {
-                inner: Inner::Heap(Vec::new()),
-                note: Some(format!(
-                    "the record map could not be put in a file ({error}); it is kept in memory"
-                )),
-            },
+        let file = Appender::or_heap(dir);
+        let note = file.fallback().map(|error| {
+            format!("the record map could not be put in a file ({error}); it is kept in memory")
+        });
+        Pairs {
+            inner: Inner::Writing(Writer {
+                file,
+                stage: Vec::with_capacity(STAGE),
+            }),
+            note,
         }
+    }
+
+    /// [`Pairs::spilling`] for a volume too large for the heap: no fallback.
+    /// An error when the file cannot be made; a file that fails later makes
+    /// [`Pairs::seal`] return an error.
+    pub fn spilling_strict(dir: &Path) -> std::io::Result<Pairs> {
+        Ok(Pairs {
+            inner: Inner::Writing(Writer {
+                file: Appender::new(dir)?,
+                stage: Vec::with_capacity(STAGE),
+            }),
+            note: None,
+        })
     }
 
     /// Why the map is in the heap although a file was wanted, if it is.

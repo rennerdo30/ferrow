@@ -647,7 +647,9 @@ impl IndexBuilder {
             path: tmp,
             armed: true,
         };
-        file.set_len(total)?;
+        // Real disk space now: a full disk fails here, not as a fault on a
+        // write through the map.
+        crate::store::reserve(&file, total)?;
         // SAFETY: the file is private to this build (created exclusively,
         // never opened by anyone else) and not resized while mapped.
         let mut map = unsafe { MmapMut::map_mut(&file)? };
@@ -790,6 +792,7 @@ impl IndexBuilder {
         }
         let index = crate::persist::index_from_own_map(&mapped)
             .map_err(|e| SaveError::Io(io::Error::other(e.to_string())))?;
+        index.use_scratch_beside(target.path);
         timings.replace = t.elapsed();
         timings.total = started.elapsed();
         timings.entries = n;

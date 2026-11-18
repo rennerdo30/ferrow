@@ -76,6 +76,7 @@ struct Inner {
     /// The last in-memory compaction since the last scan, how many there were
     /// and their total time.
     compaction: Option<ScanInfo>,
+    merge_blocked: Option<String>,
     compactions: u64,
     compaction_ms: u64,
 }
@@ -123,6 +124,7 @@ impl State {
                 last_finished: None,
                 scans_by_reason: BTreeMap::new(),
                 compaction: None,
+                merge_blocked: None,
                 compactions: 0,
                 compaction_ms: 0,
             }),
@@ -184,6 +186,7 @@ impl State {
         // The index was built from the disks again: an earlier merge of live
         // changes says nothing about it.
         inner.compaction = None;
+        inner.merge_blocked = None;
         inner.scan = Some(ScanInfo {
             at_ms: now_ms(),
             reason: reason.into(),
@@ -243,11 +246,17 @@ impl State {
             .or_default() += 1;
     }
 
+    /// Merges keep failing (`Some(why)`), or work again (`None`).
+    pub fn merge_blocked(&self, why: Option<String>) {
+        self.lock().merge_blocked = why;
+    }
+
     /// A compaction finished: the live layer grown past `reason`'s limit was
     /// folded into a new index in memory in `took`. Not a scan (no disk was
     /// read, [`State::is_scanning`] never said so): it has its own counters.
     pub fn compaction_done(&self, reason: &str, took: Duration) {
         let mut inner = self.lock();
+        inner.merge_blocked = None;
         inner.compactions += 1;
         inner.compaction_ms += took.as_millis() as u64;
         inner.compaction = Some(ScanInfo {
@@ -367,6 +376,7 @@ impl State {
             private_working_set,
             index_mapped_bytes: snapshot.index.mapped_bytes() as u64
                 + self.tables_mapped.load(Ordering::Relaxed),
+            merge_blocked: inner.merge_blocked.clone(),
             entries: snapshot.entries() as u64,
             mode: snapshot.mode.clone(),
             access: policy.mode.as_str().into(),

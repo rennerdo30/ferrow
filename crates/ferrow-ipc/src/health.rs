@@ -59,6 +59,10 @@ pub struct Health {
     /// (ADR 0007): the operating system's file cache, shared and
     /// reclaimable, in `working_set` while resident but not private.
     pub index_mapped_bytes: u64,
+    /// Set while merging the live changes into the index keeps failing (its
+    /// file cannot be written: a full disk): why, and when it is tried
+    /// again. The changes stay in memory meanwhile and grow with them.
+    pub merge_blocked: Option<String>,
     /// Entries a search can return.
     pub entries: u64,
     /// The snapshot's mode label (`live`, `walk`, `indexing`, `empty`, …).

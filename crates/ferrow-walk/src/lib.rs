@@ -773,6 +773,7 @@ fn scan_inner(
     target: Option<&FileTarget<'_>>,
 ) -> (Index, ScanReport, Vec<VolumeMap>) {
     let started = Instant::now();
+    let in_heap_before = ferrow_index::store::scratch_in_heap();
     // Beside the index file: the shards of the builder and (on Windows) the
     // tables of the MFT read spill to temporary files there.
     let spill_dir: Option<&Path> = target.map(|target| match target.path.parent() {
@@ -931,7 +932,12 @@ fn scan_inner(
                 spill: &mut read_spill,
             },
         );
-        rest.extend(walk);
+        if read_spill.fatal.is_some() {
+            // The scan fails: nothing else is read or walked.
+            rest.clear();
+        } else {
+            rest.extend(walk);
+        }
         rest
     };
     if !root_dirs.is_empty() {
@@ -955,7 +961,17 @@ fn scan_inner(
     });
 
     let entries = builder.len();
-    let (index, mut index_file, fatal_error) = match freeze_builder(builder, target) {
+    // A failed read of a large volume (no room for its files, a file that
+    // failed) fails the whole scan before anything is written: the builder is
+    // dropped (its spilled shards go with it) and the index being served stays.
+    let frozen = match read_spill.fatal.take() {
+        Some(fatal) => {
+            drop(builder);
+            Err(fatal)
+        }
+        None => freeze_builder(builder, target),
+    };
+    let (index, mut index_file, fatal_error) = match frozen {
         Ok((index, report)) => (index, report, None),
         Err(fatal) => (
             IndexBuilder::with_columns(options.columns).freeze(),
@@ -965,6 +981,14 @@ fn scan_inner(
     };
     index_file.read_file_bytes = read_spill.file_bytes;
     index_file.read_spill_failure = read_spill.failure;
+    // Every temporary buffer of the scan that went to the heap is counted;
+    // say so even when no table's own note did (the service warns).
+    let in_heap = ferrow_index::store::scratch_in_heap() - in_heap_before;
+    if in_heap > 0 && index_file.read_spill_failure.is_none() {
+        index_file.read_spill_failure = Some(format!(
+            "{in_heap} temporary table(s) of the scan were kept in memory"
+        ));
+    }
     if modes.is_empty() {
         modes.push("parallel read_dir".to_string());
     }
@@ -990,6 +1014,39 @@ fn scan_inner(
 /// (the spilled shards could not be read back): a later scan may succeed.
 pub const BUILD_FAILED: &str = "the index could not be built";
 
+/// The most entries an index that could not be built into its file is built
+/// in memory instead (about 200 MB at the peak); a larger one is not built.
+pub const HEAP_FALLBACK_ENTRIES: usize = 1_000_000;
+
+/// Bytes free for this process on the volume holding `dir`; `None` when
+/// unknown (always off Windows). The one free-space query: the service's
+/// rescan check and the scan's room check both use it.
+pub fn free_bytes(dir: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut free = 0u64;
+        // SAFETY: a NUL-terminated path and a writable count; the other
+        // outputs are optional.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 pub fn freeze_builder(
     builder: IndexBuilder,
     target: Option<&FileTarget<'_>>,
@@ -1009,6 +1066,16 @@ pub fn freeze_builder(
             },
         )),
         Err(failed) => {
+            // A large index is not built in memory instead: that would take
+            // gigabytes the file build exists to avoid (a full disk is the
+            // usual cause). The caller keeps what it has and tries later.
+            if failed.builder.len() > HEAP_FALLBACK_ENTRIES {
+                return Err(format!(
+                    "{BUILD_FAILED}: {} (not built in memory instead: {} entries)",
+                    failed.error,
+                    failed.builder.len()
+                ));
+            }
             let report = IndexFileReport {
                 timings: None,
                 spill_failure: spill_failure.or_else(|| failed.builder.spill_failure()),
@@ -1024,12 +1091,23 @@ pub fn freeze_builder(
     }
 }
 
+/// Whether a failed MFT read is the kind that fails the scan (see
+/// [`BUILD_FAILED`]) instead of falling back to the directory walk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_build_failure(reason: &str) -> bool {
+    reason.starts_with(BUILD_FAILED)
+}
+
 /// What the MFT reads of a scan kept in temporary files (see
 /// [`IndexFileReport::read_file_bytes`]).
 #[derive(Default)]
 struct ReadSpill {
     file_bytes: u64,
     failure: Option<String>,
+    /// The read of a volume too large for the heap failed (no room for its
+    /// files, a file that failed): the scan fails with this, starting with
+    /// [`BUILD_FAILED`], and the service tries again later.
+    fatal: Option<String>,
 }
 
 impl ReadSpill {
@@ -1067,6 +1145,14 @@ fn scan_from_mft(
         let started = Instant::now();
         let (device, volume) = match ntfs::read_volume_in(&dir, spill_dir) {
             Ok(v) => v,
+            Err(reason) if is_build_failure(&reason) => {
+                // No room for the volume's files (or a file failed) on a
+                // volume too large for the heap: the scan fails as a whole
+                // (the service retries it later); walking the volume instead
+                // would only fill the same disk, slower.
+                out.spill.fatal = Some(reason);
+                return walk;
+            }
             Err(reason) => {
                 out.modes.push(format!("walk {} ({reason})", dir.display()));
                 out.read_errors.push((dir.clone(), reason));
@@ -1112,6 +1198,18 @@ fn scan_from_mft(
                 .map(|id| (id.id as u64) & 0x0000_FFFF_FFFF_FFFF)
                 .collect(),
             entries: match spill_dir {
+                Some(dir) if volume.records() > HEAP_FALLBACK_ENTRIES => {
+                    match Pairs::spilling_strict(dir) {
+                        Ok(pairs) => pairs,
+                        Err(error) => {
+                            out.spill.fatal = Some(format!(
+                                "{BUILD_FAILED}: the record map of a volume of {} MFT records could not be put in a file beside the index ({error}); not kept in memory instead",
+                                volume.records()
+                            ));
+                            return walk;
+                        }
+                    }
+                }
                 Some(dir) => Pairs::spilling(dir),
                 None => Pairs::new(),
             },
@@ -1171,6 +1269,12 @@ fn scan_from_mft(
                     out.spill.failed(note);
                 }
                 out.maps.push(map);
+            }
+            Err(error) if volume.records() > HEAP_FALLBACK_ENTRIES => {
+                // A large volume's record map file failed: the scan fails and
+                // is retried (the service keeps serving its current index).
+                out.spill.fatal = Some(format!("{BUILD_FAILED}: {error}"));
+                return walk;
             }
             Err(error) => {
                 // The index has every entry, but this volume's record map is
@@ -1637,7 +1741,11 @@ mod tests {
         std::fs::create_dir(&state).unwrap();
         let (records2, chunks2) = ntfs::tests::synthetic(6_000, 211);
         assert_eq!(records, records2);
-        let mut volume = ntfs::VolumeBuilder::with_spill(records, &state);
+        let policy = ntfs::SpillPolicy {
+            heap_fallback_records: HEAP_FALLBACK_ENTRIES as u64,
+            free_bytes: None,
+        };
+        let mut volume = ntfs::VolumeBuilder::with_spill(records, &state, &policy).unwrap();
         for chunk in chunks2 {
             volume.push(chunk);
         }

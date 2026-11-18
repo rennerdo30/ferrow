@@ -384,7 +384,7 @@ fn memory_in_use_is_the_task_manager_figure_and_the_index_file_is_apart() {
     );
     let file = &row(&rows, "Index file").unwrap().1;
     assert!(
-        file.starts_with("2900 MB read from the saved file"),
+        file.starts_with("2900 MB read from the saved index files"),
         "{file}"
     );
     assert!(file.ends_with("(not counted above)"), "{file}");

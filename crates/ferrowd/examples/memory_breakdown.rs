@@ -37,7 +37,10 @@
 //!    `bounded.children` peaks sit beside the heap build's `scan2.*`; what the
 //!    files hold is printed as `FERROW-MEMORY-FILES` (file cache, not private
 //!    bytes). It is checked against the heap build's index entry for entry
-//!    and must leave no temporary file behind,
+//!    and must leave no temporary file behind. A `forgotten` round then times
+//!    the join of the same volume with nothing, `FERROW_MEMORY_FORGET`
+//!    (default 20000) and a tenth of the records forgotten, as after a
+//!    journal refresh (`FERROW-MEMORY-TIMING round=forgotten`),
 //! 10. the merge of the live changes into a new index (`compact`), in the heap
 //!     (`Live::compact`) and into the index file (`Live::compact_into`), each
 //!     with its peak.
@@ -767,6 +770,52 @@ fn markdown_phases(report: &Report) -> String {
     out
 }
 
+/// The policy of a bench run: room for the files is assumed (the machine
+/// running it has it), and the usual limit for the heap.
+fn bench_policy() -> ntfs::SpillPolicy {
+    ntfs::SpillPolicy {
+        heap_fallback_records: ferrow_walk::HEAP_FALLBACK_ENTRIES as u64,
+        free_bytes: None,
+    }
+}
+
+/// The cost of the grouping when a journal refresh forgot records after the
+/// read (`VolumeBuilder::forget`): the same stream is finished in temporary
+/// files three times, with nothing forgotten, with `FERROW_MEMORY_FORGET`
+/// records forgotten (default 20 000, spread over the volume), and with a
+/// tenth of the volume forgotten. Every name of the volume is checked against
+/// the forgotten list twice (once to count, once to place), so this is the
+/// per-name cost of that check. Prints `FERROW-MEMORY-TIMING round=forgotten`
+/// lines.
+fn forgotten_round(n: usize) {
+    let dir = std::env::temp_dir().join(format!("ferrow-memory-forgotten-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("forgotten build directory");
+    let wanted = env_usize("FERROW_MEMORY_FORGET", 20_000);
+    for forgotten in [0, wanted, n / 10] {
+        let (synth, mut parsed) = synth_stream(
+            n,
+            |records| VolumeBuilder::with_spill(records, &dir, &bench_policy()).expect("room"),
+            |b, chunk| b.push(chunk),
+        );
+        if let Some(step) = synth.entries.checked_div(forgotten) {
+            // Records spread over the volume, none of the metadata files.
+            let step = step.max(1) as u64;
+            let changed: std::collections::BTreeSet<u64> =
+                (0..forgotten as u64).map(|i| 16 + i * step).collect();
+            parsed.forget(&changed, |_| false, |_| false);
+        }
+        let started = Instant::now();
+        let volume = parsed.finish(0xF026);
+        println!(
+            "FERROW-MEMORY-TIMING round=forgotten step=from_parsed ms={:.1} forgotten={forgotten} entries={} names={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            synth.entries,
+            volume.name_count()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The scan the service makes since ADR 0007 steps 8 and 9: the same record
 /// stream as a `session`, but every table is bounded. The parsed volume's
 /// per-record table, names and grouping are written to temporary files
@@ -790,7 +839,10 @@ fn bounded_round(n: usize, report: &mut Report, reference: &Index) {
     let started = Instant::now();
     let (synth, parsed) = synth_stream(
         n,
-        |records| VolumeBuilder::with_spill(records, &dir),
+        |records| {
+            VolumeBuilder::with_spill(records, &dir, &bench_policy())
+                .expect("room beside the bench")
+        },
         |b, chunk| b.push(chunk),
     );
     report.peak(
@@ -1190,6 +1242,7 @@ fn main() {
 
     // The bounded build, against the heap build of the same stream.
     bounded_round(n, &mut report, two.live.base());
+    forgotten_round(n);
     compaction_round(&mut two.live, &mut report);
 
     // The result: the table to read.

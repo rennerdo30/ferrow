@@ -111,7 +111,7 @@ slower. The owner chose to do both: map the index and compress it.
      (4.9 MB at 2 M entries, measured), not 4 B/entry.
    - Not covered here: the scan's record map and parsed volume (decision 10),
      and the new live tables of a compaction (decision 6).
-9. **Metadata sort orders go to the file.**
+9. **Metadata sort orders go to the file.** (Done: the ids, the merge scratch and the finished order of a mapped index are anonymous temporary files beside `index.bin`, deleted on close.)
    - A sort order prepared on request (size, dates) is written beside the
      index and mapped, not kept in the heap (4 B/entry each).
 10. **The scan's MFT read is bounded** (built, FR-46 phase 7).
@@ -127,19 +127,38 @@ slower. The owner chose to do both: map the index and compress it.
       appended in chunks as the read arrives and mapped read-only afterwards.
       The live layer's frozen tables (entry to record, record to entry,
       children) are built the same way and replaced by the saved copy.
-    - The same code reads a table from the heap or from a file, so the result
-      is the same bytes. A table whose file cannot be made stays in the heap; a
-      file that fails mid-read continues in the heap; a read that cannot
-      recover runs again in the heap, with a warning.
+    - One temporary-file layer serves every table of the build: a
+      `store::Scratch` (a zero-filled file written through a map, then frozen
+      read-only) for tables of known size, `store::Appender` (chunked appends)
+      for names, their text and the record map, one creator of the files
+      (`store::create_temp_file`) and one disk-space step (`store::reserve`,
+      before the first mapped write). The same code reads a table from the heap
+      or from a file, so the result is the same bytes.
+    - **No large silent heap fallback** (the lesson of FR-47). Before a
+      volume's MFT is read the scan estimates its files (120 B per MFT record,
+      estimated from the synthetic stream) and checks the free space beside the
+      index. A volume above `HEAP_FALLBACK_ENTRIES` (1 M records) that does not
+      fit, whose file cannot be made or whose file fails during the read is
+      not read into the heap instead: the read stops at once and the scan fails
+      with `BUILD_FAILED`, so the service keeps its index and retries with its
+      back-off. A failed appender of a large volume loses its column rather
+      than reading it back (a read-back is capped at 128 MB in any case). A
+      small volume falls back to the heap; every fallback bumps
+      `scratch_in_heap()`, which the service reports.
     - Chosen over shrinking the tables only (the per-record table is 1.1 GB
       at 27 M even at 48 B per record, and the names are 0.9 GB) and over a
       streaming emission (entry ids and their order, hence the saved bytes,
       follow the directory order the emission walks; changing it would change
       results). Not chosen: a smaller `RecordInfo`; it would save under a
       third and keep the heap growing with the volume.
-    - Costs: temporary disk space (about 4 GB at 27 M, estimated) beside the
-      old and new index file, and about 10 % more CPU time in the parse and
-      emission steps (50 ms per million entries, measured).
+    - Costs: temporary disk space (about 120 B per MFT record per volume plus
+      the shards: about 4 GB at 27 M, estimated) beside the old and new index
+      file, and about 10 % more CPU time in the parse and emission steps (50
+      to 60 ms per million entries, measured at 1 M). The grouping's check for
+      names a journal refresh forgot is a bitmap over record numbers (3 MB at
+      24 M records) in front of a binary search: 12.5 ms to 14.3 ms of a
+      volume's join at 1 M entries with 20 000 forgotten records (measured),
+      not a hash lookup per name.
 
 ## Budget (27.2 M entries, private bytes)
 
@@ -147,7 +166,7 @@ slower. The owner chose to do both: map the index and compress it.
 |---|---|---|
 | Steady | 3.7 GB | 150–400 MB |
 | Start | 6.2 GB | the steady figure plus replay (no scan) |
-| Full scan | +4–5 GB (extrapolated from 182 B/entry) | about 60 MB (builder shards, working set) plus the read buffers (about 64 MB), measured at 1 M entries and extrapolated; the tables are in temporary files (decision 10) |
+| Full scan | +4–5 GB (extrapolated from 182 B/entry) | about 60 MB (builder shards, working set) plus the read buffers (about 64 MB), measured at 1 M entries and extrapolated; the tables are in temporary files (decision 10); no room for them fails the scan instead of using memory |
 | Compaction | +2.3–4.4 GB | about 60 MB (shards, working set) + the new live tables until decision 6 |
 
 The file cache holding the mapped index is not counted against the budget,
@@ -162,7 +181,7 @@ reader of the diagnostics sees both.
 3. Record maps and overlay in the file.
 4. Names stored once.
 5. Bounded rebuilds (done: FR-46 phase 5).
-6. Sort orders in the file.
+6. Sort orders in the file (done: temporary files beside the index).
 7. CI gate: the Windows memory-breakdown job asserts private bytes per
    entry, so a later change cannot quietly grow it again.
 8. Bounded scan: the MFT read and the live tables a scan builds in

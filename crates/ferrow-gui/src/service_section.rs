@@ -69,13 +69,16 @@ fn details(h: &Health, scm: &service::Scm) -> Vec<(&'static str, String, Option<
         rows.push((
             "Index file",
             format!(
-                "{} read from the saved file through the file cache ({counted})",
+                "{} read from the saved index files through the file cache ({counted})",
                 service::memory_text(h.index_mapped_bytes)
             ),
             None,
         ));
     }
     rows.push(("Items", service::items_text(h.entries), None));
+    if let Some(why) = &h.merge_blocked {
+        rows.push(("Merging changes", why.clone(), Some(Level::Caution)));
+    }
     if h.connection_errors > 0 {
         rows.push((
             "Connection errors",

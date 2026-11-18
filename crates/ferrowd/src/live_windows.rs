@@ -515,9 +515,34 @@ fn options_fingerprint(options: &WalkOptions) -> u64 {
     saved::fingerprint(&refs)
 }
 
-/// How long a scan whose index could not be built waits before it runs
-/// again.
-const BUILD_RETRY: Duration = Duration::from_secs(5 * 60);
+/// Wait `gap` before a scan is tried again, dropping the journals' records
+/// (the next scan reads everything again). An administrator's rescan ends
+/// the wait (and becomes the reason); a reader that stopped for good is
+/// reported. `false` when the channel closed (the service stops).
+fn wait_to_retry(rx: &Receiver<Message>, gap: Duration, reason: &mut String) -> bool {
+    let until = Instant::now() + gap;
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(Message::RescanNow) => {
+                *reason = REASON_ADMIN.into();
+                break;
+            }
+            // The next session does not start a stopped reader again.
+            Ok(Message::Reset {
+                device,
+                reason: why,
+                fatal: true,
+            }) => {
+                eventlog::warn(format!("journal of {device}: {why}"));
+                STATE.journal_problem(&device, true, &why);
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+    true
+}
 
 /// The most change journal (bytes of USN records) a start replays instead of
 /// scanning: about a million changed files.
@@ -547,6 +572,9 @@ const REFRESH_RETRY: Duration = Duration::from_secs(15 * 60);
 fn refresh_retry(failures: u32) -> Duration {
     (REFRESH_RETRY * 2u32.pow(failures.saturating_sub(1).min(6))).min(TABLES_REFRESH)
 }
+
+/// The longest a failed merge waits before it is tried again.
+const MAX_MERGE_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// The smallest journal size the lag limits scale down to: a journal that
 /// reports less (just created) is treated as this large.
@@ -778,6 +806,8 @@ fn maintain(
     // Only the first session may come from the saved files; a rescan reads
     // the drives.
     let mut first = true;
+    // Scans in a row whose index could not be built (or had no room).
+    let mut build_failures: u32 = 0;
     loop {
         let started = Instant::now();
         let restored = if std::mem::take(&mut first) {
@@ -851,6 +881,26 @@ fn maintain(
             };
             continue;
         }
+        // A rescan needs room for the new index file beside the old one:
+        // without it, it would read every drive only to fail at the end.
+        // The index served now stays until there is room.
+        if !store.get().index.is_empty()
+            && let Some(file) = &persist
+            && let Err(why) = file.has_room()
+        {
+            build_failures += 1;
+            let gap = refresh_retry(build_failures);
+            if build_failures == 1 {
+                eventlog::warn(format!(
+                    "no rescan now: {why}; tried again in {} min",
+                    gap.as_secs() / 60
+                ));
+            }
+            if !wait_to_retry(&rx, gap, &mut reason) {
+                return;
+            }
+            continue;
+        }
         STATE.scan_started();
         STATE.count_scan(&reason);
         let scan = || scan_into(&options, persist.as_ref());
@@ -867,40 +917,24 @@ fn maintain(
         };
         background = true;
         let took = started.elapsed();
+        if report.fatal_error.is_none() {
+            build_failures = 0;
+        }
         if let Some(fatal) = &report.fatal_error {
             // A build that could not read its spilled shards back (a failing
             // disk, a file taken away) may work later: try again then
             // instead of ending live updates. Other fatal errors (an exclude
             // that cannot be resolved) stop them, as before.
             if fatal.starts_with(ferrow_walk::BUILD_FAILED) {
+                build_failures += 1;
+                let gap = refresh_retry(build_failures);
                 eventlog::warn(format!(
                     "scan failed: {fatal}; trying again in {} min",
-                    BUILD_RETRY.as_secs() / 60
+                    gap.as_secs() / 60
                 ));
                 STATE.scan_failed();
-                // Wait, dropping the journals' records (the next scan reads
-                // everything again); an administrator's rescan ends the wait.
-                let until = Instant::now() + BUILD_RETRY;
-                while let Some(left) = until.checked_duration_since(Instant::now()) {
-                    match rx.recv_timeout(left) {
-                        Ok(Message::RescanNow) => {
-                            reason = REASON_ADMIN.into();
-                            break;
-                        }
-                        // A reader that stopped for good is reported now:
-                        // the next session does not start it again.
-                        Ok(Message::Reset {
-                            device,
-                            reason: why,
-                            fatal: true,
-                        }) => {
-                            eventlog::warn(format!("journal of {device}: {why}"));
-                            STATE.journal_problem(&device, true, &why);
-                        }
-                        Ok(_) => {}
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
+                if !wait_to_retry(&rx, gap, &mut reason) {
+                    return;
                 }
                 continue;
             }
@@ -1129,6 +1163,7 @@ fn run_session(
         vec![(u64::MAX, 0); applied.len()]
     };
     let mut tables_saved = Instant::now();
+    let mut scratch_in_heap_seen = ferrow_index::store::scratch_in_heap();
     // Attempts in a row that did not save the tables, and when the next may
     // run: tables that could not be saved at the start wait one retry gap.
     let mut refresh_failures: u32 = u32::from(!tables_current);
@@ -1173,6 +1208,16 @@ fn run_session(
             // compaction that shows them (a request is kept only once).
             if live.adoptions_pending() {
                 rescan.request(Reason::compact(REASON_LARGE_MOVE));
+            }
+            // Temporary buffers (sort orders) that should have been files
+            // beside the index but went to the heap: memory is then not
+            // what it should be. Said once per new occurrence.
+            let in_heap = ferrow_index::store::scratch_in_heap();
+            if in_heap > scratch_in_heap_seen {
+                scratch_in_heap_seen = in_heap;
+                eventlog::warn(
+                    "a temporary table (a sort order, or a table of the scan or of the live layer) could not be kept in a file beside the index (disk full or read-only?); it is in memory",
+                );
             }
             // Keep the saved index and its journal positions from falling
             // far behind. With changes, a merge brings both up to date;
@@ -1233,6 +1278,10 @@ fn run_session(
                     log_memory("before compaction", Some(&live), &base, store);
                     let save_now = can_save_tables && !rescan.rescan_waiting();
                     let mut tables_written = false;
+                    // A merge is only due with no folder read outstanding, and
+                    // none can start during it (this thread starts them): a
+                    // missing result is a failure (the index file could not
+                    // be built: a full disk), which blocks merges for a gap.
                     let report = format!("{summary}; {applied_total} live changes");
                     // Single writer: this thread, on the low-priority pool.
                     // Journal changes queue in the channel meanwhile, and
@@ -1245,6 +1294,15 @@ fn run_session(
                             // The merged index is built in the index file and
                             // read from it: no builder, no second copy of the
                             // columns in the heap.
+                            // Too little disk for the new file: keep the index as
+                            // it is (a merge in memory would take gigabytes)
+                            // and try again after the merge's gap.
+                            if let Some(file) = persist
+                                && let Err(why) = file.has_room()
+                            {
+                                eventlog::warn(format!("no merge in memory now: {why}"));
+                                return None;
+                            }
                             let build = |live: &mut Live| match ready(persist) {
                                 Some((file, _building)) => {
                                     let built = live.compact_into(Some(&file.target()));
@@ -1341,6 +1399,26 @@ fn run_session(
                             base.len()
                         ));
                         log_memory("after compaction", Some(&live), &base, store);
+                    } else {
+                        refresh_failures += 1;
+                        // Merges retry within the hour at most: the changes
+                        // wait in memory meanwhile (a transient failure, a
+                        // file held by a scanner, must not leave them there
+                        // for half a day).
+                        let gap = refresh_retry(refresh_failures).min(MAX_MERGE_RETRY);
+                        next_refresh = Instant::now() + gap;
+                        rescan.failed(Instant::now(), gap, why.clone());
+                        STATE.merge_blocked(Some(format!(
+                            "the merge in memory failed ({why}); tried again in {} min",
+                            gap.as_secs() / 60
+                        )));
+                        // Once per episode, not per attempt.
+                        if refresh_failures == 1 {
+                            eventlog::warn(format!(
+                                "the merge in memory ({why}) failed; the index stays as it is and the merge is tried again in {} min",
+                                gap.as_secs() / 60
+                            ));
+                        }
                     }
                     continue;
                 }

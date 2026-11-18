@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::memory::{Breakdown, Kind, Part, table_bytes, vec_bytes};
-use ferrow_index::store::{Col, Plain, TempColumn, zeroed_vec};
+use ferrow_index::store::{Col, Plain, Scratch};
 use ferrow_index::{
     ColumnSet, DEFAULT_SPILL_BUDGET, EntryMetadata, FileTarget, Index, IndexBuilder, ROOT_PARENT,
     SortKey, flags,
@@ -419,6 +419,9 @@ pub struct Maintenance {
     duty_earliest: Instant,
     /// Since when the delta has been past its hard limit (without a break).
     urgent_since: Option<Instant>,
+    /// After a merge failed (its file could not be written: a full disk), no
+    /// merge starts before this, urgent or prompt alike.
+    blocked_until: Option<Instant>,
     /// Since when entries have been hidden by a large folder move: they
     /// wait for folder reads and saves no longer than an overgrown delta.
     prompt_since: Option<Instant>,
@@ -434,6 +437,7 @@ impl Maintenance {
             duty_earliest: now,
             urgent_since: None,
             prompt_since: None,
+            blocked_until: None,
         }
     }
 
@@ -515,6 +519,9 @@ impl Maintenance {
         if let Some(why) = self.rescan.due(now, load.urgent) {
             return Some(Due::Rescan(why));
         }
+        if self.blocked_until.is_some_and(|until| now < until) {
+            return None;
+        }
         if (self.rescan.pending().is_some() && !load.prompt)
             || self.compact.is_none()
             || !(load.urgent
@@ -544,9 +551,21 @@ impl Maintenance {
         self.compact.take().map(Due::Compact)
     }
 
+    /// A compaction failed at `now` (its file could not be written): none
+    /// starts again for `gap`, whatever the delta's size or hidden entries
+    /// (retrying at once would only fail again, at full cost). The request
+    /// stays: it runs when the gap ends.
+    pub fn failed(&mut self, now: Instant, gap: Duration, reason: String) {
+        self.blocked_until = Some(now + gap.max(MIN_COMPACT_GAP));
+        self.compact.get_or_insert(reason);
+        self.urgent_since = None;
+        self.prompt_since = None;
+    }
+
     /// A compaction that took `took` ended at `now`: the next waits for its
     /// share of the time.
     pub fn compacted(&mut self, now: Instant, took: Duration) {
+        self.blocked_until = None;
         let gap = (took * COMPACT_DUTY).clamp(MIN_COMPACT_GAP, MAX_COMPACT_GAP);
         self.compact_earliest = now + gap;
         self.duty_earliest = now + (took * COMPACT_DUTY).min(MAX_COMPACT_GAP);
@@ -580,6 +599,12 @@ impl Maintenance {
                 }
             })
             .flatten();
+        // While blocked after a failure, the end of the block is the
+        // earliest a merge can start.
+        let compact = match (compact, self.blocked_until) {
+            (Some(at), Some(until)) if until > at => Some(until),
+            (other, _) => other,
+        };
         [self.rescan.wake_at(), compact].into_iter().flatten().min()
     }
 }
@@ -681,67 +706,18 @@ pub trait RecordSource {
     }
 }
 
-/// One of the live layer's frozen tables while a scan builds it: in the heap,
-/// or in an anonymous temporary file beside the index written through a memory
-/// map (ADR 0007, step 9), so building the table of a 27 M entry PC does not
-/// take 8 (or 4) bytes per entry of private memory on top of the saved copy
-/// that replaces it a moment later. Read as a slice either way.
-enum Built<T: Plain> {
-    Heap(Vec<T>),
-    Temp(TempColumn<T>),
-}
-
-impl<T: Plain> Built<T> {
-    /// `len` elements of `value`: in a temporary file in `dir` when there is
-    /// one and it can be made, else in the heap (the table is the same).
-    fn filled(len: usize, value: T, dir: Option<&Path>) -> Built<T> {
-        if let Some(dir) = dir
-            && let Ok(mut column) = TempColumn::zeroed(dir, len)
-        {
-            column.fill(value);
-            return Built::Temp(column);
-        }
-        Built::Heap(vec![value; len])
-    }
-
-    /// `len` zero elements (a file's pages are zero until written, and the
-    /// heap's come zeroed from the allocator: no pass over the table).
-    fn zeroed(len: usize, dir: Option<&Path>) -> Built<T> {
-        if let Some(dir) = dir
-            && let Ok(column) = TempColumn::zeroed(dir, len)
-        {
-            return Built::Temp(column);
-        }
-        Built::Heap(zeroed_vec(len))
-    }
-
-    /// The finished, read-only column (a table that cannot be frozen in its
-    /// file is copied to the heap).
-    fn freeze(self) -> Col<T> {
-        match self {
-            Built::Heap(v) => v.into(),
-            Built::Temp(column) => column.freeze().unwrap_or_else(|_| column.to_vec().into()),
-        }
-    }
-}
-
-impl<T: Plain> std::ops::Deref for Built<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        match self {
-            Built::Heap(v) => v,
-            Built::Temp(column) => column,
-        }
-    }
-}
-
-impl<T: Plain> std::ops::DerefMut for Built<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        match self {
-            Built::Heap(v) => v,
-            Built::Temp(column) => column,
-        }
-    }
+/// One of the live layer's frozen tables while a scan builds it: a
+/// [`Scratch`] buffer, an anonymous temporary file beside the index written
+/// through a memory map (ADR 0007, step 9), so building the table of a 27 M
+/// entry PC does not take 8 (or 4) bytes per entry of private memory on top of
+/// the saved copy that replaces it a moment later. When the file cannot be made
+/// the table is in the heap, as before, and `Scratch` counts it
+/// (`ferrow_index::store::scratch_in_heap`), which the service reports.
+/// `len` elements of `value`.
+fn filled<T: Plain>(len: usize, value: T, dir: Option<&Path>) -> Scratch<T> {
+    let mut table = Scratch::zeroed(len, dir);
+    table.fill(value);
+    table
 }
 
 /// What a volume's tables are built from.
@@ -984,7 +960,7 @@ impl Live {
     /// cannot be made is built in the heap.
     pub fn new_in(base: Arc<Index>, maps: &[VolumeMap], scratch: Option<&Path>) -> Live {
         let n = base.len();
-        let mut base_record = Built::filled(n, u64::MAX, scratch);
+        let mut base_record = filled(n, u64::MAX, scratch);
         for (v, map) in maps.iter().enumerate() {
             for (record, id) in map.entries.iter() {
                 if (id as usize) < n {
@@ -1018,15 +994,10 @@ impl Live {
         scratch: Option<&Path>,
     ) -> Vec<Volume> {
         // Per volume: the record → entry table and the link pairs.
-        type Tables = (Built<u32>, Vec<(u64, u32)>);
+        type Tables = (Scratch<u32>, Vec<(u64, u32)>);
         let mut tables: Vec<Tables> = seeds
             .iter()
-            .map(|seed| {
-                (
-                    Built::filled(seed.records as usize, u32::MAX, scratch),
-                    Vec::new(),
-                )
-            })
+            .map(|seed| (filled(seed.records as usize, u32::MAX, scratch), Vec::new()))
             .collect();
         for (v, record, id) in entries {
             let (record_base, links) = &mut tables[v];
@@ -1518,7 +1489,7 @@ impl Live {
         self.base_children.get_or_init(|| {
             let n = self.base.len();
             let dir = self.scratch.as_deref();
-            let mut first = Built::<u32>::zeroed(n + 1, dir);
+            let mut first = Scratch::<u32>::zeroed(n + 1, dir);
             for c in 0..n as u32 {
                 let p = self.base.parent(c);
                 if p != ROOT_PARENT {
@@ -1530,7 +1501,7 @@ impl Live {
             }
             // Fill by advancing each parent's start, then shift the starts
             // back (no second table of n entries).
-            let mut ids = Built::<u32>::zeroed(first[n] as usize, dir);
+            let mut ids = Scratch::<u32>::zeroed(first[n] as usize, dir);
             for c in 0..n as u32 {
                 let p = self.base.parent(c);
                 if p != ROOT_PARENT {
@@ -2708,9 +2679,16 @@ mod tests {
         assert_eq!(leftovers(), 0, "gone with the tables");
         // A directory that is not there: the same tables, in the heap.
         let nowhere = dir.join("missing");
+        let counted = ferrow_index::store::scratch_in_heap();
         let heap_again = Live::new_in(base, &[map], Some(&nowhere));
         assert_eq!(heap_again.base_record[..], heap.base_record[..]);
         assert!(!heap_again.base_record.is_mapped());
+        // Not silent: every table that should have been a file is counted
+        // (the service warns when the count grows).
+        assert!(
+            ferrow_index::store::scratch_in_heap() >= counted + 2,
+            "base_record and a record_base fell back"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4950,6 +4928,39 @@ mod tests {
         drop(now);
         drop(base);
         assert!(weak_old.upgrade().is_none(), "the old index is freed");
+    }
+
+    #[test]
+    fn a_failed_merge_blocks_every_merge_for_its_gap() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut m = Maintenance::after_scan(t0, s(60));
+        let prompt = Load {
+            prompt: true,
+            ..Load::default()
+        };
+        let urgent = Load::of(1000, 10, false, false);
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert!(matches!(m.due(t0, prompt), Some(Due::Compact(_))));
+        // It failed after 1 ms: neither hidden entries nor an overgrown
+        // delta start another before the gap ends.
+        let t1 = t0 + Duration::from_millis(1);
+        m.failed(t1, s(900), REASON_LARGE_MOVE.into());
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        for load in [prompt, urgent] {
+            assert_eq!(m.due(t1 + Duration::from_millis(10), load), None);
+            assert_eq!(m.due(t1 + s(899), load), None);
+            assert_eq!(
+                m.wake_at(t1 + s(1), load),
+                Some(t1 + s(900)),
+                "no busy wake"
+            );
+        }
+        assert!(matches!(m.due(t1 + s(900), prompt), Some(Due::Compact(_))));
+        // A success lifts the block.
+        m.compacted(t1 + s(901), s(1));
+        m.request(Reason::compact(REASON_LARGE_MOVE));
+        assert!(matches!(m.due(t1 + s(902), urgent), Some(Due::Compact(_))));
     }
 
     #[test]

@@ -128,7 +128,7 @@ impl SortTicket {
 }
 #[derive(Debug)]
 struct PackedIds {
-    bytes: Vec<u8>,
+    bytes: Col<u8>,
     width: usize,
     known: usize,
 }
@@ -147,20 +147,22 @@ impl PackedIds {
         known: usize,
         boundary: impl Fn(usize) -> bool,
         check: impl Fn() -> Result<(), PreparationCancelled>,
+        dir: Option<&std::path::Path>,
     ) -> Result<Self, PreparationCancelled> {
         check()?;
         let width = Self::width(ids.len());
         let flag = 1u64 << (width * 8 - 1);
-        let mut bytes = Vec::with_capacity(ids.len() * width);
+        let mut out = crate::store::Scratch::<u8>::zeroed(ids.len() * width, dir);
+        let bytes = out.as_mut_slice();
         for (i, &id) in ids.iter().enumerate() {
             if i.is_multiple_of(PREPARE_INTERVAL) {
                 check()?;
             }
             let code = u64::from(id) | if boundary(i) { flag } else { 0 };
-            bytes.extend_from_slice(&code.to_le_bytes()[..width]);
+            bytes[i * width..(i + 1) * width].copy_from_slice(&code.to_le_bytes()[..width]);
         }
         Ok(Self {
-            bytes,
+            bytes: out.freeze(),
             width,
             known,
         })
@@ -251,6 +253,9 @@ struct Column<T> {
     overflow_values: Vec<T>,
     order: OnceLock<PackedIds>,
     signal: Arc<Signal>,
+    /// Where a sort order is prepared and kept: temporary files beside the
+    /// index file it was read from (ADR 0007); none: the heap.
+    scratch: OnceLock<std::path::PathBuf>,
 }
 /// One column's values as a builder shard collects them, in arrival order,
 /// already packed like the final column (same width, absent as zero, overflow
@@ -725,7 +730,7 @@ impl<T: Value> Column<T> {
     fn sort_ids(
         &self,
         ids: &mut [u32],
-        scratch: &mut Vec<u32>,
+        scratch: &mut [u32],
         check: &mut impl FnMut() -> Result<(), PreparationCancelled>,
     ) -> Result<(), PreparationCancelled> {
         check()?;
@@ -740,10 +745,10 @@ impl<T: Value> Column<T> {
         if self.cmp(ids[mid - 1], ids[mid]) != Ordering::Greater {
             return check();
         }
-        scratch.clear();
-        for chunk in ids[..mid].chunks(PREPARE_INTERVAL) {
+        for (i, chunk) in ids[..mid].chunks(PREPARE_INTERVAL).enumerate() {
             check()?;
-            scratch.extend_from_slice(chunk);
+            let at = i * PREPARE_INTERVAL;
+            scratch[at..at + chunk.len()].copy_from_slice(chunk);
         }
         let (mut left, mut right, mut out) = (0, mid, 0usize);
         while left < mid {
@@ -769,6 +774,7 @@ impl<T: Value> Column<T> {
             overflow_ids: Vec::new(),
             overflow_values: Vec::new(),
             order: OnceLock::new(),
+            scratch: OnceLock::new(),
             signal: Arc::default(),
         }
     }
@@ -891,28 +897,42 @@ impl<T: Value> Column<T> {
                                 before();
                             }
                             column.check_live()?;
-                            let mut ids = Vec::with_capacity(names.len());
-                            for chunk in names.chunks(PREPARE_INTERVAL) {
+                            // The ids, the merge scratch and the order are
+                            // temporary files beside the index when it was
+                            // read from one (file cache, not private memory:
+                            // 4 to 10 bytes per entry each).
+                            let dir = column.scratch.get().map(std::path::PathBuf::as_path);
+                            let mut ids_buf =
+                                crate::store::Scratch::<u32>::zeroed(names.len(), dir);
+                            let ids = ids_buf.as_mut_slice();
+                            for (i, chunk) in names.chunks(PREPARE_INTERVAL).enumerate() {
                                 column.check_live()?;
-                                ids.extend_from_slice(chunk);
+                                let at = i * PREPARE_INTERVAL;
+                                ids[at..at + chunk.len()].copy_from_slice(chunk);
                             }
                             column.check_live()?;
                             // Stable input name order preserves ties. This dedicated
                             // thread never occupies or waits for the query Rayon pool.
-                            let mut scratch = Vec::with_capacity(if ids.len() > PREPARE_INTERVAL {
-                                ids.len() / 2
-                            } else {
-                                0
-                            });
-                            column.sort_ids(&mut ids, &mut scratch, &mut || column.check_live())?;
+                            let mut scratch = crate::store::Scratch::<u32>::zeroed(
+                                if ids.len() > PREPARE_INTERVAL {
+                                    ids.len() / 2
+                                } else {
+                                    0
+                                },
+                                dir,
+                            );
+                            column.sort_ids(ids, scratch.as_mut_slice(), &mut || {
+                                column.check_live()
+                            })?;
                             drop(scratch);
                             column.check_live()?;
                             let known = ids.partition_point(|&id| column.get(id).is_some());
                             let order = PackedIds::from_ids(
-                                &ids,
+                                ids,
                                 known,
                                 |i| i == 0 || column.cmp(ids[i - 1], ids[i]) != Ordering::Equal,
                                 || column.check_live(),
+                                dir,
                             )?;
                             column.check_live()?;
                             let _ = column.order.set(order);
@@ -969,7 +989,10 @@ impl<T: Value> Column<T> {
                 "overflow",
                 self.overflow_ids.capacity() * 4 + self.overflow_values.capacity() * T::RAW,
             ),
-            ("order", self.order.get().map_or(0, |o| o.bytes.capacity())),
+            (
+                "order",
+                self.order.get().map_or(0, |o| o.bytes.heap_bytes()),
+            ),
             (
                 "objects",
                 std::mem::size_of::<Self>()
@@ -986,7 +1009,9 @@ impl<T: Value> Column<T> {
         ]
     }
     fn mapped_bytes(&self) -> usize {
-        self.packed.mapped_bytes() + self.valid.mapped_bytes()
+        self.packed.mapped_bytes()
+            + self.valid.mapped_bytes()
+            + self.order.get().map_or(0, |o| o.bytes.mapped_bytes())
     }
     fn serialized_len(&self) -> usize {
         4 + self.packed.len() + self.valid.len() + self.overflow_ids.len() * (4 + T::RAW)
@@ -1052,6 +1077,7 @@ impl<T: Value> Column<T> {
             overflow_ids,
             overflow_values,
             order: OnceLock::new(),
+            scratch: OnceLock::new(),
             signal: Arc::default(),
         };
         if !n.is_multiple_of(8) && c.valid.last().is_some_and(|v| *v >> (n % 8) != 0) {
@@ -1164,6 +1190,20 @@ impl MetadataColumns {
             accessed: col(ColumnSet::ACCESSED).then(|| Column::with_len(n)),
             attributes: col(ColumnSet::ATTRIBUTES).then(|| Column::with_len(n)),
         }
+    }
+    /// Prepare sort orders in temporary files in `dir` (the index file's
+    /// directory) instead of the heap.
+    pub(crate) fn set_scratch_dir(&self, dir: &std::path::Path) {
+        fn set<T>(c: &Option<Arc<Column<T>>>, dir: &std::path::Path) {
+            if let Some(c) = c {
+                let _ = c.scratch.set(dir.to_path_buf());
+            }
+        }
+        set(&self.size, dir);
+        set(&self.modified, dir);
+        set(&self.created, dir);
+        set(&self.accessed, dir);
+        set(&self.attributes, dir);
     }
     pub(crate) fn present(&self) -> ColumnSet {
         ColumnSet(
@@ -1472,16 +1512,16 @@ mod tests {
             let mut ids = index.sorted[..len].to_vec();
             let mut expected = ids.clone();
             expected.sort_by(|&a, &b| column.cmp(a, b));
-            let mut scratch = Vec::with_capacity(len / 2);
+            let mut scratch = vec![0u32; len / 2];
             column
                 .sort_ids(&mut ids, &mut scratch, &mut || Ok(()))
                 .unwrap();
             assert_eq!(ids, expected, "len={len}");
-            assert_eq!(scratch.capacity(), len / 2);
         }
         let mut ids = index.sorted.to_vec();
         let mut calls = 0;
-        let result = column.sort_ids(&mut ids, &mut Vec::new(), &mut || {
+        let mut scratch = vec![0u32; ids.len() / 2];
+        let result = column.sort_ids(&mut ids, &mut scratch, &mut || {
             calls += 1;
             if calls == 20 {
                 Err(PreparationCancelled)
@@ -1505,6 +1545,7 @@ mod tests {
                     Ok(())
                 }
             },
+            None,
         );
         assert!(result.is_err());
         assert_eq!(calls.get(), 3);
@@ -1643,7 +1684,7 @@ mod tests {
         assert_eq!(PackedIds::width(1 << 23), 3);
         assert_eq!(PackedIds::width((1 << 23) + 1), 4);
         let ids = PackedIds {
-            bytes: vec![255, 255, 255, 0, 0, 0],
+            bytes: vec![255, 255, 255, 0, 0, 0].into(),
             width: 3,
             known: 0,
         };
@@ -1651,7 +1692,7 @@ mod tests {
         assert!(ids.group_start(0));
         assert_eq!(ids.get(1), 0);
         let ids = PackedIds {
-            bytes: vec![255, 255, 255, 255, 128],
+            bytes: vec![255, 255, 255, 255, 128].into(),
             width: 5,
             known: 0,
         };
