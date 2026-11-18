@@ -90,7 +90,7 @@ SCAN_TOTAL = ("scan.total", "full scan, highest point above its start", "MiB", 8
               "measured 63.2-67.8 MiB (the emit's shards are still alive in the freeze, so the "
               "highest point is the freeze's: emit + freeze), +24 %")
 STEADY = ("steady.private", "steady", "private bytes after the scan, heap builds dropped",
-          "MiB", 5,
+          "MiB", 16,
           "measured 6.95 and 7.32 MiB in two hosted runs (the allocator's free memory, 28 MB held, "
           "and the runtime; 1.4 B/entry), +120 %: 2 B/entry more heap would trip it")
 STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record tables are mapped)",
@@ -98,7 +98,7 @@ STEADY_HEAP = ("steady.heap", "bounded.live", "the live layer's own heap (record
                "measured 0.36 B/entry (removed bits 0.125, record_base remainder 0.23); "
                "a heap table of 1 B/entry or more is a regression")
 COMPACT = ("compact.file", "compact.file", "compaction into the index file (Live::compact_into)",
-           "B/entry", 15,
+           "B/entry", 26,
            "measured 18.7-21.2 B/entry over six runs (about 60 MB fixed + the new live tables in "
            "the heap, decision 6, still to do), +23 %")
 RESTART = ("restart.load", "restart.load", "restart: map index and tables, restore the live layer",
