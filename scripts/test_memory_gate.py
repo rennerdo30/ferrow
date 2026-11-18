@@ -22,12 +22,35 @@ def peak(phase, before, growth_mib):
             f"growth_bytes={growth} growth_per_entry={growth / N:.3f} note=a note with words")
 
 
+def limit(ident):
+    """The gate's own limit for a check, so these tests stay right when a limit is recalibrated."""
+    for c in gate.CHECKS:
+        if c[0] == ident:
+            return c[4]
+    for c in (gate.SCAN_TOTAL, ):
+        if c[0] == ident:
+            return c[3]
+    for c in (gate.STEADY, gate.STEADY_HEAP, gate.COMPACT, gate.RESTART, gate.RESTARTED):
+        if c[0] == ident:
+            return c[4]
+    raise KeyError(ident)
+
+
+def over(ident, factor=1.5):
+    """A value over the limit of `ident`, in the unit of its override."""
+    value = limit(ident) * factor
+    return value * N / MIB if ident == "compact.file" else value
+
+
 def output(entries=N, overrides=None, drop=None, done=True):
-    """What a passing run prints, with some values replaced or lines removed."""
+    """What a passing run prints (every value at 40 % of its limit), with some values replaced or lines removed."""
     o = {
-        "bounded.parse": 15, "bounded.from_parsed": 0.1, "bounded.emit": 59, "bounded.freeze": 4.5,
-        "bounded.live_new": 4.5, "bounded.children": 0.1, "compact.file": 100, "restart.load": 1.4,
-        "steady": 7, "restarted": 6, "heap_per_entry": 0.36,
+        "bounded.parse": 0.4 * limit("scan.parse"), "bounded.from_parsed": 0.4 * limit("scan.join"),
+        "bounded.emit": 0.4 * limit("scan.emit"), "bounded.freeze": 0.4 * limit("scan.freeze"),
+        "bounded.live_new": 0.4 * limit("scan.live_new"), "bounded.children": 0.4 * limit("scan.children"),
+        "compact.file": 0.4 * over("compact.file", 1) , "restart.load": 0.4 * limit("restart.load"),
+        "steady": 0.4 * limit("steady.private"), "restarted": 0.4 * limit("restart.private"),
+        "heap_per_entry": 0.4 * limit("steady.heap"),
     }
     o.update(overrides or {})
     lines = [f"FERROW-MEMORY-ACTIVE example=memory_breakdown entries={entries} changes=20000 seed=2026"]
@@ -76,14 +99,14 @@ class MemoryGate(unittest.TestCase):
 
     def test_each_limit_fails_and_names_phase_and_number(self):
         cases = {
-            "bounded.parse": ("scan.parse", 30),
-            "bounded.emit": ("scan.emit", 90),
-            "bounded.freeze": ("scan.freeze", 12),
-            "compact.file": ("compact.file", 5_000_000 * 30 / MIB),
-            "restart.load": ("restart.load", 10),
-            "steady": ("steady.private", 30),
-            "restarted": ("restart.private", 30),
-            "heap_per_entry": ("steady.heap", 4.0),
+            "bounded.parse": ("scan.parse", over("scan.parse")),
+            "bounded.emit": ("scan.emit", over("scan.emit")),
+            "bounded.freeze": ("scan.freeze", over("scan.freeze")),
+            "compact.file": ("compact.file", over("compact.file")),
+            "restart.load": ("restart.load", over("restart.load")),
+            "steady": ("steady.private", over("steady.private")),
+            "restarted": ("restart.private", over("restart.private")),
+            "heap_per_entry": ("steady.heap", over("steady.heap")),
         }
         for key, (ident, value) in cases.items():
             with self.subTest(key):
@@ -93,24 +116,39 @@ class MemoryGate(unittest.TestCase):
                 self.assertIn(ident, err)
 
     def test_total_scan_peak_fails_when_every_phase_is_inside_its_own_limit(self):
-        # emit and freeze each inside their limits, but the shards of the emit
+        # emit and freeze each just inside their limits, but the shards of the emit
         # are still alive in the freeze: the sum is over the total's limit.
-        code, _, err, _ = run(output(overrides={"bounded.emit": 78, "bounded.freeze": 7.5}))
+        emit, freeze = 0.99 * limit("scan.emit"), 0.99 * limit("scan.freeze")
+        self.assertGreater(emit + freeze, limit("scan.total"), "limits must allow the total to trip")
+        code, _, err, _ = run(output(overrides={"bounded.emit": emit, "bounded.freeze": freeze}))
         self.assertEqual(code, 1)
         self.assertIn("scan.total", err)
         self.assertNotIn("scan.emit", err.split("MEMORY GATE FAILED")[1])
 
-    def test_extrapolation_over_hard_limit_fails_over_target_warns_for_compaction(self):
-        # A steady state that is inside its own limit but, scaled to 27.2 M
-        # entries and with a rescan on top, is over the 512 MB target.
-        code, _, err, _ = run(output(overrides={"steady": 16, "bounded.emit": 78, "bounded.freeze": 4}))
-        self.assertEqual(code, 1)
-        self.assertIn("pc.scan", err)
-        # A compaction over the target only warns (its tables are in the heap, decision 6).
-        code, out, err, _ = run(output(overrides={"compact.file": 120}))
-        self.assertEqual(code, 0, err)
-        self.assertIn("over target", out)
-        self.assertIn("::warning", out)
+    def test_extrapolation_against_target_and_hard_limit(self):
+        saved = dict(gate.PC)
+        try:
+            # Target above the steady state and the restart, below a rescan: the rescan fails, the compaction only warns.
+            rows, ext = gate.evaluate(gate.parse(output()))
+            by = {r.ident: r for r in ext}
+            gate.PC["target_bytes"] = int(max(by["pc.steady"].measured, by["pc.restart"].measured) * 1.5 * MIB)
+            rows, ext = gate.evaluate(gate.parse(output()))
+            by = {r.ident: r for r in ext}
+            self.assertEqual(by["pc.steady"].status, "ok")
+            self.assertEqual(by["pc.restart"].status, "ok")
+            self.assertEqual(by["pc.scan"].status, "FAIL")
+            self.assertEqual(by["pc.compact"].status, "over target")
+            code, out, err, _ = run(output())
+            self.assertEqual(code, 1)
+            self.assertIn("pc.scan", err)
+            self.assertIn("::warning", out)
+            # Over the hard limit even the compaction fails.
+            gate.PC["hard_bytes"] = gate.PC["target_bytes"]
+            rows, ext = gate.evaluate(gate.parse(output()))
+            self.assertEqual({r.ident: r for r in ext}["pc.compact"].status, "FAIL")
+        finally:
+            gate.PC.clear()
+            gate.PC.update(saved)
 
     def test_missing_measurement_fails(self):
         code, _, err, _ = run(output(drop=["restart.load"]))
