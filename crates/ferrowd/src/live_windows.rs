@@ -484,13 +484,22 @@ fn options_fingerprint(options: &WalkOptions) -> u64 {
 const MAX_REPLAY_BYTES: i64 = 256 << 20;
 
 /// How far (bytes of change journal) the saved state may lag behind what is
-/// applied before it is brought up to date; otherwise a session leaves the
-/// saved position behind until a start must scan (MAX_REPLAY_BYTES, or the
-/// journal wrapping past it). A quarter of what a start replays.
-const REFRESH_LAG_BYTES: i64 = MAX_REPLAY_BYTES / 4;
-/// …or how long it may lag at all. Each refresh with changes is a merge,
-/// which writes the whole index file (gigabytes on a large PC): rare.
+/// applied before its tables alone are saved again (nothing changed: the
+/// index file stays); otherwise a session leaves the saved position behind
+/// until a start must scan (MAX_REPLAY_BYTES, or the journal wrapping past
+/// it). A quarter of what a start replays, and never more than a quarter of
+/// the journal itself.
+const TABLES_LAG_BYTES: i64 = MAX_REPLAY_BYTES / 4;
+/// …and before a merge brings the saved index up to date when something
+/// changed. A merge writes the whole index file (gigabytes on a large PC),
+/// so it waits for three quarters of what a start replays, or half the
+/// journal.
+const MERGE_LAG_BYTES: i64 = MAX_REPLAY_BYTES / 4 * 3;
+/// …or how long the saved state may lag at all.
 const TABLES_REFRESH: Duration = Duration::from_secs(12 * 60 * 60);
+/// After an attempt to bring the saved state up to date (it may have
+/// failed: a full disk), the next waits at least this long.
+const REFRESH_RETRY: Duration = Duration::from_secs(15 * 60);
 /// Why such a merge runs.
 const REASON_REFRESH: &str = "bring the saved index up to date";
 
@@ -514,10 +523,10 @@ fn replay_verdict(saved: (u64, i64), now: (u64, i64, i64)) -> Result<(), &'stati
     Ok(())
 }
 
-/// How far the applied journal positions are ahead of the saved ones, in
-/// journal bytes (the largest over the volumes; a replaced journal counts
-/// as far ahead).
-fn saved_lag(applied: &[(u64, i64)], saved: &[(u64, i64)]) -> i64 {
+/// Per volume, how far the applied journal position is ahead of the saved
+/// one, in journal bytes (a replaced journal, or saved tables that are not
+/// current, count as far ahead).
+fn saved_lags(applied: &[(u64, i64)], saved: &[(u64, i64)]) -> Vec<i64> {
     applied
         .iter()
         .zip(saved)
@@ -528,14 +537,30 @@ fn saved_lag(applied: &[(u64, i64)], saved: &[(u64, i64)]) -> i64 {
                 i64::MAX
             }
         })
-        .max()
-        .unwrap_or(0)
+        .collect()
 }
 
-/// Whether the saved state should be brought up to date now: it lags by
-/// REFRESH_LAG_BYTES of journal, or by anything for TABLES_REFRESH.
-fn refresh_due(lag: i64, since_saved: Duration) -> bool {
-    lag >= REFRESH_LAG_BYTES || (lag > 0 && since_saved >= TABLES_REFRESH)
+/// Whether the saved state should be brought up to date now, by a merge
+/// (`merge`: something changed) or by saving its tables. Per volume, `lags`
+/// and `spans` (the journal's size, `next - first`, 0 when unknown): due
+/// when a volume lags by its limit (see TABLES_LAG_BYTES and
+/// MERGE_LAG_BYTES; at most a quarter or half of a small journal, which
+/// would otherwise wrap past the saved position first), or by anything
+/// for TABLES_REFRESH.
+fn refresh_due(lags: &[i64], spans: &[i64], since_saved: Duration, merge: bool) -> bool {
+    let (limit, share) = if merge {
+        (MERGE_LAG_BYTES, 2)
+    } else {
+        (TABLES_LAG_BYTES, 4)
+    };
+    lags.iter().zip(spans).any(|(&lag, &span)| {
+        let limit = if span > 0 {
+            limit.min(span / share)
+        } else {
+            limit
+        };
+        lag > 0 && (lag >= limit || since_saved >= TABLES_REFRESH)
+    })
 }
 
 /// Whether `device` names a volume (`\\?\Volume{…}`, one optional trailing
@@ -544,7 +569,10 @@ fn is_volume_device(device: &str) -> bool {
     device
         .strip_prefix(r"\\?\Volume{")
         .map(|rest| rest.strip_suffix('\\').unwrap_or(rest))
-        .is_some_and(|guid| guid.ends_with('}') && !guid.contains(['\\', '/']))
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|guid| {
+            !guid.is_empty() && guid.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        })
 }
 
 /// The saved index and its live tables, when they can replace the startup
@@ -762,6 +790,7 @@ fn maintain(
                     live,
                     facts,
                     can_save_tables: true,
+                    tables_current: true,
                     summary,
                     took,
                 },
@@ -870,11 +899,13 @@ fn maintain(
         // The record maps (16 bytes per entry) are only needed to build
         // the overlay; do not keep them for the whole live session.
         drop(maps);
+        let mut tables_current = false;
         if can_save_tables
             && let Some(path) = tables.as_deref()
             && let Some(saved) = save_tables(path, &live, fingerprint, &facts)
         {
             live.replace_tables(saved);
+            tables_current = true;
         }
         reason = match run_session(
             &store,
@@ -892,6 +923,7 @@ fn maintain(
                 live,
                 facts,
                 can_save_tables,
+                tables_current,
                 summary,
                 took,
             },
@@ -911,6 +943,8 @@ struct Session {
     facts: Vec<saved::VolumeFacts>,
     /// Whether the live tables may be saved for the next start.
     can_save_tables: bool,
+    /// Whether `live.bin` holds this session's tables now.
+    tables_current: bool,
     summary: String,
     took: Duration,
 }
@@ -937,6 +971,7 @@ fn run_session(
         mut live,
         facts,
         can_save_tables,
+        tables_current,
         summary,
         took,
     } = session;
@@ -978,6 +1013,7 @@ fn run_session(
     };
     if volumes.handles.len() != facts.len() {
         eventlog::error("cannot reopen every volume; live updates stopped");
+        STATE.set_tables_mapped(0);
         return None;
     }
     let device_index: HashMap<String, usize> = facts
@@ -988,10 +1024,23 @@ fn run_session(
     // Where each journal's changes are applied up to: what saved tables
     // may claim.
     let mut applied: Vec<(u64, i64)> = facts.iter().map(|f| f.journal.unwrap_or((0, 0))).collect();
-    // What the saved tables claim (positions) and when they were saved.
-    let mut saved_at = applied.clone();
+    // What the saved tables claim (positions) and when they were saved;
+    // tables that could not be saved claim nothing (an impossible journal),
+    // so bringing them up to date is due at once.
+    let mut saved_at = if tables_current {
+        applied.clone()
+    } else {
+        vec![(u64::MAX, 0); applied.len()]
+    };
     let mut tables_saved = Instant::now();
+    let mut next_refresh = Instant::now();
     let refresh_possible = can_save_tables && tables.is_some() && persist.is_some();
+    // Each journal's size, which bounds how far the saved position may lag.
+    let spans: Vec<i64> = volumes
+        .handles
+        .iter()
+        .map(|(file, _)| ntfs::query_journal(file).map_or(0, |(_, first, next)| next - first))
+        .collect();
     let devices: Vec<String> = facts.iter().map(|f| f.device.clone()).collect();
     let (tx, rx) = (tx.clone(), rx);
     let pool = pool.as_ref();
@@ -1023,12 +1072,17 @@ fn run_session(
             // far behind. With changes, a merge brings both up to date;
             // without any, only the tables are saved again (the index is
             // unchanged).
-            let lag = saved_lag(&applied, &saved_at);
+            let lags = saved_lags(&applied, &saved_at);
+            let lagging = lags.iter().any(|&lag| lag > 0);
+            let changed = live.has_changes();
             if refresh_possible
                 && !rescan.rescan_waiting()
-                && refresh_due(lag, tables_saved.elapsed())
+                && Instant::now() >= next_refresh
+                && refresh_due(&lags, &spans, tables_saved.elapsed(), changed)
             {
-                if live.has_changes() {
+                // One attempt per REFRESH_RETRY, whatever its outcome.
+                next_refresh = Instant::now() + REFRESH_RETRY;
+                if changed {
                     rescan.request(Reason::compact(REASON_REFRESH));
                 } else if let Some(path) = tables {
                     let facts: Vec<saved::VolumeFacts> = facts
@@ -1042,9 +1096,8 @@ fn run_session(
                     if let Some(saved) = save_tables(path, &live, fingerprint, &facts) {
                         live.replace_tables(saved);
                         saved_at = applied.clone();
+                        tables_saved = Instant::now();
                     }
-                    // Tried: a failure waits for the next interval.
-                    tables_saved = Instant::now();
                 }
             }
             let load = Load {
@@ -1123,9 +1176,13 @@ fn run_session(
                         },
                     );
                     if let Some(took) = took {
-                        tables_saved = Instant::now();
+                        // The merged index replaced the file: tables saved
+                        // for the old one no longer match it.
                         if tables_written {
                             saved_at = applied.clone();
+                            tables_saved = Instant::now();
+                        } else {
+                            saved_at = vec![(u64::MAX, 0); applied.len()];
                         }
                         STATE.set_tables_mapped(live.mapped_bytes());
                         base = live.base().clone();
@@ -1153,14 +1210,17 @@ fn run_session(
                 live.next_walk_deadline(),
                 // Only a deadline ahead: once due, the refresh was asked for
                 // (a merge then wakes the maintainer itself).
-                (refresh_possible && lag > 0)
-                    .then(|| tables_saved + TABLES_REFRESH)
+                (refresh_possible && lagging)
+                    .then(|| (tables_saved + TABLES_REFRESH).max(next_refresh))
                     .filter(|&at| at > Instant::now()),
             ]
             .into_iter()
             .flatten()
             .min();
-            let batch = next_batch(rx, &device_index, wake)?;
+            let Some(batch) = next_batch(rx, &device_index, wake) else {
+                STATE.set_tables_mapped(0);
+                return None;
+            };
             let (changes, events, positions) = match batch {
                 Batch::Changes {
                     changes,
@@ -1499,25 +1559,38 @@ mod tests {
         let mb = 1i64 << 20;
         let hour = Duration::from_secs(3600);
         assert_eq!(
-            saved_lag(&[(1, 90 * mb), (2, 5)], &[(1, 10 * mb), (2, 5)]),
-            80 * mb
+            saved_lags(&[(1, 90 * mb), (2, 5)], &[(1, 10 * mb), (2, 5)]),
+            [80 * mb, 0]
         );
         assert_eq!(
-            saved_lag(&[(3, 1)], &[(1, 1)]),
-            i64::MAX,
+            saved_lags(&[(3, 1)], &[(1, 1)]),
+            [i64::MAX],
             "a replaced journal"
         );
-        assert_eq!(saved_lag(&[(1, 1)], &[(1, 9)]), 0);
-        assert!(refresh_due(64 * mb, Duration::ZERO));
-        assert!(!refresh_due(63 * mb, 11 * hour));
-        assert!(refresh_due(1, 12 * hour));
-        assert!(!refresh_due(0, 100 * hour), "nothing to bring up to date");
+        assert_eq!(saved_lags(&[(1, 1)], &[(1, 9)]), [0]);
+        let unknown = [0];
+        // Tables alone: from 64 MiB; a merge: from 192 MiB.
+        assert!(refresh_due(&[64 * mb], &unknown, Duration::ZERO, false));
+        assert!(!refresh_due(&[63 * mb], &unknown, 11 * hour, false));
+        assert!(!refresh_due(&[100 * mb], &unknown, Duration::ZERO, true));
+        assert!(refresh_due(&[192 * mb], &unknown, Duration::ZERO, true));
+        // Anything, after 12 hours; nothing, never.
+        assert!(refresh_due(&[1], &unknown, 12 * hour, true));
+        assert!(!refresh_due(&[0], &unknown, 100 * hour, false));
+        // A small journal (32 MiB): a quarter or half of it.
+        assert!(refresh_due(&[8 * mb], &[32 * mb], Duration::ZERO, false));
+        assert!(refresh_due(&[16 * mb], &[32 * mb], Duration::ZERO, true));
+        assert!(!refresh_due(&[15 * mb], &[32 * mb], Duration::ZERO, true));
+        // Tables not current: due at once.
+        assert!(refresh_due(&[i64::MAX], &unknown, Duration::ZERO, true));
     }
 
     #[test]
     fn only_a_volume_device_is_opened() {
         assert!(is_volume_device(r"\\?\Volume{0123-abcd}"));
         assert!(is_volume_device(r"\\?\Volume{0123-abcd}\"));
+        assert!(!is_volume_device(r"\\?\Volume{}"));
+        assert!(!is_volume_device(r"\\?\Volume{x}}"));
         assert!(!is_volume_device(r"\\?\Volume{x}\path\file}"));
         assert!(!is_volume_device(r"C:\Windows"));
         assert!(!is_volume_device(r"\\?\Volume{x}/y}"));
