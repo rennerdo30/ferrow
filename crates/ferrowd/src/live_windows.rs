@@ -573,6 +573,9 @@ fn refresh_retry(failures: u32) -> Duration {
     (REFRESH_RETRY * 2u32.pow(failures.saturating_sub(1).min(6))).min(TABLES_REFRESH)
 }
 
+/// The longest a failed merge waits before it is tried again.
+const MAX_MERGE_RETRY: Duration = Duration::from_secs(60 * 60);
+
 /// The smallest journal size the lag limits scale down to: a journal that
 /// reports less (just created) is treated as this large.
 const MIN_JOURNAL_SPAN: i64 = 4 << 20;
@@ -1390,7 +1393,11 @@ fn run_session(
                         log_memory("after compaction", Some(&live), &base, store);
                     } else {
                         refresh_failures += 1;
-                        let gap = refresh_retry(refresh_failures);
+                        // Merges retry within the hour at most: the changes
+                        // wait in memory meanwhile (a transient failure, a
+                        // file held by a scanner, must not leave them there
+                        // for half a day).
+                        let gap = refresh_retry(refresh_failures).min(MAX_MERGE_RETRY);
                         next_refresh = Instant::now() + gap;
                         rescan.failed(Instant::now(), gap, why.clone());
                         STATE.merge_blocked(Some(format!(
