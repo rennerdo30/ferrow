@@ -97,6 +97,8 @@ pub struct State {
     inner: Mutex<Inner>,
     started: Mutex<Option<(Instant, u64)>>,
     live_changes: AtomicU64,
+    /// Bytes of the saved live tables read through a map.
+    tables_mapped: AtomicU64,
     folder_reads: AtomicU64,
     folder_read_entries: AtomicU64,
     folder_read_ms: AtomicU64,
@@ -126,6 +128,7 @@ impl State {
             }),
             started: Mutex::new(None),
             live_changes: AtomicU64::new(0),
+            tables_mapped: AtomicU64::new(0),
             folder_reads: AtomicU64::new(0),
             folder_read_entries: AtomicU64::new(0),
             folder_read_ms: AtomicU64::new(0),
@@ -219,6 +222,11 @@ impl State {
     /// A connection ended with an error (counted; never logged one by one).
     pub fn connection_error(&self) {
         self.connection_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The live layer now reads `bytes` of its saved tables through a map.
+    pub fn set_tables_mapped(&self, bytes: usize) {
+        self.tables_mapped.store(bytes as u64, Ordering::Relaxed);
     }
 
     pub fn add_live_changes(&self, n: usize) {
@@ -357,7 +365,8 @@ impl State {
             working_set,
             private_bytes,
             private_working_set,
-            index_mapped_bytes: snapshot.index.mapped_bytes() as u64,
+            index_mapped_bytes: snapshot.index.mapped_bytes() as u64
+                + self.tables_mapped.load(Ordering::Relaxed),
             entries: snapshot.entries() as u64,
             mode: snapshot.mode.clone(),
             access: policy.mode.as_str().into(),

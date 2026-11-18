@@ -16,7 +16,7 @@ mod build;
 mod metadata;
 pub mod osname;
 pub mod persist;
-mod store;
+pub mod store;
 pub use build::{DEFAULT_SPILL_BUDGET, FileFreezeError, FileFreezeTimings, FileTarget};
 pub use metadata::{
     ColumnSet, EntryMetadata, MetadataOrder, SortKey, SortStatus, SortTicket, metadata_timestamp,
@@ -91,6 +91,8 @@ pub struct Index {
     arena: Col<u8>,
     folded_arena: Col<u8>,
     sorted: Arc<Col<u32>>,
+    /// The checksum field of the file this index is mapped from.
+    file_checksum: Option<u32>,
 }
 
 impl Index {
@@ -260,6 +262,12 @@ impl Index {
             + self.metadata.mapped_bytes()
     }
 
+    /// The checksum field of the saved file this index is mapped from (it
+    /// names that file's contents); `None` for an index in the heap.
+    pub fn file_checksum(&self) -> Option<u32> {
+        self.file_checksum
+    }
+
     /// Whether the columns are read from the saved file (it is on disk
     /// already: saving it again would write the same bytes).
     pub fn is_mapped(&self) -> bool {
@@ -306,8 +314,16 @@ impl Index {
         persist::save(self, path)
     }
 
+    /// Save, then read the same index from the file just written through a
+    /// memory map, without checking the file again (only its header, length
+    /// and checksum field against what was written). See ADR 0007.
+    pub fn save_and_map(&self, path: &std::path::Path) -> Result<Index, SaveError> {
+        persist::save_and_map(self, path)
+    }
+
     /// Load from the versioned binary format. See [`persist`]. A current
-    /// (version 4) file is memory-mapped, not read into the heap.
+    /// (version 4) file is memory-mapped, not read into the heap (read
+    /// into it when the file cannot be mapped).
     pub fn load(path: &std::path::Path) -> Result<Index, LoadError> {
         persist::load(path)
     }
@@ -349,6 +365,7 @@ impl Index {
             arena: c.arena,
             folded_arena: c.folded_arena,
             sorted: Arc::new(c.sorted),
+            file_checksum: None,
         }
     }
 }
@@ -661,6 +678,7 @@ impl IndexBuilder {
             arena: arena.into(),
             folded_arena: folded_arena.into(),
             sorted: Arc::new(sorted.into()),
+            file_checksum: None,
         };
         Ok((
             index,

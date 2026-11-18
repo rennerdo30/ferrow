@@ -280,12 +280,18 @@ jobs:
               );
               let (elapsed, cold, hits, fingerprint, heap, entries) = if args[2] == "load" {
                   let (index, timings) = Index::load_with_timings(path)?;
+                  // The index's size in the heap, the figure the memory gate
+                  // compares: a current file is mapped (ADR 0007) and holds
+                  // almost nothing in the heap, so read it into the heap
+                  // once, outside the timed load.
+                  let in_heap =
+                      ferrow_index::persist::from_bytes(&std::fs::read(path)?)?.heap_bytes();
                   (
                       timings.total,
                       timings.total,
                       index.len(),
                       0,
-                      index.heap_bytes(),
+                      in_heap,
                       index.len(),
                   )
               } else {

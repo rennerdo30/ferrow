@@ -1225,12 +1225,14 @@ name = "ferrowd"
 version = "0.1.0-beta.20"
 dependencies = [
  "arc-swap",
+ "crc32fast",
  "ferrow-fixture",
  "ferrow-index",
  "ferrow-ipc",
  "ferrow-query",
  "ferrow-walk",
  "libc",
+ "memmap2",
  "rayon",
  "serde",
  "serde_json",

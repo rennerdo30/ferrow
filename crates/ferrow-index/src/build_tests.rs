@@ -375,3 +375,17 @@ fn empty_and_single_entry_builders_freeze_to_a_file() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_parallel_checksum_equals_the_plain_one_over_several_chunks() {
+    // More than two 8 MiB chunks and a ragged end: the combined hashers
+    // must give the file's plain CRC-32.
+    let data: Vec<u8> = (0..(17 << 20) + 12_345u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    assert_eq!(crate::build::crc_parallel(&data), crc32fast::hash(&data));
+    assert_eq!(
+        crate::build::crc_parallel(&data[..100]),
+        crc32fast::hash(&data[..100])
+    );
+}

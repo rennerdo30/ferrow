@@ -35,6 +35,7 @@ mod live_windows;
 pub mod memory;
 pub mod persistence;
 pub mod protection;
+pub mod saved;
 
 /// One immutable index plus how it was produced.
 pub struct Snapshot {
@@ -95,6 +96,14 @@ impl Snapshot {
     /// Load a snapshot from a saved index file.
     pub fn from_file(path: &std::path::Path) -> std::io::Result<Snapshot> {
         let index = Index::load(path).map_err(std::io::Error::other)?;
+        if !index.is_mapped() && !index.is_empty() {
+            // An older file version, or a file that could not be mapped:
+            // correct, but held in private memory until the next save.
+            eventlog::warn(format!(
+                "the saved index is read into memory ({} entries), not mapped from its file",
+                index.len()
+            ));
+        }
         Ok(Snapshot {
             report: format!("loaded {} entries from {}", index.len(), path.display()),
             index: Arc::new(index),
@@ -325,7 +334,7 @@ pub fn initial_snapshot(config: &DaemonConfig) -> std::io::Result<Snapshot> {
 /// the volumes cannot be read directly. `serve` calls this itself.
 pub fn start_live(store: &SnapshotStore, options: WalkOptions) {
     #[cfg(windows)]
-    live_windows::start(store.clone(), options, None);
+    live_windows::start(store.clone(), options, None, None);
     #[cfg(not(windows))]
     let _ = (store, options);
 }
@@ -902,6 +911,7 @@ pub fn serve(
             store.clone(),
             config.walk_options(),
             persistence::IndexFile::new(config),
+            config.index_path.as_deref().map(saved::path_beside),
         );
     }
     eventlog::info(format!("listening on {}", config.endpoint));

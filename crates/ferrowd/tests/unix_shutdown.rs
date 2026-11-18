@@ -64,11 +64,14 @@ fn sigterm_saves_and_restart_reloads_the_index() {
         }
         let before = std::fs::metadata(&index).unwrap().ino();
         stop(&mut child);
-        assert_ne!(
-            std::fs::metadata(&index).unwrap().ino(),
-            before,
-            "shutdown did not save"
-        );
+        let after = std::fs::metadata(&index).unwrap().ino();
+        if first {
+            assert_ne!(after, before, "shutdown did not save");
+        } else {
+            // Loaded from its (current format) file and read through a map:
+            // the file is the index already, nothing to write again.
+            assert_eq!(after, before, "a mapped index was written again");
+        }
         assert!(ferrowd::Snapshot::from_file(&index).is_ok());
     }
     std::fs::remove_dir_all(root).unwrap();

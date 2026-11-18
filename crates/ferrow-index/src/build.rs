@@ -588,7 +588,7 @@ fn place_names(
 }
 
 /// The IEEE CRC-32 of `data`, in parallel chunks combined into one.
-fn crc_parallel(data: &[u8]) -> u32 {
+pub(crate) fn crc_parallel(data: &[u8]) -> u32 {
     const CHUNK: usize = 8 << 20;
     if data.len() <= CHUNK {
         return crc32fast::hash(data);

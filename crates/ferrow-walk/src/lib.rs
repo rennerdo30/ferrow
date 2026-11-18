@@ -954,6 +954,10 @@ fn scan_inner(
 /// back to the heap, with the reason in the report, when that fails), else
 /// into the heap. `Err` only when the heap fallback could not read the
 /// builder's spilled shards back either (a failing disk): there is no index.
+/// The start of a scan's fatal error when its index could not be built
+/// (the spilled shards could not be read back): a later scan may succeed.
+pub const BUILD_FAILED: &str = "the index could not be built";
+
 pub fn freeze_builder(
     builder: IndexBuilder,
     target: Option<&FileTarget<'_>>,
@@ -981,7 +985,7 @@ pub fn freeze_builder(
                 .builder
                 .freeze_checked()
                 .map(|(index, _)| (index, report))
-                .map_err(|e| format!("the index could not be built: {e}"))
+                .map_err(|e| format!("{BUILD_FAILED}: {e}"))
         }
     }
 }
