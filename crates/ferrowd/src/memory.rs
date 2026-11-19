@@ -571,12 +571,21 @@ mod tests {
         );
         #[cfg(any(windows, all(target_os = "linux", target_env = "gnu")))]
         assert!(process_with_heap().heap.is_some_and(|h| h.in_use > 0));
-        let big = vec![1u8; 64 << 20];
-        let after = process();
-        std::hint::black_box(&big);
-        assert!(
-            after.bytes() >= before.bytes() + (32 << 20),
-            "{before:?} {after:?}"
-        );
+        // The figure is the whole process's, and tests running in parallel
+        // allocate and free at the same time (one freed 32 MB right then on
+        // Ubuntu CI, FR-51). A working meter shows the 64 MB in at least one
+        // of a few tries; a broken one never does.
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let before = process();
+            let big = vec![1u8; 64 << 20];
+            let after = process();
+            std::hint::black_box(&big);
+            if after.bytes() >= before.bytes() + (32 << 20) {
+                return;
+            }
+            seen.push((before, after));
+        }
+        panic!("64 MB never showed: {seen:?}");
     }
 }
