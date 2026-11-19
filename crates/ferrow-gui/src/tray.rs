@@ -43,6 +43,8 @@ static FOCUS_SEARCH: AtomicBool = AtomicBool::new(false);
 /// Set when Ferrow starts in the tray: the window must not appear until
 /// the user opens it (eframe shows its window after the first frame).
 static KEEP_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// See [`in_tray`].
+static IN_TRAY: AtomicBool = AtomicBool::new(false);
 
 const HOTKEY_ID: i32 = 1;
 /// Wanted global hotkey as `modifiers << 16 | virtual key`; 0 is none.
@@ -114,6 +116,7 @@ pub fn window() -> Option<HWND> {
 /// Start hidden in the tray: block the window from showing until [`show`].
 pub fn start_hidden() {
     KEEP_HIDDEN.store(true, Ordering::Release);
+    IN_TRAY.store(true, Ordering::Release);
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -128,6 +131,9 @@ pub fn install(hwnd: HWND) {
     TASKBAR_CREATED.store(message, Ordering::Relaxed);
     add_icon(hwnd);
     register_hotkey(hwnd);
+    // The icon and the hotkey both need a UI thread that answers; if a
+    // driver blocks it for good, the watchdog brings a fresh copy up.
+    crate::watchdog::start(hwnd);
 }
 
 fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -156,7 +162,9 @@ fn add_icon(hwnd: HWND) {
     INSTALLED.store(added, Ordering::Release);
 }
 
-fn remove_icon() {
+/// Remove the icon. Safe from any thread (the watchdog calls it while the
+/// UI thread is stuck).
+pub fn remove_icon() {
     let hwnd = WINDOW.load(Ordering::Acquire);
     if hwnd.is_null() || !INSTALLED.swap(false, Ordering::AcqRel) {
         return;
@@ -206,6 +214,7 @@ pub fn show() {
     }
     FOCUS_SEARCH.store(true, Ordering::Release);
     KEEP_HIDDEN.store(false, Ordering::Release);
+    IN_TRAY.store(false, Ordering::Release);
     // SAFETY: hwnd is our live window; both calls are safe from any thread.
     unsafe {
         ShowWindow(
@@ -228,6 +237,7 @@ pub fn hide_to_tray() -> bool {
     if hwnd.is_null() || !INSTALLED.load(Ordering::Acquire) {
         return false;
     }
+    IN_TRAY.store(true, Ordering::Release);
     // SAFETY: hwnd is our live window.
     unsafe { ShowWindow(hwnd, SW_HIDE) };
     true
@@ -243,6 +253,13 @@ pub fn is_hidden() -> bool {
 /// True once after [`show`]: the UI should focus the search box.
 pub fn take_focus_request() -> bool {
     FOCUS_SEARCH.swap(false, Ordering::AcqRel)
+}
+
+/// True while Ferrow belongs in the tray: started there or hidden to it,
+/// and not asked to show since (even if a stuck UI thread never got to
+/// show the window). Readable from any thread.
+pub fn in_tray() -> bool {
+    IN_TRAY.load(Ordering::Acquire)
 }
 
 /// Quit the app for real (tray menu, setup). Settings are saved as they

@@ -1356,6 +1356,12 @@ impl eframe::App for FerrowApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // No vsync on Windows (FR-50): keep redraws at the refresh rate.
+        // Once per painted frame: a discarded pass's rerun does not wait.
+        #[cfg(windows)]
+        if ui.ctx().current_pass_index() == 0 {
+            crate::pacing::pace_frame();
+        }
         let ctx = ui.ctx().clone();
         self.sync_theme(&ctx, frame);
         if platform::take_tray_focus_request() {
