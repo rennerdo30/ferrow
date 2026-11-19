@@ -4,7 +4,11 @@ Release notes for each version. The release workflow copies a version's section 
 
 ## Unreleased
 
-- **The app no longer stays frozen when the graphics driver hangs.** On a PC with an AMD graphics card the app froze for good: its window showed "Not responding", and clicking the tray icon or starting Ferrow again did nothing. The driver never came back from waiting for the screen's next refresh (vsync) when showing a frame. The app no longer waits for that refresh. It draws only when something changes and has no animations, so it draws no more frames than before. If a driver still blocks the window for about 20 seconds, the app starts a fresh copy of itself and ends the stuck one. The fresh copy comes back in the tray, or with the window open if it was open or you had just tried to open it. It tries this at most three times in a row, and the count starts again once the app has run fine for 10 minutes. Not yet tried on the PC that froze: the restart decision is tested, the hang itself is not.
+- **The app no longer stays frozen when the graphics driver hangs.** On a PC with an AMD graphics card the app froze for good: its window showed "Not responding", and clicking the tray icon or starting Ferrow again did nothing. The graphics driver never came back from showing a frame, most likely while waiting for the screen's next refresh (vsync).
+- **No vsync wait (Windows):** the app no longer waits for that refresh. It still draws at most once per refresh of the screen, so moving the mouse or resizing the window draws no more often than before.
+- **Restart when stuck:** if the driver still blocks the window for about 20 seconds, the app starts a fresh copy of itself and ends the stuck one. The fresh copy comes back in the tray if it was there; otherwise it opens the window.
+- **Limit:** it tries this at most three times in a row. The count starts again once the app has run fine for 10 minutes. The window's size and position are not kept across such a restart.
+- **Not yet tried on the PC that froze.** Tested: the restart decision and the frame pacing. Measured: Windows reports a window as stuck about 5 seconds after its thread stops, whether it is shown, hidden in the tray or never shown. The driver hang itself was not reproduced.
 
 ## 0.1.0-beta.22
 

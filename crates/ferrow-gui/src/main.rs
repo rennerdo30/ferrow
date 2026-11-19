@@ -15,6 +15,8 @@ mod engine;
 #[cfg(windows)]
 mod frame;
 mod logo;
+#[cfg(windows)]
+mod pacing;
 mod platform;
 mod service;
 mod settings;
@@ -30,9 +32,11 @@ mod watchdog;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    // A copy that replaces a hung one waits for it to exit first.
+    // A copy that replaces a hung one waits for it to exit first. This
+    // runs before any other thread starts (it clears an environment
+    // variable).
     #[cfg(windows)]
-    watchdog::wait_for_replaced_copy();
+    watchdog::take_over_from_hung_copy();
     // Ferrow keeps running in the tray: starting it again shows that
     // window instead of opening a second copy.
     if platform::activate_running_instance() {
@@ -54,12 +58,13 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,
-        // No vsync: the buffer swap must not wait for a vertical blank.
-        // An AMD OpenGL driver never returned from that wait and froze the
-        // UI thread for good (FR-50). Ferrow repaints only on change and
-        // has no animations, so this adds no frames.
+        // No vsync on Windows: the buffer swap must not wait for a
+        // vertical blank. An AMD OpenGL driver never returned from
+        // `SwapBuffers` and froze the UI thread for good (FR-50); the
+        // vblank wait is the likely place. `pacing` keeps redraws at the
+        // refresh rate instead.
         glow_options: eframe::egui_glow::GlowConfiguration {
-            vsync: false,
+            vsync: !cfg!(windows),
             ..Default::default()
         },
         ..Default::default()

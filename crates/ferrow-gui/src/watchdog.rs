@@ -12,6 +12,7 @@
 //! takes over the single-instance event cleanly. A limit on restarts in a
 //! row keeps a driver that hangs every time from turning this into a loop.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HWND};
@@ -72,21 +73,33 @@ impl Watch {
     }
 }
 
-fn restarts_so_far() -> u32 {
-    std::env::var(RESTARTS_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+/// Restarts in a row before this copy, taken from the environment.
+static RESTARTS_SO_FAR: AtomicU32 = AtomicU32::new(0);
+
+fn replaced_pid(args: impl IntoIterator<Item = String>) -> Option<u32> {
+    args.into_iter()
+        .skip(1)
+        .find_map(|arg| arg.strip_prefix(REPLACES_FLAG)?.parse().ok())
 }
 
-/// Started as the replacement of a hung copy: wait (bounded) until that
-/// copy has exited, so this one does not hand its start to the hung one.
-/// Call first thing in `main`.
-pub fn wait_for_replaced_copy() {
-    let Some(pid) = std::env::args()
-        .skip(1)
-        .find_map(|arg| arg.strip_prefix(REPLACES_FLAG)?.parse::<u32>().ok())
-    else {
+/// Call first thing in `main`, before any other thread exists. Takes the
+/// restart count out of the environment (so the processes this copy
+/// starts, such as setup, do not inherit it) and, when this copy replaces
+/// a hung one, waits (bounded) until that copy has exited, so this one
+/// does not hand its start to the hung one.
+pub fn take_over_from_hung_copy() {
+    if let Some(count) = std::env::var(RESTARTS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        RESTARTS_SO_FAR.store(count, Ordering::Relaxed);
+    }
+    if std::env::var_os(RESTARTS_ENV).is_some() {
+        // SAFETY: no other thread exists yet (see above), so nothing reads
+        // the environment concurrently.
+        unsafe { std::env::remove_var(RESTARTS_ENV) };
+    }
+    let Some(pid) = replaced_pid(std::env::args()) else {
         return;
     };
     // SAFETY: a plain open for waiting; the handle is closed below.
@@ -109,14 +122,19 @@ pub fn start(hwnd: HWND) {
         .name("ferrow-watchdog".into())
         .spawn(move || {
             let hwnd = hwnd as HWND;
-            let mut watch = Watch::new(restarts_so_far());
+            let mut watch = Watch::new(RESTARTS_SO_FAR.load(Ordering::Relaxed));
             loop {
                 std::thread::sleep(POLL);
                 // SAFETY: only reads the window's state; allowed from any
                 // thread, and a window that is gone reads as not hung.
                 let hung = unsafe { IsHungAppWindow(hwnd) } != 0;
-                if watch.observe(hung) && restart(hwnd, watch.restarts + 1) {
-                    return;
+                if watch.observe(hung) {
+                    if restart(hwnd, watch.restarts + 1) {
+                        return;
+                    }
+                    // Could not start a fresh copy: wait the full time
+                    // again instead of retrying every poll.
+                    watch.hung = 0;
                 }
             }
         });
@@ -132,11 +150,12 @@ fn restart(hwnd: HWND, restarts: u32) -> bool {
     command
         .arg(format!("{REPLACES_FLAG}{}", std::process::id()))
         .env(RESTARTS_ENV, restarts.to_string());
-    // Come back the way the user left it: in the tray, unless the window
-    // was showing or the user was just trying to open it.
+    // Come back the way the user left it: in the tray only when it was
+    // there and nobody asked to open it since. A window that never got to
+    // show its first frame comes back open.
     // SAFETY: reads the window's style; allowed from any thread.
     let visible = unsafe { IsWindowVisible(hwnd) } != 0;
-    if !visible && !crate::tray::show_pending() {
+    if !visible && crate::tray::in_tray() {
         command.arg(crate::platform::TRAY_FLAG);
     }
     if command.spawn().is_err() {
@@ -173,6 +192,19 @@ mod tests {
             assert!(!watch.observe(true));
         }
         assert!(watch.observe(true));
+    }
+
+    #[test]
+    fn reads_the_replaced_copy_from_the_arguments() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            replaced_pid(args(&["ferrow-gui", "--tray", "--replaces=4242"])),
+            Some(4242)
+        );
+        assert_eq!(replaced_pid(args(&["ferrow-gui", "--tray"])), None);
+        assert_eq!(replaced_pid(args(&["ferrow-gui", "--replaces=x"])), None);
+        // The program name is never read as a flag.
+        assert_eq!(replaced_pid(args(&["--replaces=7"])), None);
     }
 
     #[test]
