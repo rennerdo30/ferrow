@@ -128,6 +128,9 @@ pub fn install(hwnd: HWND) {
     TASKBAR_CREATED.store(message, Ordering::Relaxed);
     add_icon(hwnd);
     register_hotkey(hwnd);
+    // The icon and the hotkey both need a UI thread that answers; if a
+    // driver blocks it for good, the watchdog brings a fresh copy up.
+    crate::watchdog::start(hwnd);
 }
 
 fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -156,7 +159,9 @@ fn add_icon(hwnd: HWND) {
     INSTALLED.store(added, Ordering::Release);
 }
 
-fn remove_icon() {
+/// Remove the icon. Safe from any thread (the watchdog calls it while the
+/// UI thread is stuck).
+pub fn remove_icon() {
     let hwnd = WINDOW.load(Ordering::Acquire);
     if hwnd.is_null() || !INSTALLED.swap(false, Ordering::AcqRel) {
         return;
@@ -243,6 +248,12 @@ pub fn is_hidden() -> bool {
 /// True once after [`show`]: the UI should focus the search box.
 pub fn take_focus_request() -> bool {
     FOCUS_SEARCH.swap(false, Ordering::AcqRel)
+}
+
+/// True after [`show`] until the UI took the request: the user asked for
+/// the window, even if the UI thread never got to show it.
+pub fn show_pending() -> bool {
+    FOCUS_SEARCH.load(Ordering::Acquire)
 }
 
 /// Quit the app for real (tray menu, setup). Settings are saved as they

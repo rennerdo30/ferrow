@@ -24,10 +24,15 @@ mod theme;
 #[cfg(windows)]
 mod tray;
 mod update;
+#[cfg(windows)]
+mod watchdog;
 
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // A copy that replaces a hung one waits for it to exit first.
+    #[cfg(windows)]
+    watchdog::wait_for_replaced_copy();
     // Ferrow keeps running in the tray: starting it again shows that
     // window instead of opening a second copy.
     if platform::activate_running_instance() {
@@ -49,6 +54,14 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,
+        // No vsync: the buffer swap must not wait for a vertical blank.
+        // An AMD OpenGL driver never returned from that wait and froze the
+        // UI thread for good (FR-50). Ferrow repaints only on change and
+        // has no animations, so this adds no frames.
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
