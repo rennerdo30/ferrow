@@ -2,7 +2,7 @@
 
 Release notes for each version. The release workflow copies a version's section into its GitHub release.
 
-## Unreleased
+## 0.1.0-beta.23
 
 - **The app no longer stays frozen when the graphics driver hangs.** On a PC with an AMD graphics card the app froze for good: its window showed "Not responding", and clicking the tray icon or starting Ferrow again did nothing. The graphics driver never came back from showing a frame, most likely while waiting for the screen's next refresh (vsync).
 - **No vsync wait (Windows):** the app no longer waits for that refresh. It still draws at most once per refresh of the screen, so moving the mouse or resizing the window draws no more often than before.
